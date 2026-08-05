@@ -1,0 +1,40 @@
+#!/bin/bash
+# Misc libvirt VM operations.
+# Usage: ./virmisc COMMAND [VM_NAME]
+#   list                  list all VMs and their state
+#   start     VM          power on the VM
+#   shutdown  VM          request a graceful shutdown (ACPI)
+#   domifaddr VM          show all guest interface addresses
+
+set -euo pipefail
+
+usage() {
+    echo "usage: $0 {list|start|shutdown|domifaddr} [VM_NAME]" >&2
+    exit 1
+}
+
+CMD="${1:-}"
+[ -n "$CMD" ] || usage
+
+VIRSH="virsh -c qemu:///system"
+
+case "$CMD" in
+list)
+    $VIRSH list --all
+    ;;
+start)
+    VM="${2:?usage: $0 start VM}"
+    $VIRSH start "$VM"
+    ;;
+shutdown)
+    VM="${2:?usage: $0 shutdown VM}"
+    $VIRSH shutdown "$VM"
+    ;;
+domifaddr)
+    VM="${2:?usage: $0 domifaddr VM}"
+    $VIRSH domifaddr "$VM" --full
+    ;;
+*)
+    usage
+    ;;
+esac

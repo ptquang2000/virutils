@@ -1,0 +1,260 @@
+#!/bin/bash
+# USB passthrough for libvirt VMs, end to end from the Windows host under WSL.
+# Usage: ./virusb COMMAND [ARGS]
+#   list                       list host USB devices and their sharing state
+#   show      VM               show devices passed to VM, live and persistent
+#   attach    VM VEND:PROD     share on Windows, import into WSL, hand to the VM
+#   detach    VM VEND:PROD     take it out of the VM and give it back to Windows
+#   unbind    VEND:PROD        stop sharing the device on Windows (needs UAC)
+#
+# attach crosses three layers: usbipd bind on Windows, usbipd attach --wsl to import
+# the device over vhci_hcd, then virsh attach-device. Every stage is skipped when
+# `usbipd state` says it is already done, so rerunning after a failure is safe.
+#
+# Only bind and unbind need Administrator, and a bind is persistent, so expect one
+# UAC prompt per physical device ever. detach deliberately stops short of unbinding:
+# a bound but detached device is still usable in Windows, so unbinding would spend a
+# UAC prompt to discard the state the bind just paid for.
+
+set -euo pipefail
+
+# silences virsh's "setlocale: No such file or directory" on minimal/WSL hosts
+export LC_ALL=C
+
+usage() {
+    echo "usage: $0 {list|show|attach|detach|unbind} [VM] [VENDOR:PRODUCT]" >&2
+    exit 1
+}
+
+CMD="${1:-}"
+[ -n "$CMD" ] || usage
+
+VIRSH="virsh -c qemu:///system"
+USBIPD="/mnt/c/Program Files/usbipd-win/usbipd.exe"
+USBIPD_WIN='C:\Program Files\usbipd-win\usbipd.exe'
+DISTRO=archlinux
+
+# stage narration goes to stderr so stdout stays clean enough to pipe
+say() { printf '%s\n' "$*" >&2; }
+die() {
+    printf '%s: %s\n' "$0" "$*" >&2
+    exit 1
+}
+
+# sysfs and the libvirt XML both want lowercase hex, so normalise on the way in
+read_id() {
+    case "$1" in
+    [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) ;;
+    *) die "expected VENDOR:PRODUCT (e.g. 0951:1666), got '$1'" ;;
+    esac
+    echo "$1" | tr 'A-F' 'a-f'
+}
+
+# usbipd's view of one device as BusId|StubInstanceId|PersistedGuid|ClientIPAddress,
+# or the words none/many. The hardware id only appears in InstanceId, which reads
+# USB\VID_0951&PID_1666\<serial>, hence the uppercased substring match.
+usbipd_state() {
+    local key
+    key=$(printf 'VID_%s&PID_%s' "${1%:*}" "${1#*:}" | tr 'a-f' 'A-F')
+    "$USBIPD" state | tr -d '\r' | jq -r --arg key "$key" '
+        [.Devices[] | select((.InstanceId | ascii_upcase) | contains($key))]
+        | if length == 0 then "none"
+          elif length > 1 then "many"
+          else .[0] | [.BusId, (.StubInstanceId // ""), (.PersistedGuid // ""),
+                       (.ClientIPAddress // "")] | join("|")
+          end'
+}
+
+# the address usbipd attaches us as; virbr0 has one too, so pin to eth0
+wsl_ip() { ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1; }
+
+# bind and unbind always need Administrator, so go straight through UAC rather than
+# spending a doomed call first. Start-Process discards the child's exit code, so
+# callers confirm the outcome by rereading usbipd state instead of trusting this.
+elevate() {
+    local args="'$1'"
+    shift
+    local a
+    for a in "$@"; do args="$args,'$a'"; done
+    powershell.exe -NoProfile -Command \
+        "Start-Process -FilePath '$USBIPD_WIN' -ArgumentList $args -Verb RunAs -Wait" \
+        >/dev/null 2>&1 || true
+}
+
+in_sysfs() {
+    local d
+    # root hubs live at /sys/bus/usb/devices/usbN and are skipped by the glob
+    for d in /sys/bus/usb/devices/[0-9]*-[0-9]*/; do
+        [ -r "$d/idVendor" ] || continue
+        [ "$(cat "$d/idVendor"):$(cat "$d/idProduct")" = "$1" ] && return 0
+    done
+    return 1
+}
+
+# libvirt resolves a managed hostdev by looking the device up on the host, so the
+# import has to finish enumerating before virsh sees it; without this wait the race
+# surfaces as a libvirt error blaming the VM layer
+wait_sysfs() {
+    local i
+    for i in $(seq 25); do
+        in_sysfs "$1" && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
+domstate() { $VIRSH domstate "$VM" 2>/dev/null | head -1; }
+
+# checked before anything else touches Windows, so a mistyped VM name cannot cost a
+# UAC prompt first and then fail at the last stage
+require_domain() {
+    $VIRSH domstate "$VM" >/dev/null 2>&1 ||
+        die "no such VM: $VM (see: virsh -c qemu:///system list --all)"
+}
+
+# startupPolicy only matters while a domain starts, so it belongs in persistent
+# config and is left out of a live attach. Without it a persisted hostdev whose
+# device is unplugged can stop the VM from booting at all.
+hostdev_xml() {
+    cat <<EOF
+<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source${2:-}>
+    <vendor id='0x${1%:*}'/>
+    <product id='0x${1#*:}'/>
+  </source>
+</hostdev>
+EOF
+}
+
+hostdevs() { $VIRSH dumpxml "$@" | sed -n '/<hostdev/,/<\/hostdev>/p'; }
+
+# libvirt has no idempotent attach-device, so the last stage needs the same gate as
+# the usbipd ones or a rerun after a partial failure dies on the device it already
+# added. libvirt always emits <vendor> before <product>, so pairing successive ids
+# reconstructs the VENDOR:PRODUCT of each usb hostdev.
+has_hostdev() {
+    hostdevs "$@" |
+        sed -n "s/.*<\(vendor\|product\) id='0x\([0-9a-f]*\)'.*/\2/p" |
+        paste -d: - - | grep -qx "$ID"
+}
+
+# a device can sit in the live domain, in the persistent config, or both, so each is
+# tried on its own. Only "not found" is tolerated; anything else is a real failure
+# and must not be mistaken for a clean detach.
+detach_scope() {
+    local scope="$1" out
+    if out=$(hostdev_xml "$ID" | $VIRSH detach-device "$VM" "$scope" /dev/stdin 2>&1); then
+        say "libvirt: removed from $scope"
+        return 0
+    fi
+    case "$out" in
+    *"not found"* | *"Not found"*) return 1 ;;
+    esac
+    die "$out"
+}
+
+case "$CMD" in
+list)
+    "$USBIPD" list | tr -d '\r'
+    ;;
+show)
+    VM="${2:?usage: $0 show VM}"
+    # the two views can disagree now that attach writes persistent config, and a
+    # persisted hostdev that is not live is exactly the one that surprises you at
+    # the next boot, so never show one without the other
+    echo "=== live ==="
+    hostdevs "$VM"
+    echo "=== persistent ==="
+    hostdevs --inactive "$VM"
+    ;;
+attach)
+    VM="${2:?usage: $0 attach VM VENDOR:PRODUCT}"
+    ID=$(read_id "${3:?usage: $0 attach VM VENDOR:PRODUCT}")
+    require_domain
+
+    STATE=$(usbipd_state "$ID")
+    case "$STATE" in
+    none) die "no connected USB device has hardware id $ID (see: $0 list)" ;;
+    many) die "several connected devices share hardware id $ID; unplug one" ;;
+    esac
+    IFS='|' read -r BUSID STUB GUID CLIENT <<<"$STATE"
+
+    if [ -n "$STUB$GUID" ]; then
+        say "bind: $ID ($BUSID) already shared, skipping"
+    else
+        say "bind: sharing $ID ($BUSID) on the Windows host, expect a UAC prompt"
+        elevate bind -i "$ID"
+        IFS='|' read -r BUSID STUB GUID CLIENT <<<"$(usbipd_state "$ID")"
+        [ -n "$STUB$GUID" ] || die "bind did not take effect; was the UAC prompt declined?"
+    fi
+
+    IP=$(wsl_ip)
+    if [ -n "$CLIENT" ]; then
+        [ "$CLIENT" = "$IP" ] ||
+            die "$ID is attached to $CLIENT, not to this WSL instance ($IP)"
+        say "wsl: $ID already attached here, skipping"
+    else
+        say "wsl: importing $ID into $DISTRO"
+        "$USBIPD" attach --wsl "$DISTRO" -i "$ID"
+    fi
+
+    wait_sysfs "$ID" || die "$ID never appeared in WSL; the usbipd import did not land"
+
+    if [ "$(domstate)" = running ]; then
+        if has_hostdev "$VM"; then
+            say "libvirt: $ID is already attached to $VM, skipping"
+        else
+            say "libvirt: attaching to $VM (live)"
+            hostdev_xml "$ID" | $VIRSH attach-device "$VM" --live /dev/stdin
+        fi
+    elif has_hostdev --inactive "$VM"; then
+        say "libvirt: $ID is already in $VM's persistent config, skipping"
+    else
+        say "libvirt: $VM is not running, attaching to its persistent config"
+        hostdev_xml "$ID" " startupPolicy='optional'" |
+            $VIRSH attach-device "$VM" --config /dev/stdin
+    fi
+    ;;
+detach)
+    VM="${2:?usage: $0 detach VM VENDOR:PRODUCT}"
+    ID=$(read_id "${3:?usage: $0 detach VM VENDOR:PRODUCT}")
+    require_domain
+
+    REMOVED=0
+    if [ "$(domstate)" = running ]; then
+        if detach_scope --live; then REMOVED=1; fi
+    fi
+    if detach_scope --config; then REMOVED=1; fi
+    [ "$REMOVED" = 1 ] || die "$VM has no hostdev for $ID, live or persistent"
+
+    # leaves the device bound: still usable in Windows, and ready for a prompt-free
+    # reattach later. Use `$0 unbind` to stop sharing it altogether.
+    IFS='|' read -r BUSID STUB GUID CLIENT <<<"$(usbipd_state "$ID")"
+    if [ -n "${CLIENT:-}" ]; then
+        say "wsl: returning $ID to the Windows host"
+        "$USBIPD" detach -i "$ID"
+    fi
+    ;;
+unbind)
+    ID=$(read_id "${2:?usage: $0 unbind VENDOR:PRODUCT}")
+
+    STATE=$(usbipd_state "$ID")
+    case "$STATE" in
+    none) die "no connected USB device has hardware id $ID (see: $0 list)" ;;
+    many) die "several connected devices share hardware id $ID; unplug one" ;;
+    esac
+    IFS='|' read -r BUSID STUB GUID CLIENT <<<"$STATE"
+
+    if [ -z "$STUB$GUID" ]; then
+        say "unbind: $ID ($BUSID) is not shared, nothing to do"
+    else
+        say "unbind: unsharing $ID ($BUSID), expect a UAC prompt"
+        elevate unbind -i "$ID"
+        IFS='|' read -r BUSID STUB GUID CLIENT <<<"$(usbipd_state "$ID")"
+        [ -z "$STUB$GUID" ] || die "unbind did not take effect; was the UAC prompt declined?"
+    fi
+    ;;
+*)
+    usage
+    ;;
+esac

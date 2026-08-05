@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+# Fetch a project's build output from the Windows host, then push it into a
+# Windows guest's C: drive offline by attaching its qcow2 with qemu-nbd.
+#
+#   Windows build tree --(fetch)--> staging dir --(map)--> guest NTFS
+#
+# Everything -- source dirs, destinations, excludes, post-copy cleanup -- is
+# defined in a config file under ~/.config/virutils/. README.md documents the
+# directive syntax; this script does not repeat it.
+#
+# Usage: ./virsync [-c NAME|PATH]    -- run as yourself, NOT under sudo.
+#
+# Only the few commands that need root are escalated (nbd, mount, umount), and
+# the guest NTFS is mounted with uid=, so both copy phases run unprivileged.
+# Windows Fast Startup must be off, otherwise NTFS is left dirty and ntfs-3g
+# refuses to mount read-write.
+#
+# A running guest is always shut down before the disk is touched and restarted
+# afterwards -- including on failure -- so the power state you start with is the
+# one you end with. The shutdown is graceful, falling back to a destroy after
+# @shutdown_timeout seconds. The restart is gated on the image being provably
+# detached: if teardown cannot be verified the guest is left shut off on
+# purpose, since starting it then would put two writers on one qcow2.
+set -euo pipefail
+
+die()  { printf '%s\n' "$@" >&2; exit 1; }
+warn() { printf '%s\n' "$@" >&2; }
+
+CONF_DIR="$HOME/.config/virutils"
+DEFAULT_CONF="$CONF_DIR/virsync.conf"
+
+# Under sudo, $HOME resolves to root's on any host whose sudoers sets
+# always_set_home -- discovery would quietly read /root/.config while you edit
+# a config in your own home. Refuse rather than guess which home was meant.
+[[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] \
+    && die "do not run virsync under sudo -- run it as yourself." \
+           "It escalates only the commands that actually need root."
+
+if [[ $EUID -eq 0 ]]; then SUDO=(); else SUDO=(sudo); fi
+
+# Shared by both copy phases so their flags cannot drift apart.
+RSYNC=(rsync -rlt --mkpath --info=progress2 --no-perms --no-owner --no-group)
+VIRSH=(virsh --connect qemu:///system)
+
+# Rewrite every letter as [Aa] so a path matches case-insensitively: the guest's
+# NTFS is case-insensitive, this ntfs-3g mount is not. shopt nocaseglob is not
+# enough -- bash never glob-expands a word with no wildcard in it, so a literal
+# path would stay literal and silently miss.
+ci_glob() {
+    local s="$1" out="" c i
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        if [[ "$c" == [A-Za-z] ]]; then out+="[${c^^}${c,,}]"; else out+="$c"; fi
+    done
+    printf '%s' "$out"
+}
+
+usage() {
+    printf '%s\n' \
+        "usage: $(basename "$0") [-c NAME|PATH]" \
+        "" \
+        "  -c, --config NAME|PATH  config to use. A value containing '/' is a" \
+        "                          path, taken as given; anything else names a" \
+        "                          config in $CONF_DIR" \
+        "                          ('.conf' is appended when absent)." \
+        "                          default: $DEFAULT_CONF" \
+        "  -h, --help              this message" \
+        "" \
+        "The config is the whole interface; see README.md for its format." >&2
+    exit "${1:-1}"
+}
+
+CONF_ARG=""
+while (( $# )); do
+    case "$1" in
+        -c|--config) (( $# >= 2 )) || { warn "$1 needs a value"; usage; }
+                     CONF_ARG="$2"; shift 2 ;;
+        -h|--help)   usage 0 ;;
+        *)           warn "unrecognised argument: $1"; usage ;;
+    esac
+done
+
+# Path-or-name is decided on the spelling alone, never on what happens to exist:
+# the same command must mean the same config from any directory, and the error
+# below can then name exactly one path.
+if   [[ -z "$CONF_ARG"    ]]; then CONF="$DEFAULT_CONF"
+elif [[ "$CONF_ARG" == */* ]]; then CONF="$CONF_ARG"
+else                               CONF="$CONF_DIR/${CONF_ARG%.conf}.conf"
+fi
+
+[[ -f "$CONF" ]] || die "config not found: $CONF" \
+    "Create it, or point -c elsewhere. README.md documents the format."
+
+# --- config -----------------------------------------------------------------
+# Parsed up front so a malformed config fails before anything is touched.
+REPO=""; STAGING=""; DEST=""; DOMAIN=""; NBD="/dev/nbd0"; MNT=""
+SHUTDOWN_TIMEOUT=180
+FETCH=(); MAPPINGS=(); EXCLUDES=(); CLEANUP=()
+lineno=0
+while IFS= read -r line || [[ -n "$line" ]]; do
+    (( ++lineno ))
+    line="${line%%#*}"                       # strip comments
+    line="${line#"${line%%[![:space:]]*}"}"  # trim leading space
+    line="${line%"${line##*[![:space:]]}"}"  # trim trailing space
+    [[ -z "$line" ]] && continue
+
+    case "$line" in
+        @*)  IFS='=' read -r key val <<< "${line#@}"
+             case "$key" in
+                 repo)             REPO="$val" ;;
+                 staging)          STAGING="$val" ;;
+                 dest)             DEST="$val" ;;
+                 domain)           DOMAIN="$val" ;;
+                 nbd)              NBD="$val" ;;
+                 mnt)              MNT="$val" ;;
+                 shutdown_timeout) SHUTDOWN_TIMEOUT="$val" ;;
+                 *) die "$CONF:$lineno: unknown setting '$key'" ;;
+             esac ;;
+        !*)  read -r -a pats <<< "${line#!}"
+             for p in "${pats[@]}"; do EXCLUDES+=(--exclude="$p"); done ;;
+        -*)  CLEANUP+=("${line#-}") ;;
+        \<*) [[ "$line" == *"|"* ]] \
+                 || die "$CONF:$lineno: fetch rule needs '|': $line"
+             FETCH+=("${line#<}") ;;
+        *)   # Map rules are the only unsigilled form; anything starting with
+             # punctuation is a mistyped directive, not a glob.
+             [[ "${line:0:1}" == [A-Za-z0-9_./*?] ]] \
+                 || die "$CONF:$lineno: unrecognised directive: $line"
+             [[ "$line" == *"|"* ]] \
+                 || die "$CONF:$lineno: missing '|' separator: $line"
+             MAPPINGS+=("$line") ;;
+    esac
+done < "$CONF"
+
+[[ -n "$DOMAIN" ]] || die "$CONF: @domain is required"
+[[ -n "$STAGING" ]] || die "$CONF: @staging is required"
+STAGING="/tmp/${STAGING#/}"   # @staging names a directory under /tmp
+MNT="${MNT:-/mnt/$DOMAIN}"
+
+# A map rule's destination is relative to @dest, so the install path is spelled
+# once. Empty means @dest itself.
+guest_dir() { printf '%s' "${DEST:+$DEST${1:+/}}$1"; }
+
+# '.' is how a rule spells "the root of this tree", but it must not survive into
+# a path handed to rsync: --mkpath walks the destination creating components, and
+# on reaching a literal '.' it takes the EEXIST as fatal ("mkdir ..././ failed:
+# File exists"). It only bites the first time a given path is created, so a
+# rerun papers over it. Strip the '.' instead of relying on that.
+root_rel() { local s="$1"; [[ "$s" == "." ]] && s=""; printf '%s' "$s"; }
+
+echo "config: $CONF"
+echo "  ${#FETCH[@]} fetch, ${#MAPPINGS[@]} map, ${#EXCLUDES[@]} exclude," \
+     "${#CLEANUP[@]} cleanup"
+echo "  staging: $STAGING"
+
+# --- fetch: Windows build tree -> staging -----------------------------------
+(( ${#FETCH[@]} )) || die "no fetch rules in $CONF"
+[[ -n "$REPO" ]] || die "$CONF: @repo is required"
+[[ -d "$REPO" ]] || die "repo not found: $REPO"
+command -v rsync >/dev/null || die "rsync not installed"
+
+echo "fetch: $REPO"
+for rule in "${FETCH[@]}"; do
+    rel="${rule%%|*}"
+    sub="$(root_rel "${rule#*|}")"
+    [[ -d "$REPO/$rel" ]] \
+        || { warn "   warning: no such source dir, skipped: $rel"; continue; }
+
+    echo "   $rel -> ${sub:-.}"
+    "${RSYNC[@]}" --chmod=F755,D755 "${EXCLUDES[@]}" \
+          "$REPO/$rel/" "$STAGING${sub:+/$sub}/"
+done
+
+# --- push: staging -> guest disk --------------------------------------------
+[[ -d "$STAGING" ]] || die "staging dir not found: $STAGING"
+(( ${#MAPPINGS[@]} )) || die "no map rules in $CONF"
+
+# Teardown is verified from observed state, not from exit codes -- and both
+# probes are world-readable, so verification cannot itself fail on sudo auth.
+nbd_attached() {
+    local sys="/sys/block/${NBD##*/}"
+    [[ -e "$sys/pid" ]] && return 0
+    [[ -r "$sys/size" ]] && (( $(< "$sys/size") > 0 ))
+}
+mnt_mounted() {
+    awk -v m="$MNT" '$2 == m { found = 1 } END { exit !found }' /proc/mounts
+}
+
+# Authenticate before the guest is shut down rather than partway through. No
+# keep-alive: if the timestamp lapses during a long copy, teardown asks again,
+# and if nobody answers the guest is deliberately left off -- see finish().
+if (( ${#SUDO[@]} )); then
+    command -v sudo >/dev/null || die "sudo not installed; nbd and mount need it"
+    sudo -v || die "sudo authentication failed"
+fi
+
+# A stale nbd or mount left by a failed run: going on would end with us
+# detaching or unmounting something that was never ours.
+nbd_attached && die "$NBD is already attached; free it or set @nbd elsewhere" \
+                    "  sudo qemu-nbd -d $NBD"
+mnt_mounted && die "$MNT is already mounted; unmount it first" \
+                   "  sudo umount $MNT"
+
+# A managed-save image means the guest resumes from stale RAM -- its cached NTFS
+# metadata would not match the disk we are about to edit. Refuse outright.
+"${VIRSH[@]}" dominfo "$DOMAIN" | grep -qi '^Managed save: *yes' \
+    && die "$DOMAIN has a managed-save image; resuming it after editing the disk" \
+           "would corrupt the filesystem. Run: virsh managedsave-remove $DOMAIN"
+
+ORIG_STATE="$("${VIRSH[@]}" domstate "$DOMAIN")"
+echo "domain: $DOMAIN ($ORIG_STATE)"
+
+# Reject unusable states before the trap is armed, so finish() only ever has to
+# deal with states it can actually restore.
+case "$ORIG_STATE" in
+    "shut off"|running) ;;
+    *)  # paused / pmsuspended: the guest holds RAM that no longer matches the
+        # disk once we write to it, and there is no safe way to resume.
+        die "$DOMAIN is '$ORIG_STATE'; shut it down or destroy it first" ;;
+esac
+
+finish() {
+    # No step may abort the handler under set -e: the qemu-nbd detach has to run
+    # even when the mount never happened.
+    if mnt_mounted; then
+        sync
+        "${SUDO[@]}" umount "$MNT" || true
+    fi
+    if nbd_attached; then
+        "${SUDO[@]}" qemu-nbd -d "$NBD" >/dev/null 2>&1 || true
+    fi
+    sync
+
+    # The guest may only be started once the image is provably free. Two writers
+    # on one qcow2 is the single failure this script must never cause, so the
+    # restart is gated on the state that makes it safe -- not on the exit codes
+    # above, which say nothing if sudo could not authenticate.
+    if mnt_mounted || nbd_attached; then
+        warn "" \
+             "teardown could not be verified -- leaving $DOMAIN shut off." \
+             "Starting it while ${IMG:-its disk} is still attached would put" \
+             "two writers on the image. Recover by hand:" \
+             "  sudo umount $MNT" \
+             "  sudo qemu-nbd -d $NBD" \
+             "  virsh --connect qemu:///system start $DOMAIN"
+        exit 1
+    fi
+
+    if [[ "$ORIG_STATE" == running ]]; then
+        echo "restoring $DOMAIN to running"
+        "${VIRSH[@]}" start "$DOMAIN" >/dev/null \
+            || warn "failed to restart $DOMAIN -- start it manually"
+    fi
+}
+trap finish EXIT
+
+if [[ "$ORIG_STATE" == running ]]; then
+    echo "   shutting down (graceful, up to ${SHUTDOWN_TIMEOUT}s)..."
+    "${VIRSH[@]}" shutdown "$DOMAIN" >/dev/null
+    state="$ORIG_STATE"   # so a @shutdown_timeout of 0 still has something to test
+    for (( i = 0; i < SHUTDOWN_TIMEOUT; i++ )); do
+        state="$("${VIRSH[@]}" domstate "$DOMAIN")"
+        [[ "$state" == "shut off" ]] && break
+        # Say something periodically: this is an ACPI power-button request, which
+        # Windows is free to ignore (a modal dialog, the lock screen mid-update),
+        # and a silent wait of up to @shutdown_timeout looks exactly like a hang.
+        (( i > 0 && i % 15 == 0 )) \
+            && echo "   still '$state' after ${i}s of ${SHUTDOWN_TIMEOUT}s" \
+                    "-- check the guest console for a dialog blocking shutdown"
+        sleep 1
+    done
+    if [[ "$state" != "shut off" ]]; then
+        warn "   no clean shutdown after ${SHUTDOWN_TIMEOUT}s; destroying"
+        "${VIRSH[@]}" destroy "$DOMAIN" >/dev/null
+        sleep 2
+    fi
+    echo "   shut off"
+fi
+
+# Top of the backing chain -- writing to the base image would corrupt the guest.
+IMG="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
+       | awk '$2=="disk" && $3=="sda" {print $4}')"
+[[ -f "$IMG" ]] || die "could not resolve disk image for $DOMAIN"
+echo "image: $IMG"
+
+# max_part only takes effect at module load; reload if it came up without it.
+if [[ ! -e /sys/module/nbd/parameters/max_part ]] \
+   || (( $(< /sys/module/nbd/parameters/max_part) < 1 )); then
+    "${SUDO[@]}" rmmod nbd 2>/dev/null || true
+    "${SUDO[@]}" modprobe nbd max_part=8
+fi
+
+"${SUDO[@]}" qemu-nbd -c "$NBD" "$IMG"
+"${SUDO[@]}" partx -a "$NBD" 2>/dev/null || true   # force a partition rescan
+udevadm settle
+
+# The Windows system partition: largest NTFS one on the disk. Probe each node
+# with blkid directly -- lsblk's FSTYPE can be empty if udev hasn't caught up.
+PART=""; BEST=0
+for dev in "$NBD"p*; do
+    [[ -b "$dev" ]] || continue
+    [[ "$("${SUDO[@]}" blkid -o value -s TYPE "$dev" 2>/dev/null)" == "ntfs" ]] \
+        || continue
+    size="$("${SUDO[@]}" blockdev --getsize64 "$dev")"
+    (( size > BEST )) && { BEST="$size"; PART="$dev"; }
+done
+if [[ -z "$PART" ]]; then
+    lsblk -o NAME,SIZE,FSTYPE,PARTTYPENAME "$NBD" >&2 || true
+    die "no NTFS partition found on $NBD (layout above)"
+fi
+echo "partition: $PART ($((BEST / 1024 / 1024 / 1024)) GiB)"
+
+"${SUDO[@]}" mkdir -p "$MNT"
+
+# uid=/gid= hand the whole NTFS tree to the invoking user, so the map-phase
+# rsync and the cleanup below need no privilege of their own -- which is also
+# what keeps the sudo timestamp out of the long-running part of the run.
+"${SUDO[@]}" mount -t ntfs-3g -o "uid=$(id -u),gid=$(id -g)" "$PART" "$MNT"
+
+shopt -s nullglob
+
+for rule in "${MAPPINGS[@]}"; do
+    globs="${rule%%|*}"
+    dst_rel="$(guest_dir "$(root_rel "${rule#*|}")")"
+
+    # Split the pattern list WITHOUT letting bash expand it against the cwd --
+    # read never does pathname expansion, unlike an unquoted `for g in $globs`.
+    IFS=' ' read -r -a patterns <<< "$globs"
+
+    # Expand the globs relative to the staging dir into a concrete file list.
+    files=()
+    for g in "${patterns[@]}"; do
+        matches=("$STAGING/"$g)
+        (( ${#matches[@]} )) || { warn "warning: no match for '$g'"; continue; }
+        files+=("${matches[@]}")
+    done
+    (( ${#files[@]} )) || { warn "skipping '$dst_rel': nothing matched"; continue; }
+
+    echo "-> C:\\${dst_rel//\//\\} (${#files[@]} item(s))"
+    "${RSYNC[@]}" "${EXCLUDES[@]}" "${files[@]}" "$MNT/$dst_rel/"
+done
+
+# --- post-copy cleanup ------------------------------------------------------
+# A function so IFS can be scoped: it must be newline-only, or globs containing
+# spaces ("Program Files") would be split into separate words.
+empty_guest_dirs() {
+    local IFS=$'\n'
+    local pat targets real rel n
+
+    for pat in "${CLEANUP[@]}"; do
+        targets=("$MNT"/$(ci_glob "$pat"))
+        (( ${#targets[@]} )) \
+            || { echo "   not present, skipped: C:\\${pat//\//\\}"; continue; }
+
+        for real in "${targets[@]}"; do
+            [[ -d "$real" ]] || continue
+
+            # Must be under the mount and at least two levels down, so a
+            # mistyped pattern cannot empty C:\ or a top-level directory.
+            rel="${real#"$MNT/"}"
+            if [[ "$real" != "$MNT/"* || "$rel" != */* ]]; then
+                warn "refusing unsafe cleanup path: $real"
+                continue
+            fi
+
+            # -print after -delete counts what went, in the same traversal.
+            n="$(find "$real" -mindepth 1 -delete -print | wc -l)"
+            echo "   emptied $real ($n entries)"
+        done
+    done
+}
+empty_guest_dirs
+
+shopt -u nullglob
+
+# The unmount, detach and restart happen in finish(), on the way out.
+echo "copy complete -> $DOMAIN"
