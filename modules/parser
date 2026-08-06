@@ -1,0 +1,42 @@
+# Parser for virutil: top-level dispatch plus the helpers every module shares.
+# Sourced by virutil; not executable on its own.
+
+MODULES=(exec sync usb snapshot misc)
+
+die()  { printf '%s\n' "$@" >&2; exit 1; }
+warn() { printf '%s\n' "$@" >&2; }
+say()  { printf '%s\n' "$@" >&2; }
+
+top_usage() {
+    cat >&2 <<'EOF'
+usage: virutil MODULE [ARGS]
+
+modules:
+  exec       run commands inside a Windows guest via the QEMU guest agent
+  sync       fetch build output from the Windows host and push it into a guest
+  usb        USB passthrough end to end from the Windows host under WSL
+  snapshot   external snapshots (disk and memory) for libvirt domains
+  misc       everyday domain operations: list, start, shutdown, domifaddr
+
+Run 'virutil <module>' for a module's own usage.
+EOF
+    exit "${1:-1}"
+}
+
+# parse_dispatch "$@" -- split the module name from the rest of the command line
+# and validate it. Sets the globals MODULE and REST.
+parse_dispatch() {
+    local m
+    MODULE="${1:-}"
+    if [[ -z "$MODULE" ]]; then top_usage 1; fi
+    case "$MODULE" in
+        help|-h|--help) top_usage 0 ;;
+    esac
+    shift
+    for m in "${MODULES[@]}"; do
+        [[ "$MODULE" == "$m" ]] || continue
+        REST=("$@")
+        return 0
+    done
+    die "virutil: unknown module: $MODULE (see: virutil help)"
+}

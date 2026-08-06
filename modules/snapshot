@@ -1,0 +1,51 @@
+# snapshot -- external snapshots (disk + memory) for libvirt VMs.
+# Sourced by virutil; entry point is snapshot_main. Usage:
+#   virutil snapshot create    VM [SNAP]   create an external snapshot (default name: snap-<timestamp>)
+#   virutil snapshot list      VM          list snapshots as a tree
+#   virutil snapshot revert    VM SNAP     revert to a snapshot and leave the VM running
+#   virutil snapshot delete    VM SNAP     delete a snapshot and its children
+
+DIR=/var/lib/libvirt/images
+VIRSH="virsh -c qemu:///system"
+
+snapshot_usage() {
+    echo "usage: virutil snapshot {create|list|revert|delete} VM_NAME [SNAP_NAME]" >&2
+    exit 1
+}
+
+snapshot_main() {
+    local CMD VM SNAP
+    CMD="${1:-}"
+    [ -n "$CMD" ] || snapshot_usage
+    VM="${2:-}"
+    [ -n "$VM" ] || snapshot_usage
+
+    case "$CMD" in
+    create)
+        SNAP="${3:-snap-$(date +%Y%m%d-%H%M%S)}"
+        $VIRSH snapshot-create-as \
+            --domain "$VM" \
+            --name "$SNAP" \
+            --memspec "$DIR/$VM.$SNAP.mem,snapshot=external" \
+            --diskspec "vda,snapshot=external,file=$DIR/$VM.$SNAP.qcow2" \
+            --atomic
+        echo "created: $SNAP"
+        ;;
+    list)
+        $VIRSH snapshot-list --domain "$VM" --tree
+        ;;
+    revert)
+        SNAP="${3:?usage: virutil snapshot revert VM_NAME SNAP_NAME}"
+        $VIRSH snapshot-revert --domain "$VM" --snapshotname "$SNAP" --running
+        echo "reverted: $SNAP"
+        ;;
+    delete)
+        SNAP="${3:?usage: virutil snapshot delete VM_NAME SNAP_NAME}"
+        $VIRSH snapshot-delete --domain "$VM" --snapshotname "$SNAP" --children
+        echo "deleted: $SNAP"
+        ;;
+    *)
+        snapshot_usage
+        ;;
+    esac
+}

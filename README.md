@@ -1,14 +1,15 @@
-# virctl
+# virutil
 
 A small set of shell tools for driving Windows guests under libvirt/KVM from a
-Linux host, including a WSL host talking to the Windows machine it runs on. Each
-tool is a single self-contained bash script with no build step and no
-dependencies beyond the utilities it calls.
+Linux host, including a WSL host talking to the Windows machine it runs on.
+Everything hangs off a single driver, `virutil`, which dispatches to a set of
+sourced modules under `modules/` — each a small function library with no build
+step and no dependencies beyond the utilities it calls.
 
 ## Contents
 
-- [Tools](#tools)
-- [virsync](#virsync)
+- [Modules](#modules)
+- [virutil sync](#virutil-sync)
    - [Synopsis](#synopsis)
    - [Description](#description)
    - [Options](#options)
@@ -24,33 +25,36 @@ dependencies beyond the utilities it calls.
 - [Requirements](#requirements)
 - [See also](#see-also)
 
-## Tools
+## Modules
 
-| Tool | Purpose | Usage |
+| Module | Purpose | Usage |
 | --- | --- | --- |
-| `virsync` | Fetch a project's build output from a Windows host and push it into a guest's `C:` drive offline, by attaching the qcow2 with `qemu-nbd`. | `virsync [-c NAME\|PATH]` |
-| `virexec` | Run commands inside a Windows guest through the QEMU guest agent, with no guest networking required. | `virexec {setup\|ping\|info\|run\|ps\|push\|pull\|raw} VM_NAME [FLAGS] [ARGS]` |
-| `virusb` | USB passthrough end to end from a Windows host under WSL: `usbipd` bind, import over `vhci_hcd`, then attach to the domain. | `virusb {list\|show\|attach\|detach\|unbind} [VM] [VENDOR:PRODUCT]` |
-| `virsnapshot` | External snapshots (disk and memory) for libvirt domains. | `virsnapshot {create\|list\|revert\|delete} VM_NAME [SNAP_NAME]` |
-| `virmisc` | Everyday domain operations: list, start, graceful shutdown, interface addresses. | `virmisc {list\|start\|shutdown\|domifaddr} [VM_NAME]` |
+| `sync` | Fetch a project's build output from a Windows host and push it into a guest's `C:` drive offline, by attaching the qcow2 with `qemu-nbd`. | `virutil sync [-c NAME\|PATH]` |
+| `exec` | Run commands inside a Windows guest through the QEMU guest agent, with no guest networking required. | `virutil exec {setup\|ping\|info\|cmd\|ps} VM_NAME [FLAGS] [ARGS]` |
+| `usb` | USB passthrough end to end from a Windows host under WSL: `usbipd` bind, import over `vhci_hcd`, then attach to the domain. | `virutil usb {list\|show\|attach\|detach\|unbind} [VM] [VENDOR:PRODUCT]` |
+| `snapshot` | External snapshots (disk and memory) for libvirt domains. | `virutil snapshot {create\|list\|revert\|delete} VM_NAME [SNAP_NAME]` |
+| `misc` | Everyday domain operations: list, start, graceful shutdown, interface addresses. | `virutil misc {list\|start\|shutdown\|domifaddr} [VM_NAME]` |
 
-Only `virsync` is driven by a config file; the rest take everything on the
-command line. The remainder of this document covers `virsync`.
+`virutil` alone, or `virutil help`, prints the module list. `modules/parser`
+handles the top-level dispatch plus the helpers every module shares; each
+module file declares its own subcommands. Only `sync` is driven by a config
+file; the rest take everything on the command line. The remainder of this
+document covers `virutil sync`.
 
-## virsync
+## virutil sync
 
 ### Synopsis
 
 ```
-virsync [-c NAME|PATH]
-virsync -h
+virutil sync [-c NAME|PATH]
+virutil sync -h
 ```
 
 ### Description
 
-`virsync` copies a build tree into a **powered-off** Windows guest by mounting
-its disk on the host, so nothing has to run inside the guest — no network, no
-shares, no guest agent. It works in two halves:
+`virutil sync` copies a build tree into a **powered-off** Windows guest by
+mounting its disk on the host, so nothing has to run inside the guest — no
+network, no shares, no guest agent. It works in two halves:
 
 ```
 Windows build tree --(fetch)--> staging dir --(map)--> guest NTFS
@@ -80,7 +84,7 @@ need no privilege of their own.
 
 | Option | Description |
 | --- | --- |
-| `-c`, `--config NAME\|PATH` | Config to use. A value containing `/` is a path, taken as given. Anything else names a config in `~/.config/virutils/`, with `.conf` appended when absent — so `-c win11` reads `~/.config/virutils/win11.conf`. Defaults to `~/.config/virutils/virsync.conf`. |
+| `-c`, `--config NAME\|PATH` | Config to use. A value containing `/` is a path, taken as given. Anything else names a config in `~/.config/virutils/`, with `.conf` appended when absent — so `-c win11` reads `~/.config/virutils/win11.conf`. Defaults to `~/.config/virutils/sync.conf`. |
 | `-h`, `--help` | Print usage and exit. |
 
 Path-or-name is decided from the spelling alone, never from what happens to
@@ -94,7 +98,7 @@ There are no other arguments. Everything else lives in the config.
 
 | Path | Description |
 | --- | --- |
-| `~/.config/virutils/virsync.conf` | Default config. This is the only location searched; there is no fallback beside the script. |
+| `~/.config/virutils/sync.conf` | Default config. This is the only location searched; there is no fallback beside the script. |
 | `~/.config/virutils/NAME.conf` | Additional configs, selected with `-c NAME`. |
 | `/tmp/<@staging>` | Staging directory, rebuilt from `@repo` on every run. |
 | `/mnt/<@domain>` | Default mount point for the guest filesystem, overridable with `@mnt`. |
@@ -190,7 +194,7 @@ least two levels deep.
 
 ### Example
 
-`~/.config/virutils/virsync.conf`:
+`~/.config/virutils/sync.conf`:
 
 ```
 @repo=/mnt/c/Users/me/work/myproject
@@ -217,14 +221,14 @@ helper.exe|helpers
 Then:
 
 ```
-./virsync
+./virutil sync
 ```
 
 Or, keeping several profiles side by side:
 
 ```
-./virsync -c win10
-./virsync -c ~/scratch/experiment.conf
+./virutil sync -c win10
+./virutil sync -c ~/scratch/experiment.conf
 ```
 
 ### Notes
@@ -251,7 +255,7 @@ virsh managedsave-remove DOMAIN
 domain down or destroy it first.
 
 **The guest is restarted only once the disk is provably free.** After unmounting
-and detaching, `virsync` re-reads `/proc/mounts` and
+and detaching, `virutil sync` re-reads `/proc/mounts` and
 `/sys/block/<nbd>/{pid,size}` to confirm — observed state rather than exit codes,
 and both readable without privilege, so the check cannot fail merely because
 `sudo` could not authenticate. If teardown cannot be verified, the domain is left
@@ -259,7 +263,7 @@ and both readable without privilege, so the check cannot fail merely because
 the image still attached to NBD would put two writers on one qcow2.
 
 **A stale attachment aborts the run before anything is touched.** If the NBD
-device is already attached, or the mount point already mounted, `virsync` exits
+device is already attached, or the mount point already mounted, `virutil sync` exits
 rather than risk detaching or unmounting something that is not its own.
 
 **There is no `sudo` keep-alive.** The copy phases run unprivileged, so nothing
@@ -277,23 +281,23 @@ Host:
 
 - `libvirt` with `qemu:///system`, and membership of the `libvirt` group
 - `qemu-nbd` and the `nbd` kernel module, loaded with `max_part` ≥ 1 —
-   `virsync` reloads it if necessary
+   `virutil sync` reloads it if necessary
 - `ntfs-3g`
 - `rsync`, `awk`, and `util-linux` (`partx`, `blkid`, `blockdev`, `lsblk`,
    `mount`)
 - `sudo`, for the privileged commands listed under
    [Description](#description)
 
-Guest, for `virsync`:
+Guest, for `virutil sync`:
 
 - Windows, with Fast Startup disabled
 - A single disk exposed as `sda`, whose system volume is the largest NTFS
    partition on it
 
-Guest, for `virexec`:
+Guest, for `virutil exec`:
 
 - The QEMU guest agent (`qemu-ga`, from the virtio-win guest-agent MSI) and the
-   `org.qemu.guest_agent.0` channel, which `virexec setup` adds
+   `org.qemu.guest_agent.0` channel, which `virutil exec setup` adds
 
 ## See also
 
