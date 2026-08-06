@@ -135,12 +135,12 @@ gexec() {
     # \r stripped so windows output pipes cleanly into unix tools
     out=$(jq -r '.return["out-data"] // empty' <<<"$st")
     err=$(jq -r '.return["err-data"] // empty' <<<"$st")
-    if [ -n "$out" ]; then base64 -d <<<"$out" | tr -d '\r'; fi
+    if [ -n "$out" ]; then base64 -d <<<"$out" | tr -d '\r' | sed 's/[[:space:]]*$//'; fi
     if [ -n "$err" ]; then
         errtext=$(base64 -d <<<"$err")
         case "$errtext" in
-            '#< CLIXML'*) printf '%s\n' "$errtext" | declixml | tr -d '\r' >&2 ;;
-            *)            printf '%s\n' "$errtext" | tr -d '\r' >&2 ;;
+            '#< CLIXML'*) printf '%s\n' "$errtext" | declixml | tr -d '\r' | sed 's/[[:space:]]*$//' >&2 ;;
+            *)            printf '%s\n' "$errtext" | tr -d '\r' | sed 's/[[:space:]]*$//' >&2 ;;
         esac
     fi
 
@@ -219,8 +219,10 @@ EOF
         # error stream, which is what would otherwise be serialised as CLIXML; the
         # explicit exit 1 restores the code powershell returns for an uncaught
         # terminating error, which catching would otherwise turn into a 0.
-        SCRIPT=$(printf '%s\n%s\n%s\n' \
-            '$ProgressPreference="SilentlyContinue"; try {' \
+        SCRIPT=$(printf '%s\n%s\n%s\n%s\n%s\n' \
+            '$ProgressPreference="SilentlyContinue";' \
+            'try { $Host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size(4096, 2000) } catch {}' \
+            'try {' \
             "$TEXT" \
             '} catch { [Console]::Error.WriteLine(($_ | Out-String)); exit 1 }')
 

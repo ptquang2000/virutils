@@ -1,0 +1,151 @@
+#compdef virutil
+# zsh completion for virutil -- mirrors the dispatch in modules/parser.
+
+_virutil() {
+  local -a modules
+  modules=(
+    'exec:run commands inside a Windows guest via the QEMU guest agent'
+    'sync:fetch build output from the Windows host and push into a guest'
+    'usb:USB passthrough from the Windows host under WSL'
+    'snapshot:external snapshots (disk and memory) for libvirt domains'
+    'misc:everyday domain operations'
+    'help:this message'
+  )
+
+  if (( CURRENT == 2 )); then
+    _describe -t module 'module' modules
+    return
+  fi
+
+  case $words[2] in
+    exec)     _virutil_exec ;;
+    sync)     _virutil_sync ;;
+    usb)      _virutil_usb ;;
+    snapshot) _virutil_snapshot ;;
+    misc)     _virutil_misc ;;
+  esac
+}
+
+_virutil_domains() {
+  local -a doms
+  if command -v virsh >/dev/null 2>&1; then
+    doms=(${(f)"$(virsh -c qemu:///system list --all 2>/dev/null | awk 'NR>2 && $1 !~ /^-/ {print $2}')"})
+  fi
+  _describe -t domain 'domain' doms
+}
+
+_virutil_exec() {
+  local -a cmds=(
+    'setup:add the org.qemu.guest_agent.0 channel'
+    'ping:check the guest agent is responding'
+    'info:guest OS, hostname and agent version'
+    'cmd:run a command via cmd.exe /c'
+    'ps:run a script via powershell'
+  )
+  case $CURRENT in
+    3) _describe -t command 'command' cmds ;;
+    4) _virutil_domains ;;
+    *)
+      case $words[3] in
+        cmd|ps)
+          (( CURRENT == 5 )) && _values 'option' \
+            '-d[fire and forget, print guest pid]' \
+            '--detach[fire and forget, print guest pid]' \
+            '--[end of flags]' \
+            '-[read command from stdin]'
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_virutil_sync() {
+  local state line
+  _arguments \
+    '(-c --config)'{-c,--config}'[config NAME or PATH]:config:->config' \
+    '(-h --help)'{-h,--help}'[print usage and exit]'
+  case $state in
+    config)
+      if [[ $PREFIX == */* ]]; then
+        _files
+      else
+        local -a confs
+        confs=(${~HOME}/.config/virutils/*.conf(N:t:r))
+        _describe -t config 'config' confs
+      fi
+      ;;
+  esac
+}
+
+_virutil_usb() {
+  local -a cmds=(
+    'list:list host USB devices and sharing state'
+    'show:show devices passed to a VM, live and persistent'
+    'attach:share on Windows, import into WSL, attach to the VM'
+    'detach:return a device to the Windows host'
+    'unbind:stop sharing a device on Windows'
+  )
+  case $CURRENT in
+    3) _describe -t command 'command' cmds ;;
+    *)
+      case $words[3] in
+        show|attach|detach)
+          (( CURRENT == 4 )) && { _virutil_domains; return; }
+          (( CURRENT == 5 )) && _virutil_usb_ids
+          ;;
+        unbind)
+          _virutil_usb_ids
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_virutil_usb_ids() {
+  local usbipd="/mnt/c/Program Files/usbipd-win/usbipd.exe" ids
+  if [[ -x $usbipd ]]; then
+    ids=(${(f)"$($usbipd list 2>/dev/null | tr -d '\r' | awk '{print $1}')"})
+  fi
+  _describe -t device 'VENDOR:PRODUCT' ids
+}
+
+_virutil_snapshot() {
+  local -a cmds=(
+    'create:create an external snapshot (default name snap-<timestamp>)'
+    'list:list snapshots as a tree'
+    'revert:revert to a snapshot and leave the VM running'
+    'delete:delete a snapshot and its children'
+  )
+  case $CURRENT in
+    3) _describe -t command 'command' cmds ;;
+    4) _virutil_domains ;;
+    *)
+      case $words[3] in
+        revert|delete)
+          local -a snaps
+          snaps=(${(f)"$(virsh -c qemu:///system snapshot-list --domain ${words[4]} 2>/dev/null | awk 'NR>2 && $1 !~ /^-/ {print $1}')"})
+          _describe -t snapshot 'snapshot' snaps
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_virutil_misc() {
+  local -a cmds=(
+    'list:list all VMs and their state'
+    'start:power on a VM'
+    'shutdown:request a graceful shutdown (ACPI)'
+    'domifaddr:show guest interface addresses'
+  )
+  case $CURRENT in
+    3) _describe -t command 'command' cmds ;;
+    *)
+      case $words[3] in
+        start|shutdown|domifaddr) (( CURRENT == 4 )) && _virutil_domains ;;
+      esac
+      ;;
+  esac
+}
+
+_virutil "$@"
