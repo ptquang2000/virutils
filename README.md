@@ -23,6 +23,7 @@ step and no dependencies beyond the utilities it calls.
    - [Example](#example)
    - [Notes](#notes)
 - [virutil pull](#virutil-pull)
+- [virutil push](#virutil-push)
 - [Requirements](#requirements)
 - [See also](#see-also)
 
@@ -32,6 +33,7 @@ step and no dependencies beyond the utilities it calls.
 | --- | --- | --- |
 | `sync` | Fetch a project's build output from a Windows host and push it into a guest's `C:` drive offline, by attaching the qcow2 with `qemu-nbd`. | `virutil sync [-c NAME\|PATH]` |
 | `pull` | Copy files out of a **running** guest by taking a disk-only live snapshot and reading the frozen base image read-only. | `virutil pull [-c NAME\|PATH]` |
+| `push` | Copy a file or directory from the host into a guest's `C:` drive **on demand**, offline, with no config file. | `virutil push VM SRC DST` |
 | `exec` | Run commands inside a Windows guest through the QEMU guest agent, with no guest networking required. | `virutil exec {setup\|ping\|info\|cmd\|ps} VM_NAME [FLAGS] [ARGS]` |
 | `usb` | USB passthrough end to end from a Windows host under WSL: `usbipd` bind, import over `vhci_hcd`, then attach to the domain. | `virutil usb {list\|show\|attach\|detach\|unbind} [VM] [VENDOR:PRODUCT]` |
 | `snapshot` | External snapshots (disk and memory) for libvirt domains. | `virutil snapshot {create\|list\|revert\|delete} VM_NAME [SNAP_NAME]` |
@@ -41,7 +43,7 @@ step and no dependencies beyond the utilities it calls.
 handles the top-level dispatch plus the helpers every module shares; each
 module file declares its own subcommands. Only `sync` and `pull` are driven by a
 config file; the rest take everything on the command line. The remainder of
-this document covers `virutil sync`, then `virutil pull`.
+this document covers `virutil sync`, then `virutil pull`, then `virutil push`.
 
 ## virutil sync
 
@@ -412,6 +414,66 @@ printed.
 **A single disk is assumed.** The first `disk`-type device in
 `virsh domblklist` is the one snapshotted, read, and committed — the same
 single-disk assumption `sync` documents.
+
+## virutil push
+
+`push` is `sync`'s second half on demand: copy one file or directory from the
+host into a guest's `C:` drive with no config file, using the same offline
+machinery — shut the guest down if it is running, attach its qcow2 with
+`qemu-nbd`, mount the NTFS, copy, and restore the power state you started with.
+It exists for the cases that do not deserve a config: a config file you edited
+by hand, a build artifact you want in the guest right now, a one-off test file.
+
+### Synopsis
+
+```
+virutil push VM SRC DST
+virutil push -h
+```
+
+### Arguments
+
+| Argument | Meaning |
+| --- | --- |
+| `VM` | libvirt domain whose disk is written. |
+| `SRC` | Host file or directory to copy. Must exist and be readable. |
+| `DST` | Guest path, relative to the root of `C:`. |
+
+`DST` may be spelled with backslashes and an optional `C:`/`C:\` prefix; it is
+normalised to a `C:`-relative path. A destination containing `..` is refused,
+so a mistyped path can never resolve to a write outside the mount point.
+
+### File or directory?
+
+Both `SRC` and `DST` can be files or directories. The shapes follow rsync's own
+rules, so a trailing slash means exactly what it means for rsync:
+
+| Command | Result |
+| --- | --- |
+| `virutil push vm file.txt C:\name.txt` | Copy `file.txt` as that exact file (overwriting `name.txt` if it exists). |
+| `virutil push vm file.txt C:\dir\` | Copy `file.txt` into `C:\dir\`, creating it if needed. |
+| `virutil push vm dir C:\where\` | Copy the directory `dir` itself, recursively, under `C:\where\`. |
+| `virutil push vm dir C:\where` | Same as the previous row: a trailing slash on the destination makes no difference for a directory source. |
+| `virutil push vm dir\ C:\where\` | Copy the **contents** of `dir` into `C:\where\`, not `dir` itself. |
+| `virutil push vm file.txt C:` | Copy `file.txt` to the root of `C:`. |
+
+A file source whose destination (no trailing slash) already exists as a
+directory on the guest is copied *inside* it, exactly as `rsync` and `cp`
+behave. A **directory** source always lands inside its destination, which is
+created if needed, so `dir` arrives as `C:\where\dir`; only the source's
+trailing slash chooses between the directory itself and its contents. `DST`
+ending in `/` or `\` always means a directory, even one that does not exist yet.
+
+### Notes
+
+`push` shares every safety rule `sync` documents, wholesale: it must be run as
+yourself, not under `sudo`; a running guest is shut down gracefully (falling
+back to destroy after the shutdown timeout) and restarted only once the disk is
+provably free; a domain with a managed-save image, and paused or suspended
+domains, are refused; Fast Startup must be off. All of that machinery lives in
+the shared `modules/guest` used by both `sync` and `push`. There are no
+excludes — `push` copies exactly what you name, which is the point of having it
+at all.
 
 ## Requirements
 

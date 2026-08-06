@@ -7,6 +7,7 @@ _virutil() {
     'exec:run commands inside a Windows guest via the QEMU guest agent'
     'sync:fetch build output from the Windows host and push into a guest'
     'pull:copy files out of a running guest via a live disk snapshot'
+    'push:copy a file or directory from the host into a guest on demand'
     'usb:USB passthrough from the Windows host under WSL'
     'snapshot:external snapshots (disk and memory) for libvirt domains'
     'misc:everyday domain operations'
@@ -22,6 +23,7 @@ _virutil() {
     exec)     _virutil_exec ;;
     sync)     _virutil_sync ;;
     pull)     _virutil_pull ;;
+    push)     _virutil_push ;;
     usb)      _virutil_usb ;;
     snapshot) _virutil_snapshot ;;
     misc)     _virutil_misc ;;
@@ -94,6 +96,13 @@ _virutil_pull() {
         _describe -t config 'config' confs
       fi
       ;;
+  esac
+}
+
+_virutil_push() {
+  case $CURRENT in
+    3) _virutil_domains ;;
+    4) _files ;;
   esac
 }
 

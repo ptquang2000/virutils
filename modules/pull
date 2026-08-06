@@ -20,9 +20,10 @@
 #
 # pull is sync in reverse. Same config format (map rules, excludes), same
 # nbd/mount machinery, but read-only on the guest side and with a snapshot
-# lifecycle instead of a shutdown. It reuses functions and arrays from
-# modules/sync (VIRSH, RSYNC, ci_glob, root_rel, nbd_attached, mnt_mounted),
-# so sync must be sourced first -- the virutil source order does this.
+# lifecycle instead of a shutdown. It reuses functions and arrays from the
+# shared modules/guest (VIRSH, RSYNC, ci_glob, root_rel, nbd_attached,
+# mnt_mounted), so guest must be sourced first -- the virutil source order
+# does this.
 
 CONF_DIR="$HOME/.config/virutils"
 DEFAULT_CONF="$CONF_DIR/pull.conf"

@@ -1,0 +1,111 @@
+# push -- copy a file or directory from the host into a guest's C: drive on
+# demand, with no config file. Sourced by virutil; entry point is push_main.
+# Usage:
+#   virutil push VM SRC DST    -- run as yourself, NOT under sudo.
+#
+# SRC is a path on the host; DST is a path inside the guest, relative to the
+# root of C:. Both may be files or directories. The shapes follow rsync's own
+# rules, so the trailing slash means exactly what it means for rsync:
+#
+#   push VM file.txt C:\name.txt    copy as that exact file
+#   push VM file.txt C:\dir\        copy into the directory (created if needed)
+#   push VM dir      C:\where\      copy the directory itself under where\
+#   push VM dir\     C:\where\      copy the contents of dir, not dir itself
+#
+# A file source whose destination (no trailing slash) already exists as a
+# directory on the guest is copied inside it, as rsync and cp behave. A
+# directory source always lands inside its destination, which is created if
+# needed, so a trailing slash on DST makes no difference for a directory; only
+# the source's trailing slash chooses between the directory itself and its
+# contents. DST may be
+# spelled with backslashes and an optional C:\ prefix; "C:" alone means the root
+# of C:. A DST containing '..' is refused, so a mistyped path can never write
+# outside the mount point.
+#
+# The guest is shut down if running, its disk attached with qemu-nbd, the NTFS
+# mounted, the copy made, and the guest returned to the power state it started
+# in -- the same offline machinery virutil sync uses, shared in modules/guest.
+
+push_usage() {
+    printf '%s\n' \
+        "usage: virutil push VM SRC DST" \
+        "" \
+        "  VM   libvirt domain whose disk is written" \
+        "  SRC  host file or directory to copy" \
+        "  DST  guest path, relative to C:\\; a trailing slash means a" \
+        "       directory, exactly as with rsync. Backslashes and a C:\\" \
+        "       prefix are tolerated; '..' is refused." \
+        "  -h, --help   this message" \
+        "" \
+        "A directory source is copied recursively. The guest is shut down and" \
+        "restored afterwards; see the sync notes in README.md." >&2
+    exit "${1:-1}"
+}
+
+# Normalise a guest-side DST into a C:-relative path of slash-separated
+# components: strip a drive prefix, turn backslashes into slashes, drop empty
+# and '.' components, and reject '..' so the destination can never resolve
+# outside the mount point. The trailing slash that marks a directory is handled
+# by the caller before this strips it.
+push_norm_dst() {
+    local s="$1" out="" comp
+    s="${s#[Cc]:}"
+    s="${s//\\//}"
+    while [[ -n "$s" ]]; do
+        while [[ "$s" == /* ]]; do s="${s#/}"; done
+        comp="${s%%/*}"
+        [[ -n "$comp" ]] || break
+        case "$comp" in
+            '.') ;;
+            '..') die "destination may not contain '..': $1" ;;
+            *)    out="${out:+$out/}$comp" ;;
+        esac
+        s="${s#$comp}"
+    done
+    printf '%s' "$out"
+}
+
+push_main() {
+    local VM SRC DST
+
+    case "${1:-}" in
+        -h|--help) push_usage 0 ;;
+    esac
+    (( $# >= 3 )) || push_usage
+    VM="$1"; SRC="$2"; DST="$3"
+    (( $# == 3 )) || { warn "unexpected argument: $4"; push_usage; }
+
+    [[ -e "$SRC" ]] || die "source not found: $SRC"
+    [[ -r "$SRC" ]] || die "source not readable: $SRC"
+
+    DOMAIN="$VM"
+
+    guest_open
+
+    push_copy "$SRC" "$DST"
+
+    # The unmount, detach and restart happen in guest_finish(), on the way out.
+    echo "copied -> $DOMAIN"
+}
+
+# push_copy SRC DST -- normalise DST and resolve it under the mounted guest
+# filesystem at MNT, then run the copy. A trailing slash (or backslash) on DST
+# means "this is a directory, create it if needed", captured before
+# normalisation strips it; without one, a file source whose destination already
+# exists as a directory on the guest is still copied inside it, exactly as
+# rsync would.
+push_copy() {
+    local SRC="$1" DST="$2" dst_arg win_dst DST_IS_DIR
+    if [[ "$DST" == */ || "$DST" == *'\' ]]; then DST_IS_DIR=1; else DST_IS_DIR=0; fi
+    # push_norm_dst dies on '..' from inside the command substitution, which
+    # only yields a nonzero status; propagate it so the copy never runs.
+    DST="$(push_norm_dst "$DST")" || exit 1
+    dst_arg="$MNT"
+    [[ -n "$DST" ]] && dst_arg="$MNT/$DST"
+    [[ $DST_IS_DIR = 1 ]] && dst_arg="$dst_arg/"
+
+    win_dst="${DST//\//\\}"
+    [[ $DST_IS_DIR = 1 ]] && win_dst="${win_dst:+$win_dst\\}"
+    echo "push: $SRC -> C:\\$win_dst"
+    "${RSYNC[@]}" "$SRC" "$dst_arg"
+}
