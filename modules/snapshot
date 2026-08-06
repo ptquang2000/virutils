@@ -22,11 +22,28 @@ snapshot_main() {
     case "$CMD" in
     create)
         SNAP="${3:-snap-$(date +%Y%m%d-%H%M%S)}"
+
+        # Disk targets vary by bus (vda for virtio, sda for SATA/SCSI, hda for
+        # IDE), so ask the domain instead of assuming. cdroms are read-only and
+        # are left out of the snapshot.
+        local -a DISKSPECS=()
+        local target
+        while read -r target; do
+            [ -n "$target" ] || continue
+            DISKSPECS+=(--diskspec
+                        "$target,snapshot=external,file=$DIR/$VM.$SNAP.$target.qcow2")
+        done < <("${VIRSH[@]}" domblklist "$VM" --details \
+                 | awk '$2=="disk" {print $3}')
+        [ "${#DISKSPECS[@]}" -gt 0 ] || {
+            echo "no disks found for domain '$VM'" >&2
+            exit 1
+        }
+
         "${VIRSH[@]}" snapshot-create-as \
             --domain "$VM" \
             --name "$SNAP" \
             --memspec "$DIR/$VM.$SNAP.mem,snapshot=external" \
-            --diskspec "vda,snapshot=external,file=$DIR/$VM.$SNAP.qcow2" \
+            "${DISKSPECS[@]}" \
             --atomic
         echo "created: $SNAP"
         ;;
