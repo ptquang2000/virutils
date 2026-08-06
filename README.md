@@ -22,6 +22,7 @@ step and no dependencies beyond the utilities it calls.
       - [Cleanup rules](#cleanup-rules)
    - [Example](#example)
    - [Notes](#notes)
+- [virutil pull](#virutil-pull)
 - [Requirements](#requirements)
 - [See also](#see-also)
 
@@ -30,6 +31,7 @@ step and no dependencies beyond the utilities it calls.
 | Module | Purpose | Usage |
 | --- | --- | --- |
 | `sync` | Fetch a project's build output from a Windows host and push it into a guest's `C:` drive offline, by attaching the qcow2 with `qemu-nbd`. | `virutil sync [-c NAME\|PATH]` |
+| `pull` | Copy files out of a **running** guest by taking a disk-only live snapshot and reading the frozen base image read-only. | `virutil pull [-c NAME\|PATH]` |
 | `exec` | Run commands inside a Windows guest through the QEMU guest agent, with no guest networking required. | `virutil exec {setup\|ping\|info\|cmd\|ps} VM_NAME [FLAGS] [ARGS]` |
 | `usb` | USB passthrough end to end from a Windows host under WSL: `usbipd` bind, import over `vhci_hcd`, then attach to the domain. | `virutil usb {list\|show\|attach\|detach\|unbind} [VM] [VENDOR:PRODUCT]` |
 | `snapshot` | External snapshots (disk and memory) for libvirt domains. | `virutil snapshot {create\|list\|revert\|delete} VM_NAME [SNAP_NAME]` |
@@ -37,9 +39,9 @@ step and no dependencies beyond the utilities it calls.
 
 `virutil` alone, or `virutil help`, prints the module list. `modules/parser`
 handles the top-level dispatch plus the helpers every module shares; each
-module file declares its own subcommands. Only `sync` is driven by a config
-file; the rest take everything on the command line. The remainder of this
-document covers `virutil sync`.
+module file declares its own subcommands. Only `sync` and `pull` are driven by a
+config file; the rest take everything on the command line. The remainder of
+this document covers `virutil sync`, then `virutil pull`.
 
 ## virutil sync
 
@@ -274,6 +276,142 @@ per the rule above.
 
 **The staging directory is always under `/tmp`.** Whatever `@staging` says is
 treated as a name relative to `/tmp`, including an absolute path.
+
+## virutil pull
+
+`pull` is `sync` in reverse: it copies files out of a guest's `C:` drive onto
+the host, and unlike `sync` it never powers the guest off. The guest stays
+running throughout — nothing runs in it, no guest agent, no guest-side
+software, no shutdown.
+
+```
+guest NTFS --(snapshot freezes base)--> base qcow2 --(ro mount)--> host @dest
+```
+
+A live external snapshot redirects the guest's writes to an overlay qcow2,
+which freezes the base image at a checkpoint. The base is then attached with
+`qemu-nbd -r`, mounted with `ntfs-3g` **read-only**, rsynced out to the host,
+and the overlay is folded back into the base with `virsh blockcommit` before
+the run ends — on success or failure — so the guest's disk is left exactly as
+it would have been. The only window where the disk is unusual is the run
+itself, and the guest never stops writing through it.
+
+### Synopsis
+
+```
+virutil pull [-c NAME|PATH]
+virutil pull -h
+```
+
+### Options
+
+Identical to `virutil sync`'s: `-c, --config NAME|PATH` selects a config in
+`~/.config/virutils/` (`.conf` appended when absent), defaulting to
+`~/.config/virutils/pull.conf`; `-h` prints usage. Run it as yourself, **not**
+under `sudo` — the same rules, refinements and rationale as `sync`.
+
+### Configuration
+
+Same format and parser as `sync`'s config: one directive per line, `#`
+comments, settings via `@key=value`, excludes via `!pat ...`, and map rules as
+the only unsigilled form. There are no fetch or cleanup rules — pull has
+nothing to stage and deletes nothing in the guest.
+
+| Form | Meaning |
+| --- | --- |
+| `@key=value` | A setting. See below. |
+| `globs\|subdir` | Map: copy the guest paths matching `globs` into `<@dest>/subdir` on the host. |
+| `!pat pat ...` | `rsync --exclude` patterns, applied to the copy. |
+
+#### Settings
+
+| Setting | Required | Default | Description |
+| --- | --- | --- | --- |
+| `@domain` | yes | — | libvirt domain whose disk is read. Must be **running**. |
+| `@dest` | yes | — | Host directory the files land in. Must exist and be an absolute path. |
+| `@nbd` | no | `/dev/nbd0` | NBD device used to attach the disk image. |
+| `@mnt` | no | `/mnt/<@domain>` | Host mount point for the guest filesystem. |
+
+#### Map rules
+
+```
+Program Files (x86)/Example/Product/*|
+Users/me/AppData/Local/Example/logs/*.log|logs
+*|
+```
+
+The part before `|` is a space-separated list of globs, relative to the root
+of `C:` and matched **case-insensitively** — the source is what Windows would
+see, so `program files` and `Program Files` both work. Each match is
+classified as a file or a directory: a directory is pulled **recursively**
+(its whole tree), a file is copied as-is. The glob decides which a rule picks
+up — `foo/bar` (no wildcard) matches the directory itself, `foo/bar/*` its
+contents. A leading `*` matches across directories. The part after `|` is a
+destination relative to `@dest`; empty means `@dest` itself. Globs matching
+nothing are warned about and skipped.
+
+A glob that contains spaces must be wrapped in double quotes, wildcard and all,
+so it is one glob rather than several words:
+
+```
+"Program Files (x86)/Example/Product/*"|bin
+"Program Files (x86)/Example/Product/sub"|sub
+```
+
+#### Excludes
+
+```
+!*.log *.tmp ~*
+```
+
+Ordinary `rsync` exclude patterns, exactly as in `sync`.
+
+### Example
+
+`~/.config/virutils/pull.conf`:
+
+```
+@domain=win11
+@dest=/mnt/c/Users/me/work/fromguest
+
+# configs and logs out of the running guest
+"Program Files (x86)/Example/Product/config/*.json"|config
+ProgramData/Example/logs/*.log|logs
+
+!*.tmp ~*
+```
+
+Then:
+
+```
+./virutil pull
+```
+
+### Notes
+
+**The checkpoint is at the QCOW2 level, not the filesystem level.** The base
+image freezes whatever Windows has already flushed to disk. A file whose data
+is on disk reads back complete; anything still sitting in the guest's page
+cache at snapshot time is absent; the NTFS journal may be mid-transaction and
+`ntfs-3g` mounts the volume read-only. This is the standard live-backup
+tradeoff — fine for build output and configs, not for auditing a live
+database.
+
+**The guest must be running.** `pull` dies on any other state. There is no
+managed-save or paused-state special case: those states are simply not
+`running`, and are refused. For an offline copy, run `sync` in reverse.
+
+**The overlay is always folded back.** On success *and* on failure, `pull` runs
+`blockcommit --active --pivot` to merge the guest's writes back into the base,
+then deletes the snapshot and the overlay file. The guest keeps running on the
+overlay throughout, so even a failed run loses nothing — but if teardown cannot
+be verified (see `sync`'s notes on that rule) or `blockcommit` fails, the
+snapshot is left in place deliberately and the exact recovery commands are
+printed.
+
+**A single disk is assumed.** The first `disk`-type device in
+`virsh domblklist` is the one snapshotted, read, and committed — the same
+single-disk assumption `sync` documents.
 
 ## Requirements
 

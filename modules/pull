@@ -1,0 +1,339 @@
+# pull -- copy files out of a RUNNING Windows guest to the host, by taking a
+# disk-only live snapshot and reading the frozen base image read-only. Sourced
+# by virutil; entry point is pull_main. Usage:
+#   virutil pull [-c NAME|PATH]    -- run as yourself, NOT under sudo.
+#
+#   guest NTFS --(snapshot freezes base)--> base qcow2 --(ro mount)--> host
+#
+# The guest keeps running the whole time: nothing runs in it, no agent, no
+# power-state change. A live external snapshot redirects the guest's writes to
+# an overlay qcow2, which freezes the base image at a checkpoint; the base is
+# attached with qemu-nbd -r, mounted with ntfs-3g read-only, rsynced out, and
+# the overlay is folded back into the base with virsh blockcommit before the
+# run ends -- on success or failure -- leaving the disk as it would have been.
+#
+# The checkpoint is at the QCOW2 level, not the filesystem level: a file whose
+# data Windows has flushed reads back complete, but anything still sitting in
+# the guest's page cache at snapshot time is absent, and the NTFS journal may
+# be mid-transaction. Fine for pulling build output or configs; do not audit a
+# live database this way.
+#
+# pull is sync in reverse. Same config format (map rules, excludes), same
+# nbd/mount machinery, but read-only on the guest side and with a snapshot
+# lifecycle instead of a shutdown. It reuses functions and arrays from
+# modules/sync (VIRSH, RSYNC, ci_glob, root_rel, nbd_attached, mnt_mounted),
+# so sync must be sourced first -- the virutil source order does this.
+
+CONF_DIR="$HOME/.config/virutils"
+DEFAULT_CONF="$CONF_DIR/pull.conf"
+
+SUDO=()
+
+DEST=""; DOMAIN=""; NBD="/dev/nbd0"; MNT=""
+MAPPINGS=(); EXCLUDES=()
+DISK=""; IMG=""; SNAP=""; OVERLAY=""
+
+pull_usage() {
+    printf '%s\n' \
+        "usage: virutil pull [-c NAME|PATH]" \
+        "" \
+        "  -c, --config NAME|PATH  config to use. A value containing '/' is a" \
+        "                          path, taken as given; anything else names a" \
+        "                          config in $CONF_DIR" \
+        "                          ('.conf' is appended when absent)." \
+        "                          default: $DEFAULT_CONF" \
+        "  -h, --help              this message" \
+        "" \
+        "The config is the whole interface; see README.md for its format." >&2
+    exit "${1:-1}"
+}
+
+# Teardown is verified from observed state, not from exit codes -- same probes
+# as sync: the unmount and qemu-nbd detach must run even when the mount never
+# happened, and the blockcommit that folds the overlay back must only run once
+# the base image is provably free.
+pull_finish() {
+    if mnt_mounted; then
+        sync
+        "${SUDO[@]}" umount "$MNT" || true
+    fi
+    if nbd_attached; then
+        "${SUDO[@]}" qemu-nbd -d "$NBD" >/dev/null 2>&1 || true
+    fi
+    sync
+
+    if mnt_mounted || nbd_attached; then
+        warn "" \
+             "teardown could not be verified -- the snapshot is left in place." \
+             "The guest keeps running on $OVERLAY and its data is safe, but the" \
+             "disk now has a backing chain. Fold the overlay back by hand:" \
+             "  sudo umount $MNT" \
+             "  sudo qemu-nbd -d $NBD" \
+             "  ${VIRSH[*]} blockcommit $DOMAIN $DISK --active --pivot --wait" \
+             "  ${VIRSH[*]} snapshot-delete $DOMAIN $SNAP --metadata" \
+             "  sudo rm -f $OVERLAY"
+        exit 1
+    fi
+
+    [[ -n "$SNAP" ]] || return 0   # never got as far as taking a snapshot
+
+    echo "merging overlay into base..."
+    if ! "${VIRSH[@]}" blockcommit "$DOMAIN" "$DISK" --active --pivot --wait \
+            >/dev/null 2>&1; then
+        warn "" \
+             "blockcommit failed -- the guest is running on the overlay, which" \
+             "is safe, but the disk now has a backing chain. Retry by hand:" \
+             "  ${VIRSH[*]} blockcommit $DOMAIN $DISK --active --pivot --wait" \
+             "  ${VIRSH[*]} snapshot-delete $DOMAIN $SNAP --metadata" \
+             "  sudo rm -f $OVERLAY"
+        exit 1
+    fi
+
+    if "${VIRSH[@]}" snapshot-list --name 2>/dev/null | grep -qx "$SNAP"; then
+        "${VIRSH[@]}" snapshot-delete "$DOMAIN" "$SNAP" --metadata >/dev/null 2>&1 \
+            || { warn "snapshot metadata delete failed; leaving $OVERLAY in place"; return 1; }
+    fi
+    "${SUDO[@]}" rm -f "$OVERLAY" || true
+}
+
+# Expand $1 (a case-insensitive glob, relative to the mount root) into the
+# caller-visible array `matches`. A function so IFS can be scoped: it must be
+# newline-only, or a glob containing spaces ("Program Files") would be split
+# into separate words before globbing, and never match.
+guest_matches() {
+    local IFS=$'\n'
+    matches=("$MNT/"$(ci_glob "$1"))
+}
+
+# Split a space-separated glob list into the caller-visible array `patterns`,
+# honouring double quotes so a Windows path full of spaces is one glob:
+#   'a/b/* "Program Files (x86)/c" d/*'  ->  a/b/*, Program Files (x86)/c, d/*
+split_globs() {
+    local s="$1" w
+    patterns=()
+    while [[ -n "$s" ]]; do
+        s="${s#"${s%%[![:space:]]*}"}"
+        [[ -n "$s" ]] || break
+        if [[ "${s:0:1}" == \" ]]; then
+            s="${s:1}"
+            w="${s%%\"*}"
+            patterns+=("$w")
+            [[ "$s" == *\"* ]] && s="${s#*\"}" || s=""
+        else
+            w="${s%%[[:space:]]*}"
+            patterns+=("$w")
+            s="${s#"$w"}"
+        fi
+    done
+}
+
+pull_main() {
+    local CONF_ARG CONF lineno line
+
+    # Under sudo, $HOME resolves to root's on any host whose sudoers sets
+    # always_set_home -- discovery would quietly read /root/.config while you
+    # edit a config in your own home. Refuse rather than guess which home was
+    # meant.
+    [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] \
+        && die "do not run virutil pull under sudo -- run it as yourself." \
+               "It escalates only the commands that actually need root."
+
+    if [[ $EUID -eq 0 ]]; then SUDO=(); else SUDO=(sudo); fi
+
+    CONF_ARG=""
+    while (( $# )); do
+        case "$1" in
+            -c|--config) (( $# >= 2 )) || { warn "$1 needs a value"; pull_usage; }
+                         CONF_ARG="$2"; shift 2 ;;
+            -h|--help)   pull_usage 0 ;;
+            *)           warn "unrecognised argument: $1"; pull_usage ;;
+        esac
+    done
+
+    # Path-or-name is decided on the spelling alone, never on what happens to
+    # exist: the same command must mean the same config from any directory.
+    if   [[ -z "$CONF_ARG"    ]]; then CONF="$DEFAULT_CONF"
+    elif [[ "$CONF_ARG" == */* ]]; then CONF="$CONF_ARG"
+    else                               CONF="$CONF_DIR/${CONF_ARG%.conf}.conf"
+    fi
+
+    [[ -f "$CONF" ]] || die "config not found: $CONF" \
+        "Create it, or point -c elsewhere. README.md documents the format."
+
+    # --- config -------------------------------------------------------------
+    # Parsed up front so a malformed config fails before anything is touched.
+    local key val
+    DEST=""; DOMAIN=""; NBD="/dev/nbd0"; MNT=""
+    MAPPINGS=(); EXCLUDES=()
+    lineno=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        (( ++lineno ))
+        line="${line%%#*}"                       # strip comments
+        line="${line#"${line%%[![:space:]]*}"}"  # trim leading space
+        line="${line%"${line##*[![:space:]]}"}"  # trim trailing space
+        [[ -z "$line" ]] && continue
+
+        case "$line" in
+            @*)  IFS='=' read -r key val <<< "${line#@}"
+                 case "$key" in
+                     domain) DOMAIN="$val" ;;
+                     dest)   DEST="$val" ;;
+                     nbd)    NBD="$val" ;;
+                     mnt)    MNT="$val" ;;
+                     *) die "$CONF:$lineno: unknown setting '$key'" ;;
+                 esac ;;
+            !*)  local -a pats
+                 read -r -a pats <<< "${line#!}"
+                 for p in "${pats[@]}"; do EXCLUDES+=(--exclude="$p"); done ;;
+            *)   # Map rules are the only unsigilled form; anything starting
+                 # with punctuation is a mistyped directive, not a glob. A
+                 # leading '"' is allowed: split_globs uses it to group paths.
+                 [[ "${line:0:1}" == [A-Za-z0-9_./*?] || "${line:0:1}" == '"' ]] \
+                     || die "$CONF:$lineno: unrecognised directive: $line"
+                 [[ "$line" == *"|"* ]] \
+                     || die "$CONF:$lineno: missing '|' separator: $line"
+                 MAPPINGS+=("$line") ;;
+        esac
+    done < "$CONF"
+
+    [[ -n "$DOMAIN" ]] || die "$CONF: @domain is required"
+    [[ -n "$DEST" ]]   || die "$CONF: @dest is required"
+    [[ "$DEST" == /* ]] || die "$CONF: @dest must be an absolute host path"
+    [[ -d "$DEST" ]] || die "destination not found: $DEST"
+    MNT="${MNT:-/mnt/$DOMAIN}"
+
+    echo "config: $CONF"
+    echo "  ${#MAPPINGS[@]} map, ${#EXCLUDES[@]} exclude"
+    echo "  dest: $DEST"
+
+    (( ${#MAPPINGS[@]} )) || die "no map rules in $CONF"
+    command -v rsync >/dev/null || die "rsync not installed"
+
+    # Authenticate before the snapshot is taken rather than partway through.
+    if (( ${#SUDO[@]} )); then
+        command -v sudo >/dev/null || die "sudo not installed; nbd and mount need it"
+        sudo -v || die "sudo authentication failed"
+    fi
+
+    # A stale nbd or mount left by a failed run: going on would end with us
+    # detaching or unmounting something that was never ours.
+    nbd_attached && die "$NBD is already attached; free it or set @nbd elsewhere" \
+                        "  sudo qemu-nbd -d $NBD"
+    mnt_mounted && die "$MNT is already mounted; unmount it first" \
+                       "  sudo umount $MNT"
+
+    # pull reads the live disk, so the guest must actually be running. No
+    # managed-save or paused-state concern exists here: those states are not
+    # 'running', and are refused outright by the check below.
+    local state="$("${VIRSH[@]}" domstate "$DOMAIN")"
+    echo "domain: $DOMAIN ($state)"
+    [[ "$state" == running ]] \
+        || die "$DOMAIN is '$state'; pull needs it running -- it reads the live" \
+               "disk via a snapshot. For an offline copy, run sync in reverse."
+
+    DISK="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
+           | awk '$2=="disk" {print $3; exit}')"
+    IMG="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
+          | awk '$2=="disk" {print $4; exit}')"
+    [[ -n "$DISK" ]] || die "no disk device found for $DOMAIN"
+    [[ -f "$IMG" ]] || die "could not resolve disk image for $DOMAIN"
+
+    # max_part only takes effect at module load; reload if it came up without it.
+    if [[ ! -e /sys/module/nbd/parameters/max_part ]] \
+       || (( $(< /sys/module/nbd/parameters/max_part) < 1 )); then
+        "${SUDO[@]}" rmmod nbd 2>/dev/null || true
+        "${SUDO[@]}" modprobe nbd max_part=8
+    fi
+
+    trap pull_finish EXIT
+
+    # --- live snapshot: guest writes -> overlay, base freezes -----------------
+    local snap_name="pull-$(date +%Y%m%d-%H%M%S)"
+    OVERLAY="${IMG%.*}.$snap_name.qcow2"
+    echo "snapshot: $snap_name"
+    "${VIRSH[@]}" snapshot-create-as --domain "$DOMAIN" --name "$snap_name" \
+        --disk-only --atomic \
+        --diskspec "$DISK,snapshot=external,file=$OVERLAY" \
+        || die "snapshot creation failed -- nothing was touched"
+    SNAP="$snap_name"
+
+    # The disk the guest now writes to must be the overlay, or the base we are
+    # about to read would still be live and inconsistent.
+    local top
+    top="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
+          | awk -v t="$DISK" '$2=="disk" && $3==t {print $4}')"
+    [[ "$top" == "$OVERLAY" ]] \
+        || die "snapshot did not take effect: $DISK still points at $top"
+    echo "   writes now go to $OVERLAY; base frozen: $IMG"
+
+    # --- attach frozen base read-only ----------------------------------------
+    "${SUDO[@]}" qemu-nbd -r -c "$NBD" "$IMG"
+    "${SUDO[@]}" partx -a "$NBD" 2>/dev/null || true   # force a partition rescan
+    udevadm settle
+
+    # The Windows system partition: largest NTFS one on the disk, probed with
+    # blkid directly (lsblk's FSTYPE can lag behind udev).
+    local dev size PART=""; local -i BEST=0
+    for dev in "$NBD"p*; do
+        [[ -b "$dev" ]] || continue
+        [[ "$("${SUDO[@]}" blkid -o value -s TYPE "$dev" 2>/dev/null)" == "ntfs" ]] \
+            || continue
+        size="$("${SUDO[@]}" blockdev --getsize64 "$dev")"
+        (( size > BEST )) && { BEST="$size"; PART="$dev"; }
+    done
+    if [[ -z "$PART" ]]; then
+        lsblk -o NAME,SIZE,FSTYPE,PARTTYPENAME "$NBD" >&2 || true
+        die "no NTFS partition found on $NBD (layout above)"
+    fi
+    echo "partition: $PART ($((BEST / 1024 / 1024 / 1024)) GiB)"
+
+    "${SUDO[@]}" mkdir -p "$MNT"
+    "${SUDO[@]}" mount -t ntfs-3g -o "ro,uid=$(id -u),gid=$(id -g)" "$PART" "$MNT"
+
+    # --- pull: frozen base -> host -------------------------------------------
+    shopt -s nullglob
+
+    local globs dst_rel dst g m
+    local -a patterns files dirs matches
+    for rule in "${MAPPINGS[@]}"; do
+        globs="${rule%%|*}"
+        dst_rel="$(root_rel "${rule#*|}")"
+        dst="$DEST${dst_rel:+/$dst_rel}"
+
+        # Split the pattern list honouring quoted paths: "Program Files (x86)/*"
+        # is one glob, unquoted words split on whitespace.
+        split_globs "$globs"
+
+        # Source globs match case-insensitively: the guest's NTFS is
+        # case-insensitive, and the path is what Windows would see. ci_glob
+        # makes this ntfs-3g mount behave the same way.
+        #
+        # Each match is classified as a file or a directory. A directory is
+        # pulled recursively -- rsync -r walks its whole tree -- while a file
+        # is copied as-is. The glob decides which a rule picks up: `foo/bar`
+        # (no wildcard) matches the directory itself, `foo/bar/*` its contents.
+        files=(); dirs=()
+        for g in "${patterns[@]}"; do
+            guest_matches "$g"
+            (( ${#matches[@]} )) || { warn "warning: no match for '$g'"; continue; }
+            for m in "${matches[@]}"; do
+                if   [[ -d "$m" ]]; then dirs+=("$m")
+                elif [[ -f "$m" ]]; then files+=("$m")
+                else warn "   skipped (neither file nor dir): ${m#"$MNT/"}"
+                fi
+            done
+        done
+        (( ${#files[@]} + ${#dirs[@]} )) \
+            || { warn "skipping '$dst_rel': nothing matched"; continue; }
+
+        echo "-> $DEST${dst_rel:+/$dst_rel}" \
+             "(${#files[@]} file(s), ${#dirs[@]} dir(s))"
+        "${RSYNC[@]}" "${EXCLUDES[@]}" "${dirs[@]}" "${files[@]}" "$dst/"
+    done
+
+    shopt -u nullglob
+
+    echo "copy complete -> $DEST"
+
+    # The unmount, detach and blockcommit happen in pull_finish(), on the way out.
+}

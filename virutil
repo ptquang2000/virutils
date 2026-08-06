@@ -7,6 +7,7 @@
 #
 #   virutil exec       run commands inside a Windows guest via the QEMU guest agent
 #   virutil sync       fetch build output from the Windows host, push into a guest
+#   virutil pull       copy files out of a running guest via a live disk snapshot
 #   virutil usb        USB passthrough end to end from the Windows host under WSL
 #   virutil snapshot   external snapshots (disk + memory) for libvirt domains
 #   virutil misc       everyday domain operations: list, start, shutdown, domifaddr
@@ -22,7 +23,7 @@ export LC_ALL=C
 
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
-for module in parser exec sync usb snapshot misc; do
+for module in parser exec sync pull usb snapshot misc; do
     source "$HERE/modules/$module"
 done
 
@@ -31,6 +32,7 @@ parse_dispatch "$@"
 case "$MODULE" in
     exec)     exec_main     "${REST[@]}" ;;
     sync)     sync_main     "${REST[@]}" ;;
+    pull)     pull_main     "${REST[@]}" ;;
     usb)      usb_main      "${REST[@]}" ;;
     snapshot) snapshot_main "${REST[@]}" ;;
     misc)     misc_main     "${REST[@]}" ;;
