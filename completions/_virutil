@@ -120,22 +120,27 @@ _virutil_usb() {
       case $words[3] in
         show|attach|detach)
           (( CURRENT == 4 )) && { _virutil_domains; return; }
-          (( CURRENT == 5 )) && _virutil_usb_ids
+          (( CURRENT == 5 )) && _virutil_usb_busids
           ;;
         unbind)
-          _virutil_usb_ids
+          _virutil_usb_busids
           ;;
       esac
       ;;
   esac
 }
 
-_virutil_usb_ids() {
-  local usbipd="/mnt/c/Program Files/usbipd-win/usbipd.exe" ids
+_virutil_usb_busids() {
+  local usbipd="/mnt/c/Program Files/usbipd-win/usbipd.exe" busids
+  # only the device rows start with a busid, which skips the header and the section
+  # titles; the rest of the row (hardware id, name, state) becomes the description
   if [[ -x $usbipd ]]; then
-    ids=(${(f)"$($usbipd list 2>/dev/null | tr -d '\r' | awk '{print $1}')"})
+    busids=(${(f)"$($usbipd list 2>/dev/null | tr -d '\r' |
+      awk '$1 ~ /^[0-9]+-[0-9.]+$/ { id = $1; $1 = ""
+                                     sub(/^ +/, ""); sub(/ +$/, "")
+                                     print id ":" $0 }')"})
   fi
-  _describe -t device 'VENDOR:PRODUCT' ids
+  _describe -t device 'busid' busids
 }
 
 _virutil_snapshot() {

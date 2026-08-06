@@ -2,9 +2,14 @@
 # WSL. Sourced by virutil; entry point is usb_main. Usage:
 #   virutil usb list                       list host USB devices and sharing state
 #   virutil usb show      VM               show devices passed to VM, live and persistent
-#   virutil usb attach    VM VEND:PROD     share on Windows, import into WSL, hand to the VM
-#   virutil usb detach    VM VEND:PROD     take it out of the VM and give it back to Windows
-#   virutil usb unbind    VEND:PROD        stop sharing the device on Windows (needs UAC)
+#   virutil usb attach    VM BUSID         share on Windows, import into WSL, hand to the VM
+#   virutil usb detach    VM BUSID         take it out of the VM and give it back to Windows
+#   virutil usb unbind    BUSID            stop sharing the device on Windows (needs UAC)
+#
+# A device is named by the BUSID in the first column of `virutil usb list`, the same
+# handle usbipd itself takes. libvirt hostdevs are written in terms of vendor/product,
+# so the busid is resolved to a VENDOR:PRODUCT once, up front, and the libvirt and
+# sysfs stages work from that.
 #
 # attach crosses three layers: usbipd bind on Windows, usbipd attach --wsl to import
 # the device over vhci_hcd, then virsh attach-device. Every stage is skipped when
@@ -15,38 +20,61 @@
 # a bound but detached device is still usable in Windows, so unbinding would spend a
 # UAC prompt to discard the state the bind just paid for.
 
-VIRSH="virsh -c qemu:///system"
 USBIPD="/mnt/c/Program Files/usbipd-win/usbipd.exe"
 USBIPD_WIN='C:\Program Files\usbipd-win\usbipd.exe'
 DISTRO=archlinux
 
 usb_usage() {
-    echo "usage: virutil usb {list|show|attach|detach|unbind} [VM] [VENDOR:PRODUCT]" >&2
+    echo "usage: virutil usb {list|show|attach|detach|unbind} [VM] [BUSID]" >&2
     exit 1
 }
 
-# sysfs and the libvirt XML both want lowercase hex, so normalise on the way in
-read_id() {
-    case "$1" in
-    [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) ;;
-    *) die "expected VENDOR:PRODUCT (e.g. 0951:1666), got '$1'" ;;
-    esac
-    echo "$1" | tr 'A-F' 'a-f'
+# A busid identifies a port, so it is only meaningful while something is plugged into
+# it. A VENDOR:PRODUCT is therefore also accepted: it is the only way to name a device
+# that has already been unplugged, which detach still needs in order to clear the
+# persistent hostdev it left behind. sysfs and the libvirt XML both want lowercase hex.
+read_dev() {
+    if [[ $1 =~ ^[0-9]+-[0-9]+(\.[0-9]+)*$ ]]; then
+        echo "$1"
+    elif [[ $1 =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]]; then
+        echo "${1,,}"
+    else
+        die "expected a BUSID (e.g. 3-3, see: virutil usb list), got '$1'"
+    fi
 }
 
-# usbipd's view of one device as BusId|StubInstanceId|PersistedGuid|ClientIPAddress,
-# or the words none/many. The hardware id only appears in InstanceId, which reads
-# USB\VID_0951&PID_1666\<serial>, hence the uppercased substring match.
+# usbipd's view of one device, looked up by busid or by hardware id, as
+# VendProd|BusId|StubInstanceId|PersistedGuid|ClientIPAddress, or the words none/many.
+# The hardware id only appears in InstanceId, which reads USB\VID_0951&PID_1666\<serial>.
 usbipd_state() {
-    local key
-    key=$(printf 'VID_%s&PID_%s' "${1%:*}" "${1#*:}" | tr 'a-f' 'A-F')
-    "$USBIPD" state | tr -d '\r' | jq -r --arg key "$key" '
-        [.Devices[] | select((.InstanceId | ascii_upcase) | contains($key))]
+    local busid="" key=""
+    case "$1" in
+    *:*) key=$(printf 'VID_%s&PID_%s' "${1%:*}" "${1#*:}" | tr 'a-f' 'A-F') ;;
+    *) busid="$1" ;;
+    esac
+    "$USBIPD" state | tr -d '\r' | jq -r --arg busid "$busid" --arg key "$key" '
+        def vendprod: [.InstanceId | scan("(?i)VID_([0-9a-f]{4})&PID_([0-9a-f]{4})")]
+                      | if length > 0 then (.[0] | join(":") | ascii_downcase)
+                        else "" end;
+        [ .Devices[]
+          | select(if $busid != "" then .BusId == $busid
+                   else (.InstanceId | ascii_upcase) | contains($key) end) ]
         | if length == 0 then "none"
           elif length > 1 then "many"
-          else .[0] | [.BusId, (.StubInstanceId // ""), (.PersistedGuid // ""),
-                       (.ClientIPAddress // "")] | join("|")
+          else .[0] | [vendprod, (.BusId // ""), (.StubInstanceId // ""),
+                       (.PersistedGuid // ""), (.ClientIPAddress // "")] | join("|")
           end'
+}
+
+# a busid lookup is exact, so only a hardware id can be ambiguous
+resolve_dev() {
+    STATE=$(usbipd_state "$1")
+    case "$STATE" in
+    none) die "no connected USB device at $1 (see: virutil usb list)" ;;
+    many) die "several connected devices share hardware id $1; unplug one" ;;
+    esac
+    IFS='|' read -r ID BUSID STUB GUID CLIENT <<<"$STATE"
+    [ -n "$ID" ] || die "could not read the vendor:product of $1 from usbipd state"
 }
 
 # the address usbipd attaches us as; virbr0 has one too, so pin to eth0
@@ -87,12 +115,12 @@ wait_sysfs() {
     return 1
 }
 
-domstate() { $VIRSH domstate "$VM" 2>/dev/null | head -1; }
+domstate() { "${VIRSH[@]}" domstate "$VM" 2>/dev/null | head -1; }
 
 # checked before anything else touches Windows, so a mistyped VM name cannot cost a
 # UAC prompt first and then fail at the last stage
 require_domain() {
-    $VIRSH domstate "$VM" >/dev/null 2>&1 ||
+    "${VIRSH[@]}" domstate "$VM" >/dev/null 2>&1 ||
         die "no such VM: $VM (see: virsh -c qemu:///system list --all)"
 }
 
@@ -110,7 +138,7 @@ hostdev_xml() {
 EOF
 }
 
-hostdevs() { $VIRSH dumpxml "$@" | sed -n '/<hostdev/,/<\/hostdev>/p'; }
+hostdevs() { "${VIRSH[@]}" dumpxml "$@" | sed -n '/<hostdev/,/<\/hostdev>/p'; }
 
 # libvirt has no idempotent attach-device, so the last stage needs the same gate as
 # the usbipd ones or a rerun after a partial failure dies on the device it already
@@ -127,7 +155,7 @@ has_hostdev() {
 # and must not be mistaken for a clean detach.
 detach_scope() {
     local scope="$1" out
-    if out=$(hostdev_xml "$ID" | $VIRSH detach-device "$VM" "$scope" /dev/stdin 2>&1); then
+    if out=$(hostdev_xml "$ID" | "${VIRSH[@]}" detach-device "$VM" "$scope" /dev/stdin 2>&1); then
         say "libvirt: removed from $scope"
         return 0
     fi
@@ -138,7 +166,7 @@ detach_scope() {
 }
 
 usb_main() {
-    local CMD VM ID STATE BUSID STUB GUID CLIENT REMOVED
+    local CMD VM DEV ID STATE BUSID STUB GUID CLIENT REMOVED
     CMD="${1:-}"
     [ -n "$CMD" ] || usb_usage
 
@@ -157,34 +185,28 @@ usb_main() {
         hostdevs --inactive "$VM"
         ;;
     attach)
-        VM="${2:?usage: virutil usb attach VM VENDOR:PRODUCT}"
-        ID=$(read_id "${3:?usage: virutil usb attach VM VENDOR:PRODUCT}")
+        VM="${2:?usage: virutil usb attach VM BUSID}"
+        DEV=$(read_dev "${3:?usage: virutil usb attach VM BUSID}")
         require_domain
-
-        STATE=$(usbipd_state "$ID")
-        case "$STATE" in
-        none) die "no connected USB device has hardware id $ID (see: virutil usb list)" ;;
-        many) die "several connected devices share hardware id $ID; unplug one" ;;
-        esac
-        IFS='|' read -r BUSID STUB GUID CLIENT <<<"$STATE"
+        resolve_dev "$DEV"
 
         if [ -n "$STUB$GUID" ]; then
-            say "bind: $ID ($BUSID) already shared, skipping"
+            say "bind: $BUSID ($ID) already shared, skipping"
         else
-            say "bind: sharing $ID ($BUSID) on the Windows host, expect a UAC prompt"
-            elevate bind -i "$ID"
-            IFS='|' read -r BUSID STUB GUID CLIENT <<<"$(usbipd_state "$ID")"
+            say "bind: sharing $BUSID ($ID) on the Windows host, expect a UAC prompt"
+            elevate bind -b "$BUSID"
+            IFS='|' read -r ID BUSID STUB GUID CLIENT <<<"$(usbipd_state "$BUSID")"
             [ -n "$STUB$GUID" ] || die "bind did not take effect; was the UAC prompt declined?"
         fi
 
         IP=$(wsl_ip)
         if [ -n "$CLIENT" ]; then
             [ "$CLIENT" = "$IP" ] ||
-                die "$ID is attached to $CLIENT, not to this WSL instance ($IP)"
-            say "wsl: $ID already attached here, skipping"
+                die "$BUSID is attached to $CLIENT, not to this WSL instance ($IP)"
+            say "wsl: $BUSID already attached here, skipping"
         else
-            say "wsl: importing $ID into $DISTRO"
-            "$USBIPD" attach --wsl "$DISTRO" -i "$ID"
+            say "wsl: importing $BUSID ($ID) into $DISTRO"
+            "$USBIPD" attach --wsl "$DISTRO" -b "$BUSID"
         fi
 
         wait_sysfs "$ID" || die "$ID never appeared in WSL; the usbipd import did not land"
@@ -194,20 +216,36 @@ usb_main() {
                 say "libvirt: $ID is already attached to $VM, skipping"
             else
                 say "libvirt: attaching to $VM (live)"
-                hostdev_xml "$ID" | $VIRSH attach-device "$VM" --live /dev/stdin
+                hostdev_xml "$ID" | "${VIRSH[@]}" attach-device "$VM" --live /dev/stdin
             fi
         elif has_hostdev --inactive "$VM"; then
             say "libvirt: $ID is already in $VM's persistent config, skipping"
         else
             say "libvirt: $VM is not running, attaching to its persistent config"
             hostdev_xml "$ID" " startupPolicy='optional'" |
-                $VIRSH attach-device "$VM" --config /dev/stdin
+                "${VIRSH[@]}" attach-device "$VM" --config /dev/stdin
         fi
         ;;
     detach)
-        VM="${2:?usage: virutil usb detach VM VENDOR:PRODUCT}"
-        ID=$(read_id "${3:?usage: virutil usb detach VM VENDOR:PRODUCT}")
+        VM="${2:?usage: virutil usb detach VM BUSID}"
+        DEV=$(read_dev "${3:?usage: virutil usb detach VM BUSID}")
         require_domain
+
+        # libvirt wrote the hostdev in terms of vendor/product, so a busid has to be
+        # resolved before anything can be removed. A device that is already gone from
+        # the host cannot be resolved, and its persistent hostdev is exactly the one
+        # still worth removing, so in that case the argument has to name it directly.
+        STATE=$(usbipd_state "$DEV")
+        case "$STATE" in
+        many) die "several connected devices share hardware id $DEV; unplug one" ;;
+        none)
+            case "$DEV" in
+            *:*) ID="$DEV" ;;
+            *) die "nothing is connected at busid $DEV; name the device as VENDOR:PRODUCT to remove a leftover hostdev (see: virutil usb show $VM)" ;;
+            esac
+            ;;
+        *) IFS='|' read -r ID BUSID STUB GUID CLIENT <<<"$STATE" ;;
+        esac
 
         REMOVED=0
         if [ "$(domstate)" = running ]; then
@@ -218,28 +256,23 @@ usb_main() {
 
         # leaves the device bound: still usable in Windows, and ready for a prompt-free
         # reattach later. Use `virutil usb unbind` to stop sharing it altogether.
-        IFS='|' read -r BUSID STUB GUID CLIENT <<<"$(usbipd_state "$ID")"
+        # Removing the hostdev only rebinds the driver inside WSL, so the client
+        # attachment read above still holds.
         if [ -n "${CLIENT:-}" ]; then
-            say "wsl: returning $ID to the Windows host"
-            "$USBIPD" detach -i "$ID"
+            say "wsl: returning $BUSID ($ID) to the Windows host"
+            "$USBIPD" detach -b "$BUSID"
         fi
         ;;
     unbind)
-        ID=$(read_id "${2:?usage: virutil usb unbind VENDOR:PRODUCT}")
-
-        STATE=$(usbipd_state "$ID")
-        case "$STATE" in
-        none) die "no connected USB device has hardware id $ID (see: virutil usb list)" ;;
-        many) die "several connected devices share hardware id $ID; unplug one" ;;
-        esac
-        IFS='|' read -r BUSID STUB GUID CLIENT <<<"$STATE"
+        DEV=$(read_dev "${2:?usage: virutil usb unbind BUSID}")
+        resolve_dev "$DEV"
 
         if [ -z "$STUB$GUID" ]; then
-            say "unbind: $ID ($BUSID) is not shared, nothing to do"
+            say "unbind: $BUSID ($ID) is not shared, nothing to do"
         else
-            say "unbind: unsharing $ID ($BUSID), expect a UAC prompt"
-            elevate unbind -i "$ID"
-            IFS='|' read -r BUSID STUB GUID CLIENT <<<"$(usbipd_state "$ID")"
+            say "unbind: unsharing $BUSID ($ID), expect a UAC prompt"
+            elevate unbind -b "$BUSID"
+            IFS='|' read -r ID BUSID STUB GUID CLIENT <<<"$(usbipd_state "$DEV")"
             [ -z "$STUB$GUID" ] || die "unbind did not take effect; was the UAC prompt declined?"
         fi
         ;;

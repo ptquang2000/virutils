@@ -14,7 +14,14 @@
 # trip on a variable no module has touched yet.
 
 RSYNC=(rsync -rlt --mkpath --info=progress2 --no-perms --no-owner --no-group)
+
+# Every module shares these two, so they are declared once here rather than per
+# module: all modules are sourced into one shell, and a second declaration would
+# just clobber the first. Arrays, not strings -- an unquoted string expansion
+# would word-split on whatever a path happens to contain. VIRSH_Q additionally
+# suppresses virsh's own success chatter.
 VIRSH=(virsh --connect qemu:///system)
+VIRSH_Q=("${VIRSH[@]}" --quiet)
 SUDO=()
 
 DOMAIN=""; NBD="/dev/nbd0"; MNT=""

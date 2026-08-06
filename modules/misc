@@ -5,8 +5,6 @@
 #   virutil misc shutdown  VM          request a graceful shutdown (ACPI)
 #   virutil misc domifaddr VM          show all guest interface addresses
 
-VIRSH="virsh -c qemu:///system"
-
 misc_usage() {
     echo "usage: virutil misc {list|start|shutdown|domifaddr} [VM_NAME]" >&2
     exit 1
@@ -19,19 +17,19 @@ misc_main() {
 
     case "$CMD" in
     list)
-        $VIRSH list --all
+        "${VIRSH[@]}" list --all
         ;;
     start)
         VM="${2:?usage: virutil misc start VM}"
-        $VIRSH start "$VM"
+        "${VIRSH[@]}" start "$VM"
         ;;
     shutdown)
         VM="${2:?usage: virutil misc shutdown VM}"
-        $VIRSH shutdown "$VM"
+        "${VIRSH[@]}" shutdown "$VM"
         ;;
     domifaddr)
         VM="${2:?usage: virutil misc domifaddr VM}"
-        $VIRSH domifaddr "$VM" --full
+        "${VIRSH[@]}" domifaddr "$VM" --full
         ;;
     *)
         misc_usage

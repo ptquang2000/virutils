@@ -35,7 +35,7 @@ step and no dependencies beyond the utilities it calls.
 | `pull` | Copy files out of a **running** guest by taking a disk-only live snapshot and reading the frozen base image read-only. | `virutil pull [-c NAME\|PATH]` |
 | `push` | Copy a file or directory from the host into a guest's `C:` drive **on demand**, offline, with no config file. | `virutil push VM SRC DST` |
 | `exec` | Run commands inside a Windows guest through the QEMU guest agent, with no guest networking required. | `virutil exec {setup\|ping\|info\|cmd\|ps} VM_NAME [FLAGS] [ARGS]` |
-| `usb` | USB passthrough end to end from a Windows host under WSL: `usbipd` bind, import over `vhci_hcd`, then attach to the domain. | `virutil usb {list\|show\|attach\|detach\|unbind} [VM] [VENDOR:PRODUCT]` |
+| `usb` | USB passthrough end to end from a Windows host under WSL: `usbipd` bind, import over `vhci_hcd`, then attach to the domain. | `virutil usb {list\|show\|attach\|detach\|unbind} [VM] [BUSID]` |
 | `snapshot` | External snapshots (disk and memory) for libvirt domains. | `virutil snapshot {create\|list\|revert\|delete} VM_NAME [SNAP_NAME]` |
 | `misc` | Everyday domain operations: list, start, graceful shutdown, interface addresses. | `virutil misc {list\|start\|shutdown\|domifaddr} [VM_NAME]` |
 

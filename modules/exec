@@ -31,8 +31,6 @@
 # `cmd VM -` works but is close to useless: cmd.exe /c takes a single statement,
 # so a multi-line batch file piped in will not behave like a batch file.
 
-VIRSH="virsh -q -c qemu:///system"
-
 # Windows caps a command line at 32767 chars; cmd.exe caps itself far lower.
 # Both are enforced host-side, because overflowing them fails inside the guest
 # as an unrelated-looking spawn error.
@@ -50,7 +48,7 @@ exec_usage() {
 # agent JSON -> stdout; dies on an agent-level error rather than feeding jq garbage
 agent() {
     local reply
-    reply=$($VIRSH qemu-agent-command "$VM" "$1" 2>&1) || true
+    reply=$("${VIRSH_Q[@]}" qemu-agent-command "$VM" "$1" 2>&1) || true
     case "$reply" in
         *'"error"'*|error:*) echo "$reply" >&2; exit 1 ;;
     esac
@@ -158,7 +156,7 @@ exec_main() {
 
     case "$CMD" in
     setup)
-        if $VIRSH dumpxml "$VM" | grep -q org.qemu.guest_agent.0; then
+        if "${VIRSH_Q[@]}" dumpxml "$VM" | grep -q org.qemu.guest_agent.0; then
             echo "$VM: channel already present"
             exit 0
         fi
@@ -169,10 +167,10 @@ exec_main() {
   <target type='virtio' name='org.qemu.guest_agent.0'/>
 </channel>
 EOF
-        $VIRSH attach-device "$VM" "$XML" --config
+        "${VIRSH_Q[@]}" attach-device "$VM" "$XML" --config
         # hotplug only works on a running VM; the --config copy covers the rest
-        if [ "$($VIRSH domstate "$VM")" = running ]; then
-            $VIRSH attach-device "$VM" "$XML" --live
+        if [ "$("${VIRSH_Q[@]}" domstate "$VM")" = running ]; then
+            "${VIRSH_Q[@]}" attach-device "$VM" "$XML" --live
         fi
         echo "$VM: channel added (install qemu-ga in the guest if not already there)"
         ;;

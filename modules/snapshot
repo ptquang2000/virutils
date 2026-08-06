@@ -6,7 +6,6 @@
 #   virutil snapshot delete    VM SNAP     delete a snapshot and its children
 
 DIR=/var/lib/libvirt/images
-VIRSH="virsh -c qemu:///system"
 
 snapshot_usage() {
     echo "usage: virutil snapshot {create|list|revert|delete} VM_NAME [SNAP_NAME]" >&2
@@ -23,7 +22,7 @@ snapshot_main() {
     case "$CMD" in
     create)
         SNAP="${3:-snap-$(date +%Y%m%d-%H%M%S)}"
-        $VIRSH snapshot-create-as \
+        "${VIRSH[@]}" snapshot-create-as \
             --domain "$VM" \
             --name "$SNAP" \
             --memspec "$DIR/$VM.$SNAP.mem,snapshot=external" \
@@ -32,16 +31,16 @@ snapshot_main() {
         echo "created: $SNAP"
         ;;
     list)
-        $VIRSH snapshot-list --domain "$VM" --tree
+        "${VIRSH[@]}" snapshot-list --domain "$VM" --tree
         ;;
     revert)
         SNAP="${3:?usage: virutil snapshot revert VM_NAME SNAP_NAME}"
-        $VIRSH snapshot-revert --domain "$VM" --snapshotname "$SNAP" --running
+        "${VIRSH[@]}" snapshot-revert --domain "$VM" --snapshotname "$SNAP" --running
         echo "reverted: $SNAP"
         ;;
     delete)
         SNAP="${3:?usage: virutil snapshot delete VM_NAME SNAP_NAME}"
-        $VIRSH snapshot-delete --domain "$VM" --snapshotname "$SNAP" --children
+        "${VIRSH[@]}" snapshot-delete --domain "$VM" --snapshotname "$SNAP" --children
         echo "deleted: $SNAP"
         ;;
     *)
