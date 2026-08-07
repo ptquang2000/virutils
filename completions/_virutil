@@ -69,8 +69,10 @@ _virutil_sync() {
   local state line
   _arguments \
     '(-c --config)'{-c,--config}'[config NAME or PATH]:config:->config' \
-    '(-h --help)'{-h,--help}'[print usage and exit]'
+    '(-h --help)'{-h,--help}'[print usage and exit]' \
+    '2:domain:->domain'   # 1 is the module word itself; _arguments skips words[1]
   case $state in
+    domain) _virutil_domains ;;
     config)
       if [[ $PREFIX == */* ]]; then
         _files

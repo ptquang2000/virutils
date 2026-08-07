@@ -12,7 +12,7 @@ step and no dependencies beyond the utilities it calls.
 - [virutil sync](#virutil-sync)
    - [Synopsis](#synopsis)
    - [Description](#description)
-   - [Options](#options)
+   - [Arguments and options](#arguments-and-options)
    - [Files](#files)
    - [Configuration](#configuration)
       - [Settings](#settings)
@@ -32,7 +32,7 @@ step and no dependencies beyond the utilities it calls.
 
 | Module | Purpose | Usage |
 | --- | --- | --- |
-| `sync` | Fetch a project's build output from a Windows host and push it into a guest's `C:` drive offline, by attaching the qcow2 with `qemu-nbd`. | `virutil sync [-c NAME\|PATH]` |
+| `sync` | Fetch a project's build output from a Windows host and push it into a guest's `C:` drive offline, by attaching the qcow2 with `qemu-nbd`. | `virutil sync VM [-c NAME\|PATH]` |
 | `pull` | Copy files out of a **running** guest by taking a disk-only live snapshot and reading the frozen base image read-only. | `virutil pull [-c NAME\|PATH]` |
 | `push` | Copy a file or directory from the host into a guest's `C:` drive **on demand**, offline, with no config file. | `virutil push VM SRC DST` |
 | `exec` | Run commands inside a Windows guest through the QEMU guest agent, with no guest networking required. | `virutil exec {setup\|ping\|info\|cmd\|ps} VM_NAME [FLAGS] [ARGS]` |
@@ -52,7 +52,7 @@ this document covers `virutil sync`, then `virutil pull`, then `virutil push`.
 ### Synopsis
 
 ```
-virutil sync [-c NAME|PATH]
+virutil sync VM [-c NAME|PATH]
 virutil sync -h
 ```
 
@@ -86,19 +86,28 @@ requires membership of the `libvirt` group. The guest filesystem is mounted with
 `uid=`/`gid=` set to the invoking user, so both copy phases and the cleanup pass
 need no privilege of their own.
 
-### Options
+### Arguments and options
+
+| Argument | Description |
+| --- | --- |
+| `VM` | libvirt domain whose disk is written. Required. |
 
 | Option | Description |
 | --- | --- |
 | `-c`, `--config NAME\|PATH` | Config to use. A value containing `/` is a path, taken as given. Anything else names a config in `~/.config/virutils/`, with `.conf` appended when absent — so `-c win11` reads `~/.config/virutils/win11.conf`. Defaults to `~/.config/virutils/sync.conf`. |
 | `-h`, `--help` | Print usage and exit. |
 
+The domain is an argument rather than a config setting, so one config —
+a project's build tree and where its pieces land on `C:` — can be pointed at
+any guest that runs it.
+
 Path-or-name is decided from the spelling alone, never from what happens to
 exist on disk, so the same command means the same config from any directory. One
 consequence worth knowing: `-c win11` can never refer to a file in the current
 directory — write `-c ./win11.conf` for that.
 
-There are no other arguments. Everything else lives in the config.
+Apart from `VM`, there are no other arguments. Everything else lives in the
+config.
 
 ### Files
 
@@ -107,7 +116,7 @@ There are no other arguments. Everything else lives in the config.
 | `~/.config/virutils/sync.conf` | Default config. This is the only location searched; there is no fallback beside the script. |
 | `~/.config/virutils/NAME.conf` | Additional configs, selected with `-c NAME`. |
 | `/tmp/<@staging>` | Staging directory, rebuilt from `@repo` on every run. |
-| `/mnt/<@domain>` | Default mount point for the guest filesystem, overridable with `@mnt`. |
+| `/mnt/<VM>` | Default mount point for the guest filesystem, overridable with `@mnt`. |
 
 A missing config is a fatal error naming the exact path that was looked for.
 Nothing is generated for you, and nothing else is touched first.
@@ -137,10 +146,9 @@ and is rejected.
 | --- | --- | --- | --- |
 | `@repo` | yes | — | Root of the build tree on the host. Fetch sources are relative to it. |
 | `@staging` | yes | — | Staging directory *name*. Always placed under `/tmp`, whatever is written here. |
-| `@domain` | yes | — | libvirt domain whose disk is written. |
 | `@dest` | no | *(empty)* | Install directory in the guest, relative to `C:\`. Every map destination hangs off it, so the install path is spelled once. Empty means the root of `C:`. |
 | `@nbd` | no | `/dev/nbd0` | NBD device used to attach the disk image. |
-| `@mnt` | no | `/mnt/<@domain>` | Host mount point for the guest filesystem. |
+| `@mnt` | no | `/mnt/<VM>` | Host mount point for the guest filesystem. |
 | `@shutdown_timeout` | no | `180` | Seconds to wait for the guest to shut down before aborting the run. The guest is never forced off. |
 
 #### Fetch rules
@@ -205,7 +213,6 @@ least two levels deep.
 ```
 @repo=/mnt/c/Users/me/work/myproject
 @staging=vmsync/myproject
-@domain=win11
 @dest=Program Files (x86)/Example/Product
 @shutdown_timeout=180
 
@@ -227,14 +234,14 @@ helper.exe|helpers
 Then:
 
 ```
-./virutil sync
+./virutil sync win11
 ```
 
-Or, keeping several profiles side by side:
+Or, keeping several profiles side by side, and pointing them at any guest:
 
 ```
-./virutil sync -c win10
-./virutil sync -c ~/scratch/experiment.conf
+./virutil sync win10 -c win10
+./virutil sync win11 -c ~/scratch/experiment.conf
 ```
 
 ### Notes

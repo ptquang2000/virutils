@@ -1,7 +1,11 @@
 # sync -- fetch a project's build output from the Windows host, then push it into
 # a Windows guest's C: drive offline by attaching its qcow2 with qemu-nbd.
 # Sourced by virutil; entry point is sync_main. Usage:
-#   virutil sync [-c NAME|PATH]    -- run as yourself, NOT under sudo.
+#   virutil sync VM [-c NAME|PATH]    -- run as yourself, NOT under sudo.
+#
+# The target domain is a command-line argument, not a config setting: one config
+# describes a project's build tree and where its pieces land on C:, and the same
+# description is worth pointing at any guest that runs it.
 #
 #   Windows build tree --(fetch)--> staging dir --(map)--> guest NTFS
 #
@@ -29,21 +33,24 @@
 # the mains, because the trap's guest_finish() runs after a main has returned,
 # and set -u must not trip on a variable no module has touched yet.
 
+# Prefixed per module: every module is sourced into one shell, so a bare
+# DEFAULT_CONF would be clobbered by whichever module is sourced last.
 CONF_DIR="$HOME/.config/virutils"
-DEFAULT_CONF="$CONF_DIR/sync.conf"
+SYNC_DEFAULT_CONF="$CONF_DIR/sync.conf"
 
 REPO=""; STAGING=""; DEST=""
 FETCH=(); MAPPINGS=(); EXCLUDES=(); CLEANUP=()
 
 sync_usage() {
     printf '%s\n' \
-        "usage: virutil sync [-c NAME|PATH]" \
+        "usage: virutil sync VM [-c NAME|PATH]" \
         "" \
+        "  VM                      libvirt domain whose disk is written" \
         "  -c, --config NAME|PATH  config to use. A value containing '/' is a" \
         "                          path, taken as given; anything else names a" \
         "                          config in $CONF_DIR" \
         "                          ('.conf' is appended when absent)." \
-        "                          default: $DEFAULT_CONF" \
+        "                          default: $SYNC_DEFAULT_CONF" \
         "  -h, --help              this message" \
         "" \
         "The config is the whole interface; see README.md for its format." >&2
@@ -84,22 +91,27 @@ empty_guest_dirs() {
 }
 
 sync_main() {
-    local CONF_ARG CONF lineno line
+    local CONF_ARG CONF lineno line VM
 
-    CONF_ARG=""
+    CONF_ARG=""; VM=""
     while (( $# )); do
         case "$1" in
             -c|--config) (( $# >= 2 )) || { warn "$1 needs a value"; sync_usage; }
                          CONF_ARG="$2"; shift 2 ;;
             -h|--help)   sync_usage 0 ;;
-            *)           warn "unrecognised argument: $1"; sync_usage ;;
+            -*)          warn "unrecognised argument: $1"; sync_usage ;;
+            *)           [[ -z "$VM" ]] || { warn "unexpected argument: $1"; sync_usage; }
+                         VM="$1"; shift ;;
         esac
     done
+
+    [[ -n "$VM" ]] || { warn "VM is required"; sync_usage; }
+    DOMAIN="$VM"
 
     # Path-or-name is decided on the spelling alone, never on what happens to
     # exist: the same command must mean the same config from any directory, and
     # the error below can then name exactly one path.
-    if   [[ -z "$CONF_ARG"    ]]; then CONF="$DEFAULT_CONF"
+    if   [[ -z "$CONF_ARG"    ]]; then CONF="$SYNC_DEFAULT_CONF"
     elif [[ "$CONF_ARG" == */* ]]; then CONF="$CONF_ARG"
     else                               CONF="$CONF_DIR/${CONF_ARG%.conf}.conf"
     fi
@@ -126,7 +138,8 @@ sync_main() {
                      repo)             REPO="$val" ;;
                      staging)          STAGING="$val" ;;
                      dest)             DEST="$val" ;;
-                     domain)           DOMAIN="$val" ;;
+                     domain)           die "$CONF:$lineno: @domain is no longer a setting" \
+                                           "-- pass the domain as an argument: virutil sync $val" ;;
                      nbd)              NBD="$val" ;;
                      mnt)              MNT="$val" ;;
                      shutdown_timeout) SHUTDOWN_TIMEOUT="$val" ;;
@@ -149,7 +162,6 @@ sync_main() {
         esac
     done < "$CONF"
 
-    [[ -n "$DOMAIN" ]] || die "$CONF: @domain is required"
     [[ -n "$STAGING" ]] || die "$CONF: @staging is required"
     STAGING="/tmp/${STAGING#/}"   # @staging names a directory under /tmp
 
@@ -157,6 +169,7 @@ sync_main() {
     echo "  ${#FETCH[@]} fetch, ${#MAPPINGS[@]} map, ${#EXCLUDES[@]} exclude," \
          "${#CLEANUP[@]} cleanup"
     echo "  staging: $STAGING"
+    echo "  domain: $DOMAIN"
 
     # --- fetch: Windows build tree -> staging -------------------------------
     (( ${#FETCH[@]} )) || die "no fetch rules in $CONF"

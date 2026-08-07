@@ -26,7 +26,7 @@
 # does this.
 
 CONF_DIR="$HOME/.config/virutils"
-DEFAULT_CONF="$CONF_DIR/pull.conf"
+PULL_DEFAULT_CONF="$CONF_DIR/pull.conf"
 
 SUDO=()
 
@@ -42,7 +42,7 @@ pull_usage() {
         "                          path, taken as given; anything else names a" \
         "                          config in $CONF_DIR" \
         "                          ('.conf' is appended when absent)." \
-        "                          default: $DEFAULT_CONF" \
+        "                          default: $PULL_DEFAULT_CONF" \
         "  -h, --help              this message" \
         "" \
         "The config is the whole interface; see README.md for its format." >&2
@@ -153,7 +153,7 @@ pull_main() {
 
     # Path-or-name is decided on the spelling alone, never on what happens to
     # exist: the same command must mean the same config from any directory.
-    if   [[ -z "$CONF_ARG"    ]]; then CONF="$DEFAULT_CONF"
+    if   [[ -z "$CONF_ARG"    ]]; then CONF="$PULL_DEFAULT_CONF"
     elif [[ "$CONF_ARG" == */* ]]; then CONF="$CONF_ARG"
     else                               CONF="$CONF_DIR/${CONF_ARG%.conf}.conf"
     fi
