@@ -216,7 +216,7 @@ guest_open() {
 
     # Top of the backing chain -- writing to the base image would corrupt the guest.
     IMG="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
-           | awk '$2=="disk" && $3=="sda" {print $4}')"
+           | awk '$2=="disk" {print $4; exit}')"
     [[ -f "$IMG" ]] || die "could not resolve disk image for $DOMAIN"
     echo "image: $IMG"
 
