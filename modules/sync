@@ -16,10 +16,12 @@
 #
 # A running guest is always shut down before the disk is touched and restarted
 # afterwards -- including on failure -- so the power state you start with is the
-# one you end with. The shutdown is graceful, falling back to a destroy after
-# @shutdown_timeout seconds. The restart is gated on the image being provably
-# detached: if teardown cannot be verified the guest is left shut off on
-# purpose, since starting it then would put two writers on one qcow2.
+# one you end with. The shutdown goes through qemu-guest-agent when it answers
+# and ACPI when it does not, and it is never forced: a guest that will not shut
+# down within @shutdown_timeout aborts the run, because cutting its power would
+# dirty the very filesystem we came to write. The restart is gated on the image
+# being provably detached: if teardown cannot be verified the guest is left shut
+# off on purpose, since starting it then would put two writers on one qcow2.
 
 # Everything the copy phases share -- the rsync/domain state, the offline attach
 # machinery, and the EXIT trap that restores the guest -- lives in the shared

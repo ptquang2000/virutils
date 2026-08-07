@@ -24,6 +24,7 @@ step and no dependencies beyond the utilities it calls.
    - [Notes](#notes)
 - [virutil pull](#virutil-pull)
 - [virutil push](#virutil-push)
+- [virutil domain](#virutil-domain)
 - [Requirements](#requirements)
 - [See also](#see-also)
 
@@ -37,6 +38,7 @@ step and no dependencies beyond the utilities it calls.
 | `exec` | Run commands inside a Windows guest through the QEMU guest agent, with no guest networking required. | `virutil exec {setup\|ping\|info\|cmd\|ps} VM_NAME [FLAGS] [ARGS]` |
 | `usb` | USB passthrough end to end from a Windows host under WSL: `usbipd` bind, import over `vhci_hcd`, then attach to the domain. | `virutil usb {list\|show\|attach\|detach\|unbind} [VM] [BUSID]` |
 | `snapshot` | External snapshots (disk and memory) for libvirt domains. | `virutil snapshot {create\|list\|revert\|delete} VM_NAME [SNAP_NAME]` |
+| `domain` | Create a domain from an install ISO with a KVM-tuned profile, or delete one along with its disks. | `virutil domain {create\|delete} VM [ISO] [OPTIONS]` |
 | `misc` | Everyday domain operations: list, start, graceful shutdown, interface addresses. | `virutil misc {list\|start\|shutdown\|domifaddr} [VM_NAME]` |
 
 `virutil` alone, or `virutil help`, prints the module list. `modules/parser`
@@ -139,7 +141,7 @@ and is rejected.
 | `@dest` | no | *(empty)* | Install directory in the guest, relative to `C:\`. Every map destination hangs off it, so the install path is spelled once. Empty means the root of `C:`. |
 | `@nbd` | no | `/dev/nbd0` | NBD device used to attach the disk image. |
 | `@mnt` | no | `/mnt/<@domain>` | Host mount point for the guest filesystem. |
-| `@shutdown_timeout` | no | `180` | Seconds to wait for a graceful guest shutdown before destroying the domain. |
+| `@shutdown_timeout` | no | `180` | Seconds to wait for the guest to shut down before aborting the run. The guest is never forced off. |
 
 #### Fetch rules
 
@@ -240,6 +242,31 @@ Or, keeping several profiles side by side:
 **Windows Fast Startup must be disabled in the guest.** With it on, Windows
 leaves the NTFS volume dirty on shutdown and `ntfs-3g` refuses to mount it
 read-write.
+
+**Install `qemu-guest-agent` in the guest.** The shutdown uses it when it
+answers, and ACPI only as a fallback. ACPI is a power-button event Windows is
+free to deliberate over — a modal dialog or "an app is preventing shutdown" and
+the wait runs to `@shutdown_timeout`. The agent calls Windows' own shutdown with
+applications forced closed, which usually takes seconds, and it is still a real
+shutdown: Windows closes the NTFS volume, so the disk is left clean. Grab the
+`virtio-win` guest tools ISO, install the QEMU guest agent from it, and confirm
+the host can see it:
+
+```
+virutil exec setup DOMAIN     # once per domain: adds the agent channel
+virutil exec ping DOMAIN      # confirms qemu-ga is answering
+```
+
+This is the same agent `virutil exec` uses, so a domain already set up for `exec`
+needs nothing further.
+
+**The guest is never forced off.** If it has not shut down within
+`@shutdown_timeout`, the run aborts with the guest left running rather than
+falling back to `virsh destroy`. Cutting power to a live Windows leaves the NTFS
+volume dirty — the same state Fast Startup causes above — so the disk would be
+unmountable read-write on the next run, and an interrupted write can leave the
+guest unbootable. If you decide to force it, do that by hand and expect to boot
+Windows once to let it check the volume.
 
 **Case matters in map destinations.** The guest's NTFS is case-insensitive, but
 the `ntfs-3g` mount is not. `@dest` and map destinations are used verbatim, so
@@ -467,13 +494,120 @@ ending in `/` or `\` always means a directory, even one that does not exist yet.
 ### Notes
 
 `push` shares every safety rule `sync` documents, wholesale: it must be run as
-yourself, not under `sudo`; a running guest is shut down gracefully (falling
-back to destroy after the shutdown timeout) and restarted only once the disk is
-provably free; a domain with a managed-save image, and paused or suspended
+yourself, not under `sudo`; a running guest is shut down through the guest agent
+(ACPI as a fallback, never a forced power-off) and restarted only once the disk
+is provably free; a domain with a managed-save image, and paused or suspended
 domains, are refused; Fast Startup must be off. All of that machinery lives in
 the shared `modules/guest` used by both `sync` and `push`. There are no
 excludes — `push` copies exactly what you name, which is the point of having it
 at all.
+
+## virutil domain
+
+`domain` bookends everything else here: it makes the guest the other modules
+operate on, and removes it again along with the disks nobody else cleans up.
+
+```
+virutil domain create VM ISO [OPTIONS]
+virutil domain delete VM [-y]
+```
+
+### create
+
+A wrapper around `virt-install` with a KVM-tuned profile in place of libvirt's
+defaults. The defaults it does pick — half the host's RAM, half its CPUs capped
+at 8, a 64 GiB disk, UEFI, `win11` — are aimed at a Windows guest on a WSL2
+host, which is the case this repo exists for. Everything is overridable.
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--size GiB` | `64` | Disk size. |
+| `--memory MiB` | half the host's | Guest RAM, rounded down to 512 MiB, floor 2048. |
+| `--vcpus N` | half the host's, max 8 | Virtual CPUs. |
+| `--disk PATH` | `/var/lib/libvirt/images/VM.qcow2` | Disk image path. |
+| `--osinfo ID` | `win11` | libosinfo id; see `osinfo-query os`. |
+| `--virtio ISO` | `virtio-win*.iso` beside the install ISO | Driver ISO to attach as a second cdrom. |
+| `--no-virtio` | — | Attach no driver ISO. |
+| `--network SPEC` | `user,model=virtio` | Passed to `virt-install --network`. |
+| `--bios` | — | SeaBIOS instead of UEFI. |
+| `--dry-run` | — | Print the domain XML and define nothing. |
+
+What the profile actually sets, and why:
+
+- **`--cpu host-passthrough,cache.mode=passthrough`**, with the vcpus presented
+   as one socket of *n* cores × 2 threads. The guest sees the real CPU and the
+   real cache topology; a flat *n*-socket guest is both a Windows licensing
+   problem and a worse scheduling hint.
+- **The Hyper-V enlightenments** (`synic`, `stimer`, `tlbflush`, `ipi`,
+   `frequencies`, `reenlightenment`, …). The single largest win for a Windows
+   guest: without them the guest's timer interrupts round-trip through the
+   hypervisor and an idle desktop burns real host CPU. `evmcs` and `avic` come
+   from the libosinfo profile and are switched back **off** — `avic` is AMD-only
+   and `evmcs` needs nested VMX exposed to the guest, so on the wrong host they
+   are just a domain that refuses to start.
+- **virtio-blk with `cache=none`, `io=io_uring`, and a dedicated iothread.**
+   `cache=none` keeps the host page cache out of the write path, where it would
+   otherwise hold a second copy of what Windows is already caching — on WSL2 that
+   copy competes for the memory the guest was given. `discard=unmap` and
+   `detect_zeroes=unmap` let a TRIM in the guest shrink the qcow2 again.
+- **The qcow2 is created by hand**, not by libvirt's storage driver, so it can
+   have `cluster_size=1M` (L2 metadata small enough to stay cached, and no
+   read-modify-write on a sub-cluster write), `preallocation=metadata`, and
+   `lazy_refcounts=on`. The last of those trades a `qemu-img check -r all` after
+   an unclean shutdown for cheaper writes.
+- **No balloon, no HPET, `rtc_tickpolicy=catchup`.** Two emulated devices a
+   Windows guest does not need, and a clock policy that replays missed ticks
+   rather than dropping them.
+- **`--network user,model=virtio`.** SLIRP needs no host-side setup, which
+   matters on WSL2 where the default NAT network usually is not there and the
+   `nf_nat` modules may not be either. It has no inbound path; for RDP, add
+   `--network 'user,model=virtio,portForward.0.proto=tcp,portForward.0.hostPort=13389,portForward.0.guestPort=3389'`.
+
+```
+virutil domain create win11 ~/Work/iso/Win11_24H2_tiny.iso
+virutil domain create dev --osinfo fedora40 --size 40 --memory 4096 ~/iso/f40.iso
+virutil domain create win11 ~/iso/win11.iso --dry-run | less
+```
+
+The disk is created first and **removed again if `virt-install` fails**, so a
+failed attempt does not leave an image blocking the next one under the same
+name.
+
+### delete
+
+```
+virutil domain delete VM [-y] [--keep-disk]
+```
+
+Stops the domain if it is running, undefines it with `--nvram` and
+`--snapshots-metadata`, and deletes its disks. `-y` skips the confirmation;
+without it you are asked to type the domain name back. `--keep-disk` undefines
+and leaves every image in place.
+
+This exists because `virsh undefine --remove-all-storage` only removes volumes
+libvirt knows about through a **storage pool**, and a host with no pools defined
+— the normal case here — silently keeps the disks. So the disks are resolved
+from the domain XML instead, and:
+
+- **Backing chains are followed.** An overlay left by `virutil snapshot create`
+   names its base; deleting only the top of the chain would orphan the base in
+   `/var/lib/libvirt/images`. Every file in the chain is listed and removed.
+- **Images another domain uses are kept.** Sharing one base image between
+   domains is a normal way to run a golden image, and deleting it out from under
+   the other domain is unrecoverable, so every candidate is checked against every
+   other domain's disks and backing chains first. Anything shared is reported and
+   left alone.
+- **The list is printed before anything is destroyed**, because unlinking a
+   qcow2 is the one step here that nothing undoes.
+- **An unreadable image counts as a file to delete, not as no file.** If the
+   backing chain cannot be read, the disk itself is still removed and the
+   backing files it may have had are called out — the alternative is a delete
+   that quietly turns into a keep.
+
+Privilege is escalated only where the path calls for it: the default image
+directory is root-owned, but a `--disk` in a directory of your own costs no
+password, and undefining a domain hands its images back to their original owner
+before the removal runs.
 
 ## Requirements
 
@@ -488,9 +622,23 @@ Host:
 - `sudo`, for the privileged commands listed under
    [Description](#description)
 
+Host, for `virutil domain`:
+
+- `virt-install` (`virt-manager`'s CLI) and `libosinfo`
+- `/dev/kvm` — under WSL2 that means nested virtualisation enabled
+- OVMF/edk2 firmware, unless `--bios` is passed
+- `swtpm`, optional: without it the guest gets no TPM 2.0 device, which a
+   **stock** Windows 11 ISO refuses to install without. Debloated images have the
+   check removed.
+- `acl`, optional: an install ISO under a `0700` home directory is unreachable
+   by the qemu user, and `virutil domain create` prints the `setfacl` that fixes
+   it
+
 Guest, for `virutil sync`:
 
 - Windows, with Fast Startup disabled
+- The QEMU guest agent, strongly recommended: without it the shutdown falls back
+   to ACPI, which Windows may sit on until `@shutdown_timeout` expires
 - A single disk exposed as `sda`, whose system volume is the largest NTFS
    partition on it
 

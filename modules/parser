@@ -1,7 +1,7 @@
 # Parser for virutil: top-level dispatch plus the helpers every module shares.
 # Sourced by virutil; not executable on its own.
 
-MODULES=(exec sync pull push usb snapshot misc)
+MODULES=(exec sync pull push usb snapshot domain misc)
 
 die()  { printf '%s\n' "$@" >&2; exit 1; }
 warn() { printf '%s\n' "$@" >&2; }
@@ -18,6 +18,7 @@ modules:
   push       copy a file or directory from the host into a guest on demand
   usb        USB passthrough end to end from the Windows host under WSL
   snapshot   external snapshots (disk and memory) for libvirt domains
+  domain     create and delete libvirt domains, disk included
   misc       everyday domain operations: list, start, shutdown, domifaddr
 
 Run 'virutil <module>' for a module's own usage.

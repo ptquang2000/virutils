@@ -10,6 +10,7 @@ _virutil() {
     'push:copy a file or directory from the host into a guest on demand'
     'usb:USB passthrough from the Windows host under WSL'
     'snapshot:external snapshots (disk and memory) for libvirt domains'
+    'domain:create and delete libvirt domains, disk included'
     'misc:everyday domain operations'
     'help:this message'
   )
@@ -26,6 +27,7 @@ _virutil() {
     push)     _virutil_push ;;
     usb)      _virutil_usb ;;
     snapshot) _virutil_snapshot ;;
+    domain)   _virutil_domain ;;
     misc)     _virutil_misc ;;
   esac
 }
@@ -162,6 +164,44 @@ _virutil_snapshot() {
           ;;
       esac
       ;;
+  esac
+}
+
+_virutil_domain() {
+  local -a cmds=(
+    'create:define a domain and boot the installer'
+    'delete:undefine a domain and delete its disks'
+  )
+  case $words[3] in
+    create)
+      case $CURRENT in
+        3) _describe -t command 'command' cmds ;;
+        4) ;;                       # the new domain's name: nothing to complete
+        5) _files -g '*.iso' ;;
+        *) _values 'option' \
+             '--size[disk size in GiB]' \
+             '--memory[guest RAM in MiB]' \
+             '--vcpus[virtual CPUs]' \
+             '--disk[disk image path]' \
+             '--osinfo[libosinfo id]' \
+             '--virtio[virtio-win ISO to attach]' \
+             '--no-virtio[do not attach a virtio-win ISO]' \
+             '--network[virt-install --network value]' \
+             '--bios[seabios instead of UEFI]' \
+             '--dry-run[print the domain XML and define nothing]'
+           ;;
+      esac
+      ;;
+    delete)
+      case $CURRENT in
+        4) _virutil_domains ;;
+        *) _values 'option' \
+             '(-y --yes)'{-y,--yes}'[do not ask for confirmation]' \
+             '--keep-disk[undefine but leave the disks in place]'
+           ;;
+      esac
+      ;;
+    *) (( CURRENT == 3 )) && _describe -t command 'command' cmds ;;
   esac
 }
 

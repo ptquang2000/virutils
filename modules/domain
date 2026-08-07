@@ -1,0 +1,482 @@
+# domain -- create and delete libvirt domains, disk included.
+# Sourced by virutil; entry point is domain_main. Usage:
+#   virutil domain create VM ISO [OPTIONS]   define a domain and boot the installer
+#   virutil domain delete VM [-y]            undefine a domain and delete its disks
+#
+# create wraps virt-install with a KVM-tuned profile rather than libvirt's
+# defaults: host-passthrough CPU with a real core/thread topology, virtio-blk on
+# a dedicated iothread with cache=none and io_uring, the Hyper-V enlightenments
+# a Windows guest needs to stop burning CPU on timers, no balloon and no HPET.
+# On a WSL2 host these are the difference between a usable guest and a sluggish
+# one -- the storage path especially, since the qcow2 already sits on a virtual
+# disk inside Hyper-V.
+#
+# delete is the counterpart virsh does not really provide: `undefine
+# --remove-all-storage` only removes volumes libvirt knows about through a
+# storage pool, and this host defines none. So the disks are resolved from the
+# domain XML, walked through their backing chains, checked against every other
+# domain, and unlinked here.
+
+DOMAIN_IMAGE_DIR=/var/lib/libvirt/images
+
+# UEFI is mandatory for Windows 11 and the firmware paths differ per distro.
+# Ordered pairs of CODE:VARS; the first pair that exists wins. The non-secboot
+# CODE image is deliberate -- the secure-boot build needs <smm> and a matching
+# VARS template, and tiny Windows images have the Secure Boot check stripped
+# anyway, so requiring it would only add a way to fail.
+DOMAIN_OVMF=(
+    /usr/share/OVMF/x64/OVMF_CODE.4m.fd:/usr/share/OVMF/x64/OVMF_VARS.4m.fd
+    /usr/share/OVMF/OVMF_CODE.4m.fd:/usr/share/OVMF/OVMF_VARS.4m.fd
+    /usr/share/OVMF/OVMF_CODE.fd:/usr/share/OVMF/OVMF_VARS.fd
+    /usr/share/edk2/ovmf/OVMF_CODE.fd:/usr/share/edk2/ovmf/OVMF_VARS.fd
+    /usr/share/edk2-ovmf/x64/OVMF_CODE.fd:/usr/share/edk2-ovmf/x64/OVMF_VARS.fd
+    /usr/share/qemu/ovmf-x86_64-code.bin:/usr/share/qemu/ovmf-x86_64-vars.bin
+)
+
+domain_usage() {
+    printf '%s\n' \
+        "usage: virutil domain create VM ISO [OPTIONS]" \
+        "       virutil domain delete VM [-y]" \
+        "" \
+        "create options:" \
+        "  --size GiB        disk size (default 64)" \
+        "  --memory MiB      guest RAM (default: half the host's)" \
+        "  --vcpus N         virtual CPUs (default: half the host's, max 8)" \
+        "  --disk PATH       disk image path (default $DOMAIN_IMAGE_DIR/VM.qcow2)" \
+        "  --osinfo ID       libosinfo id (default win11; see osinfo-query os)" \
+        "  --virtio ISO      virtio-win ISO to attach (default: found next to ISO)" \
+        "  --no-virtio       do not attach a virtio-win ISO" \
+        "  --network SPEC    virt-install --network value (default user,model=virtio)" \
+        "  --bios            seabios instead of UEFI" \
+        "  --dry-run         print the domain XML and define nothing" \
+        "" \
+        "delete options:" \
+        "  -y, --yes         do not ask for confirmation" \
+        "  --keep-disk       undefine the domain but leave its disks in place" \
+        "" \
+        "  -h, --help        this message" >&2
+    exit "${1:-1}"
+}
+
+domain_main() {
+    local CMD
+    CMD="${1:-}"
+    case "$CMD" in
+        "")        domain_usage 1 ;;
+        -h|--help) domain_usage 0 ;;
+    esac
+    shift
+
+    # The same rule guest_open() enforces, for the same reason: under sudo the
+    # escalation is all-or-nothing and $HOME is root's. Escalate the two commands
+    # that need it (qemu-img into a root-owned directory, rm of the images) and
+    # leave every virsh call unprivileged, which is what libvirt group membership
+    # is for.
+    [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] \
+        && die "do not run virutil under sudo -- run it as yourself." \
+               "It escalates only the commands that actually need root."
+    if [[ $EUID -eq 0 ]]; then SUDO=(); else SUDO=(sudo); fi
+
+    case "$CMD" in
+        create) domain_create "$@" ;;
+        delete) domain_delete "$@" ;;
+        *)      die "virutil domain: unknown command: $CMD (see: virutil domain -h)" ;;
+    esac
+}
+
+# domain_exists NAME -- true if libvirt knows the domain, running or not.
+domain_exists() {
+    "${VIRSH_Q[@]}" dominfo "$1" >/dev/null 2>&1
+}
+
+# domain_disks NAME -- the file-backed disks of a domain, one per line, cdroms
+# excluded. --details is what makes the device column available, so a cdrom can
+# be told from a disk without guessing from the target name. The source is cut
+# off the front of the line rather than taken as $4, so a path containing spaces
+# survives; virsh indents every row, hence the leading [[:space:]]* in the cut.
+domain_disks() {
+    "${VIRSH[@]}" domblklist "$1" --details 2>/dev/null \
+        | awk '$1 == "file" && $2 == "disk" {
+                   sub(/^[[:space:]]*([^[:space:]]+[[:space:]]+){3}/, ""); print }'
+}
+
+# domain_chain FILE -- FILE plus every backing file under it. An overlay left by
+# `virutil snapshot create` names its base and the base names nothing, so this is
+# what turns "delete the disk" into "delete the disk and the images it stands on"
+# instead of orphaning gigabytes in $DOMAIN_IMAGE_DIR.
+domain_chain() {
+    local out
+    # Unprivileged first: libvirt's dynamic ownership leaves a running domain's
+    # image owned by the qemu user, but plenty of images stay readable, and asking
+    # for a password once per image just to list them is noise.
+    out="$(qemu-img info --backing-chain -- "$1" 2>/dev/null || true)"
+    [[ -n "$out" ]] \
+        || out="$("${SUDO[@]}" qemu-img info --backing-chain -- "$1" 2>/dev/null || true)"
+
+    # An unreadable image must not read as "this disk has no files" -- that would
+    # quietly turn a delete into a keep. Fall back to the disk itself and say so,
+    # since the one thing lost is the backing files under it.
+    if [[ -z "$out" ]]; then
+        warn "could not read the backing chain of $1;" \
+             "treating it as a single image -- any backing files stay behind"
+        printf '%s\n' "$1"
+        return
+    fi
+    printf '%s\n' "$out" | awk '/^image: /{ sub(/^image: /, ""); print }'
+}
+
+# domain_in_use FILE EXCEPT -- true if any domain other than EXCEPT references
+# FILE, directly or as a backing file. Two domains sharing one base image is a
+# normal way to run a golden image, and deleting it out from under the other one
+# is unrecoverable, so nothing is unlinked without this check.
+domain_in_use() {
+    local file="$1" except="$2" other disk member
+    while read -r other; do
+        [[ -n "$other" && "$other" != "$except" ]] || continue
+        while read -r disk; do
+            [[ -n "$disk" ]] || continue
+            while read -r member; do
+                [[ "$member" == "$file" ]] && return 0
+                # Quiet: an unreadable image belonging to some *other* domain is
+                # not this run's problem, and the caller already reported the
+                # ones that are.
+            done < <(domain_chain "$disk" 2>/dev/null)
+        done < <(domain_disks "$other")
+    done < <("${VIRSH_Q[@]}" list --all --name 2>/dev/null)
+    return 1
+}
+
+# domain_readable_by_qemu FILE -- warn if the qemu user cannot traverse to FILE.
+# libvirt relabels the file itself but never the directories above it, and a home
+# directory is 0700 on most installs, so an ISO under ~ fails at domain start with
+# a bare "Permission denied" naming only the ISO. Catch it here, where the fix can
+# be printed. Checked from the path's mode bits rather than by attempting the open
+# as another user: the probe must not itself need root.
+domain_readable_by_qemu() {
+    local file="$1" dir missing=() qemu_user
+    qemu_user="$(awk -F'"' '/^[[:space:]]*user[[:space:]]*=/ {print $2}' \
+                 /etc/libvirt/qemu.conf 2>/dev/null | tail -1)"
+    qemu_user="${qemu_user:-libvirt-qemu}"
+    [[ "$qemu_user" == root ]] && return 0
+
+    dir="$(dirname -- "$file")"
+    while :; do
+        # The tenth character of the mode string is other-execute: 'x', or 't' on
+        # a sticky world-executable directory like /tmp. Read from the mode bits
+        # rather than with -x, which answers for the invoking user, not for qemu.
+        # An ACL entry for the qemu user counts as traversable even when the mode
+        # bits say otherwise -- that is exactly what the suggested fix installs,
+        # so a second run must not repeat the warning.
+        if [[ ! "$(stat -c '%A' "$dir")" =~ ^.{9}[xt] ]] \
+           && ! getfacl -pc -- "$dir" 2>/dev/null | grep -q "^user:$qemu_user:..x"; then
+            missing+=("$dir")
+        fi
+        [[ "$dir" == / ]] && break
+        dir="$(dirname -- "$dir")"
+    done
+
+    (( ${#missing[@]} )) || return 0
+    warn "$qemu_user cannot traverse to $file:" \
+         "  ${missing[*]}" \
+         "The domain will fail to start with 'permission denied'. Fix it with:" \
+         "  sudo setfacl -m u:$qemu_user:x ${missing[*]}"
+}
+
+domain_create() {
+    local VM="" ISO="" SIZE=64 MEM="" VCPUS="" IMG="" OSINFO=win11
+    local VIRTIO="" NO_VIRTIO=0 NETWORK="user,model=virtio" BIOS=0 DRYRUN=0
+
+    while (( $# )); do
+        case "$1" in
+            --size)     SIZE="${2:?--size needs a value}"; shift 2 ;;
+            --memory)   MEM="${2:?--memory needs a value}"; shift 2 ;;
+            --vcpus)    VCPUS="${2:?--vcpus needs a value}"; shift 2 ;;
+            --disk)     IMG="${2:?--disk needs a value}"; shift 2 ;;
+            --osinfo)   OSINFO="${2:?--osinfo needs a value}"; shift 2 ;;
+            --virtio)   VIRTIO="${2:?--virtio needs a value}"; shift 2 ;;
+            --no-virtio) NO_VIRTIO=1; shift ;;
+            --network)  NETWORK="${2:?--network needs a value}"; shift 2 ;;
+            --bios)     BIOS=1; shift ;;
+            --dry-run)  DRYRUN=1; shift ;;
+            -h|--help)  domain_usage 0 ;;
+            -*)         die "virutil domain create: unknown option: $1" ;;
+            *)
+                if   [[ -z "$VM"  ]]; then VM="$1"
+                elif [[ -z "$ISO" ]]; then ISO="$1"
+                else die "virutil domain create: unexpected argument: $1"
+                fi
+                shift ;;
+        esac
+    done
+
+    [[ -n "$VM"  ]] || domain_usage
+    [[ -n "$ISO" ]] || domain_usage
+    command -v virt-install >/dev/null || die "virt-install not installed"
+    command -v qemu-img     >/dev/null || die "qemu-img not installed"
+    [[ -e /dev/kvm ]] || die "/dev/kvm is missing -- no hardware virtualisation." \
+                             "Under WSL2 this usually means nested virtualisation is off."
+    [[ -f "$ISO" ]] || die "install ISO not found: $ISO"
+    domain_exists "$VM" && die "domain '$VM' already exists" \
+                               "  virutil domain delete $VM"
+
+    [[ "$SIZE" =~ ^[0-9]+$ ]] || die "--size wants a whole number of GiB, got '$SIZE'"
+    IMG="${IMG:-$DOMAIN_IMAGE_DIR/$VM.qcow2}"
+    [[ -e "$IMG" ]] && die "disk image already exists: $IMG" \
+                           "Pass --disk to put it elsewhere, or remove it first."
+
+    # Half the host's RAM and half its CPUs, which leaves the host -- and, on
+    # WSL2, everything else sharing the same lightweight VM -- room to work.
+    # vcpus is capped at 8: past that a desktop Windows guest gains nothing and
+    # the vcpu threads just contend with the host.
+    if [[ -z "$MEM" ]]; then
+        MEM=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 / 2 ))
+        MEM=$(( MEM / 512 * 512 ))
+        (( MEM < 2048 )) && MEM=2048
+    fi
+    if [[ -z "$VCPUS" ]]; then
+        VCPUS=$(( $(nproc) / 2 ))
+        (( VCPUS > 8 )) && VCPUS=8
+        (( VCPUS < 2 )) && VCPUS=2
+    fi
+    [[ "$MEM"   =~ ^[0-9]+$ ]] || die "--memory wants MiB, got '$MEM'"
+    [[ "$VCPUS" =~ ^[0-9]+$ ]] || die "--vcpus wants a whole number, got '$VCPUS'"
+
+    # Present the vcpus as cores of one socket, paired into threads when the count
+    # allows. Windows licences and schedules by socket, and a flat 8-socket guest
+    # is both a licensing problem and a worse scheduling hint than 4 cores x 2.
+    local threads=1
+    (( VCPUS % 2 == 0 )) && threads=2
+    local cores=$(( VCPUS / threads ))
+
+    local -a ARGS=(
+        --connect qemu:///system
+        --name "$VM"
+        --osinfo "$OSINFO"
+        --virt-type kvm
+        --machine q35
+        --memory "$MEM"
+        # No balloon device: it costs a little guest CPU and a lot of predictability,
+        # and nothing here overcommits host memory.
+        --memballoon none
+        --vcpus "$VCPUS"
+        # host-passthrough exposes the real CPU, which is what lets the guest use
+        # AVX and friends; cache.mode=passthrough exposes the real cache topology
+        # so the guest scheduler stops guessing.
+        --cpu "host-passthrough,cache.mode=passthrough,topology.sockets=1,topology.cores=$cores,topology.threads=$threads"
+        --iothreads 1
+        --network "$NETWORK"
+        --graphics spice,listen=none
+        --video virtio
+        --channel spicevmc
+        --sound none
+        --rng /dev/urandom
+        --noautoconsole
+    )
+
+    if (( BIOS )); then
+        ARGS+=(--boot cdrom,hd)
+    else
+        local pair code vars
+        for pair in "${DOMAIN_OVMF[@]}"; do
+            [[ -f "${pair%%:*}" && -f "${pair##*:}" ]] || continue
+            code="${pair%%:*}"; vars="${pair##*:}"
+            break
+        done
+        [[ -n "${code:-}" ]] || die \
+            "no OVMF firmware found -- install edk2-ovmf (or pass --bios)." \
+            "Windows 11 will not install without UEFI."
+        ARGS+=(--boot "loader=$code,loader.readonly=yes,loader.type=pflash,loader.secure=no,nvram.template=$vars,cdrom,hd")
+    fi
+
+    # swtpm is what backs an emulated TPM; without it libvirt cannot honour a <tpm>
+    # device at all. Stock Windows 11 setup refuses to install without one, so say
+    # so rather than let the guest reach the installer and stop there.
+    if [[ "$OSINFO" == win* ]] && command -v swtpm >/dev/null; then
+        ARGS+=(--tpm backend.type=emulator,backend.version=2.0,model=tpm-crb)
+    else
+        ARGS+=(--tpm none)
+        [[ "$OSINFO" == win11* ]] && warn \
+            "swtpm is not installed, so the guest gets no TPM 2.0 device." \
+            "Debloated Windows 11 images have the check removed and install fine;" \
+            "a stock ISO will stop at 'This PC can't run Windows 11'. Install swtpm" \
+            "and recreate the domain if you need one."
+    fi
+
+    if [[ "$OSINFO" == win* ]]; then
+        # The Hyper-V enlightenments. This is the single largest win for a Windows
+        # guest: without synic/stimer the guest's timer interrupts round-trip
+        # through the hypervisor, and an idle desktop burns real host CPU.
+        # evmcs and avic come from the libosinfo profile and are dropped here --
+        # avic is AMD-only and evmcs needs nested VMX exposed to the guest, so on
+        # the wrong host they turn into a domain that refuses to start.
+        ARGS+=(--features "hyperv.relaxed.state=on,hyperv.vapic.state=on,hyperv.spinlocks.state=on,hyperv.spinlocks.retries=8191,hyperv.vpindex.state=on,hyperv.runtime.state=on,hyperv.synic.state=on,hyperv.stimer.state=on,hyperv.stimer.direct.state=on,hyperv.frequencies.state=on,hyperv.tlbflush.state=on,hyperv.ipi.state=on,hyperv.reenlightenment.state=on,hyperv.reset.state=on,hyperv.evmcs.state=off,hyperv.avic.state=off")
+        # hpet off: Windows does not need it and emulating it is pure overhead.
+        # rtc catchup replays timer ticks the guest missed instead of dropping them.
+        ARGS+=(--clock hypervclock_present=yes,rtc_tickpolicy=catchup,hpet_present=no)
+    fi
+
+    # cache=none takes the host page cache out of the write path -- it would
+    # otherwise cache the same blocks Windows is already caching, and on WSL2 that
+    # second copy competes with the host for the memory the guest was given.
+    # io_uring keeps the submission cost of that decision low; the dedicated
+    # iothread keeps virtio-blk completions off the vcpu threads. discard=unmap
+    # and detect_zeroes=unmap let a TRIM in the guest shrink the qcow2 back down.
+    local DISKOPTS="bus=virtio,format=qcow2,cache=none,io=io_uring,discard=unmap,detect_zeroes=unmap,driver.iothread=1,driver.queues=$VCPUS"
+
+    # The virtio-win ISO, since a Windows installer cannot see a virtio disk
+    # without it -- shipping the guest a disk it cannot find is the one failure
+    # this profile invites, so the drivers ride along by default.
+    if [[ "$OSINFO" == win* && $NO_VIRTIO -eq 0 && -z "$VIRTIO" ]]; then
+        local candidate
+        for candidate in "$(dirname -- "$ISO")"/virtio-win*.iso; do
+            [[ -f "$candidate" ]] && VIRTIO="$candidate"
+        done
+    fi
+    (( NO_VIRTIO )) && VIRTIO=""
+
+    domain_readable_by_qemu "$ISO"
+    [[ -n "$VIRTIO" ]] && domain_readable_by_qemu "$VIRTIO"
+
+    # virt-install only accepts a sizeless --disk for an image that already exists,
+    # and a dry run creates nothing -- so size= stands in for the real qcow2 there.
+    local DISKSPEC="path=$IMG,$DISKOPTS"
+    (( DRYRUN )) && DISKSPEC="path=$IMG,size=$SIZE,$DISKOPTS"
+
+    ARGS+=(--disk "$DISKSPEC")
+    ARGS+=(--disk "path=$ISO,device=cdrom,bus=sata,readonly=on")
+    [[ -n "$VIRTIO" ]] && ARGS+=(--disk "path=$VIRTIO,device=cdrom,bus=sata,readonly=on")
+
+    if (( DRYRUN )); then
+        virt-install "${ARGS[@]}" --dry-run --print-xml 1
+        return
+    fi
+
+    say "domain:  $VM ($OSINFO)"
+    say "cpu:     $VCPUS vcpus (1 socket x $cores cores x $threads threads)"
+    say "memory:  ${MEM} MiB"
+    say "disk:    $IMG (${SIZE} GiB)"
+    say "iso:     $ISO"
+    [[ -n "$VIRTIO" ]] && say "virtio:  $VIRTIO"
+
+    # Created here rather than left to virt-install so the qcow2 gets options
+    # libvirt's storage driver does not offer. cluster_size=1M cuts the L2 metadata
+    # for a 64 GiB image from megabytes to hundreds of kilobytes, so it stays
+    # cached, and it collapses the read-modify-write a sub-cluster write costs.
+    # preallocation=metadata allocates those tables up front, so the guest's first
+    # write into a region does not stall behind them. lazy_refcounts defers refcount
+    # updates: worth it here, at the price of a `qemu-img check -r all` after an
+    # unclean shutdown.
+    # Only escalate when the destination actually calls for it: the default
+    # $DOMAIN_IMAGE_DIR is root-owned, but --disk pointing somewhere of your own
+    # should not cost a password.
+    local -a IMGSUDO=()
+    [[ -w "$(dirname -- "$IMG")" ]] || IMGSUDO=("${SUDO[@]}")
+
+    "${IMGSUDO[@]}" qemu-img create -f qcow2 \
+        -o cluster_size=1M,preallocation=metadata,lazy_refcounts=on \
+        -- "$IMG" "${SIZE}G" >/dev/null \
+        || die "could not create $IMG"
+
+    # From here on a failure has already created the disk, so clean it up rather
+    # than leave a stray image that blocks the next attempt at the same name.
+    if ! virt-install "${ARGS[@]}"; then
+        "${IMGSUDO[@]}" rm -f -- "$IMG"
+        die "virt-install failed -- $IMG removed"
+    fi
+
+    say "" \
+        "defined and started. Open the console with:" \
+        "  virt-viewer --connect qemu:///system $VM"
+    # An if, not a '&&' one-liner: this is the last statement in the function, so
+    # a false test would become the function's -- and, under set -e, the script's
+    # -- exit status.
+    if [[ -n "$VIRTIO" ]]; then
+        say "In Windows Setup, 'Load driver' -> the virtio-win CD -> amd64\\<version>" \
+            "makes the virtio disk visible."
+    fi
+}
+
+domain_delete() {
+    local VM="" YES=0 KEEP=0
+
+    while (( $# )); do
+        case "$1" in
+            -y|--yes)    YES=1; shift ;;
+            --keep-disk) KEEP=1; shift ;;
+            -h|--help)   domain_usage 0 ;;
+            -*)          die "virutil domain delete: unknown option: $1" ;;
+            *)           [[ -z "$VM" ]] || die "unexpected argument: $1"
+                         VM="$1"; shift ;;
+        esac
+    done
+    [[ -n "$VM" ]] || domain_usage
+    domain_exists "$VM" || die "no such domain: $VM"
+
+    # Everything the disks are resolved from disappears with the domain, so the
+    # list is built while the XML still exists -- and shown before anything is
+    # destroyed, because unlinking a qcow2 is the one step here nothing undoes.
+    local -a REMOVE=() SHARED=()
+    local disk member
+    if (( ! KEEP )); then
+        while read -r disk; do
+            [[ -n "$disk" ]] || continue
+            while read -r member; do
+                [[ -n "$member" && -e "$member" ]] || continue
+                if domain_in_use "$member" "$VM"; then SHARED+=("$member")
+                else REMOVE+=("$member")
+                fi
+            done < <(domain_chain "$disk")
+        done < <(domain_disks "$VM")
+    fi
+
+    local state; state="$("${VIRSH[@]}" domstate "$VM" 2>/dev/null || true)"
+    say "domain: $VM ($state)"
+    if (( ${#REMOVE[@]} )); then
+        say "these files will be deleted:"
+        printf '  %s\n' "${REMOVE[@]}" >&2
+    else
+        say "no disk files will be deleted"
+    fi
+    (( ${#SHARED[@]} )) && warn \
+        "kept -- another domain uses them:" \
+        "$(printf '  %s\n' "${SHARED[@]}")"
+
+    if (( ! YES )); then
+        [[ -t 0 ]] || die "not a terminal; pass -y to confirm"
+        local reply
+        read -r -p "type the domain name to confirm: " reply
+        [[ "$reply" == "$VM" ]] || die "aborted"
+    fi
+
+    # A running domain still has the image open, so it goes first. This is a
+    # forced power-off, which is only acceptable because the disk is about to be
+    # deleted -- everywhere else in virutil a guest is shut down properly.
+    if [[ "$state" != "shut off" ]]; then
+        "${VIRSH[@]}" destroy "$VM" >/dev/null || die "could not stop $VM"
+        say "destroyed"
+    fi
+
+    # --nvram deletes the per-domain UEFI variable store, which is otherwise left
+    # behind in /var/lib/libvirt/qemu/nvram and inherited by the next domain that
+    # reuses the name. --snapshots-metadata clears snapshot records that would
+    # otherwise block the undefine outright.
+    "${VIRSH[@]}" undefine "$VM" --nvram --snapshots-metadata >/dev/null \
+        || die "could not undefine $VM"
+    say "undefined"
+
+    # Unprivileged first, as with the chain read: undefining the domain hands the
+    # images back to their original owner, so an image in your own directory needs
+    # no password at all. $DOMAIN_IMAGE_DIR is root-owned, so that one still does.
+    local f rc=0
+    for f in ${REMOVE[@]+"${REMOVE[@]}"}; do
+        if rm -f -- "$f" 2>/dev/null || "${SUDO[@]}" rm -f -- "$f"; then
+            say "removed $f"
+        else
+            warn "could not remove $f"
+            rc=1
+        fi
+    done
+    # The domain is gone either way, but a leftover image is worth a nonzero exit:
+    # it is what will block recreating the domain under the same name.
+    return "$rc"
+}

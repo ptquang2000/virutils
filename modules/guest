@@ -59,6 +59,15 @@ mnt_mounted() {
     awk -v m="$MNT" '$2 == m { found = 1 } END { exit !found }' /proc/mounts
 }
 
+# ntfs-3g does not fail a read-write mount request on a dirty volume -- it warns
+# and mounts read-only anyway, exiting 0. Without this probe the run looks fine
+# until rsync is deep into the copy and every write comes back EROFS. Field 4 of
+# /proc/mounts leads with the ro/rw flag.
+mnt_writable() {
+    awk -v m="$MNT" '$2 == m { split($4, o, ","); if (o[1] == "rw") found = 1 }
+                     END { exit !found }' /proc/mounts
+}
+
 guest_finish() {
     # No step may abort the handler under set -e: the qemu-nbd detach has to run
     # even when the mount never happened.
@@ -86,10 +95,19 @@ guest_finish() {
         exit 1
     fi
 
+    # Only start what is actually off: a run that aborts because the guest would
+    # not shut down reaches here with the domain still running, and 'virsh start'
+    # on it would fail for the uninteresting reason and read as a real problem.
     if [[ "$ORIG_STATE" == running ]]; then
-        echo "restoring $DOMAIN to running"
-        "${VIRSH[@]}" start "$DOMAIN" >/dev/null \
-            || warn "failed to restart $DOMAIN -- start it manually"
+        local now; now="$("${VIRSH[@]}" domstate "$DOMAIN" 2>/dev/null || true)"
+        if [[ "$now" == "shut off" ]]; then
+            echo "restoring $DOMAIN to running"
+            "${VIRSH[@]}" start "$DOMAIN" >/dev/null \
+                || warn "failed to restart $DOMAIN -- start it manually"
+        elif [[ -z "$now" ]]; then
+            warn "could not read the state of $DOMAIN -- it was running when this" \
+                 "started; check it and start it manually if needed"
+        fi
     fi
 }
 
@@ -149,26 +167,50 @@ guest_open() {
     trap guest_finish EXIT
 
     if [[ "$ORIG_STATE" == running ]]; then
-        echo "   shutting down (graceful, up to ${SHUTDOWN_TIMEOUT}s)..."
-        "${VIRSH[@]}" shutdown "$DOMAIN" >/dev/null
+        # Prefer the guest agent over ACPI. An ACPI request is a power-button
+        # event Windows may deliberate over or refuse outright -- a modal dialog
+        # or "an app is preventing shutdown" and the wait runs to the timeout.
+        # qemu-guest-agent instead calls Windows' own shutdown with apps forced
+        # closed, which is both faster and still a real shutdown: Windows closes
+        # the NTFS volume, so the disk is left clean and mountable read-write.
+        # Probe with guest-ping rather than trusting the channel's XML state --
+        # the channel can read 'connected' with nothing listening in the guest.
+        local mode=acpi
+        if "${VIRSH[@]}" qemu-agent-command "$DOMAIN" \
+               '{"execute":"guest-ping"}' >/dev/null 2>&1; then
+            mode=agent
+        else
+            warn "   qemu-guest-agent is not answering; falling back to ACPI." \
+                 "Installing it in the guest makes this shutdown much faster" \
+                 "-- see the README note on guest shutdown."
+        fi
+
+        echo "   shutting down (--mode $mode, up to ${SHUTDOWN_TIMEOUT}s)..."
+        "${VIRSH[@]}" shutdown --mode "$mode" "$DOMAIN" >/dev/null
         local state="$ORIG_STATE"   # so a @shutdown_timeout of 0 still has something to test
         for (( i = 0; i < SHUTDOWN_TIMEOUT; i++ )); do
             state="$("${VIRSH[@]}" domstate "$DOMAIN")"
             [[ "$state" == "shut off" ]] && break
-            # Say something periodically: this is an ACPI power-button request,
-            # which Windows is free to ignore (a modal dialog, the lock screen
-            # mid-update), and a silent wait of up to @shutdown_timeout looks
-            # exactly like a hang.
+            # Say something periodically: a silent wait of up to
+            # @shutdown_timeout looks exactly like a hang.
             (( i > 0 && i % 15 == 0 )) \
                 && echo "   still '$state' after ${i}s of ${SHUTDOWN_TIMEOUT}s" \
                         "-- check the guest console for a dialog blocking shutdown"
             sleep 1
         done
-        if [[ "$state" != "shut off" ]]; then
-            warn "   no clean shutdown after ${SHUTDOWN_TIMEOUT}s; destroying"
-            "${VIRSH[@]}" destroy "$DOMAIN" >/dev/null
-            sleep 2
-        fi
+
+        # No destroy fallback. Cutting power to a running Windows leaves the NTFS
+        # volume dirty, which ntfs-3g then refuses to mount read-write -- so the
+        # "fallback" cannot do the job the shutdown was for, and it risks the
+        # filesystem of the guest we are here to update. Stop and let the guest
+        # keep running; the trap leaves it in the state it was found in.
+        [[ "$state" == "shut off" ]] \
+            || die "$DOMAIN did not shut down within ${SHUTDOWN_TIMEOUT}s (still '$state')." \
+                   "Nothing was written and the guest is left running." \
+                   "Check its console for a dialog blocking shutdown, or raise" \
+                   "@shutdown_timeout. If you must force it, run" \
+                   "'virsh --connect qemu:///system destroy $DOMAIN' yourself and" \
+                   "expect to boot Windows once to clear the dirty NTFS volume."
         echo "   shut off"
     fi
 
@@ -212,4 +254,15 @@ guest_open() {
     # and any cleanup need no privilege of their own -- which is also what keeps
     # the sudo timestamp out of the long-running part of the run.
     "${SUDO[@]}" mount -t ntfs-3g -o "uid=$(id -u),gid=$(id -g)" "$PART" "$MNT"
+
+    # A read-only mount cannot do the one thing this lifecycle exists for, so
+    # stop here rather than let the copy phase discover it file by file. The trap
+    # unmounts, detaches, and restarts the guest -- which is also the fix, since
+    # Windows clears its own dirty bit on a full boot and shutdown.
+    mnt_writable || die \
+        "$PART mounted read-only: the NTFS volume is dirty, so ntfs-3g refused" \
+        "read-write (it warns and falls back rather than failing the mount)." \
+        "Nothing was written. Usually this means the guest was powered off" \
+        "abruptly, or Fast Startup is still enabled in it. Boot the guest, let" \
+        "Windows check the volume, shut it down fully, then run this again."
 }
