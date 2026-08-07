@@ -8,6 +8,7 @@ step and no dependencies beyond the utilities it calls.
 
 ## Contents
 
+- [Installation](#installation)
 - [Modules](#modules)
    - [domains](#domains)
    - [transfer](#transfer)
@@ -34,6 +35,43 @@ step and no dependencies beyond the utilities it calls.
    - [list, start, shutdown, addr](#list-start-shutdown-addr)
 - [Requirements](#requirements)
 - [See also](#see-also)
+
+## Installation
+
+```sh
+git clone https://github.com/ptquang2000/virutils.git
+cd virutils
+./install.sh
+```
+
+`install.sh` symlinks `virutil` into `~/.local/bin` and the zsh completion into
+`${XDG_DATA_HOME:-~/.local/share}/zsh/site-functions`, then reports on the
+[requirements](#requirements) below, per module — nothing there is fatal, since
+a host that only ever runs `virutil exec` has no use for `virt-install`.
+
+The links point at the checkout, and `virutil` resolves its module directory
+through the symlink rather than around it, so the checkout is the installed
+copy: `git pull` is the upgrade path, and nothing needs reinstalling. Re-running
+the script is harmless.
+
+| Option | |
+| --- | --- |
+| `--bin DIR` | where to link `virutil`, also `$BIN` |
+| `--completions DIR` | where to link `_virutil`, also `$COMP_DIR` |
+| `--no-completions` | skip the zsh completion |
+| `--check` | only report on dependencies, install nothing |
+| `--uninstall` | remove the links, leave the checkout alone |
+
+For the completion to be picked up, its directory has to be on `fpath` before
+`compinit` runs:
+
+```sh
+fpath+=( "${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions" )
+```
+
+Installed as part of [the dotfiles](https://github.com/ptquang2000/.dotfiles),
+none of this is needed: `setup.sh` links `virutils/vir*` into `~/.local/bin`
+itself and `.zshrc` puts `virutils/completions` on `fpath` directly.
 
 ## Modules
 
