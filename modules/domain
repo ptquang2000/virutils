@@ -1,7 +1,14 @@
-# domain -- create and delete libvirt domains, disk included.
+# domain -- the libvirt domain lifecycle, disk included.
 # Sourced by virutil; entry point is domain_main. Usage:
 #   virutil domain create VM ISO [OPTIONS]   define a domain and boot the installer
 #   virutil domain delete VM [-y]            undefine a domain and delete its disks
+#   virutil domain list                      list all domains and their state
+#   virutil domain start    VM               power on the domain
+#   virutil domain shutdown VM               request a graceful shutdown (ACPI)
+#   virutil domain addr     VM               show all guest interface addresses
+#
+# list/start/shutdown/addr are thin virsh wrappers -- they exist so the whole
+# lifecycle is reachable from one module instead of a separate junk drawer.
 #
 # create wraps virt-install with a KVM-tuned profile rather than libvirt's
 # defaults: host-passthrough CPU with a real core/thread topology, virtio-blk on
@@ -37,6 +44,10 @@ domain_usage() {
     printf '%s\n' \
         "usage: virutil domain create VM ISO [OPTIONS]" \
         "       virutil domain delete VM [-y]" \
+        "       virutil domain list" \
+        "       virutil domain start    VM" \
+        "       virutil domain shutdown VM" \
+        "       virutil domain addr     VM" \
         "" \
         "create options:" \
         "  --size GiB        disk size (default 64)" \
@@ -78,10 +89,22 @@ domain_main() {
     if [[ $EUID -eq 0 ]]; then SUDO=(); else SUDO=(sudo); fi
 
     case "$CMD" in
-        create) domain_create "$@" ;;
-        delete) domain_delete "$@" ;;
-        *)      die "virutil domain: unknown command: $CMD (see: virutil domain -h)" ;;
+        create)   domain_create "$@" ;;
+        delete)   domain_delete "$@" ;;
+        list)     "${VIRSH[@]}" list --all ;;
+        start)    domain_need_vm start    "$@"; "${VIRSH[@]}" start     "$1" ;;
+        shutdown) domain_need_vm shutdown "$@"; "${VIRSH[@]}" shutdown  "$1" ;;
+        addr)     domain_need_vm addr     "$@"; "${VIRSH[@]}" domifaddr "$1" --full ;;
+        *)        die "virutil domain: unknown command: $CMD (see: virutil domain -h)" ;;
     esac
+}
+
+# domain_need_vm CMD [ARGS...] -- the one argument the virsh wrappers take.
+# Bash's ${1:?...} would do, but it prefixes the message with a script line
+# number, which is noise for a usage error.
+domain_need_vm() {
+    local cmd="$1"; shift
+    (( $# >= 1 )) || die "usage: virutil domain $cmd VM"
 }
 
 # domain_exists NAME -- true if libvirt knows the domain, running or not.

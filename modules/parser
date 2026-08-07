@@ -1,7 +1,7 @@
 # Parser for virutil: top-level dispatch plus the helpers every module shares.
 # Sourced by virutil; not executable on its own.
 
-MODULES=(exec sync pull push usb snapshot domain misc)
+MODULES=(domain snapshot sync pull push exec usb)
 
 die()  { printf '%s\n' "$@" >&2; exit 1; }
 warn() { printf '%s\n' "$@" >&2; }
@@ -11,15 +11,20 @@ top_usage() {
     cat >&2 <<'EOF'
 usage: virutil MODULE [ARGS]
 
-modules:
-  exec       run commands inside a Windows guest via the QEMU guest agent
+domains
+  domain     the domain lifecycle: create, delete, list, start, shutdown, addr
+  snapshot   external snapshots (disk and memory) for libvirt domains
+
+transfer
   sync       fetch build output from the Windows host and push it into a guest
   pull       copy files out of a running guest via a live disk snapshot
   push       copy a file or directory from the host into a guest on demand
+
+guest
+  exec       run commands inside a Windows guest via the QEMU guest agent
+
+hardware
   usb        USB passthrough end to end from the Windows host under WSL
-  snapshot   external snapshots (disk and memory) for libvirt domains
-  domain     create and delete libvirt domains, disk included
-  misc       everyday domain operations: list, start, shutdown, domifaddr
 
 Run 'virutil <module>' for a module's own usage.
 EOF

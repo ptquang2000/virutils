@@ -2,33 +2,46 @@
 # zsh completion for virutil -- mirrors the dispatch in modules/parser.
 
 _virutil() {
-  local -a modules
-  modules=(
-    'exec:run commands inside a Windows guest via the QEMU guest agent'
+  # One tag per group in `virutil help`, so the module list reads the same way in
+  # both places. Whether they render as separate blocks is the user's call, via
+  # zstyle group-name -- distinct tags are what make that possible.
+  local -a domains transfer guest hardware other
+  domains=(
+    'domain:the domain lifecycle: create, delete, list, start, shutdown, addr'
+    'snapshot:external snapshots (disk and memory) for libvirt domains'
+  )
+  transfer=(
     'sync:fetch build output from the Windows host and push into a guest'
     'pull:copy files out of a running guest via a live disk snapshot'
     'push:copy a file or directory from the host into a guest on demand'
+  )
+  guest=(
+    'exec:run commands inside a Windows guest via the QEMU guest agent'
+  )
+  hardware=(
     'usb:USB passthrough from the Windows host under WSL'
-    'snapshot:external snapshots (disk and memory) for libvirt domains'
-    'domain:create and delete libvirt domains, disk included'
-    'misc:everyday domain operations'
+  )
+  other=(
     'help:this message'
   )
 
   if (( CURRENT == 2 )); then
-    _describe -t module 'module' modules
+    _describe -t domains  'domain module'   domains
+    _describe -t transfer 'transfer module' transfer
+    _describe -t guest    'guest module'    guest
+    _describe -t hardware 'hardware module' hardware
+    _describe -t other    'other'           other
     return
   fi
 
   case $words[2] in
-    exec)     _virutil_exec ;;
+    domain)   _virutil_domain ;;
+    snapshot) _virutil_snapshot ;;
     sync)     _virutil_sync ;;
     pull)     _virutil_pull ;;
     push)     _virutil_push ;;
+    exec)     _virutil_exec ;;
     usb)      _virutil_usb ;;
-    snapshot) _virutil_snapshot ;;
-    domain)   _virutil_domain ;;
-    misc)     _virutil_misc ;;
   esac
 }
 
@@ -173,8 +186,16 @@ _virutil_domain() {
   local -a cmds=(
     'create:define a domain and boot the installer'
     'delete:undefine a domain and delete its disks'
+    'list:list all domains and their state'
+    'start:power on a domain'
+    'shutdown:request a graceful shutdown (ACPI)'
+    'addr:show guest interface addresses'
   )
   case $words[3] in
+    start|shutdown|addr)
+      (( CURRENT == 4 )) && _virutil_domains
+      ;;
+    list) ;;                        # takes no arguments
     create)
       case $CURRENT in
         3) _describe -t command 'command' cmds ;;
@@ -204,23 +225,6 @@ _virutil_domain() {
       esac
       ;;
     *) (( CURRENT == 3 )) && _describe -t command 'command' cmds ;;
-  esac
-}
-
-_virutil_misc() {
-  local -a cmds=(
-    'list:list all VMs and their state'
-    'start:power on a VM'
-    'shutdown:request a graceful shutdown (ACPI)'
-    'domifaddr:show guest interface addresses'
-  )
-  case $CURRENT in
-    3) _describe -t command 'command' cmds ;;
-    *)
-      case $words[3] in
-        start|shutdown|domifaddr) (( CURRENT == 4 )) && _virutil_domains ;;
-      esac
-      ;;
   esac
 }
 

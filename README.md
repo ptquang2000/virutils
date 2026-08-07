@@ -9,6 +9,10 @@ step and no dependencies beyond the utilities it calls.
 ## Contents
 
 - [Modules](#modules)
+   - [domains](#domains)
+   - [transfer](#transfer)
+   - [guest](#guest)
+   - [hardware](#hardware)
 - [virutil sync](#virutil-sync)
    - [Synopsis](#synopsis)
    - [Description](#description)
@@ -25,27 +29,50 @@ step and no dependencies beyond the utilities it calls.
 - [virutil pull](#virutil-pull)
 - [virutil push](#virutil-push)
 - [virutil domain](#virutil-domain)
+   - [create](#create)
+   - [delete](#delete)
+   - [list, start, shutdown, addr](#list-start-shutdown-addr)
 - [Requirements](#requirements)
 - [See also](#see-also)
 
 ## Modules
+
+The seven modules fall into four groups, which is also the order
+`virutil help` prints them in.
+
+### domains
+
+| Module | Purpose | Usage |
+| --- | --- | --- |
+| `domain` | The domain lifecycle: create one from an install ISO with a KVM-tuned profile, delete one along with its disks, and the everyday operations in between. | `virutil domain {create\|delete\|list\|start\|shutdown\|addr} [VM] [ISO] [OPTIONS]` |
+| `snapshot` | External snapshots (disk and memory) for libvirt domains. | `virutil snapshot {create\|list\|revert\|delete} VM_NAME [SNAP_NAME]` |
+
+### transfer
 
 | Module | Purpose | Usage |
 | --- | --- | --- |
 | `sync` | Fetch a project's build output from a Windows host and push it into a guest's `C:` drive offline, by attaching the qcow2 with `qemu-nbd`. | `virutil sync VM [-c NAME\|PATH]` |
 | `pull` | Copy files out of a **running** guest by taking a disk-only live snapshot and reading the frozen base image read-only. | `virutil pull [-c NAME\|PATH]` |
 | `push` | Copy a file or directory from the host into a guest's `C:` drive **on demand**, offline, with no config file. | `virutil push VM SRC DST` |
+
+### guest
+
+| Module | Purpose | Usage |
+| --- | --- | --- |
 | `exec` | Run commands inside a Windows guest through the QEMU guest agent, with no guest networking required. | `virutil exec {setup\|ping\|info\|cmd\|ps} VM_NAME [FLAGS] [ARGS]` |
+
+### hardware
+
+| Module | Purpose | Usage |
+| --- | --- | --- |
 | `usb` | USB passthrough end to end from a Windows host under WSL: `usbipd` bind, import over `vhci_hcd`, then attach to the domain. | `virutil usb {list\|show\|attach\|detach\|unbind} [VM] [BUSID]` |
-| `snapshot` | External snapshots (disk and memory) for libvirt domains. | `virutil snapshot {create\|list\|revert\|delete} VM_NAME [SNAP_NAME]` |
-| `domain` | Create a domain from an install ISO with a KVM-tuned profile, or delete one along with its disks. | `virutil domain {create\|delete} VM [ISO] [OPTIONS]` |
-| `misc` | Everyday domain operations: list, start, graceful shutdown, interface addresses. | `virutil misc {list\|start\|shutdown\|domifaddr} [VM_NAME]` |
 
 `virutil` alone, or `virutil help`, prints the module list. `modules/parser`
 handles the top-level dispatch plus the helpers every module shares; each
 module file declares its own subcommands. Only `sync` and `pull` are driven by a
 config file; the rest take everything on the command line. The remainder of
-this document covers `virutil sync`, then `virutil pull`, then `virutil push`.
+this document covers `virutil sync`, then `virutil pull`, then `virutil push`,
+then `virutil domain`.
 
 ## virutil sync
 
@@ -512,11 +539,16 @@ at all.
 ## virutil domain
 
 `domain` bookends everything else here: it makes the guest the other modules
-operate on, and removes it again along with the disks nobody else cleans up.
+operate on, removes it again along with the disks nobody else cleans up, and
+covers the everyday operations in between.
 
 ```
 virutil domain create VM ISO [OPTIONS]
 virutil domain delete VM [-y]
+virutil domain list
+virutil domain start    VM
+virutil domain shutdown VM
+virutil domain addr     VM
 ```
 
 ### create
@@ -615,6 +647,27 @@ Privilege is escalated only where the path calls for it: the default image
 directory is root-owned, but a `--disk` in a directory of your own costs no
 password, and undefining a domain hands its images back to their original owner
 before the removal runs.
+
+### list, start, shutdown, addr
+
+```
+virutil domain list
+virutil domain start    VM
+virutil domain shutdown VM
+virutil domain addr     VM
+```
+
+Thin wrappers over `virsh list --all`, `virsh start`, `virsh shutdown` and
+`virsh domifaddr --full`. They add nothing but a shorter name and a consistent
+connection URI (`qemu:///system`, so they match what every other module talks
+to), and they live here so the whole lifecycle is one module rather than a
+separate junk drawer. `shutdown` is the graceful ACPI request — for the
+guest-agent path that `sync` and `push` use, see `modules/guest`.
+
+Note that `addr` is `virsh domifaddr`; the shorter name is deliberate, since the
+`dom` prefix is redundant under a module already called `domain`. These four
+were previously `virutil misc {list|start|shutdown|domifaddr}`, and `misc` no
+longer exists.
 
 ## Requirements
 
