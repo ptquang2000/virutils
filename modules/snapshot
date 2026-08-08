@@ -1,21 +1,21 @@
-# snapshot -- external snapshots (disk + memory) for libvirt VMs.
-# Sourced by virutil; entry point is snapshot_main. Usage:
-#   virutil snapshot create    VM [SNAP]   create an external snapshot (default name: snap-<timestamp>)
-#   virutil snapshot list      VM          list snapshots as a tree
-#   virutil snapshot revert    VM SNAP     revert to a snapshot and leave the VM running
-#   virutil snapshot delete    VM SNAP     delete a snapshot, keeping the current state
+# snapshot -- external snapshots (disk + memory) for libvirt domains
 
-DIR=/var/lib/libvirt/images
+DIR="${VIRUTIL_IMAGE_DIR:-/var/lib/libvirt/images}"
 
 snapshot_usage() {
-    echo "usage: virutil snapshot {create|list|revert|delete} VM_NAME [SNAP_NAME]" >&2
-    exit 1
+    printf '%s\n' \
+        "usage: virutil snapshot create VM [SNAP]  (default name snap-<timestamp>)" \
+        "       virutil snapshot list   VM" \
+        "       virutil snapshot revert VM SNAP" \
+        "       virutil snapshot delete VM SNAP" >&2
+    exit "${1:-1}"
 }
 
 snapshot_main() {
     local CMD VM SNAP
     CMD="${1:-}"
     [ -n "$CMD" ] || snapshot_usage
+    case "$CMD" in -h|--help) snapshot_usage 0 ;; esac
     VM="${2:-}"
     [ -n "$VM" ] || snapshot_usage
 
@@ -23,9 +23,7 @@ snapshot_main() {
     create)
         SNAP="${3:-snap-$(date +%Y%m%d-%H%M%S)}"
 
-        # Disk targets vary by bus (vda for virtio, sda for SATA/SCSI, hda for
-        # IDE), so ask the domain instead of assuming. cdroms are read-only and
-        # are left out of the snapshot.
+        # Disk targets vary by bus, so ask the domain. cdroms are read-only.
         local -a DISKSPECS=()
         local target
         while read -r target; do

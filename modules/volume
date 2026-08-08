@@ -1,17 +1,12 @@
 # volume -- the staging-volume transport: a scratch qcow2 the host and a running
-# guest take turns owning. Sourced by virutil; driven through modules/xfer.
+# guest take turns owning. Driven through modules/xfer.
 #
 #   host --(rsync over qemu-nbd)--> scratch qcow2 --(hotplug)--> guest
 #                                                --(robocopy)--> C:\
 #
-# The point of it is what it does *not* need: the guest keeps running, and
-# nothing has to be installed in it. virtio-blk is already there holding C:, and
-# robocopy ships with Windows -- so the only guest-side requirement is the agent,
-# which virutil needs for a clean shutdown anyway.
-#
-# The price is that every byte is written twice, and that the two sides must
-# take strict turns. Two writers on one qcow2 is the one unrecoverable mistake
-# available here, so the sequence is enforced rather than assumed:
+# Needs nothing installed in the guest beyond the agent. Every byte is written
+# twice, and the two sides must take strict turns -- two writers on one qcow2 is
+# the one unrecoverable mistake available here, so the sequence is enforced:
 #
 #   1. the image is provably not attached to the domain   (volume_open)
 #   2. host: qemu-nbd -c, mount, the caller's copy phase
@@ -19,14 +14,12 @@
 #   4. guest: attach-device --live, read-only for a write run
 #   5. guest: robocopy, then detach-device --live
 #
-# Step 4 attaches read-only in the write direction, which is not a formality:
-# Windows then cannot dirty the filesystem, so the next host-side mount does not
-# have to deal with a volume the guest left half-closed. The read direction has
-# no such luxury -- the guest has to write -- so it flushes and offlines the
+# Step 4's read-only is not a formality: Windows then cannot dirty the
+# filesystem. The read direction has to write, so it flushes and offlines the
 # volume in the guest before the detach.
 #
-# The staging image is created once per domain and kept: formatting it is the
-# slow part, and an empty qcow2 costs nothing to leave lying around.
+# The staging image is created once per domain and kept: formatting is the slow
+# part and an empty qcow2 costs nothing to leave lying around.
 
 VOLUME_DIR=/var/lib/libvirt/images
 VOLUME_SIZE=16                 # GiB, sparse -- an upper bound, not an allocation
@@ -36,16 +29,14 @@ VOLUME_ATTACHED=0
 VOLUME_MODE=""
 VOLUME_FS=""                   # exfat or ntfs, decided by what the host can make
 
-# volume_image -- the per-domain staging image path. Per domain rather than
-# shared, because two runs against two guests must not queue behind each other,
-# and because the disk is attached by path.
+# Per domain, not shared: two runs against two guests must not queue behind
+# each other, and the disk is attached by path.
 volume_image() {
     printf '%s/%s-xfer.qcow2' "$VOLUME_DIR" "$DOMAIN"
 }
 
-# The first free virtio target. vda is the guest's own disk; anything already in
-# the domain is skipped so a leftover from an interrupted run cannot be
-# shadowed by a second attach at the same name.
+# The first free virtio target; anything already in the domain is skipped so a
+# leftover from an interrupted run cannot be shadowed by a second attach.
 volume_free_target() {
     local used letter
     used="$("${VIRSH[@]}" domblklist "$DOMAIN" 2>/dev/null | awk 'NR>2 {print $1}')"
@@ -55,8 +46,7 @@ volume_free_target() {
     die "no free virtio disk target on $DOMAIN"
 }
 
-# True if the staging image is attached to the domain right now. This is the
-# gate on every host-side mount: the image must be the host's alone.
+# The gate on every host-side mount: the image must be the host's alone.
 volume_is_attached() {
     "${VIRSH[@]}" domblklist "$DOMAIN" 2>/dev/null \
         | awk -v img="$VOLUME_IMG" '$2 == img { found = 1 } END { exit !found }'
@@ -77,11 +67,8 @@ EOF
 
 # --- image lifecycle --------------------------------------------------------
 
-# Which filesystem the staging volume gets. exFAT first: it is an in-kernel
-# driver on the host, where NTFS is FUSE (ntfs-3g), and Windows reads both
-# natively -- so exFAT is the faster half of the double write, by a wide margin
-# on many small files. Neither is a hard requirement: with no mkfs at all the
-# guest formats it, which is the case on a host that only ever mounts NTFS.
+# exFAT first: in-kernel on the host, where NTFS is FUSE, and Windows reads
+# both. With no mkfs at all the guest formats it.
 volume_pick_fs() {
     if command -v mkfs.exfat >/dev/null; then VOLUME_FS=exfat
     elif command -v mkfs.ntfs >/dev/null || command -v mkntfs >/dev/null; then VOLUME_FS=ntfs
@@ -89,9 +76,8 @@ volume_pick_fs() {
     fi
 }
 
-# One GPT partition spanning the disk. Windows will not touch a fixed disk with
-# no partition table -- it shows up as 'not initialized' -- so the superfloppy
-# layout that would be simpler here is not an option.
+# One GPT partition spanning the disk: Windows shows a fixed disk with no
+# partition table as 'not initialized'.
 volume_partition() {
     "${SUDO[@]}" sfdisk --quiet "$NBD" <<'EOF'
 label: gpt
@@ -101,9 +87,8 @@ EOF
     udevadm settle
 }
 
-# volume_create -- make the staging image if it is not there yet, and format it
-# by whichever half of the machine can. Idempotent: an existing image with a
-# readable filesystem is left exactly as it is.
+# volume_create -- make the staging image and format it by whichever half of the
+# machine can. Idempotent.
 volume_create() {
     local created=0
     if [[ ! -e "$VOLUME_IMG" ]]; then
@@ -142,10 +127,7 @@ volume_create() {
                 || die "$mk failed on ${NBD}p1"
             ;;
         guest)
-            # Nothing on the host can make a filesystem Windows reads, so
-            # Windows makes it: the blank disk is handed over read-write once,
-            # formatted from inside, and handed back. It only happens on the
-            # first run against a domain.
+            # Windows makes it instead: one read-write handover, first run only.
             "${SUDO[@]}" qemu-nbd -d "$NBD" >/dev/null 2>&1 || true
             volume_format_in_guest
             return 0
@@ -155,10 +137,7 @@ volume_create() {
     "${SUDO[@]}" qemu-nbd -d "$NBD" >/dev/null 2>&1 || true
 }
 
-# The fallback for a host with no mkfs the guest could read: attach the raw
-# image read-write and let Windows initialise, partition and format it. Slower
-# than doing it here and it costs one read-write attach, but it needs nothing
-# installed on the host and produces a filesystem Windows is certain to like.
+# The fallback for a host with no mkfs the guest could read.
 volume_format_in_guest() {
     say "staging volume: no host mkfs for exFAT or NTFS -- formatting it in $DOMAIN"
     VOLUME_TARGET="$(volume_free_target)"
@@ -192,9 +171,8 @@ Write-Output "formatted"' \
 
 # --- the two halves ---------------------------------------------------------
 
-# volume_open MODE -- take host-side ownership of the staging volume and mount
-# it at MNT. MODE is write (the caller fills it) or read (the caller empties it
-# after volume_collect has filled it from the guest).
+# volume_open MODE -- take host-side ownership of the volume and mount it at
+# MNT. MODE is write or read.
 volume_open() {
     VOLUME_MODE="$1"
     xfer_privilege
@@ -209,8 +187,7 @@ volume_open() {
     VOLUME_IMG="$(volume_image)"
     MNT="${MNT:-/mnt/$DOMAIN-xfer}"
 
-    # A stale nbd or mount from a failed run: going on would end with us
-    # detaching or unmounting something that was never ours.
+    # A stale nbd or mount from a failed run is not ours to tear down.
     nbd_attached && die "$NBD is already attached; free it or set @nbd elsewhere" \
                         "  sudo qemu-nbd -d $NBD"
     mnt_mounted && die "$MNT is already mounted; unmount it first" \
@@ -220,8 +197,7 @@ volume_open() {
     XFER_ARMED=1
 
     # The image may still be in the domain from a run that died between the
-    # robocopy and the detach. Take it back before touching it -- this is the
-    # check that keeps the host and the guest from writing at once.
+    # robocopy and the detach.
     if volume_is_attached; then
         warn "the staging volume is still attached to $DOMAIN from an earlier run;" \
              "detaching it before the host takes it"
@@ -240,27 +216,21 @@ volume_open() {
 
     local fstype; fstype="$("${SUDO[@]}" blkid -o value -s TYPE "$part")"
     "${SUDO[@]}" mkdir -p "$MNT"
-    # uid=/gid= hand the tree to the invoking user, so the copy phase needs no
-    # privilege of its own and the sudo timestamp stays out of the long part.
+    # uid=/gid= hand the tree to the invoking user.
     "${SUDO[@]}" mount -t "$fstype" -o "uid=$(id -u),gid=$(id -g)" "$part" "$MNT" \
         || die "could not mount the staging volume ($fstype) at $MNT"
     mnt_writable || die "the staging volume mounted read-only at $MNT"
 
     say "staging: $MNT ($fstype, $(nbd_part_size "$part") GiB)"
 
-    # Every run starts from an empty volume, in both directions. The image is
-    # kept between runs because formatting it is the slow part -- but its
-    # *contents* are one run's payload, and delivery is a robocopy of the whole
-    # tree onto C:. Leaving last run's files there would silently re-deliver
-    # them, every run, for as long as the image lives.
+    # The image is kept between runs, its contents are not: delivery is a
+    # robocopy of the whole tree onto C:.
     find "$MNT" -mindepth 1 -maxdepth 1 \
          ! -name 'System Volume Information' -exec rm -rf -- {} + 2>/dev/null || true
 }
 
 # volume_handoff READONLY -- release the volume host-side and give it to the
-# guest. The release is verified from /proc/mounts and sysfs, not from exit
-# codes, because a umount that silently failed and an attach that follows it is
-# exactly the two-writer case.
+# guest, verified from /proc/mounts and sysfs rather than from exit codes.
 volume_handoff() {
     local readonly="$1"
 
@@ -273,9 +243,8 @@ volume_handoff() {
     fi
     sync
 
-    # An if, not '||' and '&&' chained: with both probes false the chain's exit
-    # status would be the failing probe's, and set -e would take the run down at
-    # the exact moment everything is fine.
+    # An if, not a chain: under set -e the chain's status with both probes false
+    # would take the run down at the moment everything is fine.
     if mnt_mounted || nbd_attached; then
         die "the staging volume is still held by the host ($MNT / $NBD);" \
             "refusing to hand it to $DOMAIN -- two writers on one image" \
@@ -289,17 +258,14 @@ volume_handoff() {
     say "handed $VOLUME_TARGET to $DOMAIN${readonly:+ (read-only)}"
 }
 
-# The guest's own release: flush its cache and take the volume offline, so the
-# filesystem is closed before the device disappears underneath it. Skipping this
-# is what leaves an NTFS volume dirty, which ntfs-3g then refuses to mount
-# read-write on the next run.
+# Flush the guest's cache and take the volume offline, so the filesystem is
+# closed before the device disappears underneath it.
 volume_release_in_guest() {
     xfer_ps '
 try { Get-Volume -FileSystemLabel "'"$XFER_LABEL"'" -ErrorAction SilentlyContinue |
       Write-VolumeCache -ErrorAction SilentlyContinue } catch {}
-# By serial or label only -- deliberately not the RAW fallback the format path
-# uses. Taking a disk offline is a real action, and "the unformatted one" is a
-# guess: on a guest with another blank disk it would be the wrong one.
+# By serial or label only, not the RAW fallback the format path uses: on a
+# guest with another blank disk that would offline the wrong one.
 $d = Get-Disk | Where-Object { $_.SerialNumber -like "*'"$XFER_LABEL"'*" } | Select-Object -First 1
 if (-not $d) {
   $v = Get-Volume -FileSystemLabel "'"$XFER_LABEL"'" -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -320,9 +286,8 @@ volume_detach() {
                 "remove it by hand before the next run:" \
                 "  ${VIRSH[*]} detach-disk $DOMAIN $VOLUME_TARGET --live"
 
-    # The detach is asynchronous -- libvirt returns once the guest has been
-    # asked, not once it has let go -- and the next host-side mount must not
-    # start before it has.
+    # The detach is asynchronous: libvirt returns once the guest has been asked,
+    # not once it has let go.
     local i
     for (( i = 0; i < 30; i++ )); do
         volume_is_attached || { VOLUME_ATTACHED=0; return 0; }
@@ -335,9 +300,7 @@ volume_detach() {
 # --- the transport contract -------------------------------------------------
 
 # Write: hand the filled volume over read-only, robocopy its whole tree onto
-# C:\, take it back. The tree under MNT is already C:-shaped -- that is the
-# whole reason sync and push need no changes -- so one robocopy of the root
-# reproduces every mapping the copy phase made.
+# C:\, take it back. The tree under MNT is already C:-shaped.
 volume_deliver() {
     local letter
     volume_handoff readonly
@@ -355,9 +318,8 @@ volume_deliver() {
 }
 
 # Read: hand an empty volume over read-write, have the guest fill it from the
-# named C:-relative paths, take it back and mount it for the caller. Each
-# pattern keeps its position under the root, so what lands at MNT has the same
-# C:-relative shape the disk transport would have shown.
+# named C:-relative paths, take it back and mount it. Each pattern keeps its
+# position under the root, so MNT has the shape the disk transport would show.
 volume_collect() {
     local letter pat script sep
     volume_handoff ""
@@ -366,14 +328,11 @@ volume_collect() {
     [[ -n "$letter" ]] || die "the staging volume never got a drive letter in $DOMAIN"
     say "guest: C:\\ -> $letter:"
 
-    # One script for every pattern: each round trip through the agent costs a
-    # process launch in the guest, and a config with a dozen map rules would
-    # spend more time starting powershell than copying.
+    # One script for every pattern: each round trip costs a process launch.
     script='$ErrorActionPreference = "Stop"
 $copied = 0
 foreach ($p in @('
-    # Joined with a separator *between* items, never after the last one:
-    # powershell parses @('a','b',) as an error, not as a two-element array.
+    # Separator between items only: powershell rejects @('a','b',).
     local sep=""
     for pat in "$@"; do
         script+="$sep'$(xfer_ps_quote "$pat")'"; sep=","
@@ -412,9 +371,8 @@ if ($copied -eq 0) { throw "nothing matched in the guest" }'
     say "collected into $MNT"
 }
 
-# Teardown, from the EXIT trap. Whatever happened, the run must not end with the
-# volume mounted here *and* attached there. Host side first, then the guest's,
-# because the host's is the one that blocks the next run.
+# Teardown, from the EXIT trap: the run must not end with the volume mounted
+# here *and* attached there. Host side first -- it blocks the next run.
 volume_close() {
     (( XFER_ARMED )) || return 0
 

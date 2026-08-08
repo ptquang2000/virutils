@@ -1,17 +1,12 @@
 #!/usr/bin/env bash
 # install.sh -- put virutil on PATH and its zsh completion on fpath.
 #
-# virutil resolves its module directory from its own path *through* a symlink
-# (readlink -f), so installing is a matter of linking the driver rather than
-# copying it: the checkout stays the source of truth and `git pull` is the
-# upgrade path.
+# virutil resolves its module directory through the symlink, so this links the
+# driver rather than copying it: the checkout stays the source of truth.
 #
 #   ./install.sh                 link into ~/.local/bin and the zsh site-functions dir
 #   ./install.sh --check         report on dependencies and exit
 #   ./install.sh --uninstall     remove the links this script made
-#
-# The dotfiles setup already links $DOTS/virutils/vir* into ~/.local/bin, so
-# this script is for standalone checkouts -- it is idempotent either way.
 set -euo pipefail
 
 log()  { printf '\033[1;34m[*]\033[0m %s\n' "$*"; }
@@ -28,7 +23,7 @@ DO_COMPLETIONS=1
 ACTION=install
 
 usage() {
-    sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+    sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
     cat <<EOF
 
 Options:
@@ -57,8 +52,7 @@ done
 
 # --- dependencies ------------------------------------------------------------
 #
-# Nothing here is fatal: the modules are independent, and a host that only ever
-# runs `virutil exec` has no use for virt-install. So the check reports per
+# Nothing here is fatal: the modules are independent, so the check reports per
 # module and leaves the judgement to whoever is reading.
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -67,14 +61,14 @@ have() { command -v "$1" >/dev/null 2>&1; }
 REQUIRED=(
     "core            |virsh awk"
     "sync pull push  |qemu-nbd rsync sudo partx blkid blockdev lsblk mount"
-    "domain          |virt-install qemu-img"
+    "domain          |virt-install virt-xml qemu-img"
     "exec            |jq python3"
     "volume transport|jq sfdisk qemu-img"
     "usb             |jq usbipd.exe powershell.exe"
 )
 OPTIONAL=(
     "domain: TPM 2.0 device, which a stock Windows 11 installer requires|swtpm"
-    "domain: --osinfo autodetection for an install ISO|osinfo-query"
+    "domain: detecting --osinfo from an install ISO|osinfo-detect"
     "domain: fixing ISO permissions under a 0700 home|setfacl"
     "sync pull: NTFS volumes on the guest disk|mount.ntfs-3g"
     "volume transport: host-side formatting of the staging image (the guest formats it otherwise)|mkfs.exfat"
@@ -105,23 +99,24 @@ check_deps() {
         done
     done
 
-    # The nbd module backs every qemu-nbd mount; sync reloads it with max_part
-    # itself, but a host that cannot load it at all will fail late instead of here.
+    # The nbd module backs every qemu-nbd mount.
     if [[ ! -e /sys/module/nbd ]] && ! modinfo nbd >/dev/null 2>&1; then
         warn "the nbd kernel module is unavailable -- sync, pull and push need it"
         missing_any=1
     fi
-    # virtiofsd is not on PATH on every distro (Arch installs it in /usr/lib), so
-    # it is looked for where the transport itself looks rather than with have().
-    # Tested one path at a time: `ls a b c` exits nonzero when *any* of them is
-    # missing, which would report a virtiofsd that is installed as absent.
+    # virtiofsd is not on PATH on every distro (Arch installs it in /usr/lib),
+    # so it is looked for where the transport itself looks. One path at a time:
+    # `ls a b c` exits nonzero when *any* is missing.
     if ! have virtiofsd; then
         vfsd=""
         for p in /usr/lib/virtiofsd /usr/libexec/virtiofsd /usr/lib/qemu/virtiofsd; do
             [[ -x "$p" ]] && { vfsd="$p"; break; }
         done
-        [[ -n "$vfsd" ]] \
-            || warn "optional: virtiofsd not found -- no virtiofs transport (volume and disk still work)"
+        if [[ -z "$vfsd" ]]; then
+            warn "virtiofsd not found -- virtiofs is the default transport for" \
+                 "sync, pull and push. Install it, or pass --transport volume."
+            missing_any=1
+        fi
     fi
     [[ -e /dev/kvm ]] || warn "no /dev/kvm -- virutil domain cannot start a guest (nested virtualisation, under WSL2)"
     if have id && ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx libvirt; then

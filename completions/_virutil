@@ -2,9 +2,8 @@
 # zsh completion for virutil -- mirrors the dispatch in modules/parser.
 
 _virutil() {
-  # One tag per group in `virutil help`, so the module list reads the same way in
-  # both places. Whether they render as separate blocks is the user's call, via
-  # zstyle group-name -- distinct tags are what make that possible.
+  # One tag per group in `virutil help`, so zstyle group-name can render them
+  # as separate blocks.
   local -a domains transfer guest hardware other
   domains=(
     'domain:the domain lifecycle: create, delete, list, start, shutdown, addr'
@@ -12,8 +11,8 @@ _virutil() {
   )
   transfer=(
     'sync:fetch build output from the Windows host and push into a guest'
-    'pull:copy files out of a running guest'
-    'push:copy a file or directory from the host into a guest on demand'
+    'pull:copy a file or directory out of a running guest'
+    'push:copy a file or directory from the host into a guest'
   )
   guest=(
     'exec:run commands inside a Windows guest via the QEMU guest agent'
@@ -63,9 +62,7 @@ _virutil_osinfo() {
 
 _virutil_exec() {
   local -a cmds=(
-    'setup:add the org.qemu.guest_agent.0 channel'
     'ping:check the guest agent is responding'
-    'info:guest OS, hostname and agent version'
     'cmd:run a command via cmd.exe /c'
     'ps:run a script via powershell'
   )
@@ -90,7 +87,7 @@ _virutil_sync() {
   local state line
   _arguments \
     '(-c --config)'{-c,--config}'[config NAME or PATH]:config:->config' \
-    '--transport[how to move the files]:transport:->transport' \
+    '(-t --transport)'{-t,--transport}'[how to move the files]:transport:->transport' \
     '(-h --help)'{-h,--help}'[print usage and exit]' \
     '2:domain:->domain'   # 1 is the module word itself; _arguments skips words[1]
   case $state in
@@ -108,43 +105,54 @@ _virutil_sync() {
   esac
 }
 
+# pull and push take the same shape: VM SRC DST. Only the side each path lives
+# on differs, so only the middle argument completes differently.
 _virutil_pull() {
-  local state line
-  _arguments \
-    '(-c --config)'{-c,--config}'[config NAME or PATH]:config:->config' \
-    '--transport[how to move the files]:transport:->transport' \
-    '(-h --help)'{-h,--help}'[print usage and exit]'
-  case $state in
-    transport) _virutil_transports ;;
-    config)
-      if [[ $PREFIX == */* ]]; then
-        _files
-      else
-        local -a confs
-        confs=(${~HOME}/.config/virutils/*.conf(N:t:r))
-        _describe -t config 'config' confs
-      fi
-      ;;
+  case $words[CURRENT-1] in
+    -t|--transport) _virutil_transports; return ;;
+  esac
+  case $CURRENT in
+    3) _virutil_domains ;;
+    4) ;;                             # the guest-side source: nothing to complete
+    5) _files -/ ;;
+    *) _values 'option' \
+         '(-t --transport)'{-t,--transport}'[how to move the files]' ;;
   esac
 }
 
 _virutil_transports() {
   _values 'transport' \
-    'auto[pick one: virtiofs, else volume, else disk]' \
-    'disk[the guest'\''s own disk over qemu-nbd; a write shuts it down]' \
+    'virtiofs[a live virtio-fs share (default)]' \
     'volume[a staging qcow2 hotplugged into the running guest]' \
-    'virtiofs[a live virtio-fs share]'
+    'disk[the guest'\''s own disk over qemu-nbd; a write shuts it down]'
+}
+
+# Sizes are free-form numbers, so the best a completion can do is offer sensible
+# round values and let anything else be typed over them.
+_virutil_size() {
+  _values -w 'GiB' 32 64 128 256 512
+}
+
+_virutil_memory() {
+  _values -w 'MiB' 2048 4096 8192 12288 16384 24576 32768
+}
+
+_virutil_vcpus() {
+  local -a n
+  n=(1 2 4 6 8 12 16)
+  _values -w 'vcpus' $n
 }
 
 _virutil_push() {
   case $words[CURRENT-1] in
-    --transport) _virutil_transports; return ;;
+    -t|--transport) _virutil_transports; return ;;
   esac
   case $CURRENT in
     3) _virutil_domains ;;
     4) _files ;;
     5) ;;                             # the guest-side destination: nothing to complete
-    *) _values 'option' '--transport[how to move the files]' ;;
+    *) _values 'option' \
+         '(-t --transport)'{-t,--transport}'[how to move the files]' ;;
   esac
 }
 
@@ -212,15 +220,32 @@ _virutil_domain() {
     'create:define a domain and boot the installer'
     'delete:undefine a domain and delete its disks'
     'list:list all domains and their state'
-    'start:power on a domain'
+    'start:power on a domain, optionally resizing it first'
     'shutdown:request a graceful shutdown (ACPI)'
     'addr:show guest interface addresses'
   )
   case $words[3] in
-    start|shutdown|addr)
+    shutdown|addr)
       (( CURRENT == 4 )) && _virutil_domains
       ;;
     list) ;;                        # takes no arguments
+    start)
+      case $CURRENT in
+        3) _describe -t command 'command' cmds ;;
+        4) _virutil_domains ;;
+        *)
+           case $words[CURRENT-1] in
+             -s|--size)   _virutil_size;   return ;;
+             -m|--memory) _virutil_memory; return ;;
+             -c|--vcpus)  _virutil_vcpus;  return ;;
+           esac
+           _values 'option' \
+             '(-s --size)'{-s,--size}'[grow the disk image, GiB]' \
+             '(-m --memory)'{-m,--memory}'[guest RAM, MiB]' \
+             '(-c --vcpus)'{-c,--vcpus}'[virtual CPUs]'
+           ;;
+      esac
+      ;;
     create)
       case $CURRENT in
         3) _describe -t command 'command' cmds ;;
@@ -230,22 +255,19 @@ _virutil_domain() {
            # the value-taking flags read the next word, so complete for the flag
            # behind us before offering another flag
            case $words[CURRENT-1] in
-             --disk)   _files; return ;;
-             --virtio) _files -g '*.iso'; return ;;
-             --osinfo) _virutil_osinfo; return ;;
-             --size|--memory|--vcpus|--network) return ;;
+             -d|--disk)   _files;          return ;;
+             -o|--osinfo) _virutil_osinfo; return ;;
+             -s|--size)   _virutil_size;   return ;;
+             -m|--memory) _virutil_memory; return ;;
+             -c|--vcpus)  _virutil_vcpus;  return ;;
            esac
            _values 'option' \
-             '--size[disk size in GiB]' \
-             '--memory[guest RAM in MiB]' \
-             '--vcpus[virtual CPUs]' \
-             '--disk[disk image path]' \
-             '--osinfo[libosinfo id]' \
-             '--virtio[virtio-win ISO to attach]' \
-             '--no-virtio[do not attach a virtio-win ISO]' \
-             '--network[virt-install --network value]' \
-             '--bios[seabios instead of UEFI]' \
-             '--dry-run[print the domain XML and define nothing]'
+             '(-s --size)'{-s,--size}'[disk size, GiB]' \
+             '(-m --memory)'{-m,--memory}'[guest RAM, MiB]' \
+             '(-c --vcpus)'{-c,--vcpus}'[virtual CPUs]' \
+             '(-d --disk)'{-d,--disk}'[disk image path]' \
+             '(-o --osinfo)'{-o,--osinfo}'[libosinfo id; detected from the ISO by default]' \
+             '(-n --dry-run)'{-n,--dry-run}'[print the domain XML and define nothing]'
            ;;
       esac
       ;;
@@ -254,7 +276,7 @@ _virutil_domain() {
         4) _virutil_domains ;;
         *) _values 'option' \
              '(-y --yes)'{-y,--yes}'[do not ask for confirmation]' \
-             '--keep-disk[undefine but leave the disks in place]'
+             '(-k --keep-disk)'{-k,--keep-disk}'[undefine but leave the disks in place]'
            ;;
       esac
       ;;

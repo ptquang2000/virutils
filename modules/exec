@@ -1,39 +1,22 @@
 # exec -- run commands inside a Windows guest via the QEMU guest agent.
-# Sourced by virutil; entry point is exec_main. Usage:
-#   virutil exec setup  VM                    add the org.qemu.guest_agent.0 channel to the VM
-#   virutil exec ping   VM                    check that the guest agent is responding
-#   virutil exec info   VM                    guest OS, hostname and agent version
-#   virutil exec cmd    VM [-d] CMD...        run CMD via cmd.exe /c, print stdout/stderr
-#   virutil exec ps     VM [-d] SCRIPT...     run SCRIPT via powershell (quoting-safe)
 #
-# Windows guests only. virt-manager does not add the agent channel itself, so
-# `setup` is needed once per VM (plus qemu-ga in the guest: the virtio-win
-# guest-agent MSI). Commands run as SYSTEM. The guest exit code becomes ours.
+#   virutil exec ping VM                 check that the guest agent is responding
+#   virutil exec cmd  VM [-d] CMD...     run CMD via cmd.exe /c
+#   virutil exec ps   VM [-d] SCRIPT...  run SCRIPT via powershell (quoting-safe)
 #
-# Flags sit between the VM name and the command; parsing stops at the first
-# non-flag, and `--` forces the end of flags so a command may start with `-`.
-#   --detach, -d   fire and forget: print the guest pid and exit 0. There is no
-#                  output and no exit code -- capture-output is off -- but the
-#                  command survives the channel dropping, which is the only way
-#                  to run a reboot or a long installer. Redirect to a file in
-#                  the guest and fetch it afterwards if you need the output.
+# Commands run as SYSTEM and the guest exit code becomes ours. Flags sit between
+# the VM name and the command; parsing stops at the first non-flag, and `--`
+# forces the end of flags so a command may start with `-`.
 #
 # stdin is overloaded, disambiguated by whether `-` sits in the command slot:
-#   virutil exec ps VM -        the script is read from stdin (quoting-free, and
-#                               the way to run anything longer than a one-liner)
-#   echo x | virutil exec ps VM CMD
-#                               stdin becomes the guest process's stdin. Buffered
-#                               whole, not streamed -- kilobytes, not disk images
-#                               -- and the guest sees EOF immediately, so this
-#                               cannot answer an interactive prompt. Keeps
-#                               secrets out of both process lists, unlike putting
-#                               them in CMD.
-# `cmd VM -` works but is close to useless: cmd.exe /c takes a single statement,
-# so a multi-line batch file piped in will not behave like a batch file.
+#   virutil exec ps VM -           the script is read from stdin
+#   echo x | virutil exec ps VM C  stdin becomes the guest process's stdin,
+#                                  buffered whole and EOF'd immediately, so it
+#                                  cannot answer an interactive prompt
 
 # Windows caps a command line at 32767 chars; cmd.exe caps itself far lower.
-# Both are enforced host-side, because overflowing them fails inside the guest
-# as an unrelated-looking spawn error.
+# Both are enforced host-side: overflowing them fails inside the guest as an
+# unrelated-looking spawn error.
 CMDLINE_MAX=32767
 CMD_EXE_MAX=8191
 
@@ -41,7 +24,15 @@ DETACH=0
 INPUT_B64=
 
 exec_usage() {
-    echo "usage: virutil exec {setup|ping|info|cmd|ps} VM_NAME [FLAGS] [ARGS]" >&2
+    printf '%s\n' \
+        "usage: virutil exec {ping|cmd|ps} VM [FLAGS] [ARGS]" \
+        "" \
+        "  -d, --detach   fire and forget: print the guest pid and exit 0." \
+        "                 No output and no exit code, but the command survives" \
+        "                 the channel dropping -- the only way to run a reboot" \
+        "                 or a long installer." \
+        "  --             end of flags" \
+        "  -              read the command from stdin" >&2
     exit 1
 }
 
@@ -55,8 +46,7 @@ agent() {
     echo "$reply"
 }
 
-# flags -> DETACH, remainder -> E_REST; stops at the first non-flag so the
-# command text is never parsed for flags
+# flags -> DETACH, remainder -> E_REST
 parse_flags() {
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -70,7 +60,7 @@ parse_flags() {
     E_REST=("$@")
 }
 
-# command text -> TEXT, host stdin -> INPUT_B64; see the stdin note in the header
+# command text -> TEXT, host stdin -> INPUT_B64
 resolve_text() {
     [ $# -gt 0 ] || return 1
     if [ $# -eq 1 ] && [ "$1" = "-" ]; then
@@ -82,10 +72,8 @@ resolve_text() {
 }
 
 # powershell serialises its error stream as CLIXML whenever stderr is redirected.
-# The ps wrapper writes errors straight to the console handle to avoid that, so
-# this is only reached by errors raised outside the wrapper's reach -- a parse
-# error, or a nested powershell.exe. Passes the raw text through when python3 is
-# missing rather than making python3 a hard dependency of every run.
+# Only errors raised outside the ps wrapper's reach get here. Passes the raw text
+# through when python3 is missing rather than making it a hard dependency.
 declixml() {
     command -v python3 >/dev/null 2>&1 || { cat; return; }
     python3 -c '
@@ -119,8 +107,7 @@ gexec() {
         return 0
     fi
 
-    # backoff: a one-liner returns almost immediately, an installer runs for
-    # minutes -- neither should be polled at the other's rate
+    # backoff: a one-liner returns at once, an installer runs for minutes
     ms=50
     while :; do
         st=$(agent "$(jq -nc --argjson pid "$pid" \
@@ -146,18 +133,13 @@ gexec() {
     return "$ec"
 }
 
-# exec_ps_text SCRIPT -- run SCRIPT in $VM's powershell and return its exit code.
-# Factored out of the ps command because the transports in modules/xfer drive
-# the guest the same way: everything they do inside Windows is a powershell
-# script over the agent, and the wrapping, encoding and length limits below are
-# the part that must not be reimplemented twice.
+# exec_ps_text SCRIPT -- run SCRIPT in $VM's powershell, return its exit code.
+# Shared with the transports in modules/xfer.
 exec_ps_text() {
     local SCRIPT ENC
-    # The preference kills "Preparing modules for first use" progress spam on
-    # stderr. The catch writes to the console handle rather than powershell's
-    # error stream, which is what would otherwise be serialised as CLIXML; the
-    # explicit exit 1 restores the code powershell returns for an uncaught
-    # terminating error, which catching would otherwise turn into a 0.
+    # The catch writes to the console handle rather than powershell's error
+    # stream, which would otherwise be serialised as CLIXML; the explicit exit 1
+    # restores the code an uncaught terminating error would have returned.
     SCRIPT=$(printf '%s\n%s\n%s\n%s\n%s\n' \
         '$ProgressPreference="SilentlyContinue";' \
         'try { $Host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size(4096, 2000) } catch {}' \
@@ -188,45 +170,18 @@ exec_main() {
     shift 2
 
     case "$CMD" in
-    setup)
-        if "${VIRSH_Q[@]}" dumpxml "$VM" | grep -q org.qemu.guest_agent.0; then
-            echo "$VM: channel already present"
-            exit 0
-        fi
-        XML=$(mktemp) && trap 'rm -f "$XML"' EXIT
-        cat >"$XML" <<'EOF'
-<channel type='unix'>
-  <source mode='bind'/>
-  <target type='virtio' name='org.qemu.guest_agent.0'/>
-</channel>
-EOF
-        "${VIRSH_Q[@]}" attach-device "$VM" "$XML" --config
-        # hotplug only works on a running VM; the --config copy covers the rest
-        if [ "$("${VIRSH_Q[@]}" domstate "$VM")" = running ]; then
-            "${VIRSH_Q[@]}" attach-device "$VM" "$XML" --live
-        fi
-        echo "$VM: channel added (install qemu-ga in the guest if not already there)"
-        ;;
     ping)
         agent '{"execute":"guest-ping"}' >/dev/null
         echo "$VM: agent up"
-        ;;
-    info)
-        # pretty-name lies on windows (reports the win10 sku), so build from version fields
-        agent '{"execute":"guest-get-osinfo"}' \
-            | jq -r '.return | "os: \(.version // .["pretty-name"] // .name) build \(.["kernel-release"] // "?") (\(.machine))"'
-        agent '{"execute":"guest-get-host-name"}' | jq -r '"host-name: " + .return["host-name"]'
-        agent '{"execute":"guest-info"}' | jq -r '"qemu-ga: " + .return.version'
         ;;
     cmd)
         parse_flags "$@"
         set -- ${E_REST[@]+"${E_REST[@]}"}
         resolve_text "$@" || { echo "usage: virutil exec cmd VM [-d] CMD..." >&2; exit 1; }
 
-        # qemu-ga flattens the arg array into a Windows command line with glib's
-        # rules, which backslash-escape embedded quotes -- and cmd.exe has never
-        # understood \" as an escape, so the command arrives mangled with a zero
-        # exit code. ps encodes to base64 and is immune, so send them there.
+        # qemu-ga backslash-escapes embedded quotes, and cmd.exe has never
+        # understood \" as an escape, so the command would arrive mangled with a
+        # zero exit code. ps encodes to base64 and is immune.
         case "$TEXT" in
             *'"'*) echo "virutil exec: cmd cannot carry embedded quotes through cmd.exe; use ps" >&2
                    exit 1 ;;

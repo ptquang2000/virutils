@@ -1,5 +1,4 @@
-# Parser for virutil: top-level dispatch plus the helpers every module shares.
-# Sourced by virutil; not executable on its own.
+# parser -- top-level dispatch plus the helpers every module shares
 
 MODULES=(domain snapshot sync pull push exec usb)
 
@@ -17,10 +16,10 @@ domains
 
 transfer
   sync       fetch build output from the Windows host and push it into a guest
-  pull       copy files out of a running guest
-  push       copy a file or directory from the host into a guest on demand
+  pull       copy a file or directory out of a running guest
+  push       copy a file or directory from the host into a guest
 
-  All three take --transport disk|volume|virtiofs (default: auto).
+  All three take -t/--transport disk|volume|virtiofs (default: virtiofs).
 
 guest
   exec       run commands inside a Windows guest via the QEMU guest agent
@@ -33,8 +32,7 @@ EOF
     exit "${1:-1}"
 }
 
-# parse_dispatch "$@" -- split the module name from the rest of the command line
-# and validate it. Sets the globals MODULE and REST.
+# parse_dispatch "$@" -- sets MODULE and REST
 parse_dispatch() {
     local m
     MODULE="${1:-}"

@@ -1,25 +1,16 @@
-# guest -- shared machinery for the modules that reach into a guest's disk
-# (sync and push write it; pull borrows the probes and the path helpers).
-# Sourced by virutil; no entry point of its own.
+# guest -- the offline attach lifecycle, plus the helpers every module shares.
 #
-# The offline attach lifecycle: shut the domain down if it is running, attach
-# its qcow2 with qemu-nbd, mount the largest NTFS partition, and on the way out
-# -- success or failure -- verify the teardown from observed state and restore
-# the power state the run started from. guest_open() does the setup and arms
-# the EXIT trap; guest_finish() is the trap handler. The copy phases that run
-# between them live in modules/sync and modules/push.
+# guest_open() shuts the domain down if running, attaches its qcow2 with
+# qemu-nbd, mounts the largest NTFS partition at MNT and arms guest_finish() as
+# the EXIT trap; guest_finish() verifies teardown and restores the power state.
 #
-# State lives at module scope -- not local to the mains -- for two reasons: the
-# EXIT trap's guest_finish() runs after a main has returned, and set -u must not
-# trip on a variable no module has touched yet.
+# State lives at module scope, not local to the mains: the trap runs after a
+# main has returned and set -u must not trip on it.
 
 RSYNC=(rsync -rlt --mkpath --info=progress2 --no-perms --no-owner --no-group)
 
-# Every module shares these two, so they are declared once here rather than per
-# module: all modules are sourced into one shell, and a second declaration would
-# just clobber the first. Arrays, not strings -- an unquoted string expansion
-# would word-split on whatever a path happens to contain. VIRSH_Q additionally
-# suppresses virsh's own success chatter.
+# Arrays, not strings: an unquoted string expansion would word-split on whatever
+# a path happens to contain.
 VIRSH=(virsh --connect qemu:///system)
 VIRSH_Q=("${VIRSH[@]}" --quiet)
 SUDO=()
@@ -28,10 +19,9 @@ DOMAIN=""; NBD="/dev/nbd0"; MNT=""
 SHUTDOWN_TIMEOUT=180
 ORIG_STATE=""; IMG=""
 
-# Rewrite every letter as [Aa] so a path matches case-insensitively: the guest's
-# NTFS is case-insensitive, this ntfs-3g mount is not. shopt nocaseglob is not
-# enough -- bash never glob-expands a word with no wildcard in it, so a literal
-# path would stay literal and silently miss.
+# Rewrite every letter as [Aa] so a path matches case-insensitively. nocaseglob
+# is not enough: bash never glob-expands a word with no wildcard in it, so a
+# literal path would stay literal and silently miss.
 ci_glob() {
     local s="$1" out="" c i
     for (( i = 0; i < ${#s}; i++ )); do
@@ -41,15 +31,12 @@ ci_glob() {
     printf '%s' "$out"
 }
 
-# '.' is how a rule spells "the root of this tree", but it must not survive into
-# a path handed to rsync: --mkpath walks the destination creating components, and
-# on reaching a literal '.' it takes the EEXIST as fatal ("mkdir ..././ failed:
-# File exists"). It only bites the first time a given path is created, so a
-# rerun papers over it. Strip the '.' instead of relying on that.
+# '.' spells "the root of this tree", but must not reach rsync: --mkpath takes
+# the EEXIST on a literal '.' as fatal ("mkdir ..././ failed: File exists").
 root_rel() { local s="$1"; [[ "$s" == "." ]] && s=""; printf '%s' "$s"; }
 
-# Teardown is verified from observed state, not from exit codes -- and both
-# probes are world-readable, so verification cannot itself fail on sudo auth.
+# Teardown is verified from observed state, not exit codes. Both probes are
+# world-readable, so verification cannot itself fail on sudo auth.
 nbd_attached() {
     local sys="/sys/block/${NBD##*/}"
     [[ -e "$sys/pid" ]] && return 0
@@ -59,18 +46,15 @@ mnt_mounted() {
     awk -v m="$MNT" '$2 == m { found = 1 } END { exit !found }' /proc/mounts
 }
 
-# ntfs-3g does not fail a read-write mount request on a dirty volume -- it warns
-# and mounts read-only anyway, exiting 0. Without this probe the run looks fine
-# until rsync is deep into the copy and every write comes back EROFS. Field 4 of
-# /proc/mounts leads with the ro/rw flag.
+# ntfs-3g does not fail a read-write mount on a dirty volume: it warns, mounts
+# read-only and exits 0. Field 4 of /proc/mounts leads with the ro/rw flag.
 mnt_writable() {
     awk -v m="$MNT" '$2 == m { split($4, o, ","); if (o[1] == "rw") found = 1 }
                      END { exit !found }' /proc/mounts
 }
 
 guest_finish() {
-    # No step may abort the handler under set -e: the qemu-nbd detach has to run
-    # even when the mount never happened.
+    # No step may abort the handler under set -e.
     if mnt_mounted; then
         sync
         "${SUDO[@]}" umount "$MNT" || true
@@ -80,10 +64,8 @@ guest_finish() {
     fi
     sync
 
-    # The guest may only be started once the image is provably free. Two writers
-    # on one qcow2 is the single failure this module must never cause, so the
-    # restart is gated on the state that makes it safe -- not on the exit codes
-    # above, which say nothing if sudo could not authenticate.
+    # Two writers on one qcow2 is the failure this module must never cause, so
+    # the restart is gated on observed state, not on the exit codes above.
     if mnt_mounted || nbd_attached; then
         warn "" \
              "teardown could not be verified -- leaving $DOMAIN shut off." \
@@ -95,9 +77,8 @@ guest_finish() {
         exit 1
     fi
 
-    # Only start what is actually off: a run that aborts because the guest would
-    # not shut down reaches here with the domain still running, and 'virsh start'
-    # on it would fail for the uninteresting reason and read as a real problem.
+    # Only start what is actually off: a run that aborted on a guest that would
+    # not shut down reaches here with the domain still running.
     if [[ "$ORIG_STATE" == running ]]; then
         local now; now="$("${VIRSH[@]}" domstate "$DOMAIN" 2>/dev/null || true)"
         if [[ "$now" == "shut off" ]]; then
@@ -111,38 +92,29 @@ guest_finish() {
     fi
 }
 
-# guest_open -- the setup half of an offline disk write. Requires DOMAIN (and
-# optionally NBD, MNT, SHUTDOWN_TIMEOUT) to be set by the caller; sets ORIG_STATE
-# and IMG, mounts the guest filesystem at MNT, and arms guest_finish as the EXIT
-# trap so the teardown happens no matter how the run ends.
+# guest_open -- requires DOMAIN (and optionally NBD, MNT, SHUTDOWN_TIMEOUT) from
+# the caller; sets ORIG_STATE and IMG and mounts the guest filesystem at MNT.
 guest_open() {
-    # The sudo rule every module shares, in modules/xfer: escalate the handful of
-    # commands that need root, never the whole run. (The copy phases need no
-    # privilege of their own, so sudo would only get in the way.)
+
     xfer_privilege
 
     MNT="${MNT:-/mnt/$DOMAIN}"
     command -v rsync >/dev/null || die "rsync not installed"
 
     # Authenticate before the guest is shut down rather than partway through.
-    # No keep-alive: if the timestamp lapses during a long copy, teardown asks
-    # again, and if nobody answers the guest is deliberately left off -- see
-    # guest_finish().
     if (( ${#SUDO[@]} )); then
         command -v sudo >/dev/null || die "sudo not installed; nbd and mount need it"
         sudo -v || die "sudo authentication failed"
     fi
 
-    # A stale nbd or mount left by a failed run: going on would end with us
-    # detaching or unmounting something that was never ours.
+    # A stale nbd or mount left by a failed run is not ours to tear down.
     nbd_attached && die "$NBD is already attached; free it or set @nbd elsewhere" \
                         "  sudo qemu-nbd -d $NBD"
     mnt_mounted && die "$MNT is already mounted; unmount it first" \
                        "  sudo umount $MNT"
 
-    # A managed-save image means the guest resumes from stale RAM -- its cached
-    # NTFS metadata would not match the disk we are about to edit. Refuse
-    # outright.
+    # A managed-save image means the guest resumes from stale RAM, whose cached
+    # NTFS metadata would not match the disk we are about to edit.
     "${VIRSH[@]}" dominfo "$DOMAIN" | grep -qi '^Managed save: *yes' \
         && die "$DOMAIN has a managed-save image; resuming it after editing the disk" \
                "would corrupt the filesystem. Run: virsh managedsave-remove $DOMAIN"
@@ -150,26 +122,20 @@ guest_open() {
     ORIG_STATE="$("${VIRSH[@]}" domstate "$DOMAIN")"
     echo "domain: $DOMAIN ($ORIG_STATE)"
 
-    # Reject unusable states before the trap is armed, so guest_finish() only
-    # ever has to deal with states it can actually restore.
+    # Reject unusable states before the trap is armed.
     case "$ORIG_STATE" in
         "shut off"|running) ;;
-        *)  # paused / pmsuspended: the guest holds RAM that no longer matches
-            # the disk once we write to it, and there is no safe way to resume.
+        *)  # paused / pmsuspended: the RAM would no longer match the disk
             die "$DOMAIN is '$ORIG_STATE'; shut it down or destroy it first" ;;
     esac
 
     trap guest_finish EXIT
 
     if [[ "$ORIG_STATE" == running ]]; then
-        # Prefer the guest agent over ACPI. An ACPI request is a power-button
-        # event Windows may deliberate over or refuse outright -- a modal dialog
-        # or "an app is preventing shutdown" and the wait runs to the timeout.
-        # qemu-guest-agent instead calls Windows' own shutdown with apps forced
-        # closed, which is both faster and still a real shutdown: Windows closes
-        # the NTFS volume, so the disk is left clean and mountable read-write.
-        # Probe with guest-ping rather than trusting the channel's XML state --
-        # the channel can read 'connected' with nothing listening in the guest.
+        # Prefer the agent over ACPI: an ACPI request is a power-button event
+        # Windows may deliberate over until the timeout, while the agent calls
+        # Windows' own shutdown with apps forced closed -- still a real shutdown,
+        # so the NTFS volume is left clean and mountable read-write.
         local mode=acpi
         if "${VIRSH[@]}" qemu-agent-command "$DOMAIN" \
                '{"execute":"guest-ping"}' >/dev/null 2>&1; then
@@ -186,19 +152,15 @@ guest_open() {
         for (( i = 0; i < SHUTDOWN_TIMEOUT; i++ )); do
             state="$("${VIRSH[@]}" domstate "$DOMAIN")"
             [[ "$state" == "shut off" ]] && break
-            # Say something periodically: a silent wait of up to
-            # @shutdown_timeout looks exactly like a hang.
+            # A silent wait of up to @shutdown_timeout looks like a hang.
             (( i > 0 && i % 15 == 0 )) \
                 && echo "   still '$state' after ${i}s of ${SHUTDOWN_TIMEOUT}s" \
                         "-- check the guest console for a dialog blocking shutdown"
             sleep 1
         done
 
-        # No destroy fallback. Cutting power to a running Windows leaves the NTFS
-        # volume dirty, which ntfs-3g then refuses to mount read-write -- so the
-        # "fallback" cannot do the job the shutdown was for, and it risks the
-        # filesystem of the guest we are here to update. Stop and let the guest
-        # keep running; the trap leaves it in the state it was found in.
+        # No destroy fallback: cutting power leaves the NTFS volume dirty, which
+        # ntfs-3g then refuses to mount read-write.
         [[ "$state" == "shut off" ]] \
             || die "$DOMAIN did not shut down within ${SHUTDOWN_TIMEOUT}s (still '$state')." \
                    "Nothing was written and the guest is left running." \
@@ -209,15 +171,12 @@ guest_open() {
         echo "   shut off"
     fi
 
-    # Top of the backing chain -- writing to the base image would corrupt the guest.
+    # Top of the backing chain: writing to the base would corrupt the guest.
     IMG="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
            | awk '$2=="disk" {print $4; exit}')"
     [[ -f "$IMG" ]] || die "could not resolve disk image for $DOMAIN"
     echo "image: $IMG"
 
-    # The nbd lifecycle and the partition probe live in modules/xfer, shared with
-    # pull (which attaches a frozen snapshot read-only) and with the staging
-    # volume -- three callers, one way of doing it.
     nbd_connect "$IMG"
 
     # The Windows system partition: the largest NTFS one on the disk.
@@ -230,15 +189,11 @@ guest_open() {
 
     "${SUDO[@]}" mkdir -p "$MNT"
 
-    # uid=/gid= hand the whole NTFS tree to the invoking user, so the copy phase
-    # and any cleanup need no privilege of their own -- which is also what keeps
-    # the sudo timestamp out of the long-running part of the run.
+    # uid=/gid= hand the tree to the invoking user, so the copy phase needs no
+    # privilege of its own.
     "${SUDO[@]}" mount -t ntfs-3g -o "uid=$(id -u),gid=$(id -g)" "$PART" "$MNT"
 
-    # A read-only mount cannot do the one thing this lifecycle exists for, so
-    # stop here rather than let the copy phase discover it file by file. The trap
-    # unmounts, detaches, and restarts the guest -- which is also the fix, since
-    # Windows clears its own dirty bit on a full boot and shutdown.
+    # Stop here rather than let the copy phase discover it file by file.
     mnt_writable || die \
         "$PART mounted read-only: the NTFS volume is dirty, so ntfs-3g refused" \
         "read-write (it warns and falls back rather than failing the mount)." \

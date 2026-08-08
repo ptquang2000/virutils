@@ -1,36 +1,15 @@
 #!/usr/bin/env bash
 # virutil -- drive libvirt/KVM guest operations from a Linux host (incl. WSL).
 #
-# A single driver around a set of sourced modules. Each module is a function
-# library declaring one <name>_main entry point; the parser module handles the
-# top-level dispatch. Usage:
+# A driver around a set of sourced modules, each declaring one <name>_main entry
+# point. Only virutil is installed, so the module directory is resolved from the
+# script's own path -- through a symlink, not around it.
 #
-# The modules fall into four groups:
-#
-#   domains    virutil domain     the domain lifecycle: create, delete, list,
-#                                 start, shutdown, addr
-#              virutil snapshot   external snapshots (disk + memory)
-#   transfer   virutil sync       fetch build output from the Windows host, push
-#                                 it into a guest
-#              virutil pull       copy files out of a running guest
-#              virutil push       copy one file or directory into a guest
-#
-#              All three take --transport, which picks how the bytes move: the
-#              guest's own disk over qemu-nbd, a staging volume hotplugged into
-#              the running guest, or a live virtio-fs share. See modules/xfer.
-#   guest      virutil exec       run commands inside a Windows guest via the
-#                                 QEMU guest agent
-#   hardware   virutil usb        USB passthrough end to end from the Windows
-#                                 host under WSL
-#
-#   virutil help       this message
-#
-# Only virutil is installed (symlinked into ~/.local/bin by the dotfiles setup),
-# so the module directory is resolved from the script's own path -- through a
-# symlink, not around it.
+#   virutil help    the module list
+
 set -euo pipefail
 
-# silences virsh's "setlocale: No such file or directory" on minimal/WSL hosts
+# silences virsh's "setlocale: No such file or directory" on minimal hosts
 export LC_ALL=C
 
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"

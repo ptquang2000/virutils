@@ -1,37 +1,8 @@
-# push -- copy a file or directory from the host into a guest's C: drive on
-# demand, with no config file. Sourced by virutil; entry point is push_main.
-# Usage:
-#   virutil push VM SRC DST [--transport T]  -- as yourself, NOT under sudo.
-#
-# SRC is a path on the host; DST is a path inside the guest, relative to the
-# root of C:. Both may be files or directories. The shapes follow rsync's own
-# rules, so the trailing slash means exactly what it means for rsync:
-#
-#   push VM file.txt C:\name.txt    copy as that exact file
-#   push VM file.txt C:\dir\        copy into the directory (created if needed)
-#   push VM dir      C:\where\      copy the directory itself under where\
-#   push VM dir\     C:\where\      copy the contents of dir, not dir itself
-#
-# A file source whose destination (no trailing slash) already exists as a
-# directory on the guest is copied inside it, as rsync and cp behave. A
-# directory source always lands inside its destination, which is created if
-# needed, so a trailing slash on DST makes no difference for a directory; only
-# the source's trailing slash chooses between the directory itself and its
-# contents. DST may be
-# spelled with backslashes and an optional C:\ prefix; "C:" alone means the root
-# of C:. A DST containing '..' is refused, so a mistyped path can never write
-# outside the mount point.
-#
-# The transport decides what happens next, and by default the guest keeps
-# running: a staging volume or a virtio-fs share carries the file in while
-# Windows is up. --transport disk is the offline path -- shut the guest down,
-# attach its disk with qemu-nbd, mount the NTFS, copy, and return it to the
-# power state it started in, the machinery virutil sync has always used.
-# See modules/xfer.
+# push -- copy a file or directory from the host into a guest's C: drive
 
 push_usage() {
     printf '%s\n' \
-        "usage: virutil push VM SRC DST [--transport T]" \
+        "usage: virutil push VM SRC DST [-t T]" \
         "" \
         "  VM   libvirt domain whose disk is written" \
         "  SRC  host file or directory to copy" \
@@ -39,18 +10,17 @@ push_usage() {
         "       directory, exactly as with rsync. Backslashes and a C:\\" \
         "       prefix are tolerated; '..' is refused." \
         "$(xfer_transport_help)" \
-        "  -h, --help   this message" \
+        "  -h, --help              this message" \
         "" \
         "A directory source is copied recursively. Only the disk transport" \
         "shuts the guest down; see README.md." >&2
     exit "${1:-1}"
 }
 
-# Normalise a guest-side DST into a C:-relative path of slash-separated
-# components: strip a drive prefix, turn backslashes into slashes, drop empty
-# and '.' components, and reject '..' so the destination can never resolve
-# outside the mount point. The trailing slash that marks a directory is handled
-# by the caller before this strips it.
+# Normalise a guest-side DST into a C:-relative path: strip a drive prefix, turn
+# backslashes into slashes, drop empty and '.' components, refuse '..' so the
+# destination can never resolve outside the mount point. The trailing slash that
+# marks a directory is handled by the caller before this strips it.
 push_norm_dst() {
     local s="$1" out="" comp
     s="${s#[Cc]:}"
@@ -64,19 +34,19 @@ push_norm_dst() {
             '..') die "destination may not contain '..': $1" ;;
             *)    out="${out:+$out/}$comp" ;;
         esac
-        s="${s#$comp}"
+        s="${s#"$comp"}"
     done
     printf '%s' "$out"
 }
 
 push_main() {
-    local VM="" SRC="" DST="" TRANSPORT=auto
+    local VM="" SRC="" DST="" TRANSPORT=""
 
     while (( $# )); do
         case "$1" in
-            --transport) TRANSPORT="${2:?--transport needs a value}"; shift 2 ;;
-            -h|--help)   push_usage 0 ;;
-            -*)          warn "unrecognised argument: $1"; push_usage ;;
+            -t|--transport) TRANSPORT="${2:?$1 needs a value}"; shift 2 ;;
+            -h|--help)      push_usage 0 ;;
+            -*)             warn "unrecognised argument: $1"; push_usage ;;
             *)
                 if   [[ -z "$VM"  ]]; then VM="$1"
                 elif [[ -z "$SRC" ]]; then SRC="$1"
@@ -94,33 +64,22 @@ push_main() {
     DOMAIN="$VM"
     domain_exists "$DOMAIN" || die "no such domain: $DOMAIN (see: virutil domain list)"
 
-    # Which transport is decided before anything is opened, so a run that cannot
-    # work says so while the guest is still untouched.
     xfer_select write "$TRANSPORT"
     xfer_open
 
-    # The copy phase is the same for all three: MNT is a C:-shaped tree, whether
-    # that is the guest's real C: (disk), a staging volume, or a share.
     push_copy "$SRC" "$DST"
 
     xfer_deliver
 
-    # Teardown -- unmount, detach, hand the volume back, restart the guest --
-    # happens in the EXIT trap, on the way out.
+    # Teardown happens in the EXIT trap.
     echo "copied -> $DOMAIN"
 }
 
-# push_copy SRC DST -- normalise DST and resolve it under the mounted guest
-# filesystem at MNT, then run the copy. A trailing slash (or backslash) on DST
-# means "this is a directory, create it if needed", captured before
-# normalisation strips it; without one, a file source whose destination already
-# exists as a directory on the guest is still copied inside it, exactly as
-# rsync would.
+# push_copy SRC DST -- resolve DST under MNT and run the copy. A trailing slash
+# on DST means "this is a directory, create it if needed".
 push_copy() {
     local SRC="$1" DST="$2" dst_arg win_dst DST_IS_DIR
     if [[ "$DST" == */ || "$DST" == *'\' ]]; then DST_IS_DIR=1; else DST_IS_DIR=0; fi
-    # push_norm_dst dies on '..' from inside the command substitution, which
-    # only yields a nonzero status; propagate it so the copy never runs.
     DST="$(push_norm_dst "$DST")" || exit 1
     dst_arg="$MNT"
     [[ -n "$DST" ]] && dst_arg="$MNT/$DST"

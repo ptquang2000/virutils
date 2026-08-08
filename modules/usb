@@ -1,38 +1,31 @@
-# usb -- USB passthrough for libvirt VMs, end to end from the Windows host under
-# WSL. Sourced by virutil; entry point is usb_main. Usage:
-#   virutil usb list                       list host USB devices and sharing state
-#   virutil usb show      VM               show devices passed to VM, live and persistent
-#   virutil usb attach    VM BUSID         share on Windows, import into WSL, hand to the VM
-#   virutil usb detach    VM BUSID         take it out of the VM and give it back to Windows
-#   virutil usb unbind    BUSID            stop sharing the device on Windows (needs UAC)
+# usb -- USB passthrough for libvirt domains, end to end from the Windows host
+# under WSL: usbipd bind, usbipd attach --wsl over vhci_hcd, virsh attach-device.
+# Every stage is skipped when `usbipd state` says it is already done, so
+# rerunning after a failure is safe.
 #
-# A device is named by the BUSID in the first column of `virutil usb list`, the same
-# handle usbipd itself takes. libvirt hostdevs are written in terms of vendor/product,
-# so the busid is resolved to a VENDOR:PRODUCT once, up front, and the libvirt and
-# sysfs stages work from that.
-#
-# attach crosses three layers: usbipd bind on Windows, usbipd attach --wsl to import
-# the device over vhci_hcd, then virsh attach-device. Every stage is skipped when
-# `usbipd state` says it is already done, so rerunning after a failure is safe.
-#
-# Only bind and unbind need Administrator, and a bind is persistent, so expect one
-# UAC prompt per physical device ever. detach deliberately stops short of unbinding:
-# a bound but detached device is still usable in Windows, so unbinding would spend a
-# UAC prompt to discard the state the bind just paid for.
+# Only bind and unbind need Administrator, and a bind is persistent, so expect
+# one UAC prompt per physical device ever. detach stops short of unbinding: a
+# bound but detached device is still usable in Windows.
 
 USBIPD="/mnt/c/Program Files/usbipd-win/usbipd.exe"
 USBIPD_WIN='C:\Program Files\usbipd-win\usbipd.exe'
 DISTRO=archlinux
 
 usb_usage() {
-    echo "usage: virutil usb {list|show|attach|detach|unbind} [VM] [BUSID]" >&2
-    exit 1
+    printf '%s\n' \
+        "usage: virutil usb list" \
+        "       virutil usb show   VM" \
+        "       virutil usb attach VM BUSID" \
+        "       virutil usb detach VM BUSID|VENDOR:PRODUCT" \
+        "       virutil usb unbind BUSID" \
+        "" \
+        "BUSID is the first column of 'virutil usb list'." >&2
+    exit "${1:-1}"
 }
 
-# A busid identifies a port, so it is only meaningful while something is plugged into
-# it. A VENDOR:PRODUCT is therefore also accepted: it is the only way to name a device
-# that has already been unplugged, which detach still needs in order to clear the
-# persistent hostdev it left behind. sysfs and the libvirt XML both want lowercase hex.
+# A busid identifies a port, so it is only meaningful while something is plugged
+# in. VENDOR:PRODUCT is the only way to name an unplugged device, which detach
+# needs to clear a leftover hostdev. sysfs and libvirt want lowercase hex.
 read_dev() {
     if [[ $1 =~ ^[0-9]+-[0-9]+(\.[0-9]+)*$ ]]; then
         echo "$1"
@@ -43,9 +36,9 @@ read_dev() {
     fi
 }
 
-# usbipd's view of one device, looked up by busid or by hardware id, as
-# VendProd|BusId|StubInstanceId|PersistedGuid|ClientIPAddress, or the words none/many.
-# The hardware id only appears in InstanceId, which reads USB\VID_0951&PID_1666\<serial>.
+# usbipd's view of one device as
+# VendProd|BusId|StubInstanceId|PersistedGuid|ClientIPAddress, or none/many.
+# The hardware id only appears in InstanceId: USB\VID_0951&PID_1666\<serial>.
 usbipd_state() {
     local busid="" key=""
     case "$1" in
@@ -80,9 +73,8 @@ resolve_dev() {
 # the address usbipd attaches us as; virbr0 has one too, so pin to eth0
 wsl_ip() { ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1; }
 
-# bind and unbind always need Administrator, so go straight through UAC rather than
-# spending a doomed call first. Start-Process discards the child's exit code, so
-# callers confirm the outcome by rereading usbipd state instead of trusting this.
+# Start-Process discards the child's exit code, so callers confirm the outcome by
+# rereading usbipd state instead of trusting this.
 elevate() {
     local args="'$1'"
     shift
@@ -103,9 +95,9 @@ in_sysfs() {
     return 1
 }
 
-# libvirt resolves a managed hostdev by looking the device up on the host, so the
-# import has to finish enumerating before virsh sees it; without this wait the race
-# surfaces as a libvirt error blaming the VM layer
+# libvirt resolves a managed hostdev by looking it up on the host, so the import
+# has to finish enumerating first; the race surfaces as a libvirt error blaming
+# the VM layer.
 wait_sysfs() {
     local i
     for i in $(seq 25); do
@@ -140,19 +132,17 @@ EOF
 
 hostdevs() { "${VIRSH[@]}" dumpxml "$@" | sed -n '/<hostdev/,/<\/hostdev>/p'; }
 
-# libvirt has no idempotent attach-device, so the last stage needs the same gate as
-# the usbipd ones or a rerun after a partial failure dies on the device it already
-# added. libvirt always emits <vendor> before <product>, so pairing successive ids
-# reconstructs the VENDOR:PRODUCT of each usb hostdev.
+# libvirt has no idempotent attach-device, so this gates the last stage. libvirt
+# always emits <vendor> before <product>, so pairing successive ids reconstructs
+# each hostdev's VENDOR:PRODUCT.
 has_hostdev() {
     hostdevs "$@" |
         sed -n "s/.*<\(vendor\|product\) id='0x\([0-9a-f]*\)'.*/\2/p" |
         paste -d: - - | grep -qx "$ID"
 }
 
-# a device can sit in the live domain, in the persistent config, or both, so each is
-# tried on its own. Only "not found" is tolerated; anything else is a real failure
-# and must not be mistaken for a clean detach.
+# A device can sit in the live domain, the persistent config, or both. Only
+# "not found" is tolerated.
 detach_scope() {
     local scope="$1" out
     if out=$(hostdev_xml "$ID" | "${VIRSH[@]}" detach-device "$VM" "$scope" /dev/stdin 2>&1); then
@@ -169,6 +159,7 @@ usb_main() {
     local CMD VM DEV ID STATE BUSID STUB GUID CLIENT REMOVED
     CMD="${1:-}"
     [ -n "$CMD" ] || usb_usage
+    case "$CMD" in -h|--help) usb_usage 0 ;; esac
 
     case "$CMD" in
     list)
@@ -176,9 +167,8 @@ usb_main() {
         ;;
     show)
         VM="${2:?usage: virutil usb show VM}"
-        # the two views can disagree now that attach writes persistent config, and a
-        # persisted hostdev that is not live is exactly the one that surprises you at
-        # the next boot, so never show one without the other
+        # A persisted hostdev that is not live is the one that surprises you at
+        # the next boot, so never show one view without the other.
         echo "=== live ==="
         hostdevs "$VM"
         echo "=== persistent ==="
@@ -231,10 +221,9 @@ usb_main() {
         DEV=$(read_dev "${3:?usage: virutil usb detach VM BUSID}")
         require_domain
 
-        # libvirt wrote the hostdev in terms of vendor/product, so a busid has to be
-        # resolved before anything can be removed. A device that is already gone from
-        # the host cannot be resolved, and its persistent hostdev is exactly the one
-        # still worth removing, so in that case the argument has to name it directly.
+        # libvirt wrote the hostdev in terms of vendor/product, so a busid has to
+        # be resolved first. A device already gone from the host cannot be, so the
+        # argument has to name it as VENDOR:PRODUCT.
         STATE=$(usbipd_state "$DEV")
         case "$STATE" in
         many) die "several connected devices share hardware id $DEV; unplug one" ;;
@@ -254,10 +243,8 @@ usb_main() {
         if detach_scope --config; then REMOVED=1; fi
         [ "$REMOVED" = 1 ] || die "$VM has no hostdev for $ID, live or persistent"
 
-        # leaves the device bound: still usable in Windows, and ready for a prompt-free
-        # reattach later. Use `virutil usb unbind` to stop sharing it altogether.
-        # Removing the hostdev only rebinds the driver inside WSL, so the client
-        # attachment read above still holds.
+        # Leaves the device bound: still usable in Windows, and ready for a
+        # prompt-free reattach. `virutil usb unbind` stops sharing altogether.
         if [ -n "${CLIENT:-}" ]; then
             say "wsl: returning $BUSID ($ID) to the Windows host"
             "$USBIPD" detach -b "$BUSID"
