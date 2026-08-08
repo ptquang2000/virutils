@@ -23,7 +23,7 @@ domain_usage() {
         "usage: virutil domain create VM ISO [OPTIONS]" \
         "       virutil domain delete VM [-y] [-k]" \
         "       virutil domain list" \
-        "       virutil domain start    VM [-s GiB] [-m MiB] [-c N]" \
+        "       virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]" \
         "       virutil domain shutdown VM" \
         "       virutil domain addr     VM" \
         "" \
@@ -37,10 +37,11 @@ domain_usage() {
         "                    'none' (default: found beside ISO)" \
         "  -n, --dry-run     print the domain XML and define nothing" \
         "" \
-        "start options (domain must be shut off; each is written to the config):" \
+        "start options (-s/-m/-c need the domain shut off; each is written to the config):" \
         "  -s, --size GiB    grow the disk image (never shrinks)" \
         "  -m, --memory MiB  guest RAM" \
         "  -c, --vcpus N     virtual CPUs" \
+        "  -G, --no-gui      start it without opening the console" \
         "" \
         "delete options:" \
         "  -y, --yes         do not ask for confirmation" \
@@ -424,7 +425,7 @@ domain_create() {
 
     say "" \
         "defined and started. Open the console with:" \
-        "  virt-viewer --connect qemu:///system $VM"
+        "  virutil domain start $VM"
     if [[ -n "$VIRTIO" ]]; then
         say "In Windows Setup, 'Load driver' -> the virtio-win CD -> amd64\\<version>" \
             "makes the virtio disk visible." \
@@ -432,14 +433,37 @@ domain_create() {
     fi
 }
 
+domain_console() {
+    local -a VIEWER
+    if command -v virt-manager >/dev/null; then
+        VIEWER=(virt-manager --connect qemu:///system --show-domain-console "$1")
+    elif command -v virt-viewer >/dev/null; then
+        VIEWER=(virt-viewer --connect qemu:///system --wait "$1")
+    else
+        warn "no console opened: neither virt-manager nor virt-viewer is installed." \
+             "  virsh --connect qemu:///system console $1   (serial, if configured)"
+        return 0
+    fi
+
+    if [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+        warn "no console opened: no DISPLAY or WAYLAND_DISPLAY for ${VIEWER[0]}." \
+             "Under WSL that means WSLg is off or this is not a graphical session."
+        return 0
+    fi
+
+    setsid "${VIEWER[@]}" >/dev/null 2>&1 &
+    say "console: ${VIEWER[0]} (pid $!)"
+}
+
 domain_start() {
-    local VM="" SIZE="" MEM="" VCPUS=""
+    local VM="" SIZE="" MEM="" VCPUS="" CONSOLE=1
 
     while (( $# )); do
         case "$1" in
             -s|--size)   SIZE="${2:?$1 needs a value}";  shift 2 ;;
             -m|--memory) MEM="${2:?$1 needs a value}";   shift 2 ;;
             -c|--vcpus)  VCPUS="${2:?$1 needs a value}"; shift 2 ;;
+            -G|--no-gui) CONSOLE=0; shift ;;
             -h|--help)   domain_usage 0 ;;
             -*)          die "virutil domain start: unknown option: $1" ;;
             *)           [[ -z "$VM" ]] || die "unexpected argument: $1"
@@ -493,7 +517,15 @@ domain_start() {
             "        the guest still has to extend its partition (diskmgmt.msc)"
     fi
 
-    "${VIRSH[@]}" start "$VM"
+    local state; state="$("${VIRSH[@]}" domstate "$VM" 2>/dev/null || true)"
+    if [[ "$state" == running ]]; then
+        say "$VM is already running"
+    else
+        "${VIRSH[@]}" start "$VM"
+    fi
+
+    (( CONSOLE )) && domain_console "$VM"
+    return 0
 }
 
 domain_delete() {

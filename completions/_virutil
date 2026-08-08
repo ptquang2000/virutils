@@ -47,7 +47,10 @@ _virutil() {
 _virutil_domains() {
   local -a doms
   if command -v virsh >/dev/null 2>&1; then
-    doms=(${(f)"$(virsh -c qemu:///system list --all 2>/dev/null | awk 'NR>2 && $1 !~ /^-/ {print $2}')"})
+    doms=(${(f)"$(virsh -c qemu:///system list --all 2>/dev/null |
+      awk 'NR>2 && NF { name = $2; $1 = ""; $2 = ""
+                        sub(/^ +/, ""); sub(/ +$/, "")
+                        print name ":" $0 }')"})
   fi
   _describe -t domain 'domain' doms
 }
@@ -220,7 +223,7 @@ _virutil_domain() {
     'create:define a domain and boot the installer'
     'delete:undefine a domain and delete its disks'
     'list:list all domains and their state'
-    'start:power on a domain, optionally resizing it first'
+    'start:power on a domain and open its console'
     'shutdown:request a graceful shutdown (ACPI)'
     'addr:show guest interface addresses'
   )
@@ -242,7 +245,8 @@ _virutil_domain() {
            _values 'option' \
              '(-s --size)'{-s,--size}'[grow the disk image, GiB]' \
              '(-m --memory)'{-m,--memory}'[guest RAM, MiB]' \
-             '(-c --vcpus)'{-c,--vcpus}'[virtual CPUs]'
+             '(-c --vcpus)'{-c,--vcpus}'[virtual CPUs]' \
+             '(-G --no-gui)'{-G,--no-gui}'[start it without opening the console]'
            ;;
       esac
       ;;

@@ -698,7 +698,7 @@ virutil domain create VM ISO [-s GiB] [-m MiB] [-c N] [-d PATH] [-o ID]
                              [-v ISO|none] [-n]
 virutil domain delete VM [-y] [-k]
 virutil domain list
-virutil domain start    VM [-s GiB] [-m MiB] [-c N]
+virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]
 virutil domain shutdown VM
 virutil domain addr     VM
 ```
@@ -859,18 +859,19 @@ before the removal runs.
 ### start
 
 ```
-virutil domain start VM [-s GiB] [-m MiB] [-c N]
+virutil domain start VM [-s GiB] [-m MiB] [-c N] [-G]
 ```
 
-Bare, this is `virsh start`. With any of `-s`, `-m` or `-c` it first rewrites
-what the domain gets, then starts it — the three things worth changing about a
-guest you already have, without editing XML by hand.
+Bare, this is `virsh start` plus the console window. With any of `-s`, `-m` or
+`-c` it first rewrites what the domain gets, then starts it — the three things
+worth changing about a guest you already have, without editing XML by hand.
 
 | Option | Effect |
 | --- | --- |
 | `-s`, `--size GiB` | `qemu-img resize` on the top of the disk's backing chain. |
 | `-m`, `--memory MiB` | `virt-xml --edit --memory`, both `memory` and `currentMemory`. |
 | `-c`, `--vcpus N` | `virt-xml --edit --vcpus`, count **and** topology together. |
+| `-G`, `--no-gui` | Start the domain and open no console. |
 
 They take the same values, and the same short flags, as the matching `create`
 options.
@@ -880,9 +881,17 @@ virutil domain shutdown win11
 virutil domain start win11 -m 16384 -c 8
 ```
 
-Three rules follow from what these actually do:
+Four rules follow from what these actually do:
 
-- **The domain must be shut off.** All three are persistent edits to the domain
+- **The console opens by default.** `virt-manager --connect qemu:///system
+   --show-domain-console` — the `--connect` is not optional, virt-manager
+   refuses `--show-*` without it — started under `setsid` with its output
+   discarded, so the window survives the shell and the prompt comes straight
+   back. Without virt-manager it falls back to `virt-viewer --wait`, and with
+   neither installed, or with no `DISPLAY`/`WAYLAND_DISPLAY` to draw on, it says
+   so and leaves the domain running. A domain that is already running is not an
+   error here: the console still opens. `-G` skips all of it.
+- **The domain must be shut off** for `-s`, `-m` and `-c`. All three are persistent edits to the domain
    config and the disk image, and none of them is a live change; `start` says
    so and stops rather than doing half of it.
 - **The disk only grows.** `qemu-img resize` is run without `--shrink`, so a
