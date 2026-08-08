@@ -1,16 +1,14 @@
 # guest -- the offline attach lifecycle, plus the helpers every module shares.
 #
-# guest_open() shuts the domain down if running, attaches its qcow2 with
-# qemu-nbd, mounts the largest NTFS partition at MNT and arms guest_finish() as
-# the EXIT trap; guest_finish() verifies teardown and restores the power state.
+# guest_open() shuts the domain down, attaches its qcow2 with qemu-nbd, mounts
+# the largest NTFS partition at MNT and arms guest_finish() as the EXIT trap.
 #
-# State lives at module scope, not local to the mains: the trap runs after a
-# main has returned and set -u must not trip on it.
+# State lives at module scope: the trap runs after a main has returned and
+# set -u must not trip on it.
 
 RSYNC=(rsync -rlt --mkpath --info=progress2 --no-perms --no-owner --no-group)
 
-# Arrays, not strings: an unquoted string expansion would word-split on whatever
-# a path happens to contain.
+# Arrays, not strings: an unquoted expansion would word-split on a path.
 VIRSH=(virsh --connect qemu:///system)
 VIRSH_Q=("${VIRSH[@]}" --quiet)
 SUDO=()
@@ -20,8 +18,7 @@ SHUTDOWN_TIMEOUT=180
 ORIG_STATE=""; IMG=""
 
 # Rewrite every letter as [Aa] so a path matches case-insensitively. nocaseglob
-# is not enough: bash never glob-expands a word with no wildcard in it, so a
-# literal path would stay literal and silently miss.
+# is not enough: bash never glob-expands a word with no wildcard in it.
 ci_glob() {
     local s="$1" out="" c i
     for (( i = 0; i < ${#s}; i++ )); do
@@ -35,8 +32,8 @@ ci_glob() {
 # the EEXIST on a literal '.' as fatal ("mkdir ..././ failed: File exists").
 root_rel() { local s="$1"; [[ "$s" == "." ]] && s=""; printf '%s' "$s"; }
 
-# Teardown is verified from observed state, not exit codes. Both probes are
-# world-readable, so verification cannot itself fail on sudo auth.
+# Verified from observed state, not exit codes. Both probes are world-readable,
+# so verification cannot itself fail on sudo auth.
 nbd_attached() {
     local sys="/sys/block/${NBD##*/}"
     [[ -e "$sys/pid" ]] && return 0
@@ -64,8 +61,8 @@ guest_finish() {
     fi
     sync
 
-    # Two writers on one qcow2 is the failure this module must never cause, so
-    # the restart is gated on observed state, not on the exit codes above.
+    # The restart is gated on observed state, not the exit codes above: two
+    # writers on one qcow2 is the failure this module must never cause.
     if mnt_mounted || nbd_attached; then
         warn "" \
              "teardown could not be verified -- leaving $DOMAIN shut off." \
@@ -132,10 +129,9 @@ guest_open() {
     trap guest_finish EXIT
 
     if [[ "$ORIG_STATE" == running ]]; then
-        # Prefer the agent over ACPI: an ACPI request is a power-button event
-        # Windows may deliberate over until the timeout, while the agent calls
-        # Windows' own shutdown with apps forced closed -- still a real shutdown,
-        # so the NTFS volume is left clean and mountable read-write.
+        # Prefer the agent: ACPI is a power-button event Windows may deliberate
+        # over until the timeout. The agent calls Windows' own shutdown with
+        # apps forced closed, which still leaves NTFS clean.
         local mode=acpi
         if "${VIRSH[@]}" qemu-agent-command "$DOMAIN" \
                '{"execute":"guest-ping"}' >/dev/null 2>&1; then
@@ -179,7 +175,6 @@ guest_open() {
 
     nbd_connect "$IMG"
 
-    # The Windows system partition: the largest NTFS one on the disk.
     local PART; PART="$(nbd_find_part ntfs)"
     if [[ -z "$PART" ]]; then
         lsblk -o NAME,SIZE,FSTYPE,PARTTYPENAME "$NBD" >&2 || true
@@ -189,8 +184,7 @@ guest_open() {
 
     "${SUDO[@]}" mkdir -p "$MNT"
 
-    # uid=/gid= hand the tree to the invoking user, so the copy phase needs no
-    # privilege of its own.
+    # uid=/gid= hand the tree over, so the copy phase needs no privilege.
     "${SUDO[@]}" mount -t ntfs-3g -o "uid=$(id -u),gid=$(id -g)" "$PART" "$MNT"
 
     # Stop here rather than let the copy phase discover it file by file.

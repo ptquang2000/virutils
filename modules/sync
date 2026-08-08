@@ -5,10 +5,10 @@
 CONF_DIR="$HOME/.config/virutils"
 SYNC_DEFAULT_CONF="$CONF_DIR/sync.conf"
 
-# Under the cache directory, not /tmp: the fetch is an incremental rsync, so a
-# staging tree that survives a reboot copies only what changed, and a tmpfs /tmp
-# would put a multi-gigabyte build tree in RAM. A fixed root with @staging as a
-# name under it, so a mistyped @staging can only name a directory virutil owns.
+# Not /tmp: the fetch is an incremental rsync, so a staging tree that survives a
+# reboot copies only what changed, and a tmpfs /tmp would hold a multi-gigabyte
+# build tree in RAM. @staging is a name under a fixed root, so a mistyped one
+# can only name a directory virutil owns.
 SYNC_STAGING_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/virutil"
 
 REPO=""; STAGING=""; DEST=""
@@ -35,8 +35,8 @@ sync_usage() {
 # A map rule's destination is relative to @dest. Empty means @dest itself.
 guest_dir() { printf '%s' "${DEST:+$DEST${1:+/}}$1"; }
 
-# A function so IFS can be scoped: newline-only, or a glob containing spaces
-# ("Program Files") would be split into separate words.
+# A function so IFS can be scoped to newlines: a glob containing spaces
+# ("Program Files") would otherwise split into separate words.
 empty_guest_dirs() {
     local IFS=$'\n'
     local pat targets real rel n
@@ -49,8 +49,7 @@ empty_guest_dirs() {
         for real in "${targets[@]}"; do
             [[ -d "$real" ]] || continue
 
-            # At least two levels down, so a mistyped pattern cannot empty C:\
-            # or a top-level directory.
+            # Two levels down minimum, so a mistyped pattern cannot empty C:\.
             rel="${real#"$MNT/"}"
             if [[ "$real" != "$MNT/"* || "$rel" != */* ]]; then
                 warn "refusing unsafe cleanup path: $real"
@@ -83,8 +82,8 @@ sync_main() {
     [[ -n "$VM" ]] || { warn "VM is required"; sync_usage; }
     DOMAIN="$VM"
 
-    # Path-or-name is decided on the spelling alone, never on what exists: the
-    # same command must mean the same config from any directory.
+    # Decided on spelling alone, never on what exists: the same command must
+    # mean the same config from any directory.
     if   [[ -z "$CONF_ARG"    ]]; then CONF="$SYNC_DEFAULT_CONF"
     elif [[ "$CONF_ARG" == */* ]]; then CONF="$CONF_ARG"
     else                               CONF="$CONF_DIR/${CONF_ARG%.conf}.conf"
@@ -149,8 +148,8 @@ sync_main() {
     echo "  staging: $STAGING"
     echo "  domain: $DOMAIN"
 
-    # Chosen before the fetch: a transport that cannot work is worth saying so
-    # before spending minutes pulling a build tree off the Windows host.
+    # Before the fetch: a transport that cannot work is worth saying so before
+    # spending minutes pulling a build tree off the Windows host.
     domain_exists "$DOMAIN" || die "no such domain: $DOMAIN (see: virutil domain list)"
     xfer_select write "${TRANSPORT:-$SYNC_TRANSPORT}"
 
@@ -177,8 +176,8 @@ sync_main() {
     [[ -d "$STAGING" ]] || die "staging dir not found: $STAGING"
     (( ${#MAPPINGS[@]} )) || die "no map rules in $CONF"
 
-    # MNT ends up standing for the root of C: whichever transport is used,
-    # which is why the copy phase below is written once.
+    # MNT stands for the root of C: whichever transport is used, which is why
+    # the copy phase below is written once.
     xfer_open
 
     shopt -s nullglob

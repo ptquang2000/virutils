@@ -31,7 +31,7 @@ pull_finish() {
     sync
 
     # The blockcommit must only run once the base image is provably free, so
-    # teardown is verified from observed state rather than from exit codes.
+    # teardown is verified from observed state rather than exit codes.
     if mnt_mounted || nbd_attached; then
         warn "" \
              "teardown could not be verified -- the snapshot is left in place." \
@@ -91,9 +91,9 @@ pull_norm_src() {
 # the frozen base read-only, and mount it at MNT. The guest is never touched,
 # which is what makes this the transport that needs no agent.
 #
-# The checkpoint is at the QCOW2 level, not the filesystem level: anything still
-# in the guest's page cache is absent and the NTFS journal may be
-# mid-transaction. Fine for build output; do not audit a live database this way.
+# The checkpoint is at the QCOW2 level, not the filesystem level: the guest's
+# page cache is absent and the NTFS journal may be mid-transaction. Fine for
+# build output; do not audit a live database this way.
 pull_open_disk() {
     MNT="${MNT:-/mnt/$DOMAIN}"
 
@@ -200,9 +200,8 @@ pull_main() {
 }
 
 # pull_copy SRC DST -- expand SRC under MNT and rsync what it matched into DST.
-# The glob is rewritten case-insensitively: the guest's NTFS is
-# case-insensitive, an ntfs-3g mount is not, and bash never glob-expands a word
-# with no wildcard in it, so nocaseglob alone would not do.
+# The glob is rewritten case-insensitively: NTFS is, an ntfs-3g mount is not,
+# and nocaseglob alone would not do -- see ci_glob in modules/guest.
 pull_copy() {
     local SRC="$1" DST="$2" m
     local -a matches files dirs

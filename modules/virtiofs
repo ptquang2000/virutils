@@ -13,6 +13,10 @@ VIRTIOFS_QUEUE=1024
 VIRTIOFS_LETTER=""
 VIRTIOFS_SENTINEL=".virutil-xfer"   # how the guest recognises the share; see below
 
+# Read by the EXIT trap, so module scope: set -u must not trip on them.
+VIRTIOFS_OURS=0
+VIRTIOFS_SVC_PRIOR=""
+
 # The path goes into the XML explicitly: libvirt only finds virtiofsd where it
 # was built to look, and distros disagree (Arch /usr/lib, Fedora /usr/libexec).
 VIRTIOFS_BINARY=(
@@ -80,7 +84,9 @@ virtiofs_attached() {
     "${VIRSH[@]}" dumpxml "$@" 2>/dev/null | grep -q "<target dir='$XFER_TAG'/>"
 }
 
-# virtiofs_setup -- attach the share, live and persistent. Idempotent.
+# virtiofs_setup -- attach the share for the duration of the run. Idempotent.
+# --live only: a device in the persisted XML would leave a drive letter in the
+# guest for the rest of its life. Unplug costs under a second.
 virtiofs_setup() {
     local dir="$1" binary xml
     binary="$(virtiofs_binary)" || exit 1
@@ -98,14 +104,22 @@ virtiofs_setup() {
             "Or use --transport volume, which needs no restart at all."
     fi
 
-    xml="$(virtiofs_fs_xml "$binary" "$dir")"
-    virtiofs_attached "$DOMAIN" \
-        || printf '%s\n' "$xml" | "${VIRSH[@]}" attach-device "$DOMAIN" --live /dev/stdin \
-        || die "could not attach the virtio-fs share to $DOMAIN"
-    virtiofs_attached --inactive "$DOMAIN" \
-        || printf '%s\n' "$xml" | "${VIRSH[@]}" attach-device "$DOMAIN" --config /dev/stdin \
-        || warn "the share is live but could not be written to $DOMAIN's config;" \
-                "it will not survive a restart"
+    # One already attached is residue from a run that died before its trap --
+    # the tag is virutil's own -- so adopt it rather than leave it stranded.
+    if ! virtiofs_attached "$DOMAIN"; then
+        xml="$(virtiofs_fs_xml "$binary" "$dir")"
+        printf '%s\n' "$xml" | "${VIRSH[@]}" attach-device "$DOMAIN" --live /dev/stdin \
+            || die "could not attach the virtio-fs share to $DOMAIN"
+    fi
+    VIRTIOFS_OURS=1
+
+    # Left by an older virutil, which persisted it: it would come back on boot.
+    if virtiofs_attached --inactive "$DOMAIN"; then
+        virtiofs_match_xml "$dir" \
+            | "${VIRSH[@]}" detach-device "$DOMAIN" --config /dev/stdin >/dev/null 2>&1 \
+            || warn "could not remove the stale virtio-fs share from $DOMAIN's" \
+                    "persisted config; it will reappear on the next boot"
+    fi
 }
 
 # VirtioFsSvc is the virtio-win viofs service; it maps each tag to a drive
@@ -122,13 +136,32 @@ virtiofs_start_service() {
     }
     case "$out" in
         *RUNNING*) ;;
-        *)  VM="$DOMAIN"; DETACH=0
+        *)  # Read before it is changed, so the trap can put it back.
+            VIRTIOFS_SVC_PRIOR="$(xfer_ps \
+                '(Get-Service VirtioFsSvc).StartType' 2>/dev/null | tr -d '[:space:]')"
+            VM="$DOMAIN"; DETACH=0
             gexec sc.exe '["config","VirtioFsSvc","start=","auto"]' >/dev/null 2>&1 || true
             gexec sc.exe '["start","VirtioFsSvc"]' >/dev/null \
                 || die "could not start VirtioFsSvc in $DOMAIN; check it in the" \
                        "guest (services.msc) and that WinFsp is installed"
             ;;
     esac
+}
+
+# Automatic is the viofs installer's own default, so restoring it would be a
+# guest round trip that changes nothing.
+virtiofs_restore_service() {
+    case "$VIRTIOFS_SVC_PRIOR" in
+        ""|Automatic) return 0 ;;
+        Manual|Disabled|Boot|System) ;;
+        *) return 0 ;;
+    esac
+    local start=demand
+    [[ "$VIRTIOFS_SVC_PRIOR" == Disabled ]] && start=disabled
+    VM="$DOMAIN"; DETACH=0
+    gexec sc.exe "[\"config\",\"VirtioFsSvc\",\"start=\",\"$start\"]" >/dev/null 2>&1 \
+        || warn "could not restore VirtioFsSvc to $VIRTIOFS_SVC_PRIOR in $DOMAIN"
+    gexec sc.exe '["stop","VirtioFsSvc"]' >/dev/null 2>&1 || true
 }
 
 # Which letter the tag landed on -- the client takes the highest free one, so it
@@ -228,7 +261,25 @@ if ($copied -eq 0) { throw "nothing matched in the guest" }'
     xfer_ps "$script" || die "collecting from $DOMAIN failed"
 }
 
-# Nothing to undo: the share stays attached on purpose.
+# Teardown, from the EXIT trap: nothing transferred stays readable at a drive
+# letter once the command has returned. Unplug first, so the guest has lost the
+# mapping before the directory empties underneath it.
 virtiofs_close() {
-    :
+    (( XFER_ARMED )) || return 0
+
+    if (( VIRTIOFS_OURS )) && virtiofs_attached "$DOMAIN"; then
+        virtiofs_match_xml "$VIRTIOFS_DIR" \
+            | "${VIRSH[@]}" detach-device "$DOMAIN" --live /dev/stdin >/dev/null 2>&1 \
+            || warn "could not detach the virtio-fs share from $DOMAIN;" \
+                    "$VIRTIOFS_LETTER: is still mapped there. Remove it with:" \
+                    "  ${VIRSH[*]} detach-device $DOMAIN --live <the <filesystem> element>"
+    fi
+
+    # Runs even when the detach failed: a share with nothing in it is inert.
+    if [[ -n "$VIRTIOFS_DIR" && -d "$VIRTIOFS_DIR" ]]; then
+        find "$VIRTIOFS_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null \
+            || warn "could not empty the share directory $VIRTIOFS_DIR"
+    fi
+
+    virtiofs_restore_service
 }

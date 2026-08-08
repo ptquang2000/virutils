@@ -163,18 +163,17 @@ gain through a full stop and start. The share is left attached between runs.
 
 ### Everything a transport needs, at create time
 
-A domain from `virutil domain create` needs no further XML: the guest-agent
-channel, the shared-memfd memory backing **and** the virtio-fs share device are
-all in the profile, so the default transport has nothing to attach at all. The
-share directory (`~/.cache/virutil-VM`) is created at the same time, and the
-domain will not start without it — set `VIRUTIL_VIRTIOFS=none` to leave the
-device out.
+A domain from `virutil domain create` carries the *capacity* for every
+transport, not the devices: the guest-agent channel and the shared-memfd memory
+backing are in the profile, because neither can be added to a running domain —
+the channel needs a cold plug and `memoryBacking` a full stop and start.
 
-One thing cannot be pre-declared, by design: the `volume` transport's staging
-disk. It exists to be attached and detached, and a permanently attached one
-would be a second writer on an image the host has to mount. It is hotplugged per
-run and needs no domain preparation — `q35` comes with fourteen `pcie-root-port`s
-and a Windows guest uses six.
+Everything else is hotplugged per run, so a domain that never moves a file
+carries nothing for one. The virtio-fs share device is attached live on first
+use (`~/.cache/virutil-VM`, created then); the `volume` transport's staging disk
+must be, since a permanently attached one would be a second writer on an image
+the host has to mount. Neither needs domain preparation — `q35` comes with
+fourteen `pcie-root-port`s and a Windows guest uses six.
 
 What remains outside the XML entirely is guest-side software: `qemu-ga` (the
 virtio-win MSI), and WinFsp plus the viofs driver for `virtiofs`.
@@ -774,12 +773,11 @@ What the profile actually sets, and why:
    with apps forced closed rather than an ACPI event it may sit on until
    `@shutdown_timeout`. It costs one virtio-serial port, so it is not optional
    and there is no flag to leave it out.
-- **The virtio-fs share device**, pointing at `~/.cache/virutil-VM`, which the
-   default transport then needs no attach for. The directory is created here,
-   and the domain will not start without it —
-   `VIRUTIL_VIRTIOFS=none` leaves the device out, and `VIRUTIL_VIRTIOFS=DIR`
-   puts the share somewhere else. If `virtiofsd` is not installed the device is
-   skipped with a warning rather than failing the create.
+- **No virtio-fs share device.** Only the memfd backing above, which is what
+   actually has to be cold. The device hotplugs, so provisioning one here would
+   put a drive letter in every guest whether or not it ever moves a file, and
+   pin the domain to a share directory it will not start without. The default
+   transport attaches it live on first use instead.
 - **`--network network=default,model=virtio`**, overridable with
    `$VIRUTIL_NETWORK`. On a host where libvirt's default NAT network is not
    available — WSL2 often, where the `nf_nat` modules may be missing — SLIRP
@@ -811,7 +809,6 @@ profile once, or prefix a single `create` with them.
 | `VIRUTIL_NETWORK` | `network=default,model=virtio` | Passed to `virt-install --network`. |
 | `VIRUTIL_FIRMWARE` | `uefi` | `bios` selects SeaBIOS instead. Windows 11 will not install without UEFI. |
 | `VIRUTIL_SHARED_MEMORY` | `1` | `0` leaves guest RAM on private anonymous memory, which makes virtio-fs impossible without a later cold restart. |
-| `VIRUTIL_VIRTIOFS` | `~/.cache/virutil-VM` | Host side of the virtio-fs share. `none` leaves the device out of the domain. |
 
 ```
 VIRUTIL_FIRMWARE=bios VIRUTIL_VIRTIO=none \

@@ -15,7 +15,7 @@
 #                                  cannot answer an interactive prompt
 
 # Windows caps a command line at 32767 chars; cmd.exe caps itself far lower.
-# Both are enforced host-side: overflowing them fails inside the guest as an
+# Enforced host-side: overflowing them fails in the guest as an
 # unrelated-looking spawn error.
 CMDLINE_MAX=32767
 CMD_EXE_MAX=8191
@@ -71,9 +71,9 @@ resolve_text() {
     fi
 }
 
-# powershell serialises its error stream as CLIXML whenever stderr is redirected.
-# Only errors raised outside the ps wrapper's reach get here. Passes the raw text
-# through when python3 is missing rather than making it a hard dependency.
+# powershell serialises its error stream as CLIXML whenever stderr is
+# redirected; only errors outside the ps wrapper's reach get here. Passes the
+# raw text through when python3 is missing rather than depending on it.
 declixml() {
     command -v python3 >/dev/null 2>&1 || { cat; return; }
     python3 -c '
@@ -137,9 +137,9 @@ gexec() {
 # Shared with the transports in modules/xfer.
 exec_ps_text() {
     local SCRIPT ENC
-    # The catch writes to the console handle rather than powershell's error
-    # stream, which would otherwise be serialised as CLIXML; the explicit exit 1
-    # restores the code an uncaught terminating error would have returned.
+    # The catch writes to the console handle, not powershell's error stream,
+    # which would be serialised as CLIXML; the explicit exit 1 restores the code
+    # an uncaught terminating error would have returned.
     SCRIPT=$(printf '%s\n%s\n%s\n%s\n%s\n' \
         '$ProgressPreference="SilentlyContinue";' \
         'try { $Host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size(4096, 2000) } catch {}' \
@@ -179,9 +179,9 @@ exec_main() {
         set -- ${E_REST[@]+"${E_REST[@]}"}
         resolve_text "$@" || { echo "usage: virutil exec cmd VM [-d] CMD..." >&2; exit 1; }
 
-        # qemu-ga backslash-escapes embedded quotes, and cmd.exe has never
-        # understood \" as an escape, so the command would arrive mangled with a
-        # zero exit code. ps encodes to base64 and is immune.
+        # qemu-ga backslash-escapes embedded quotes and cmd.exe has never
+        # understood \" as an escape, so the command arrives mangled with a zero
+        # exit code. ps encodes to base64 and is immune.
         case "$TEXT" in
             *'"'*) echo "virutil exec: cmd cannot carry embedded quotes through cmd.exe; use ps" >&2
                    exit 1 ;;

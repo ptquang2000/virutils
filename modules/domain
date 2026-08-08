@@ -11,13 +11,6 @@ DOMAIN_OVMF=(
     /usr/share/qemu/ovmf-x86_64-code.bin:/usr/share/qemu/ovmf-x86_64-vars.bin
 )
 
-DOMAIN_VIRTIOFSD=(
-    /usr/lib/virtiofsd
-    /usr/libexec/virtiofsd
-    /usr/lib/qemu/virtiofsd
-    /usr/local/libexec/virtiofsd
-)
-
 domain_usage() {
     printf '%s\n' \
         "usage: virutil domain create VM ISO [OPTIONS]" \
@@ -55,8 +48,7 @@ domain_usage() {
         "  VIRUTIL_VIRTIO         (auto)       virtio-win ISO path, or 'none'" \
         "  VIRUTIL_NETWORK        network=default,model=virtio" \
         "  VIRUTIL_FIRMWARE       uefi         or 'bios'" \
-        "  VIRUTIL_SHARED_MEMORY  1            or '0'; virtio-fs needs 1" \
-        "  VIRUTIL_VIRTIOFS       (auto)       share directory, or 'none'" >&2
+        "  VIRUTIL_SHARED_MEMORY  1            or '0'; virtio-fs needs 1" >&2
     exit "${1:-1}"
 }
 
@@ -96,7 +88,7 @@ domain_exists() {
 
 # domain_disks NAME -- file-backed disks, one per line, cdroms excluded. The
 # source is cut off the front of the line rather than taken as $4, so a path
-# containing spaces survives.
+# with spaces survives.
 domain_disks() {
     "${VIRSH[@]}" domblklist "$1" --details 2>/dev/null \
         | awk '$1 == "file" && $2 == "disk" {
@@ -157,9 +149,9 @@ domain_readable_by_qemu() {
     file="$(realpath -- "$file" 2>/dev/null || printf '%s' "$PWD/$file")"
     dir="$(dirname -- "$file")"
     while :; do
-        # The tenth character of the mode string is other-execute: 'x', or 't'
-        # on a sticky world-executable directory. Read from the mode bits rather
-        # than with -x, which answers for the invoking user, not for qemu.
+        # Tenth character of the mode string is other-execute: 'x', or 't' when
+        # sticky. Read from the bits, not -x, which answers for the invoking
+        # user rather than for qemu.
         if [[ ! "$(stat -c '%A' "$dir")" =~ ^.{9}[xt] ]] \
            && ! getfacl -pc -- "$dir" 2>/dev/null | grep -q "^user:$qemu_user:..x"; then
             missing+=("$dir")
@@ -196,15 +188,6 @@ domain_detect_osinfo() {
     printf '%s' "${short:-${VIRUTIL_OSINFO:-win11}}"
 }
 
-domain_virtiofsd() {
-    local p
-    for p in "${DOMAIN_VIRTIOFSD[@]}"; do
-        [[ -x "$p" ]] && { printf '%s' "$p"; return 0; }
-    done
-    command -v virtiofsd 2>/dev/null && return 0
-    return 1
-}
-
 # domain_topology N -- prints "CORES THREADS" for N vcpus. One socket: Windows
 # licences and schedules by socket.
 domain_topology() {
@@ -230,13 +213,12 @@ domain_default_vcpus() {
 
 domain_create() {
     local VM="" ISO="" SIZE=64 MEM="" VCPUS="" IMG="" OSINFO="" DRYRUN=0
-    local VIRTIO NETWORK BIOS=0 SHAREMEM=1 SHAREDIR candidate
+    local VIRTIO NETWORK BIOS=0 SHAREMEM=1 candidate
 
     VIRTIO="${VIRUTIL_VIRTIO:-}"
     NETWORK="${VIRUTIL_NETWORK:-network=default,model=virtio}"
     [[ "${VIRUTIL_FIRMWARE:-uefi}" == bios ]] && BIOS=1
     [[ "${VIRUTIL_SHARED_MEMORY:-1}" == 0 ]] && SHAREMEM=0
-    SHAREDIR="${VIRUTIL_VIRTIOFS:-}"
 
     while (( $# )); do
         case "$1" in
@@ -308,27 +290,11 @@ domain_create() {
     )
 
     # memoryBacking is a cold setting: without a shared memfd here, virtio-fs
-    # later costs a full stop and start, not a reboot.
+    # later costs a full stop and start, not a reboot. The share device itself
+    # is not provisioned -- it hotplugs, and one in the XML would put a drive
+    # letter in every guest whether or not it ever moves a file.
     if (( SHAREMEM )); then
         ARGS+=(--memorybacking access.mode=shared,source.type=memfd)
-    fi
-
-    if [[ "$SHAREDIR" != none ]] && (( SHAREMEM )); then
-        local vfsd
-        if vfsd="$(domain_virtiofsd)"; then
-            SHAREDIR="${SHAREDIR:-${XDG_CACHE_HOME:-$HOME/.cache}/virutil-$VM}"
-            # The domain will not start if the source directory is missing.
-            (( DRYRUN )) || mkdir -p "$SHAREDIR" \
-                || die "could not create the share directory $SHAREDIR"
-            ARGS+=(--filesystem "type=mount,accessmode=passthrough,driver.type=virtiofs,driver.queue=1024,binary.path=$vfsd,source.dir=$SHAREDIR,target.dir=$XFER_TAG")
-        else
-            SHAREDIR=none
-            warn "virtiofsd is not installed, so the domain gets no virtio-fs share." \
-                 "Install it (package 'virtiofsd') and recreate the domain, or use" \
-                 "virutil push/pull/sync --transport volume."
-        fi
-    else
-        SHAREDIR=none
     fi
 
     if (( BIOS )); then
@@ -359,9 +325,9 @@ domain_create() {
 
     if [[ "$OSINFO" == win* ]]; then
         # Without synic/stimer the guest's timer interrupts round-trip through
-        # the hypervisor and an idle desktop burns real host CPU. evmcs and avic
-        # are off: avic is AMD-only and evmcs needs nested VMX exposed, so on the
-        # wrong host they produce a domain that refuses to start.
+        # the hypervisor and an idle desktop burns host CPU. evmcs and avic are
+        # off: avic is AMD-only and evmcs needs nested VMX, so on the wrong host
+        # they produce a domain that refuses to start.
         ARGS+=(--features "hyperv.relaxed.state=on,hyperv.vapic.state=on,hyperv.spinlocks.state=on,hyperv.spinlocks.retries=8191,hyperv.vpindex.state=on,hyperv.runtime.state=on,hyperv.synic.state=on,hyperv.stimer.state=on,hyperv.stimer.direct.state=on,hyperv.frequencies.state=on,hyperv.tlbflush.state=on,hyperv.ipi.state=on,hyperv.reenlightenment.state=on,hyperv.reset.state=on,hyperv.evmcs.state=off,hyperv.avic.state=off")
         ARGS+=(--clock hypervclock_present=yes,rtc_tickpolicy=catchup,hpet_present=no)
     fi
@@ -401,14 +367,13 @@ domain_create() {
     local memnote=""
     (( SHAREMEM )) && memnote=" (shared memfd)"
     say "memory:  ${MEM} MiB$memnote"
-    [[ "$SHAREDIR" != none ]] && say "share:   $SHAREDIR (virtio-fs, tag $XFER_TAG)"
     say "disk:    $IMG (${SIZE} GiB)"
     say "iso:     $ISO"
     [[ -n "$VIRTIO" ]] && say "virtio:  $VIRTIO"
 
-    # cluster_size=1M keeps the L2 metadata of a 64 GiB image small enough to
-    # stay cached; preallocation=metadata keeps the guest's first write into a
-    # region from stalling behind table allocation. lazy_refcounts trades a
+    # cluster_size=1M keeps a 64 GiB image's L2 metadata small enough to stay
+    # cached; preallocation=metadata stops the guest's first write into a region
+    # stalling behind table allocation. lazy_refcounts trades a
     # `qemu-img check -r all` after an unclean shutdown for faster writes.
     local -a IMGSUDO=()
     [[ -w "$(dirname -- "$IMG")" ]] || IMGSUDO=("${SUDO[@]}")
@@ -544,7 +509,7 @@ domain_delete() {
     [[ -n "$VM" ]] || domain_usage
     domain_exists "$VM" || die "no such domain: $VM"
 
-    # Built while the XML still exists, and shown before anything is destroyed:
+    # Built while the XML still exists and shown before anything is destroyed:
     # unlinking a qcow2 is the one step here nothing undoes.
     local -a REMOVE=() SHARED=()
     local disk member

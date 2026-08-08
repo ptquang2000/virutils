@@ -109,8 +109,8 @@ wait_sysfs() {
 
 domstate() { "${VIRSH[@]}" domstate "$VM" 2>/dev/null | head -1; }
 
-# checked before anything else touches Windows, so a mistyped VM name cannot cost a
-# UAC prompt first and then fail at the last stage
+# checked before anything touches Windows, so a mistyped VM name cannot cost a
+# UAC prompt and then fail at the last stage
 require_domain() {
     "${VIRSH[@]}" domstate "$VM" >/dev/null 2>&1 ||
         die "no such VM: $VM (see: virsh -c qemu:///system list --all)"

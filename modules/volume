@@ -4,9 +4,9 @@
 #   host --(rsync over qemu-nbd)--> scratch qcow2 --(hotplug)--> guest
 #                                                --(robocopy)--> C:\
 #
-# Needs nothing installed in the guest beyond the agent. Every byte is written
-# twice, and the two sides must take strict turns -- two writers on one qcow2 is
-# the one unrecoverable mistake available here, so the sequence is enforced:
+# Needs nothing in the guest beyond the agent. Every byte is written twice, and
+# the two sides must take strict turns -- two writers on one qcow2 is the one
+# unrecoverable mistake available here, so the sequence is enforced:
 #
 #   1. the image is provably not attached to the domain   (volume_open)
 #   2. host: qemu-nbd -c, mount, the caller's copy phase
@@ -14,12 +14,10 @@
 #   4. guest: attach-device --live, read-only for a write run
 #   5. guest: robocopy, then detach-device --live
 #
-# Step 4's read-only is not a formality: Windows then cannot dirty the
-# filesystem. The read direction has to write, so it flushes and offlines the
-# volume in the guest before the detach.
+# Step 4's read-only stops Windows dirtying the filesystem. The read direction
+# has to write, so it flushes and offlines the volume before the detach.
 #
-# The staging image is created once per domain and kept: formatting is the slow
-# part and an empty qcow2 costs nothing to leave lying around.
+# The image is created once per domain and kept: formatting is the slow part.
 
 VOLUME_DIR=/var/lib/libvirt/images
 VOLUME_SIZE=16                 # GiB, sparse -- an upper bound, not an allocation
@@ -29,14 +27,13 @@ VOLUME_ATTACHED=0
 VOLUME_MODE=""
 VOLUME_FS=""                   # exfat or ntfs, decided by what the host can make
 
-# Per domain, not shared: two runs against two guests must not queue behind
-# each other, and the disk is attached by path.
+# Per domain: two runs against two guests must not queue behind each other.
 volume_image() {
     printf '%s/%s-xfer.qcow2' "$VOLUME_DIR" "$DOMAIN"
 }
 
-# The first free virtio target; anything already in the domain is skipped so a
-# leftover from an interrupted run cannot be shadowed by a second attach.
+# The first free virtio target: a leftover from an interrupted run must not be
+# shadowed by a second attach.
 volume_free_target() {
     local used letter
     used="$("${VIRSH[@]}" domblklist "$DOMAIN" 2>/dev/null | awk 'NR>2 {print $1}')"
@@ -68,7 +65,7 @@ EOF
 # --- image lifecycle --------------------------------------------------------
 
 # exFAT first: in-kernel on the host, where NTFS is FUSE, and Windows reads
-# both. With no mkfs at all the guest formats it.
+# both. With no mkfs at all, the guest formats it.
 volume_pick_fs() {
     if command -v mkfs.exfat >/dev/null; then VOLUME_FS=exfat
     elif command -v mkfs.ntfs >/dev/null || command -v mkntfs >/dev/null; then VOLUME_FS=ntfs
@@ -223,14 +220,13 @@ volume_open() {
 
     say "staging: $MNT ($fstype, $(nbd_part_size "$part") GiB)"
 
-    # The image is kept between runs, its contents are not: delivery is a
-    # robocopy of the whole tree onto C:.
+    # The image is kept between runs, its contents are not.
     find "$MNT" -mindepth 1 -maxdepth 1 \
          ! -name 'System Volume Information' -exec rm -rf -- {} + 2>/dev/null || true
 }
 
 # volume_handoff READONLY -- release the volume host-side and give it to the
-# guest, verified from /proc/mounts and sysfs rather than from exit codes.
+# guest, verified from /proc/mounts and sysfs rather than exit codes.
 volume_handoff() {
     local readonly="$1"
 
@@ -243,8 +239,8 @@ volume_handoff() {
     fi
     sync
 
-    # An if, not a chain: under set -e the chain's status with both probes false
-    # would take the run down at the moment everything is fine.
+    # An if, not a chain: under set -e a chain with both probes false would
+    # take the run down at the moment everything is fine.
     if mnt_mounted || nbd_attached; then
         die "the staging volume is still held by the host ($MNT / $NBD);" \
             "refusing to hand it to $DOMAIN -- two writers on one image" \
@@ -259,11 +255,20 @@ volume_handoff() {
 }
 
 # Flush the guest's cache and take the volume offline, so the filesystem is
-# closed before the device disappears underneath it.
+# closed before the device disappears underneath it. The drive letter goes back
+# first: Windows remembers an assignment long after the disk behind it has gone.
 volume_release_in_guest() {
     xfer_ps '
 try { Get-Volume -FileSystemLabel "'"$XFER_LABEL"'" -ErrorAction SilentlyContinue |
       Write-VolumeCache -ErrorAction SilentlyContinue } catch {}
+try {
+  $lv = Get-Volume -FileSystemLabel "'"$XFER_LABEL"'" -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+  if ($lv -and $lv.DriveLetter) {
+    Get-Partition -DriveLetter $lv.DriveLetter -ErrorAction Stop |
+      Remove-PartitionAccessPath -AccessPath ($lv.DriveLetter + ":\") -ErrorAction Stop
+  }
+} catch {}
 # By serial or label only, not the RAW fallback the format path uses: on a
 # guest with another blank disk that would offline the wrong one.
 $d = Get-Disk | Where-Object { $_.SerialNumber -like "*'"$XFER_LABEL"'*" } | Select-Object -First 1
@@ -299,8 +304,8 @@ volume_detach() {
 
 # --- the transport contract -------------------------------------------------
 
-# Write: hand the filled volume over read-only, robocopy its whole tree onto
-# C:\, take it back. The tree under MNT is already C:-shaped.
+# Hand the filled volume over read-only, robocopy its tree onto C:\, take it
+# back. The tree under MNT is already C:-shaped.
 volume_deliver() {
     local letter
     volume_handoff readonly
@@ -317,9 +322,9 @@ volume_deliver() {
     say "delivered -> $DOMAIN"
 }
 
-# Read: hand an empty volume over read-write, have the guest fill it from the
-# named C:-relative paths, take it back and mount it. Each pattern keeps its
-# position under the root, so MNT has the shape the disk transport would show.
+# Hand an empty volume over read-write, have the guest fill it from the named
+# C:-relative paths, take it back and mount it. Each pattern keeps its position
+# under the root, so MNT has the shape the disk transport would show.
 volume_collect() {
     local letter pat script sep
     volume_handoff ""
@@ -372,7 +377,7 @@ if ($copied -eq 0) { throw "nothing matched in the guest" }'
 }
 
 # Teardown, from the EXIT trap: the run must not end with the volume mounted
-# here *and* attached there. Host side first -- it blocks the next run.
+# here *and* attached there. Host side first, since it blocks the next run.
 volume_close() {
     (( XFER_ARMED )) || return 0
 

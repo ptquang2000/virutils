@@ -19,8 +19,8 @@ push_usage() {
 
 # Normalise a guest-side DST into a C:-relative path: strip a drive prefix, turn
 # backslashes into slashes, drop empty and '.' components, refuse '..' so the
-# destination can never resolve outside the mount point. The trailing slash that
-# marks a directory is handled by the caller before this strips it.
+# destination can never resolve outside the mount point. The caller handles the
+# trailing slash that marks a directory before this strips it.
 push_norm_dst() {
     local s="$1" out="" comp
     s="${s#[Cc]:}"
@@ -70,8 +70,6 @@ push_main() {
     push_copy "$SRC" "$DST"
 
     xfer_deliver
-
-    # Teardown happens in the EXIT trap.
     echo "copied -> $DOMAIN"
 }
 

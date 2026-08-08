@@ -27,8 +27,8 @@ xfer_transport_help() {
         "                                      qemu-nbd (a write shuts it down)"
 }
 
-# Escalate the handful of commands that genuinely need root, never the whole
-# run: under sudo $HOME is root's, so config discovery would read /root.
+# Escalate only what needs root: under sudo $HOME is root's, so config
+# discovery would read /root.
 xfer_privilege() {
     [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] \
         && die "do not run virutil under sudo -- run it as yourself." \
@@ -40,16 +40,16 @@ xfer_running() {
     [[ "$("${VIRSH[@]}" domstate "$1" 2>/dev/null)" == running ]]
 }
 
-# Probed with guest-ping rather than read from the channel's XML state: the
-# channel reads 'connected' with nothing listening on the other side.
+# guest-ping, not the channel's XML state: the channel reads 'connected' with
+# nothing listening on the other side.
 xfer_agent_ok() {
     "${VIRSH[@]}" qemu-agent-command "$1" '{"execute":"guest-ping"}' \
         >/dev/null 2>&1
 }
 
 # xfer_select MODE REQUEST -- validate the transport before anything is touched.
-# There is no fallback: a transport that cannot work is an error naming the fix,
-# never a silent downgrade that turns "copy a file" into "reboot Windows".
+# No fallback: a transport that cannot work is an error naming the fix, never a
+# silent downgrade that turns "copy a file" into "reboot Windows".
 xfer_select() {
     XFER_MODE="$1"
     local want="${2:-$XFER_DEFAULT}" dom="$DOMAIN"
@@ -82,8 +82,7 @@ xfer_select() {
 # --- dispatch ---------------------------------------------------------------
 #
 # One EXIT trap for the whole run, armed by whichever open() succeeded. Backend
-# state lives at module scope: the trap fires after the main has returned and
-# set -u must not trip on it.
+# state lives at module scope: the trap fires after the main has returned.
 
 xfer_open() {
     XFER_MODE=write
@@ -148,7 +147,7 @@ nbd_connect() {
 }
 
 # nbd_find_part TYPE... -- the largest partition on $NBD whose filesystem is one
-# of TYPE. Probed with blkid directly: lsblk's FSTYPE column can lag behind udev.
+# of TYPE. blkid directly: lsblk's FSTYPE column can lag behind udev.
 nbd_find_part() {
     local dev fstype size want=" $* " best=0 part=""
     for dev in "$NBD"p*; do
@@ -170,7 +169,7 @@ nbd_part_size() {
 # --- guest-side primitives --------------------------------------------------
 
 # xfer_ps SCRIPT -- run SCRIPT in the guest via modules/exec. Bash scoping is
-# dynamic, so setting VM here reaches gexec().
+# dynamic, so VM set here reaches gexec().
 xfer_ps() {
     VM="$DOMAIN"
     DETACH=0
@@ -180,6 +179,10 @@ xfer_ps() {
 # The letter Windows gave a volume, by label, or nothing. Polled: a hotplugged
 # disk takes a moment to be enumerated and assigned one. Also brings the disk
 # online (Windows' SAN policy) and assigns a letter if it came up without one.
+#
+# Both of those are scoped to the staging disk. Windows keeps an online state
+# and a letter assignment in the registry, so doing either to a disk a file copy
+# was not asked to touch is a permanent change to the guest.
 xfer_drive_letter() {
     local tries="${1:-30}"
     xfer_ps '
@@ -188,14 +191,29 @@ do {
   $v = Get-Volume -FileSystemLabel "'"$XFER_LABEL"'" -ErrorAction SilentlyContinue |
        Select-Object -First 1
   if ($v -and $v.DriveLetter) { Write-Output $v.DriveLetter; exit 0 }
-  foreach ($d in (Get-Disk -ErrorAction SilentlyContinue | Where-Object { $_.IsOffline })) {
-    try { Set-Disk -Number $d.Number -IsOffline $false -ErrorAction Stop } catch {}
+
+  # By serial, then by the labelled volume -- never the RAW fallback, which
+  # names any unformatted disk and so is not an identity.
+  $disk = Get-Disk -ErrorAction SilentlyContinue |
+          Where-Object { $_.SerialNumber -like "*'"$XFER_LABEL"'*" } | Select-Object -First 1
+  if (-not $disk -and $v) {
+    # Matched on the volume path: the volume has no letter to look it up by yet.
+    $disk = Get-Partition -ErrorAction SilentlyContinue |
+            Where-Object { $_.AccessPaths -contains $v.Path } |
+            Get-Disk -ErrorAction SilentlyContinue | Select-Object -First 1
   }
-  if ($v -and -not $v.DriveLetter) {
-    try {
-      Get-Partition | Where-Object { $_.AccessPaths -and -not $_.DriveLetter } |
-        Add-PartitionAccessPath -AssignDriveLetter -ErrorAction Stop
-    } catch {}
+
+  if ($disk) {
+    if ($disk.IsOffline) {
+      try { Set-Disk -Number $disk.Number -IsOffline $false -ErrorAction Stop } catch {}
+    }
+    if ($v -and -not $v.DriveLetter) {
+      try {
+        Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue |
+          Where-Object { -not $_.DriveLetter -and $_.Type -ne "Reserved" } |
+          Add-PartitionAccessPath -AssignDriveLetter -ErrorAction Stop
+      } catch {}
+    }
   }
   Start-Sleep -Milliseconds 500
 } while ((Get-Date) -lt $deadline)
@@ -207,8 +225,7 @@ xfer_ps_quote() { printf '%s' "${1//\'/\'\'}"; }
 
 # xfer_empty_guest_dirs PATTERN... -- sync's cleanup rules, run inside the guest
 # (the live transports hold what we are *sending*, not the guest's C:).
-# A pattern must be at least two levels down, so a mistyped one cannot empty C:\
-# or a top-level directory.
+# Two levels down minimum, so a mistyped pattern cannot empty C:\.
 xfer_empty_guest_dirs() {
     local pat script rel sep=""
     script='$ErrorActionPreference = "Stop"
@@ -236,8 +253,8 @@ exit 0'
 
 # A powershell fragment leaving the staging disk in $disk, or $null. Three
 # probes, because none holds alone: virtio-blk does not always surface libvirt's
-# <serial>, a freshly created image has no label, and 'the raw one' is only
-# unambiguous while unformatted.
+# <serial>, a fresh image has no label, and 'the raw one' only holds while
+# nothing else is unformatted.
 xfer_ps_find_disk() {
     printf '%s' '
 $disk = Get-Disk | Where-Object { $_.SerialNumber -like "*'"$XFER_LABEL"'*" } | Select-Object -First 1
