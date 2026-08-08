@@ -1,0 +1,80 @@
+name: release
+
+# Tag and push to cut a release:
+#
+#   git tag -a v1.0.0 -m 'v1.0.0' && git push origin v1.0.0
+#
+# The job syntax-checks every shell file, builds a tarball that unpacks into
+# virutil-<version>/ (so `tar xf ... && cd virutil-<version> && ./install.sh`
+# works the same as a checkout), and publishes it with generated notes.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'existing tag to build a release from (e.g. v1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "name=virutil-${tag#v}" >> "$GITHUB_OUTPUT"
+
+      # Nothing here has a build step, so the only pre-release gate that means
+      # anything is that the scripts parse. bash for the driver and its modules,
+      # zsh for the completion, which is not bash-parseable.
+      - name: Syntax check
+        run: |
+          sudo apt-get install -y --no-install-recommends zsh shellcheck >/dev/null
+          bash -n virutil install.sh
+          for m in modules/*; do bash -n "$m"; done
+          zsh -n completions/_virutil
+          # Files are named explicitly: the modules are sourced fragments with no
+          # shebang, and the completion is zsh, which shellcheck cannot parse at
+          # all. Errors only -- the warning level is all false positives here
+          # (comma-separated virt-install arguments, cross-module variables).
+          shellcheck -s bash -S error -e SC1090,SC1091 virutil install.sh modules/*
+
+      - name: Build tarball
+        id: build
+        run: |
+          name='${{ steps.version.outputs.name }}'
+          mkdir -p "dist/$name"
+          cp -r virutil install.sh modules completions README.md LICENSE "dist/$name/"
+          tar -C dist -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          tar -tzf "$name.tar.gz"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag='${{ steps.version.outputs.tag }}'
+          name='${{ steps.version.outputs.name }}'
+          # Re-running the dispatch for a tag that already has a release should
+          # refresh the assets rather than fail on the create.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$name.tar.gz" "$name.tar.gz.sha256" --clobber
+          else
+            gh release create "$tag" \
+              --title "$tag" \
+              --generate-notes \
+              "$name.tar.gz" "$name.tar.gz.sha256"
+          fi
