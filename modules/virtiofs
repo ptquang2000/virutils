@@ -1,0 +1,275 @@
+# virtiofs -- the shared-directory transport: a host directory the running guest
+# sees live. Sourced by virutil; driven through modules/xfer.
+#
+#   host dir <--(virtiofsd, vhost-user)--> guest drive letter --(robocopy)--> C:\
+#
+# The fastest of the three and the only one where both sides hold the same bytes
+# at once, so nothing is copied twice and neither side has to wait for the
+# other. What it costs is setup, and the setup is the reason it is never chosen
+# automatically unless it is already in place:
+#
+#   host   virtiofsd, and libvirt spawning it for a <filesystem> device
+#   guest  WinFsp, plus the viofs driver and its VirtioFsSvc service
+#   domain guest RAM on a shared memfd -- vhost-user maps the guest's memory
+#          directly, and memoryBacking is a cold setting: adding it to an
+#          existing domain costs a full stop and start, not a reboot
+#
+# `virutil domain create` sets the memory backing up by default, so a domain
+# made by this tool is one `virtiofs_setup` away. An older one needs the cold
+# restart once, and says so.
+#
+# The share itself is left attached between runs -- it is the expensive part and
+# it costs nothing idle, which is the whole point of choosing this transport.
+
+VIRTIOFS_DIR=""                # the host side of the share
+VIRTIOFS_CACHE=auto            # auto is coherent enough for a host that writes
+VIRTIOFS_QUEUE=1024
+VIRTIOFS_LETTER=""
+VIRTIOFS_SENTINEL=".virutil-xfer"   # how the guest recognises the share; see below
+
+# libvirt only finds virtiofsd where it was built to look, and distros disagree
+# (Arch /usr/lib, Fedora /usr/libexec), so the path goes into the XML explicitly
+# and a host without it fails here, with a message, instead of at attach time.
+VIRTIOFS_BINARY=(
+    /usr/lib/virtiofsd
+    /usr/libexec/virtiofsd
+    /usr/lib/qemu/virtiofsd
+    /usr/local/libexec/virtiofsd
+)
+
+virtiofs_host_dir() {
+    printf '%s/virutil-%s' "${XDG_CACHE_HOME:-$HOME/.cache}" "$DOMAIN"
+}
+
+virtiofs_binary() {
+    local p
+    for p in "${VIRTIOFS_BINARY[@]}"; do
+        [[ -x "$p" ]] && { printf '%s' "$p"; return 0; }
+    done
+    command -v virtiofsd 2>/dev/null && return 0
+    die "virtiofsd not found in any of:" \
+        "$(printf '  %s\n' "${VIRTIOFS_BINARY[@]}")" \
+        "Install it (package 'virtiofsd' on Arch, 'virtiofsd'/'qemu-virtiofsd'" \
+        "elsewhere), or use --transport volume, which needs nothing new."
+}
+
+# Guest RAM the host can map. Without it a vhost-user device cannot attach at
+# all: virtiofsd maps the guest's memory directly, and private anonymous memory
+# cannot be handed to another process.
+virtiofs_shared_mem() {
+    "${VIRSH[@]}" dumpxml "$@" 2>/dev/null | grep -q "<access mode='shared'/>"
+}
+
+# The <cache> element is emitted only for the two modes libvirt's schema
+# accepts. virtiofsd itself understands auto|always|never, but libvirt's XML
+# enum is none|always and rejects the domain outright otherwise:
+#
+#   XML error: Invalid value for attribute 'mode' in element 'cache': 'auto'
+#
+# 'auto' is virtiofsd's own default, so the way to ask for it is to say nothing
+# -- which is what VIRTIOFS_CACHE=auto does here.
+virtiofs_fs_xml() {
+    local cache=""
+    case "$VIRTIOFS_CACHE" in
+        auto)         cache="" ;;
+        none|always)  cache="
+    <cache mode='$VIRTIOFS_CACHE'/>" ;;
+        *) die "virtiofs cache mode must be auto, none or always, got '$VIRTIOFS_CACHE'" ;;
+    esac
+    cat <<EOF
+<filesystem type='mount' accessmode='passthrough'>
+  <driver type='virtiofs' queue='$VIRTIOFS_QUEUE'/>
+  <binary path='$1'>$cache
+  </binary>
+  <source dir='$2'/>
+  <target dir='$XFER_TAG'/>
+</filesystem>
+EOF
+}
+
+# What detach and the presence check use: libvirt matches a filesystem device by
+# its target, and every other attribute is one more thing that can differ from
+# what is actually attached.
+virtiofs_match_xml() {
+    cat <<EOF
+<filesystem type='mount' accessmode='passthrough'>
+  <source dir='$1'/>
+  <target dir='$XFER_TAG'/>
+</filesystem>
+EOF
+}
+
+virtiofs_attached() {
+    "${VIRSH[@]}" dumpxml "$@" 2>/dev/null | grep -q "<target dir='$XFER_TAG'/>"
+}
+
+# virtiofs_setup -- attach the share, live and persistent. Idempotent, and
+# separated from open() so `virutil share`-shaped one-off setup and a transport
+# run reach it the same way.
+virtiofs_setup() {
+    local dir="$1" binary xml
+    binary="$(virtiofs_binary)" || exit 1
+
+    mkdir -p "$dir"
+
+    if ! virtiofs_shared_mem "$DOMAIN"; then
+        die "$DOMAIN is running without shared memory backing, so a virtio-fs" \
+            "device cannot attach to it: virtiofsd has to map the guest's RAM." \
+            "This is a cold setting -- a reboot from inside the guest will not" \
+            "pick it up. Fix it once:" \
+            "  virt-xml --connect qemu:///system $DOMAIN --edit --define \\" \
+            "     --memorybacking access.mode=shared,source.type=memfd" \
+            "  virutil domain shutdown $DOMAIN && virutil domain start $DOMAIN" \
+            "Or use --transport volume, which needs no restart at all."
+    fi
+
+    xml="$(virtiofs_fs_xml "$binary" "$dir")"
+    virtiofs_attached "$DOMAIN" \
+        || printf '%s\n' "$xml" | "${VIRSH[@]}" attach-device "$DOMAIN" --live /dev/stdin \
+        || die "could not attach the virtio-fs share to $DOMAIN"
+    virtiofs_attached --inactive "$DOMAIN" \
+        || printf '%s\n' "$xml" | "${VIRSH[@]}" attach-device "$DOMAIN" --config /dev/stdin \
+        || warn "the share is live but could not be written to $DOMAIN's config;" \
+                "it will not survive a restart"
+}
+
+# The guest half. VirtioFsSvc is the virtio-win viofs service; it maps each tag
+# to a drive letter, highest free first. Starting it here is what makes the
+# share turn up without anyone logging in.
+virtiofs_start_service() {
+    local out
+    out="$(VM="$DOMAIN"; DETACH=0; gexec sc.exe '["query","VirtioFsSvc"]' 2>&1)" || {
+        die "$DOMAIN has no VirtioFsSvc service, so nothing in the guest is" \
+            "listening for the share. Install, in this order:" \
+            "  1. WinFsp                 https://winfsp.dev" \
+            "  2. the viofs driver from the virtio-win ISO (viofs\\<os>\\amd64)" \
+            "Then run this again -- or use --transport volume, which needs neither."
+    }
+    case "$out" in
+        *RUNNING*) ;;
+        *)  VM="$DOMAIN"; DETACH=0
+            gexec sc.exe '["config","VirtioFsSvc","start=","auto"]' >/dev/null 2>&1 || true
+            gexec sc.exe '["start","VirtioFsSvc"]' >/dev/null \
+                || die "could not start VirtioFsSvc in $DOMAIN; check it in the" \
+                       "guest (services.msc) and that WinFsp is installed"
+            ;;
+    esac
+}
+
+# Which letter the tag landed on. The client takes the highest free letter, so
+# it moves as drives come and go and must be asked for every run rather than
+# assumed.
+#
+# Found by looking for a file the host just wrote into the share, rather than by
+# interrogating the drive's metadata: a WinFsp volume's DisplayRoot, Description
+# and ProviderName are whatever the client chose to report, and none of them is
+# guaranteed to mention the tag. A file the host put there a moment ago is not
+# ambiguous, and proves the share works in the same breath -- which is the thing
+# the caller actually needs to know.
+virtiofs_letter() {
+    xfer_ps '
+$deadline = (Get-Date).AddSeconds(20)
+do {
+  foreach ($d in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+    try {
+      if (Test-Path -LiteralPath (Join-Path ($d.Name + ":\") "'"$VIRTIOFS_SENTINEL"'")) {
+        Write-Output $d.Name; exit 0
+      }
+    } catch {}
+  }
+  Start-Sleep -Milliseconds 500
+} while ((Get-Date) -lt $deadline)
+exit 1' 2>/dev/null | tr -d '[:space:]'
+}
+
+# --- the transport contract -------------------------------------------------
+
+# There is no host-side lifecycle to speak of: the share is a directory. What
+# open() does is make sure it exists, is attached, and has a client in the guest
+# holding a letter -- because a run that discovers otherwise after the copy
+# phase has wasted the copy.
+virtiofs_open() {
+    xfer_privilege
+    command -v rsync >/dev/null || die "rsync not installed"
+
+    VIRTIOFS_DIR="$(virtiofs_host_dir)"
+    virtiofs_setup "$VIRTIOFS_DIR"
+    virtiofs_start_service
+
+    MNT="$VIRTIOFS_DIR"
+
+    # Every run starts from an empty share, in both directions: delivery is a
+    # robocopy of the whole tree onto C:, so anything left over from last run
+    # would be delivered again. Done before the sentinel is written, since that
+    # is the one file that has to survive the sweep.
+    find "$MNT" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
+
+    # The marker the guest finds the drive letter by. Rewritten every run so a
+    # stale share from a previous domain cannot be mistaken for this one.
+    printf '%s\n' "$DOMAIN" > "$MNT/$VIRTIOFS_SENTINEL"
+
+    VIRTIOFS_LETTER="$(virtiofs_letter)"
+    [[ -n "$VIRTIOFS_LETTER" ]] \
+        || die "the share is attached and VirtioFsSvc is running, but no drive" \
+               "letter in $DOMAIN maps to '$XFER_TAG'. Check it in the guest:" \
+               "  virutil exec ps $DOMAIN Get-PSDrive"
+
+    trap xfer_close EXIT
+    XFER_ARMED=1
+
+    say "share:  $MNT  ->  $VIRTIOFS_LETTER: in $DOMAIN"
+}
+
+# The tree under MNT is already C:-shaped, so one robocopy of the share's root
+# reproduces every mapping the copy phase made -- the same trick the volume
+# transport uses, minus the handover.
+virtiofs_deliver() {
+    say "guest: $VIRTIOFS_LETTER: -> C:\\"
+    # /XF the sentinel: it is ours, and copying it to the root of C: would be a
+    # stray dotfile in the guest for no reason.
+    xfer_robocopy "$VIRTIOFS_LETTER:\\" "C:\\" /XF "$VIRTIOFS_SENTINEL" \
+        || die "robocopy failed inside $DOMAIN"
+    say "delivered -> $DOMAIN"
+}
+
+virtiofs_collect() {
+    local pat script sep
+    say "guest: C:\\ -> $VIRTIOFS_LETTER:"
+
+    script='$ErrorActionPreference = "Stop"
+$copied = 0
+foreach ($p in @('
+    # Joined with a separator *between* items, never after the last one:
+    # powershell parses @('a','b',) as an error, not as a two-element array.
+    local sep=""
+    for pat in "$@"; do
+        script+="$sep'$(xfer_ps_quote "$pat")'"; sep=","
+    done
+    script+=')) {
+  $src = Join-Path "C:\" $p
+  foreach ($item in @(Get-Item -Path $src -ErrorAction SilentlyContinue)) {
+    if (-not $item) { continue }
+    $rel = $item.FullName.Substring(3)
+    $dst = Join-Path "'"$VIRTIOFS_LETTER"':\" $rel
+    if ($item.PSIsContainer) {
+      $null = robocopy $item.FullName $dst /E /NJH /NJS /NP /NDL /R:1 /W:1
+      if ($LASTEXITCODE -ge 8) { throw "robocopy $($item.FullName) failed ($LASTEXITCODE)" }
+    } else {
+      $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dst)
+      Copy-Item -LiteralPath $item.FullName -Destination $dst -Force
+    }
+    $copied++
+  }
+}
+Write-Output "collected $copied item(s)"
+if ($copied -eq 0) { throw "nothing matched in the guest" }'
+
+    xfer_ps "$script" || die "collecting from $DOMAIN failed"
+}
+
+# Nothing to undo: the share stays attached on purpose. Setting it up is the
+# expensive part of this transport, and an idle share costs nothing -- detaching
+# it after every run would turn the fastest transport into the slowest.
+virtiofs_close() {
+    :
+}

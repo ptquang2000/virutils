@@ -1,7 +1,7 @@
 # push -- copy a file or directory from the host into a guest's C: drive on
 # demand, with no config file. Sourced by virutil; entry point is push_main.
 # Usage:
-#   virutil push VM SRC DST    -- run as yourself, NOT under sudo.
+#   virutil push VM SRC DST [--transport T]  -- as yourself, NOT under sudo.
 #
 # SRC is a path on the host; DST is a path inside the guest, relative to the
 # root of C:. Both may be files or directories. The shapes follow rsync's own
@@ -22,23 +22,27 @@
 # of C:. A DST containing '..' is refused, so a mistyped path can never write
 # outside the mount point.
 #
-# The guest is shut down if running, its disk attached with qemu-nbd, the NTFS
-# mounted, the copy made, and the guest returned to the power state it started
-# in -- the same offline machinery virutil sync uses, shared in modules/guest.
+# The transport decides what happens next, and by default the guest keeps
+# running: a staging volume or a virtio-fs share carries the file in while
+# Windows is up. --transport disk is the offline path -- shut the guest down,
+# attach its disk with qemu-nbd, mount the NTFS, copy, and return it to the
+# power state it started in, the machinery virutil sync has always used.
+# See modules/xfer.
 
 push_usage() {
     printf '%s\n' \
-        "usage: virutil push VM SRC DST" \
+        "usage: virutil push VM SRC DST [--transport T]" \
         "" \
         "  VM   libvirt domain whose disk is written" \
         "  SRC  host file or directory to copy" \
         "  DST  guest path, relative to C:\\; a trailing slash means a" \
         "       directory, exactly as with rsync. Backslashes and a C:\\" \
         "       prefix are tolerated; '..' is refused." \
+        "$(xfer_transport_help)" \
         "  -h, --help   this message" \
         "" \
-        "A directory source is copied recursively. The guest is shut down and" \
-        "restored afterwards; see the sync notes in README.md." >&2
+        "A directory source is copied recursively. Only the disk transport" \
+        "shuts the guest down; see README.md." >&2
     exit "${1:-1}"
 }
 
@@ -66,25 +70,43 @@ push_norm_dst() {
 }
 
 push_main() {
-    local VM SRC DST
+    local VM="" SRC="" DST="" TRANSPORT=auto
 
-    case "${1:-}" in
-        -h|--help) push_usage 0 ;;
-    esac
-    (( $# >= 3 )) || push_usage
-    VM="$1"; SRC="$2"; DST="$3"
-    (( $# == 3 )) || { warn "unexpected argument: $4"; push_usage; }
+    while (( $# )); do
+        case "$1" in
+            --transport) TRANSPORT="${2:?--transport needs a value}"; shift 2 ;;
+            -h|--help)   push_usage 0 ;;
+            -*)          warn "unrecognised argument: $1"; push_usage ;;
+            *)
+                if   [[ -z "$VM"  ]]; then VM="$1"
+                elif [[ -z "$SRC" ]]; then SRC="$1"
+                elif [[ -z "$DST" ]]; then DST="$1"
+                else warn "unexpected argument: $1"; push_usage
+                fi
+                shift ;;
+        esac
+    done
+    [[ -n "$VM" && -n "$SRC" && -n "$DST" ]] || push_usage
 
     [[ -e "$SRC" ]] || die "source not found: $SRC"
     [[ -r "$SRC" ]] || die "source not readable: $SRC"
 
     DOMAIN="$VM"
+    domain_exists "$DOMAIN" || die "no such domain: $DOMAIN (see: virutil domain list)"
 
-    guest_open
+    # Which transport is decided before anything is opened, so a run that cannot
+    # work says so while the guest is still untouched.
+    xfer_select write "$TRANSPORT"
+    xfer_open
 
+    # The copy phase is the same for all three: MNT is a C:-shaped tree, whether
+    # that is the guest's real C: (disk), a staging volume, or a share.
     push_copy "$SRC" "$DST"
 
-    # The unmount, detach and restart happen in guest_finish(), on the way out.
+    xfer_deliver
+
+    # Teardown -- unmount, detach, hand the volume back, restart the guest --
+    # happens in the EXIT trap, on the way out.
     echo "copied -> $DOMAIN"
 }
 

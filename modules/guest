@@ -116,15 +116,10 @@ guest_finish() {
 # and IMG, mounts the guest filesystem at MNT, and arms guest_finish as the EXIT
 # trap so the teardown happens no matter how the run ends.
 guest_open() {
-    # Under sudo, $HOME resolves to root's on any host whose sudoers sets
-    # always_set_home -- config discovery would quietly read /root/.config while
-    # you edit a config in your own home. Refuse rather than guess which home was
-    # meant. (The copy phases need no privilege of their own, so sudo would only
-    # get in the way.)
-    [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] \
-        && die "do not run virutil under sudo -- run it as yourself." \
-               "It escalates only the commands that actually need root."
-    if [[ $EUID -eq 0 ]]; then SUDO=(); else SUDO=(sudo); fi
+    # The sudo rule every module shares, in modules/xfer: escalate the handful of
+    # commands that need root, never the whole run. (The copy phases need no
+    # privilege of their own, so sudo would only get in the way.)
+    xfer_privilege
 
     MNT="${MNT:-/mnt/$DOMAIN}"
     command -v rsync >/dev/null || die "rsync not installed"
@@ -220,33 +215,18 @@ guest_open() {
     [[ -f "$IMG" ]] || die "could not resolve disk image for $DOMAIN"
     echo "image: $IMG"
 
-    # max_part only takes effect at module load; reload if it came up without it.
-    if [[ ! -e /sys/module/nbd/parameters/max_part ]] \
-       || (( $(< /sys/module/nbd/parameters/max_part) < 1 )); then
-        "${SUDO[@]}" rmmod nbd 2>/dev/null || true
-        "${SUDO[@]}" modprobe nbd max_part=8
-    fi
+    # The nbd lifecycle and the partition probe live in modules/xfer, shared with
+    # pull (which attaches a frozen snapshot read-only) and with the staging
+    # volume -- three callers, one way of doing it.
+    nbd_connect "$IMG"
 
-    "${SUDO[@]}" qemu-nbd -c "$NBD" "$IMG"
-    "${SUDO[@]}" partx -a "$NBD" 2>/dev/null || true   # force a partition rescan
-    udevadm settle
-
-    # The Windows system partition: largest NTFS one on the disk. Probe each
-    # node with blkid directly -- lsblk's FSTYPE can be empty if udev hasn't
-    # caught up.
-    local dev size PART=""; local -i BEST=0
-    for dev in "$NBD"p*; do
-        [[ -b "$dev" ]] || continue
-        [[ "$("${SUDO[@]}" blkid -o value -s TYPE "$dev" 2>/dev/null)" == "ntfs" ]] \
-            || continue
-        size="$("${SUDO[@]}" blockdev --getsize64 "$dev")"
-        (( size > BEST )) && { BEST="$size"; PART="$dev"; }
-    done
+    # The Windows system partition: the largest NTFS one on the disk.
+    local PART; PART="$(nbd_find_part ntfs)"
     if [[ -z "$PART" ]]; then
         lsblk -o NAME,SIZE,FSTYPE,PARTTYPENAME "$NBD" >&2 || true
         die "no NTFS partition found on $NBD (layout above)"
     fi
-    echo "partition: $PART ($((BEST / 1024 / 1024 / 1024)) GiB)"
+    echo "partition: $PART ($(nbd_part_size "$PART") GiB)"
 
     "${SUDO[@]}" mkdir -p "$MNT"
 

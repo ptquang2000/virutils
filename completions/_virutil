@@ -12,7 +12,7 @@ _virutil() {
   )
   transfer=(
     'sync:fetch build output from the Windows host and push into a guest'
-    'pull:copy files out of a running guest via a live disk snapshot'
+    'pull:copy files out of a running guest'
     'push:copy a file or directory from the host into a guest on demand'
   )
   guest=(
@@ -90,10 +90,12 @@ _virutil_sync() {
   local state line
   _arguments \
     '(-c --config)'{-c,--config}'[config NAME or PATH]:config:->config' \
+    '--transport[how to move the files]:transport:->transport' \
     '(-h --help)'{-h,--help}'[print usage and exit]' \
     '2:domain:->domain'   # 1 is the module word itself; _arguments skips words[1]
   case $state in
     domain) _virutil_domains ;;
+    transport) _virutil_transports ;;
     config)
       if [[ $PREFIX == */* ]]; then
         _files
@@ -110,8 +112,10 @@ _virutil_pull() {
   local state line
   _arguments \
     '(-c --config)'{-c,--config}'[config NAME or PATH]:config:->config' \
+    '--transport[how to move the files]:transport:->transport' \
     '(-h --help)'{-h,--help}'[print usage and exit]'
   case $state in
+    transport) _virutil_transports ;;
     config)
       if [[ $PREFIX == */* ]]; then
         _files
@@ -124,10 +128,23 @@ _virutil_pull() {
   esac
 }
 
+_virutil_transports() {
+  _values 'transport' \
+    'auto[pick one: virtiofs, else volume, else disk]' \
+    'disk[the guest'\''s own disk over qemu-nbd; a write shuts it down]' \
+    'volume[a staging qcow2 hotplugged into the running guest]' \
+    'virtiofs[a live virtio-fs share]'
+}
+
 _virutil_push() {
+  case $words[CURRENT-1] in
+    --transport) _virutil_transports; return ;;
+  esac
   case $CURRENT in
     3) _virutil_domains ;;
     4) _files ;;
+    5) ;;                             # the guest-side destination: nothing to complete
+    *) _values 'option' '--transport[how to move the files]' ;;
   esac
 }
 

@@ -12,9 +12,12 @@
 #              virutil snapshot   external snapshots (disk + memory)
 #   transfer   virutil sync       fetch build output from the Windows host, push
 #                                 it into a guest
-#              virutil pull       copy files out of a running guest via a live
-#                                 disk snapshot
+#              virutil pull       copy files out of a running guest
 #              virutil push       copy one file or directory into a guest
+#
+#              All three take --transport, which picks how the bytes move: the
+#              guest's own disk over qemu-nbd, a staging volume hotplugged into
+#              the running guest, or a live virtio-fs share. See modules/xfer.
 #   guest      virutil exec       run commands inside a Windows guest via the
 #                                 QEMU guest agent
 #   hardware   virutil usb        USB passthrough end to end from the Windows
@@ -32,7 +35,7 @@ export LC_ALL=C
 
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
-for module in parser guest domain snapshot sync pull push exec usb; do
+for module in parser guest xfer volume virtiofs domain snapshot sync pull push exec usb; do
     source "$HERE/modules/$module"
 done
 

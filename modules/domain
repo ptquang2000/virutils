@@ -14,8 +14,16 @@
 # defaults: host-passthrough CPU with a real core/thread topology, virtio-blk on
 # a dedicated iothread with cache=none and io_uring, the Hyper-V enlightenments
 # a Windows guest needs to stop burning CPU on timers, no balloon and no HPET,
-# and guest RAM on a shared memfd so a virtio-fs share can be hotplugged later
-# without the cold restart memoryBacking would otherwise cost.
+# guest RAM on a shared memfd so a virtio-fs share can be hotplugged later
+# without the cold restart memoryBacking would otherwise cost, and the
+# qemu-guest-agent channel, which nothing can add from inside the guest and
+# every transport but disk depends on.
+#
+# The aim is a domain that needs no further XML: --virtiofs additionally
+# declares the share itself. The one thing that cannot be pre-declared is the
+# staging volume the volume transport uses -- it exists precisely to be attached
+# and detached, and a permanently attached one would be a second writer on an
+# image the host has to mount.
 # On a WSL2 host these are the difference between a usable guest and a sluggish
 # one -- the storage path especially, since the qcow2 already sits on a virtual
 # disk inside Hyper-V.
@@ -63,6 +71,10 @@ domain_usage() {
         "  --bios            seabios instead of UEFI" \
         "  --no-shared-memory  do not back guest RAM with a shared memfd" \
         "                    (virtio-fs will then need a cold restart to enable)" \
+        "  --virtiofs [DIR]  declare the virtio-fs share up front, so the" \
+        "                    virtiofs transport needs no attach (default DIR:" \
+        "                    ~/.cache/virutil-VM). The domain will not start" \
+        "                    if DIR is missing." \
         "  --dry-run         print the domain XML and define nothing" \
         "" \
         "delete options:" \
@@ -212,7 +224,7 @@ domain_readable_by_qemu() {
 domain_create() {
     local VM="" ISO="" SIZE=64 MEM="" VCPUS="" IMG="" OSINFO=win11
     local VIRTIO="" NO_VIRTIO=0 NETWORK="network=default,model=virtio" BIOS=0 DRYRUN=0
-    local SHAREMEM=1
+    local SHAREMEM=1 VIRTIOFS=0 SHAREDIR="" candidate
 
     while (( $# )); do
         case "$1" in
@@ -226,6 +238,14 @@ domain_create() {
             --network)  NETWORK="${2:?--network needs a value}"; shift 2 ;;
             --bios)     BIOS=1; shift ;;
             --no-shared-memory) SHAREMEM=0; shift ;;
+            --virtiofs) VIRTIOFS=1
+                        # An optional value: --virtiofs alone takes the default
+                        # directory, --virtiofs DIR names one. A following word
+                        # that starts with '-' is the next option, not a path.
+                        if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
+                            SHAREDIR="$2"; shift
+                        fi
+                        shift ;;
             --dry-run)  DRYRUN=1; shift ;;
             -h|--help)  domain_usage 0 ;;
             -*)         die "virutil domain create: unknown option: $1" ;;
@@ -297,6 +317,15 @@ domain_create() {
         --graphics spice,listen=none
         --video virtio
         --channel spicevmc
+        # The qemu-guest-agent channel, which virt-manager does not add and
+        # nothing can work around from inside the guest. Every transport except
+        # disk needs it (it is what runs the copy in Windows), and disk wants it
+        # too: with the agent, a shutdown is Windows' own with apps forced
+        # closed; without it, an ACPI power-button event Windows may deliberate
+        # over until @shutdown_timeout expires. It costs one virtio-serial port
+        # and nothing else, so it is not optional here.
+        # `virutil exec setup` still exists, for domains made before this.
+        --channel unix,target.type=virtio,target.name=org.qemu.guest_agent.0
         --sound none
         --rng /dev/urandom
         --noautoconsole
@@ -311,6 +340,34 @@ domain_create() {
     # live host<->guest share instead of one power cycle away.
     if (( SHAREMEM )); then
         ARGS+=(--memorybacking access.mode=shared,source.type=memfd)
+    fi
+
+    # The virtio-fs share, declared up front rather than hotplugged later. The
+    # device itself is free when unused -- virtiofsd idles -- and having it in
+    # the persistent config means the transport never has to attach anything.
+    # Opt-in all the same, for one reason: from here on the domain will not
+    # start if the source directory is missing, so the share is a start-time
+    # dependency on a host path. virutil creates it, and nothing removes it, but
+    # a directory under ~/.cache is not a thing to make a domain's boot depend
+    # on without being asked.
+    if (( VIRTIOFS )); then
+        (( SHAREMEM )) || die "--virtiofs needs shared memory backing:" \
+                              "virtiofsd maps the guest's RAM, which --no-shared-memory" \
+                              "makes impossible. Drop one of the two."
+        local vfsd=""
+        for candidate in /usr/lib/virtiofsd /usr/libexec/virtiofsd \
+                         /usr/lib/qemu/virtiofsd /usr/local/libexec/virtiofsd; do
+            [[ -x "$candidate" ]] && { vfsd="$candidate"; break; }
+        done
+        [[ -n "$vfsd" ]] || vfsd="$(command -v virtiofsd || true)"
+        [[ -n "$vfsd" ]] || die "--virtiofs needs virtiofsd on the host" \
+                                "(package 'virtiofsd'), which is not installed."
+        SHAREDIR="${SHAREDIR:-${XDG_CACHE_HOME:-$HOME/.cache}/virutil-$VM}"
+        # Not on a dry run: it defines nothing, so it should leave nothing
+        # behind either.
+        (( DRYRUN )) || mkdir -p "$SHAREDIR" \
+            || die "could not create the share directory $SHAREDIR"
+        ARGS+=(--filesystem "type=mount,accessmode=passthrough,driver.type=virtiofs,driver.queue=1024,binary.path=$vfsd,source.dir=$SHAREDIR,target.dir=virutil-xfer")
     fi
 
     if (( BIOS )); then
@@ -396,6 +453,7 @@ domain_create() {
     local memnote=""
     (( SHAREMEM )) && memnote=" (shared memfd)"
     say "memory:  ${MEM} MiB$memnote"
+    (( VIRTIOFS )) && say "share:   $SHAREDIR (virtio-fs, tag virutil-xfer)"
     say "disk:    $IMG (${SIZE} GiB)"
     say "iso:     $ISO"
     [[ -n "$VIRTIO" ]] && say "virtio:  $VIRTIO"

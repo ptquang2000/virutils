@@ -17,8 +17,10 @@ domains
 
 transfer
   sync       fetch build output from the Windows host and push it into a guest
-  pull       copy files out of a running guest via a live disk snapshot
+  pull       copy files out of a running guest
   push       copy a file or directory from the host into a guest on demand
+
+  All three take --transport disk|volume|virtiofs (default: auto).
 
 guest
   exec       run commands inside a Windows guest via the QEMU guest agent

@@ -1,24 +1,33 @@
 # sync -- fetch a project's build output from the Windows host, then push it into
-# a Windows guest's C: drive offline by attaching its qcow2 with qemu-nbd.
-# Sourced by virutil; entry point is sync_main. Usage:
-#   virutil sync VM [-c NAME|PATH]    -- run as yourself, NOT under sudo.
+# a Windows guest's C: drive. Sourced by virutil; entry point is sync_main.
+# Usage:
+#   virutil sync VM [-c NAME|PATH] [--transport T]  -- as yourself, NOT sudo.
 #
 # The target domain is a command-line argument, not a config setting: one config
 # describes a project's build tree and where its pieces land on C:, and the same
 # description is worth pointing at any guest that runs it.
 #
-#   Windows build tree --(fetch)--> staging dir --(map)--> guest NTFS
+#   Windows build tree --(fetch)--> staging dir --(map)--> the guest's C:
+#
+# How that last arrow is drawn is the transport's business, not sync's: the
+# guest's own disk with it shut down, a staging volume hotplugged into it, or a
+# live virtio-fs share. The map phase writes the same C:-shaped tree under MNT
+# either way, which is why there is one copy phase and not three. --transport
+# picks; @transport sets a default per config. See modules/xfer.
 #
 # Everything -- source dirs, destinations, excludes, post-copy cleanup -- is
 # defined in a config file under ~/.config/virutils/. README.md documents the
 # directive syntax; this module does not repeat it.
 #
 # Only the few commands that need root are escalated (nbd, mount, umount), and
-# the guest NTFS is mounted with uid=, so both copy phases run unprivileged.
-# Windows Fast Startup must be off, otherwise NTFS is left dirty and ntfs-3g
-# refuses to mount read-write.
+# the mounted filesystem is handed to the invoking user with uid=, so both copy
+# phases run unprivileged.
 #
-# A running guest is always shut down before the disk is touched and restarted
+# The rest of this applies to the disk transport, which is the only one that
+# touches the guest's own filesystem. Windows Fast Startup must be off,
+# otherwise NTFS is left dirty and ntfs-3g refuses to mount read-write.
+#
+# A running guest is always shut down before its disk is touched and restarted
 # afterwards -- including on failure -- so the power state you start with is the
 # one you end with. The shutdown goes through qemu-guest-agent when it answers
 # and ACPI when it does not, and it is never forced: a guest that will not shut
@@ -38,12 +47,22 @@
 CONF_DIR="$HOME/.config/virutils"
 SYNC_DEFAULT_CONF="$CONF_DIR/sync.conf"
 
+# Where @staging resolves to. Under the cache directory rather than /tmp for two
+# reasons: the fetch is an incremental rsync, so a staging tree that survives a
+# reboot means the next run copies only what changed instead of the whole build
+# tree again; and a tmpfs /tmp would put a multi-gigabyte build output in RAM on
+# the one kind of host -- WSL2 -- this tool exists for. It stays a fixed root
+# with @staging as a name under it, so a mistyped @staging can only ever name a
+# directory virutil owns.
+SYNC_STAGING_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/virutil"
+
 REPO=""; STAGING=""; DEST=""
 FETCH=(); MAPPINGS=(); EXCLUDES=(); CLEANUP=()
+SYNC_TRANSPORT=""   # @transport in the config; --transport on the command line wins
 
 sync_usage() {
     printf '%s\n' \
-        "usage: virutil sync VM [-c NAME|PATH]" \
+        "usage: virutil sync VM [-c NAME|PATH] [--transport T]" \
         "" \
         "  VM                      libvirt domain whose disk is written" \
         "  -c, --config NAME|PATH  config to use. A value containing '/' is a" \
@@ -51,6 +70,7 @@ sync_usage() {
         "                          config in $CONF_DIR" \
         "                          ('.conf' is appended when absent)." \
         "                          default: $SYNC_DEFAULT_CONF" \
+        "$(xfer_transport_help)" \
         "  -h, --help              this message" \
         "" \
         "The config is the whole interface; see README.md for its format." >&2
@@ -91,13 +111,15 @@ empty_guest_dirs() {
 }
 
 sync_main() {
-    local CONF_ARG CONF lineno line VM
+    local CONF_ARG CONF lineno line VM TRANSPORT
 
-    CONF_ARG=""; VM=""
+    CONF_ARG=""; VM=""; TRANSPORT=""
     while (( $# )); do
         case "$1" in
             -c|--config) (( $# >= 2 )) || { warn "$1 needs a value"; sync_usage; }
                          CONF_ARG="$2"; shift 2 ;;
+            --transport) (( $# >= 2 )) || { warn "$1 needs a value"; sync_usage; }
+                         TRANSPORT="$2"; shift 2 ;;
             -h|--help)   sync_usage 0 ;;
             -*)          warn "unrecognised argument: $1"; sync_usage ;;
             *)           [[ -z "$VM" ]] || { warn "unexpected argument: $1"; sync_usage; }
@@ -124,6 +146,7 @@ sync_main() {
     local key val
     REPO=""; STAGING=""; DEST=""
     FETCH=(); MAPPINGS=(); EXCLUDES=(); CLEANUP=()
+    SYNC_TRANSPORT=""
     lineno=0
     while IFS= read -r line || [[ -n "$line" ]]; do
         (( ++lineno ))
@@ -142,6 +165,7 @@ sync_main() {
                                            "-- pass the domain as an argument: virutil sync $val" ;;
                      nbd)              NBD="$val" ;;
                      mnt)              MNT="$val" ;;
+                     transport)        SYNC_TRANSPORT="$val" ;;
                      shutdown_timeout) SHUTDOWN_TIMEOUT="$val" ;;
                      *) die "$CONF:$lineno: unknown setting '$key'" ;;
                  esac ;;
@@ -163,13 +187,25 @@ sync_main() {
     done < "$CONF"
 
     [[ -n "$STAGING" ]] || die "$CONF: @staging is required"
-    STAGING="/tmp/${STAGING#/}"   # @staging names a directory under /tmp
+    # A name under the root, never a path: leading slashes are stripped and '..'
+    # is refused outright. Stripping alone is not containment -- '../../etc' is
+    # relative and would still land outside the root the fetch is documented to
+    # stay inside.
+    [[ "/$STAGING/" == */../* ]] \
+        && die "$CONF: @staging may not contain '..': $STAGING"
+    STAGING="$SYNC_STAGING_ROOT/${STAGING#/}"
 
     echo "config: $CONF"
     echo "  ${#FETCH[@]} fetch, ${#MAPPINGS[@]} map, ${#EXCLUDES[@]} exclude," \
          "${#CLEANUP[@]} cleanup"
     echo "  staging: $STAGING"
     echo "  domain: $DOMAIN"
+
+    # Chosen before the fetch, not after it: a transport that cannot work is
+    # worth saying so before spending minutes pulling a build tree off the
+    # Windows host.
+    domain_exists "$DOMAIN" || die "no such domain: $DOMAIN (see: virutil domain list)"
+    xfer_select write "${TRANSPORT:-${SYNC_TRANSPORT:-auto}}"
 
     # --- fetch: Windows build tree -> staging -------------------------------
     (( ${#FETCH[@]} )) || die "no fetch rules in $CONF"
@@ -194,10 +230,11 @@ sync_main() {
     [[ -d "$STAGING" ]] || die "staging dir not found: $STAGING"
     (( ${#MAPPINGS[@]} )) || die "no map rules in $CONF"
 
-    # Shut the guest down, attach its disk with qemu-nbd, mount the NTFS, and
-    # arm the EXIT trap that unmounts, detaches and restores power on the way
-    # out. See modules/guest.
-    guest_open
+    # Pick the transport and open it: for disk that means shutting the guest
+    # down and mounting its NTFS, for volume a staging qcow2, for virtiofs a
+    # share -- and in every case MNT ends up standing for the root of C:, which
+    # is why the copy phase below is written once. See modules/xfer.
+    xfer_open
 
     shopt -s nullglob
 
@@ -225,10 +262,21 @@ sync_main() {
         "${RSYNC[@]}" "${EXCLUDES[@]}" "${files[@]}" "$MNT/$dst_rel/"
     done
 
-    empty_guest_dirs
-
     shopt -u nullglob
 
-    # The unmount, detach and restart happen in guest_finish(), on the way out.
+    # Land the tree in the guest. A no-op for the disk transport, where MNT is
+    # already C:; a robocopy inside the guest for the other two.
+    xfer_deliver
+
+    # Cleanup rules delete *in the guest*, so they run after delivery and go
+    # wherever the guest's C: actually is: through the mount for disk, through
+    # the agent for the live transports.
+    if (( ${#CLEANUP[@]} )); then
+        if [[ "$XFER" == disk ]]; then empty_guest_dirs
+        else xfer_empty_guest_dirs "${CLEANUP[@]}"
+        fi
+    fi
+
+    # The unmount, detach and restart happen in the EXIT trap, on the way out.
     echo "copy complete -> $DOMAIN"
 }

@@ -146,6 +146,39 @@ gexec() {
     return "$ec"
 }
 
+# exec_ps_text SCRIPT -- run SCRIPT in $VM's powershell and return its exit code.
+# Factored out of the ps command because the transports in modules/xfer drive
+# the guest the same way: everything they do inside Windows is a powershell
+# script over the agent, and the wrapping, encoding and length limits below are
+# the part that must not be reimplemented twice.
+exec_ps_text() {
+    local SCRIPT ENC
+    # The preference kills "Preparing modules for first use" progress spam on
+    # stderr. The catch writes to the console handle rather than powershell's
+    # error stream, which is what would otherwise be serialised as CLIXML; the
+    # explicit exit 1 restores the code powershell returns for an uncaught
+    # terminating error, which catching would otherwise turn into a 0.
+    SCRIPT=$(printf '%s\n%s\n%s\n%s\n%s\n' \
+        '$ProgressPreference="SilentlyContinue";' \
+        'try { $Host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size(4096, 2000) } catch {}' \
+        'try {' \
+        "$1" \
+        '} catch { [Console]::Error.WriteLine(($_ | Out-String)); exit 1 }')
+
+    # UTF-16LE base64 sidesteps every quoting layer between here and the guest
+    ENC=$(printf '%s' "$SCRIPT" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)
+    # + the powershell.exe flags that precede it on the command line
+    if [ $(( ${#ENC} + 128 )) -gt "$CMDLINE_MAX" ]; then
+        echo "virutil: script encodes to ${#ENC} chars, over Windows's $CMDLINE_MAX" \
+             "command-line limit (~12000 chars of source); shorten it, or stage" \
+             "a .ps1 in the guest and run that" >&2
+        exit 1
+    fi
+
+    gexec powershell.exe "$(jq -nc --arg e "$ENC" \
+        '["-NoProfile","-NonInteractive","-OutputFormat","Text","-EncodedCommand",$e]')"
+}
+
 exec_main() {
     local CMD VM
     CMD="${1:-}"
@@ -211,31 +244,7 @@ EOF
         parse_flags "$@"
         set -- ${E_REST[@]+"${E_REST[@]}"}
         resolve_text "$@" || { echo "usage: virutil exec ps VM [-d] SCRIPT..." >&2; exit 1; }
-
-        # The preference kills "Preparing modules for first use" progress spam on
-        # stderr. The catch writes to the console handle rather than powershell's
-        # error stream, which is what would otherwise be serialised as CLIXML; the
-        # explicit exit 1 restores the code powershell returns for an uncaught
-        # terminating error, which catching would otherwise turn into a 0.
-        SCRIPT=$(printf '%s\n%s\n%s\n%s\n%s\n' \
-            '$ProgressPreference="SilentlyContinue";' \
-            'try { $Host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size(4096, 2000) } catch {}' \
-            'try {' \
-            "$TEXT" \
-            '} catch { [Console]::Error.WriteLine(($_ | Out-String)); exit 1 }')
-
-        # UTF-16LE base64 sidesteps every quoting layer between here and the guest
-        ENC=$(printf '%s' "$SCRIPT" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)
-        # + the powershell.exe flags that precede it on the command line
-        if [ $(( ${#ENC} + 128 )) -gt "$CMDLINE_MAX" ]; then
-            echo "virutil exec: script encodes to ${#ENC} chars, over Windows's $CMDLINE_MAX" \
-                 "command-line limit (~12000 chars of source); shorten it, or stage" \
-                 "a .ps1 in the guest and run that" >&2
-            exit 1
-        fi
-
-        gexec powershell.exe "$(jq -nc --arg e "$ENC" \
-            '["-NoProfile","-NonInteractive","-OutputFormat","Text","-EncodedCommand",$e]')"
+        exec_ps_text "$TEXT"
         ;;
     *)
         exec_usage

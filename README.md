@@ -14,6 +14,7 @@ step and no dependencies beyond the utilities it calls.
    - [transfer](#transfer)
    - [guest](#guest)
    - [hardware](#hardware)
+- [Transports](#transports)
 - [virutil sync](#virutil-sync)
    - [Synopsis](#synopsis)
    - [Description](#description)
@@ -76,7 +77,8 @@ itself and `.zshrc` puts `virutils/completions` on `fpath` directly.
 ## Modules
 
 The seven modules fall into four groups, which is also the order
-`virutil help` prints them in.
+`virutil help` prints them in. The three transfer modules additionally share a
+[transport](#transports) layer, which decides *how* the bytes move.
 
 ### domains
 
@@ -89,9 +91,9 @@ The seven modules fall into four groups, which is also the order
 
 | Module | Purpose | Usage |
 | --- | --- | --- |
-| `sync` | Fetch a project's build output from a Windows host and push it into a guest's `C:` drive offline, by attaching the qcow2 with `qemu-nbd`. | `virutil sync VM [-c NAME\|PATH]` |
-| `pull` | Copy files out of a **running** guest by taking a disk-only live snapshot and reading the frozen base image read-only. | `virutil pull [-c NAME\|PATH]` |
-| `push` | Copy a file or directory from the host into a guest's `C:` drive **on demand**, offline, with no config file. | `virutil push VM SRC DST` |
+| `sync` | Fetch a project's build output from a Windows host and push it into a guest's `C:` drive. | `virutil sync VM [-c NAME\|PATH] [--transport T]` |
+| `pull` | Copy files out of a **running** guest. | `virutil pull [-c NAME\|PATH] [--transport T]` |
+| `push` | Copy a file or directory from the host into a guest's `C:` drive **on demand**, with no config file. | `virutil push VM SRC DST [--transport T]` |
 
 ### guest
 
@@ -105,6 +107,9 @@ The seven modules fall into four groups, which is also the order
 | --- | --- | --- |
 | `usb` | USB passthrough end to end from a Windows host under WSL: `usbipd` bind, import over `vhci_hcd`, then attach to the domain. | `virutil usb {list\|show\|attach\|detach\|unbind} [VM] [BUSID]` |
 
+All three take `--transport`, and all three write the same C:-shaped tree
+whichever one is chosen — see [Transports](#transports).
+
 `virutil` alone, or `virutil help`, prints the module list. `modules/parser`
 handles the top-level dispatch plus the helpers every module shares; each
 module file declares its own subcommands. Only `sync` and `pull` are driven by a
@@ -112,12 +117,92 @@ config file; the rest take everything on the command line. The remainder of
 this document covers `virutil sync`, then `virutil pull`, then `virutil push`,
 then `virutil domain`.
 
+## Transports
+
+`sync`, `pull` and `push` describe *what* to move. A transport decides *how*,
+and the three differ in what they need from the guest rather than in what they
+achieve. `--transport` picks one; `auto` is the default.
+
+| | `disk` | `volume` | `virtiofs` |
+| --- | --- | --- | --- |
+| Guest must be | shut down to write, running to read | running | running |
+| Who writes `C:` | the host, through `ntfs-3g` | the guest, `robocopy` | the guest, `robocopy` |
+| Host side | `qemu-nbd` on the guest's own qcow2 | `qemu-nbd` on a scratch qcow2 | `virtiofsd` |
+| Guest side | nothing | the agent (`viostor` is already there) | the agent, WinFsp, viofs |
+| Domain change | none | a disk that comes and goes | shared-memfd RAM, a **cold** restart to add |
+| Copies of the data | 1 | 2 | 1 |
+| Fixed cost per run | a full shutdown and boot | seconds | none |
+
+**`disk`** is the original, and the only one that needs nothing at all from
+inside the guest — which is what makes it the fallback when there is no agent,
+no drivers, or the guest will not boot. For a write it shuts the guest down,
+mounts its NTFS over `qemu-nbd`, copies, and restores the power state it found.
+For a read it leaves the guest running and reads a frozen snapshot instead.
+
+**`volume`** keeps the guest running and installs nothing. A scratch qcow2 is
+filled by the host over `qemu-nbd`, released, hotplugged into the guest, and
+`robocopy`'d onto `C:` from inside. The host and the guest take strict turns:
+two writers on one image is the one unrecoverable mistake available here, so
+every handover is verified from `/proc/mounts` and the domain's own device list
+rather than from exit codes. A write hands the volume over **read-only**, so
+the guest cannot dirty the filesystem the host has to mount next.
+
+**`virtiofs`** exports a host directory the running guest sees live, so nothing
+is copied twice. It needs WinFsp and the viofs driver in the guest, `virtiofsd`
+on the host, and guest RAM on a shared memfd — which `virutil domain create`
+sets up by default, but which an older domain can only gain through a full stop
+and start. The share is left attached between runs.
+
+### Everything a transport needs, at create time
+
+A domain from `virutil domain create` needs no further XML: the guest-agent
+channel and the shared-memfd memory backing are both in the profile, and
+`--virtiofs` adds the share device itself, so `virtiofs` has nothing to attach
+at all. The share is opt-in only because it makes the domain's *start* depend on
+the host directory existing.
+
+One thing cannot be pre-declared, by design: the `volume` transport's staging
+disk. It exists to be attached and detached, and a permanently attached one
+would be a second writer on an image the host has to mount. It is hotplugged per
+run and needs no domain preparation — `q35` comes with fourteen `pcie-root-port`s
+and a Windows guest uses six.
+
+What remains outside the XML entirely is guest-side software: `qemu-ga` (the
+virtio-win MSI), and WinFsp plus the viofs driver for `virtiofs`.
+
+### auto
+
+1. `virtiofs` if the guest is running, already has the share, and the agent answers.
+2. `volume` if the guest is running and the agent answers.
+3. `disk` if the guest is shut off (or, for a read, running with no agent).
+
+`auto` never shuts a running guest down. Turning "copy a file" into "reboot
+Windows" behind your back is not a fallback, so a running guest with no agent is
+an error that names the two ways forward — install the agent, or ask for
+`--transport disk` explicitly.
+
+### The staging volume
+
+`volume` keeps one scratch image per domain at
+`/var/lib/libvirt/images/VM-xfer.qcow2`, 16 GiB and sparse, created and
+formatted on first use and kept afterwards. It is formatted exFAT when the host
+has `mkfs.exfat` — an in-kernel driver on both sides, where NTFS on the host is
+FUSE — NTFS when it has `mkfs.ntfs`, and by **Windows itself** when it has
+neither: the blank image is handed to the guest once, `Initialize-Disk` and
+`Format-Volume` run inside it, and it comes back ready. Delete the image to
+rebuild it.
+
+The volume is found from inside the guest by its label, `VIRUTILXFER`, and its
+drive letter is asked for on every run rather than assumed, because Windows
+assigns the highest free one and that moves.
+
+
 ## virutil sync
 
 ### Synopsis
 
 ```
-virutil sync VM [-c NAME|PATH]
+virutil sync VM [-c NAME|PATH] [--transport disk|volume|virtiofs]
 virutil sync -h
 ```
 
@@ -132,7 +217,7 @@ Windows build tree --(fetch)--> staging dir --(map)--> guest NTFS
 ```
 
 **Fetch** mirrors selected directories out of the build tree into a staging
-directory under `/tmp`, applying the exclude patterns. The staging layout is
+directory under `~/.cache/virutil/`, applying the exclude patterns. The staging layout is
 normally arranged to mirror what will land in the guest, so the map rules stay
 trivial.
 
@@ -160,6 +245,7 @@ need no privilege of their own.
 | Option | Description |
 | --- | --- |
 | `-c`, `--config NAME\|PATH` | Config to use. A value containing `/` is a path, taken as given. Anything else names a config in `~/.config/virutils/`, with `.conf` appended when absent — so `-c win11` reads `~/.config/virutils/win11.conf`. Defaults to `~/.config/virutils/sync.conf`. |
+| `--transport T` | How to move the files: `auto` (default), `disk`, `volume` or `virtiofs`. See [Transports](#transports). Overrides `@transport` in the config. |
 | `-h`, `--help` | Print usage and exit. |
 
 The domain is an argument rather than a config setting, so one config —
@@ -180,7 +266,7 @@ config.
 | --- | --- |
 | `~/.config/virutils/sync.conf` | Default config. This is the only location searched; there is no fallback beside the script. |
 | `~/.config/virutils/NAME.conf` | Additional configs, selected with `-c NAME`. |
-| `/tmp/<@staging>` | Staging directory, rebuilt from `@repo` on every run. |
+| `~/.cache/virutil/<@staging>` | Staging directory, refreshed from `@repo` on every run. |
 | `/mnt/<VM>` | Default mount point for the guest filesystem, overridable with `@mnt`. |
 
 A missing config is a fatal error naming the exact path that was looked for.
@@ -210,7 +296,7 @@ and is rejected.
 | Setting | Required | Default | Description |
 | --- | --- | --- | --- |
 | `@repo` | yes | — | Root of the build tree on the host. Fetch sources are relative to it. |
-| `@staging` | yes | — | Staging directory *name*. Always placed under `/tmp`, whatever is written here. |
+| `@staging` | yes | — | Staging directory *name*. Always placed under `~/.cache/virutil/` (`$XDG_CACHE_HOME/virutil/`), whatever is written here. |
 | `@dest` | no | *(empty)* | Install directory in the guest, relative to `C:\`. Every map destination hangs off it, so the install path is spelled once. Empty means the root of `C:`. |
 | `@nbd` | no | `/dev/nbd0` | NBD device used to attach the disk image. |
 | `@mnt` | no | `/mnt/<VM>` | Host mount point for the guest filesystem. |
@@ -375,19 +461,35 @@ refreshes the `sudo` timestamp while they run. On a copy longer than
 again at teardown. If nobody answers, teardown fails and the guest is left off,
 per the rule above.
 
-**The staging directory is always under `/tmp`.** Whatever `@staging` says is
-treated as a name relative to `/tmp`, including an absolute path.
+**The staging directory is always under `~/.cache/virutil/`.** Whatever
+`@staging` says is treated as a name relative to that root, including an
+absolute path — so a mistyped `@staging` can only ever name a directory virutil
+owns.
+
+It lives there rather than in `/tmp` because the fetch is an *incremental*
+rsync: a staging tree that survives a reboot means the next run copies only what
+changed out of the Windows build tree, instead of all of it again. It also keeps
+a multi-gigabyte build output off a tmpfs. Existing configs need no change —
+`@staging=foo` simply moves from `/tmp/foo` to `~/.cache/virutil/foo`, and the
+first run after this refetches into the new location.
 
 ## virutil pull
 
 `pull` is `sync` in reverse: it copies files out of a guest's `C:` drive onto
-the host, and unlike `sync` it never powers the guest off. The guest stays
-running throughout — nothing runs in it, no guest agent, no guest-side
-software, no shutdown.
+the host, and it never powers the guest off under any transport.
+
+Under `--transport disk` — the default when the guest has no agent — nothing
+runs inside the guest at all:
 
 ```
 guest NTFS --(snapshot freezes base)--> base qcow2 --(ro mount)--> host @dest
 ```
+
+Under `volume` or `virtiofs` the guest does the reading instead: the map rules'
+globs are resolved *in Windows*, `robocopy`'d into the staging volume or the
+share, and rsynced out of it on the host. That is file-level consistency
+instead of block-level, and no snapshot at all — but it needs the agent. See
+[Transports](#transports).
 
 A live external snapshot redirects the guest's writes to an overlay qcow2,
 which freezes the base image at a checkpoint. The base is then attached with
@@ -400,7 +502,7 @@ itself, and the guest never stops writing through it.
 ### Synopsis
 
 ```
-virutil pull [-c NAME|PATH]
+virutil pull [-c NAME|PATH] [--transport disk|volume|virtiofs]
 virutil pull -h
 ```
 
@@ -498,9 +600,13 @@ cache at snapshot time is absent; the NTFS journal may be mid-transaction and
 tradeoff — fine for build output and configs, not for auditing a live
 database.
 
-**The guest must be running.** `pull` dies on any other state. There is no
-managed-save or paused-state special case: those states are simply not
-`running`, and are refused. For an offline copy, run `sync` in reverse.
+**The guest must be running**, under every transport. `pull` dies on any other
+state. There is no managed-save or paused-state special case: those states are
+simply not `running`, and are refused.
+
+**The snapshot notes below apply to `--transport disk` only.** The live
+transports take no snapshot, so none of it is relevant to them: they ask the
+guest for the files instead.
 
 **The overlay is always folded back.** On success *and* on failure, `pull` runs
 `blockcommit --active --pivot` to merge the guest's writes back into the base,
@@ -517,16 +623,20 @@ single-disk assumption `sync` documents.
 ## virutil push
 
 `push` is `sync`'s second half on demand: copy one file or directory from the
-host into a guest's `C:` drive with no config file, using the same offline
-machinery — shut the guest down if it is running, attach its qcow2 with
-`qemu-nbd`, mount the NTFS, copy, and restore the power state you started with.
-It exists for the cases that do not deserve a config: a config file you edited
-by hand, a build artifact you want in the guest right now, a one-off test file.
+host into a guest's `C:` drive with no config file, over any of the three
+[transports](#transports). It exists for the cases that do not deserve a config:
+a config file you edited by hand, a build artifact you want in the guest right
+now, a one-off test file.
+
+By default the guest keeps running — `auto` picks a live transport whenever the
+agent answers. `--transport disk` is the offline path: shut the guest down,
+attach its qcow2 with `qemu-nbd`, mount the NTFS, copy, and restore the power
+state you started with.
 
 ### Synopsis
 
 ```
-virutil push VM SRC DST
+virutil push VM SRC DST [--transport disk|volume|virtiofs]
 virutil push -h
 ```
 
@@ -565,12 +675,16 @@ ending in `/` or `\` always means a directory, even one that does not exist yet.
 
 ### Notes
 
-`push` shares every safety rule `sync` documents, wholesale: it must be run as
-yourself, not under `sudo`; a running guest is shut down through the guest agent
-(ACPI as a fallback, never a forced power-off) and restarted only once the disk
-is provably free; a domain with a managed-save image, and paused or suspended
-domains, are refused; Fast Startup must be off. All of that machinery lives in
-the shared `modules/guest` used by both `sync` and `push`. There are no
+`push` shares every safety rule `sync` documents, wholesale, and the rules that
+matter depend on the transport. Under `disk`: it must be run as yourself, not
+under `sudo`; a running guest is shut down through the guest agent (ACPI as a
+fallback, never a forced power-off) and restarted only once the disk is provably
+free; a domain with a managed-save image, and paused or suspended domains, are
+refused; Fast Startup must be off. That machinery lives in the shared
+`modules/guest`. Under `volume` and `virtiofs` none of it applies — the guest is
+never stopped — and the rule that replaces it is the handover check in
+`modules/volume`: the staging image is never mounted here and attached there at
+the same time. There are no
 excludes — `push` copies exactly what you name, which is the point of having it
 at all.
 
@@ -608,6 +722,7 @@ host, which is the case this repo exists for. Everything is overridable.
 | `--network SPEC` | `user,model=virtio` | Passed to `virt-install --network`. |
 | `--bios` | — | SeaBIOS instead of UEFI. |
 | `--no-shared-memory` | — | Do not back guest RAM with a shared memfd. |
+| `--virtiofs [DIR]` | off, `~/.cache/virutil-VM` | Declare the virtio-fs share in the domain XML, so the `virtiofs` transport needs no attach. |
 | `--dry-run` | — | Print the domain XML and define nothing. |
 
 What the profile actually sets, and why:
@@ -645,6 +760,13 @@ What the profile actually sets, and why:
    preallocated, so an idle guest uses no more host memory than before), so every
    new domain gets it and stays one hotplug away from a live host↔guest share
    instead of one power cycle away. `--no-shared-memory` opts out.
+- **The qemu-guest-agent channel** (`org.qemu.guest_agent.0`). `virt-manager`
+   does not add it and nothing inside the guest can, yet the `volume` and
+   `virtiofs` transports need it — it is what runs the copy in Windows — and the
+   `disk` transport wants it, since with the agent a shutdown is Windows' own
+   with apps forced closed rather than an ACPI event it may sit on until
+   `@shutdown_timeout`. It costs one virtio-serial port, so it is not optional.
+   `virutil exec setup` still exists, for domains created before this.
 - **`--network user,model=virtio`.** SLIRP needs no host-side setup, which
    matters on WSL2 where the default NAT network usually is not there and the
    `nf_nat` modules may not be either. It has no inbound path; for RDP, add
@@ -730,6 +852,14 @@ Host:
 - `sudo`, for the privileged commands listed under
    [Description](#description)
 
+Host, per [transport](#transports):
+
+- `disk` — everything above; nothing further
+- `volume` — `sfdisk`, `qemu-img` and `jq`, plus `mkfs.exfat` (or `mkfs.ntfs`)
+   if you would rather the host formatted the staging image than the guest
+- `virtiofs` — `virtiofsd`, found at `/usr/lib/virtiofsd`, `/usr/libexec/virtiofsd`
+   or on `PATH`
+
 Host, for `virutil domain`:
 
 - `virt-install` (`virt-manager`'s CLI) and `libosinfo`
@@ -742,13 +872,16 @@ Host, for `virutil domain`:
    by the qemu user, and `virutil domain create` prints the `setfacl` that fixes
    it
 
-Guest, for `virutil sync`:
+Guest, for `virutil sync`, `pull` and `push`:
 
-- Windows, with Fast Startup disabled
-- The QEMU guest agent, strongly recommended: without it the shutdown falls back
-   to ACPI, which Windows may sit on until `@shutdown_timeout` expires
-- A single disk exposed as `sda`, whose system volume is the largest NTFS
-   partition on it
+- Windows, with Fast Startup disabled (`disk` transport)
+- A single disk whose system volume is the largest NTFS partition on it
+   (`disk` transport)
+- The QEMU guest agent — **required** by the `volume` and `virtiofs`
+   transports, which run the guest-side copy through it, and strongly
+   recommended for `disk`, where without it the shutdown falls back to ACPI and
+   Windows may sit on it until `@shutdown_timeout` expires
+- WinFsp and the virtio-win viofs driver, for `virtiofs` only
 
 Guest, for `virutil exec`:
 

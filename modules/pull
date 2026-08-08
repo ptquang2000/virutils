@@ -1,12 +1,17 @@
-# pull -- copy files out of a RUNNING Windows guest to the host, by taking a
-# disk-only live snapshot and reading the frozen base image read-only. Sourced
-# by virutil; entry point is pull_main. Usage:
-#   virutil pull [-c NAME|PATH]    -- run as yourself, NOT under sudo.
+# pull -- copy files out of a RUNNING Windows guest to the host. Sourced by
+# virutil; entry point is pull_main. Usage:
+#   virutil pull [-c NAME|PATH] [--transport T]  -- as yourself, NOT under sudo.
+#
+# The guest keeps running under every transport; what differs is who does the
+# reading. Under volume and virtiofs the guest does: the map rules' globs are
+# resolved in Windows and robocopied into a staging volume or a share, which the
+# host then reads. That needs the agent, and gives file-level consistency.
+#
+# Under the disk transport nothing runs in the guest at all -- no agent, no
+# power-state change -- and the host reads a frozen snapshot instead:
 #
 #   guest NTFS --(snapshot freezes base)--> base qcow2 --(ro mount)--> host
-#
-# The guest keeps running the whole time: nothing runs in it, no agent, no
-# power-state change. A live external snapshot redirects the guest's writes to
+# A live external snapshot redirects the guest's writes to
 # an overlay qcow2, which freezes the base image at a checkpoint; the base is
 # attached with qemu-nbd -r, mounted with ntfs-3g read-only, rsynced out, and
 # the overlay is folded back into the base with virsh blockcommit before the
@@ -20,7 +25,8 @@
 #
 # pull is sync in reverse. Same config format (map rules, excludes), same
 # nbd/mount machinery, but read-only on the guest side and with a snapshot
-# lifecycle instead of a shutdown. It reuses functions and arrays from the
+# lifecycle instead of a shutdown. The snapshot notes above and below are about
+# the disk transport only. It reuses functions and arrays from the
 # shared modules/guest (VIRSH, RSYNC, ci_glob, root_rel, nbd_attached,
 # mnt_mounted), so guest must be sourced first -- the virutil source order
 # does this.
@@ -36,13 +42,14 @@ DISK=""; IMG=""; SNAP=""; OVERLAY=""
 
 pull_usage() {
     printf '%s\n' \
-        "usage: virutil pull [-c NAME|PATH]" \
+        "usage: virutil pull [-c NAME|PATH] [--transport T]" \
         "" \
         "  -c, --config NAME|PATH  config to use. A value containing '/' is a" \
         "                          path, taken as given; anything else names a" \
         "                          config in $CONF_DIR" \
         "                          ('.conf' is appended when absent)." \
         "                          default: $PULL_DEFAULT_CONF" \
+        "$(xfer_transport_help)" \
         "  -h, --help              this message" \
         "" \
         "The config is the whole interface; see README.md for its format." >&2
@@ -128,8 +135,83 @@ split_globs() {
     done
 }
 
+# pull_open_disk -- the original transport, unchanged in substance: take a
+# disk-only live snapshot so the guest's writes go to an overlay, attach the
+# frozen base read-only, and mount it at MNT. The guest keeps running and is
+# never touched, which is what makes this the one that works with no agent.
+pull_open_disk() {
+    # The mount point is the disk transport's own; the live transports set MNT
+    # to the staging volume's or the share's, so defaulting it here for all
+    # three would have them mounting on top of each other's.
+    MNT="${MNT:-/mnt/$DOMAIN}"
+
+    # Authenticate before the snapshot is taken rather than partway through.
+    if (( ${#SUDO[@]} )); then
+        command -v sudo >/dev/null || die "sudo not installed; nbd and mount need it"
+        sudo -v || die "sudo authentication failed"
+    fi
+
+    # A stale nbd or mount left by a failed run: going on would end with us
+    # detaching or unmounting something that was never ours.
+    nbd_attached && die "$NBD is already attached; free it or set @nbd elsewhere" \
+                        "  sudo qemu-nbd -d $NBD"
+    mnt_mounted && die "$MNT is already mounted; unmount it first" \
+                       "  sudo umount $MNT"
+
+    # pull reads the live disk, so the guest must actually be running. No
+    # managed-save or paused-state concern exists here: those states are not
+    # 'running', and are refused outright by the check below.
+    local state="$("${VIRSH[@]}" domstate "$DOMAIN")"
+    echo "domain: $DOMAIN ($state)"
+    [[ "$state" == running ]] \
+        || die "$DOMAIN is '$state'; the disk transport reads the live disk via" \
+               "a snapshot. Start it, or copy the other way with virutil sync."
+
+    DISK="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
+           | awk '$2=="disk" {print $3; exit}')"
+    IMG="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
+          | awk '$2=="disk" {print $4; exit}')"
+    [[ -n "$DISK" ]] || die "no disk device found for $DOMAIN"
+    [[ -f "$IMG" ]] || die "could not resolve disk image for $DOMAIN"
+
+    nbd_reload
+    trap pull_finish EXIT
+
+    # --- live snapshot: guest writes -> overlay, base freezes -----------------
+    local snap_name="pull-$(date +%Y%m%d-%H%M%S)"
+    OVERLAY="${IMG%.*}.$snap_name.qcow2"
+    echo "snapshot: $snap_name"
+    "${VIRSH[@]}" snapshot-create-as --domain "$DOMAIN" --name "$snap_name" \
+        --disk-only --atomic \
+        --diskspec "$DISK,snapshot=external,file=$OVERLAY" \
+        || die "snapshot creation failed -- nothing was touched"
+    SNAP="$snap_name"
+
+    # The disk the guest now writes to must be the overlay, or the base we are
+    # about to read would still be live and inconsistent.
+    local top
+    top="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
+          | awk -v t="$DISK" '$2=="disk" && $3==t {print $4}')"
+    [[ "$top" == "$OVERLAY" ]] \
+        || die "snapshot did not take effect: $DISK still points at $top"
+    echo "   writes now go to $OVERLAY; base frozen: $IMG"
+
+    # --- attach frozen base read-only ----------------------------------------
+    nbd_connect "$IMG" -r
+
+    local PART; PART="$(nbd_find_part ntfs)"
+    if [[ -z "$PART" ]]; then
+        lsblk -o NAME,SIZE,FSTYPE,PARTTYPENAME "$NBD" >&2 || true
+        die "no NTFS partition found on $NBD (layout above)"
+    fi
+    echo "partition: $PART ($(nbd_part_size "$PART") GiB)"
+
+    "${SUDO[@]}" mkdir -p "$MNT"
+    "${SUDO[@]}" mount -t ntfs-3g -o "ro,uid=$(id -u),gid=$(id -g)" "$PART" "$MNT"
+}
+
 pull_main() {
-    local CONF_ARG CONF lineno line
+    local CONF_ARG CONF lineno line TRANSPORT=auto
 
     # Under sudo, $HOME resolves to root's on any host whose sudoers sets
     # always_set_home -- discovery would quietly read /root/.config while you
@@ -146,6 +228,8 @@ pull_main() {
         case "$1" in
             -c|--config) (( $# >= 2 )) || { warn "$1 needs a value"; pull_usage; }
                          CONF_ARG="$2"; shift 2 ;;
+            --transport) (( $# >= 2 )) || { warn "$1 needs a value"; pull_usage; }
+                         TRANSPORT="$2"; shift 2 ;;
             -h|--help)   pull_usage 0 ;;
             *)           warn "unrecognised argument: $1"; pull_usage ;;
         esac
@@ -201,7 +285,6 @@ pull_main() {
     [[ -n "$DEST" ]]   || die "$CONF: @dest is required"
     [[ "$DEST" == /* ]] || die "$CONF: @dest must be an absolute host path"
     [[ -d "$DEST" ]] || die "destination not found: $DEST"
-    MNT="${MNT:-/mnt/$DOMAIN}"
 
     echo "config: $CONF"
     echo "  ${#MAPPINGS[@]} map, ${#EXCLUDES[@]} exclude"
@@ -210,88 +293,30 @@ pull_main() {
     (( ${#MAPPINGS[@]} )) || die "no map rules in $CONF"
     command -v rsync >/dev/null || die "rsync not installed"
 
-    # Authenticate before the snapshot is taken rather than partway through.
-    if (( ${#SUDO[@]} )); then
-        command -v sudo >/dev/null || die "sudo not installed; nbd and mount need it"
-        sudo -v || die "sudo authentication failed"
+    # Which way the bytes come out. disk is the original: freeze the live disk
+    # behind a snapshot and read it, needing nothing from the guest. The other
+    # two ask the guest to copy what we want into a volume or a share -- faster,
+    # and consistent at the file level rather than the block level, but they need
+    # the agent. See modules/xfer.
+    xfer_select read "$TRANSPORT"
+
+    if [[ "$XFER" == disk ]]; then
+        pull_open_disk
+    else
+        xfer_open_read
+
+        # Every glob from every map rule, collected in one guest round trip:
+        # each trip costs a powershell launch inside Windows, and a config with
+        # a dozen rules would spend more time starting them than copying.
+        local -a allpats=()
+        for rule in "${MAPPINGS[@]}"; do
+            split_globs "${rule%%|*}"
+            allpats+=("${patterns[@]}")
+        done
+        xfer_collect "${allpats[@]}"
     fi
 
-    # A stale nbd or mount left by a failed run: going on would end with us
-    # detaching or unmounting something that was never ours.
-    nbd_attached && die "$NBD is already attached; free it or set @nbd elsewhere" \
-                        "  sudo qemu-nbd -d $NBD"
-    mnt_mounted && die "$MNT is already mounted; unmount it first" \
-                       "  sudo umount $MNT"
-
-    # pull reads the live disk, so the guest must actually be running. No
-    # managed-save or paused-state concern exists here: those states are not
-    # 'running', and are refused outright by the check below.
-    local state="$("${VIRSH[@]}" domstate "$DOMAIN")"
-    echo "domain: $DOMAIN ($state)"
-    [[ "$state" == running ]] \
-        || die "$DOMAIN is '$state'; pull needs it running -- it reads the live" \
-               "disk via a snapshot. For an offline copy, run sync in reverse."
-
-    DISK="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
-           | awk '$2=="disk" {print $3; exit}')"
-    IMG="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
-          | awk '$2=="disk" {print $4; exit}')"
-    [[ -n "$DISK" ]] || die "no disk device found for $DOMAIN"
-    [[ -f "$IMG" ]] || die "could not resolve disk image for $DOMAIN"
-
-    # max_part only takes effect at module load; reload if it came up without it.
-    if [[ ! -e /sys/module/nbd/parameters/max_part ]] \
-       || (( $(< /sys/module/nbd/parameters/max_part) < 1 )); then
-        "${SUDO[@]}" rmmod nbd 2>/dev/null || true
-        "${SUDO[@]}" modprobe nbd max_part=8
-    fi
-
-    trap pull_finish EXIT
-
-    # --- live snapshot: guest writes -> overlay, base freezes -----------------
-    local snap_name="pull-$(date +%Y%m%d-%H%M%S)"
-    OVERLAY="${IMG%.*}.$snap_name.qcow2"
-    echo "snapshot: $snap_name"
-    "${VIRSH[@]}" snapshot-create-as --domain "$DOMAIN" --name "$snap_name" \
-        --disk-only --atomic \
-        --diskspec "$DISK,snapshot=external,file=$OVERLAY" \
-        || die "snapshot creation failed -- nothing was touched"
-    SNAP="$snap_name"
-
-    # The disk the guest now writes to must be the overlay, or the base we are
-    # about to read would still be live and inconsistent.
-    local top
-    top="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
-          | awk -v t="$DISK" '$2=="disk" && $3==t {print $4}')"
-    [[ "$top" == "$OVERLAY" ]] \
-        || die "snapshot did not take effect: $DISK still points at $top"
-    echo "   writes now go to $OVERLAY; base frozen: $IMG"
-
-    # --- attach frozen base read-only ----------------------------------------
-    "${SUDO[@]}" qemu-nbd -r -c "$NBD" "$IMG"
-    "${SUDO[@]}" partx -a "$NBD" 2>/dev/null || true   # force a partition rescan
-    udevadm settle
-
-    # The Windows system partition: largest NTFS one on the disk, probed with
-    # blkid directly (lsblk's FSTYPE can lag behind udev).
-    local dev size PART=""; local -i BEST=0
-    for dev in "$NBD"p*; do
-        [[ -b "$dev" ]] || continue
-        [[ "$("${SUDO[@]}" blkid -o value -s TYPE "$dev" 2>/dev/null)" == "ntfs" ]] \
-            || continue
-        size="$("${SUDO[@]}" blockdev --getsize64 "$dev")"
-        (( size > BEST )) && { BEST="$size"; PART="$dev"; }
-    done
-    if [[ -z "$PART" ]]; then
-        lsblk -o NAME,SIZE,FSTYPE,PARTTYPENAME "$NBD" >&2 || true
-        die "no NTFS partition found on $NBD (layout above)"
-    fi
-    echo "partition: $PART ($((BEST / 1024 / 1024 / 1024)) GiB)"
-
-    "${SUDO[@]}" mkdir -p "$MNT"
-    "${SUDO[@]}" mount -t ntfs-3g -o "ro,uid=$(id -u),gid=$(id -g)" "$PART" "$MNT"
-
-    # --- pull: frozen base -> host -------------------------------------------
+    # --- pull: whatever MNT now holds -> host --------------------------------
     shopt -s nullglob
 
     local globs dst_rel dst g m

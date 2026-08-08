@@ -1,0 +1,374 @@
+# xfer -- the transport layer: three ways to get bytes between the host and a
+# guest, behind one contract. Sourced by virutil; no entry point of its own.
+#
+# sync, pull and push describe *what* to move; a transport decides *how*, and
+# the three differ in what they need from the guest rather than in what they
+# achieve:
+#
+#   disk      the guest's own qcow2, attached to the host with qemu-nbd.
+#             Needs nothing from the guest -- which is why it is the only one
+#             that works on a guest with no agent, no drivers, or one that will
+#             not boot. For a write it must be shut down first (modules/guest);
+#             for a read it stays running behind a live snapshot (modules/pull).
+#
+#   volume    a scratch qcow2 handed back and forth: the host fills it over
+#             qemu-nbd, detaches, hotplugs it into the running guest, and the
+#             guest robocopies out of it. Every byte is written twice and the
+#             two sides take turns, but nothing has to be installed in the guest
+#             -- virtio-blk is already there, holding C:. (modules/volume)
+#
+#   virtiofs  a host directory exported live over virtio-fs. One copy, no turns,
+#             but it needs WinFsp and the viofs driver in the guest and guest RAM
+#             the host can map, which is a cold setting. (modules/virtiofs)
+#
+# The contract, in the write direction:
+#
+#   xfer_open           prepare, and set MNT to a host directory that stands for
+#                       the root of the guest's C:. Arms the EXIT trap.
+#   ...                 the caller rsyncs into $MNT/<path>, exactly as before
+#   xfer_deliver        make what is under MNT appear at C:\ in the guest
+#   xfer_close          teardown, from the trap
+#
+# and in the read direction:
+#
+#   xfer_open_read      prepare MNT for reading
+#   xfer_collect PAT... bring the named guest paths into MNT, C:-relative
+#   ...                 the caller rsyncs out of $MNT
+#   xfer_close
+#
+# For the disk transport xfer_deliver is a no-op: MNT *is* C:, so the copy phase
+# has already delivered. That is what lets sync and push keep one copy phase for
+# all three -- they write a C:-shaped tree either way, and the transport decides
+# whether that tree is the real C:, a staging volume, or a share.
+
+XFER=""            # the resolved backend: disk, volume or virtiofs
+XFER_MODE=""       # write or read
+XFER_ARMED=0       # whether the EXIT trap has anything to undo
+
+# The staging volume and the virtio-fs share are both found by name from inside
+# the guest, so the names are part of the protocol between the two halves.
+# 11 characters: the exFAT label limit, and NTFS is happy with it too.
+XFER_LABEL="VIRUTILXFER"
+XFER_TAG="virutil-xfer"
+
+xfer_transport_help() {
+    printf '%s\n' \
+        "  --transport T   how to move the files:" \
+        "                    auto      (default) virtiofs if the guest already" \
+        "                              has the share, else volume if it is" \
+        "                              running with an agent, else disk" \
+        "                    disk      the guest's own disk over qemu-nbd" \
+        "                              (a write shuts the guest down)" \
+        "                    volume    a staging qcow2 hotplugged into the" \
+        "                              running guest, copied out with robocopy" \
+        "                    virtiofs  a live virtio-fs share"
+}
+
+# The rule every module that escalates shares: under sudo the escalation is
+# all-or-nothing and $HOME is root's, so config discovery would read /root while
+# you edit a config in your own home. Escalate the handful of commands that
+# genuinely need root instead, which is what libvirt group membership is for.
+xfer_privilege() {
+    [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] \
+        && die "do not run virutil under sudo -- run it as yourself." \
+               "It escalates only the commands that actually need root."
+    if [[ $EUID -eq 0 ]]; then SUDO=(); else SUDO=(sudo); fi
+}
+
+xfer_running() {
+    [[ "$("${VIRSH[@]}" domstate "$1" 2>/dev/null)" == running ]]
+}
+
+# Probed with guest-ping rather than read from the channel's XML state: the
+# channel reads 'connected' with nothing listening on the other side.
+xfer_agent_ok() {
+    "${VIRSH[@]}" qemu-agent-command "$1" '{"execute":"guest-ping"}' \
+        >/dev/null 2>&1
+}
+
+# True if the running domain already exports our share. Deliberately narrow:
+# auto picks virtiofs only when the whole path is already in place, never by
+# setting it up, because setting it up can cost a cold restart.
+xfer_virtiofs_ready() {
+    "${VIRSH[@]}" dumpxml "$1" 2>/dev/null | grep -q "<target dir='$XFER_TAG'/>"
+}
+
+# xfer_select MODE REQUEST -- resolve 'auto' to a concrete transport and refuse
+# the combinations that cannot work, before anything is touched.
+#
+# auto never shuts a running guest down. Falling back to disk behind your back
+# would turn "copy a file" into "reboot Windows", so a running guest that cannot
+# take a live transport is an error naming the two ways out, not a surprise.
+xfer_select() {
+    XFER_MODE="$1"
+    local want="${2:-auto}" dom="$DOMAIN"
+
+    case "$want" in
+        auto|disk|volume|virtiofs) ;;
+        *) die "unknown transport: $want (auto, disk, volume or virtiofs)" ;;
+    esac
+
+    if [[ "$want" == auto ]]; then
+        if xfer_running "$dom" && xfer_virtiofs_ready "$dom" && xfer_agent_ok "$dom"; then
+            want=virtiofs
+        elif xfer_running "$dom" && xfer_agent_ok "$dom"; then
+            want=volume
+        elif xfer_running "$dom" && [[ "$XFER_MODE" == read ]]; then
+            # pull's disk transport reads a snapshot of the live disk, so a
+            # running guest with no agent is still fine there.
+            want=disk
+        elif xfer_running "$dom"; then
+            die "$dom is running, but the qemu guest agent is not answering," \
+                "so nothing can be copied into it without shutting it down." \
+                "Either install the agent (virutil exec setup $dom, plus the" \
+                "guest-agent MSI from virtio-win), or ask for the offline" \
+                "transport explicitly:" \
+                "  --transport disk"
+        else
+            want=disk
+        fi
+    fi
+
+    # Now the explicit requests, which get the same checks with a different tone:
+    # you asked for this one, so say exactly what it is missing.
+    case "$want" in
+        volume|virtiofs)
+            xfer_running "$dom" \
+                || die "--transport $want needs $dom running; it is" \
+                       "'$("${VIRSH[@]}" domstate "$dom" 2>/dev/null)'." \
+                       "Start it, or use --transport disk."
+            xfer_agent_ok "$dom" \
+                || die "--transport $want needs the qemu guest agent in $dom," \
+                       "which is what runs the copy inside it. Install it with" \
+                       "virutil exec setup $dom plus the guest-agent MSI from" \
+                       "the virtio-win ISO, or use --transport disk."
+            command -v jq >/dev/null \
+                || die "jq not installed; --transport $want talks to the guest agent"
+            ;;
+    esac
+
+    XFER="$want"
+    echo "transport: $XFER"
+}
+
+# --- dispatch ---------------------------------------------------------------
+#
+# One EXIT trap for the whole run, armed by whichever open() succeeded. The
+# backends' own state lives at module scope, not local to a main, because the
+# trap fires after the main has returned and set -u must not trip on it.
+
+xfer_open() {
+    XFER_MODE=write
+    case "$XFER" in
+        disk)     guest_open ;;          # arms its own trap; see modules/guest
+        volume)   volume_open write ;;
+        virtiofs) virtiofs_open write ;;
+    esac
+}
+
+xfer_open_read() {
+    XFER_MODE=read
+    case "$XFER" in
+        volume)   volume_open read ;;
+        virtiofs) virtiofs_open read ;;
+        *)        die "internal: xfer_open_read is not for the $XFER transport" ;;
+    esac
+}
+
+xfer_deliver() {
+    case "$XFER" in
+        disk)     ;;                     # MNT is C: -- already delivered
+        volume)   volume_deliver ;;
+        virtiofs) virtiofs_deliver ;;
+    esac
+}
+
+xfer_collect() {
+    case "$XFER" in
+        volume)   volume_collect "$@" ;;
+        virtiofs) virtiofs_collect "$@" ;;
+        *)        die "internal: xfer_collect is not for the $XFER transport" ;;
+    esac
+}
+
+xfer_close() {
+    case "$XFER" in
+        volume)   volume_close ;;
+        virtiofs) virtiofs_close ;;
+    esac
+}
+
+# --- host-side primitives ---------------------------------------------------
+#
+# The nbd lifecycle, factored out of modules/guest and modules/pull, which grew
+# their own copies of it. Only the caller's intent differs: guest attaches the
+# domain's disk read-write with it shut down, pull attaches a frozen snapshot
+# read-only, volume attaches a scratch image nobody else has open.
+
+# max_part only takes effect at module load, so a module already up without it
+# has to be reloaded or the partition nodes never appear.
+nbd_reload() {
+    if [[ ! -e /sys/module/nbd/parameters/max_part ]] \
+       || (( $(< /sys/module/nbd/parameters/max_part) < 1 )); then
+        "${SUDO[@]}" rmmod nbd 2>/dev/null || true
+        "${SUDO[@]}" modprobe nbd max_part=8
+    fi
+}
+
+# nbd_connect IMG [-r] -- attach IMG at $NBD and settle the partition table.
+nbd_connect() {
+    local img="$1" ro="${2:-}"
+    nbd_reload
+    "${SUDO[@]}" qemu-nbd ${ro:+-r} -c "$NBD" "$img"
+    "${SUDO[@]}" partx -a "$NBD" 2>/dev/null || true   # force a partition rescan
+    udevadm settle
+}
+
+# nbd_find_part TYPE... -- the largest partition on $NBD whose filesystem is one
+# of TYPE, printed on stdout; empty if there is none. Each node is probed with
+# blkid directly because lsblk's FSTYPE column can lag behind udev.
+#
+# Only the path is returned, not the size alongside it: callers read this from a
+# command substitution, so anything it set in a variable would be set in a
+# subshell and lost. Whoever wants the size asks blockdev for it.
+nbd_find_part() {
+    local dev fstype size want=" $* " best=0 part=""
+    for dev in "$NBD"p*; do
+        [[ -b "$dev" ]] || continue
+        fstype="$("${SUDO[@]}" blkid -o value -s TYPE "$dev" 2>/dev/null)"
+        [[ -n "$fstype" && "$want" == *" $fstype "* ]] || continue
+        size="$("${SUDO[@]}" blockdev --getsize64 "$dev")"
+        (( size > best )) && { best="$size"; part="$dev"; }
+    done
+    printf '%s' "$part"
+}
+
+# nbd_part_size DEV -- its size in whole GiB, for the one line that reports it.
+nbd_part_size() {
+    local bytes; bytes="$("${SUDO[@]}" blockdev --getsize64 "$1" 2>/dev/null || echo 0)"
+    printf '%s' "$(( bytes / 1024 / 1024 / 1024 ))"
+}
+
+# --- guest-side primitives --------------------------------------------------
+#
+# Everything that has to happen inside Windows goes through the guest agent, so
+# it works with no network, no shares and nobody logged in. The powershell
+# encoding, the size limits and the CLIXML handling all live in modules/exec;
+# this reuses exec_ps_text() rather than growing a second copy.
+
+# xfer_ps SCRIPT -- run SCRIPT in the guest, stdout to stdout, guest exit code
+# as ours. VM is the domain exec's helpers read; bash scoping is dynamic, so the
+# assignment reaches gexec() without every caller having to know that.
+xfer_ps() {
+    VM="$DOMAIN"
+    DETACH=0
+    exec_ps_text "$1"
+}
+
+# The letter Windows gave a volume, by label -- polled, because a hotplugged
+# disk takes a moment to be enumerated, mounted and assigned one, and the
+# alternative to polling is a race that fails on a busy guest and passes on an
+# idle one. Prints the letter (no colon) or nothing.
+#
+# Two things are worked around here: a disk that comes up offline (Windows'
+# SAN policy, which is OnlineAll on a client SKU but not everywhere), and a
+# volume that is mounted with no drive letter at all.
+xfer_drive_letter() {
+    local tries="${1:-30}"
+    xfer_ps '
+$deadline = (Get-Date).AddSeconds('"$tries"')
+do {
+  $v = Get-Volume -FileSystemLabel "'"$XFER_LABEL"'" -ErrorAction SilentlyContinue |
+       Select-Object -First 1
+  if ($v -and $v.DriveLetter) { Write-Output $v.DriveLetter; exit 0 }
+  foreach ($d in (Get-Disk -ErrorAction SilentlyContinue | Where-Object { $_.IsOffline })) {
+    try { Set-Disk -Number $d.Number -IsOffline $false -ErrorAction Stop } catch {}
+  }
+  if ($v -and -not $v.DriveLetter) {
+    try {
+      Get-Partition | Where-Object { $_.AccessPaths -and -not $_.DriveLetter } |
+        Add-PartitionAccessPath -AssignDriveLetter -ErrorAction Stop
+    } catch {}
+  }
+  Start-Sleep -Milliseconds 500
+} while ((Get-Date) -lt $deadline)
+exit 1' 2>/dev/null | tr -d '[:space:]'
+}
+
+# Single quotes are the only thing that needs escaping in a powershell literal,
+# and doubling them is how it is done.
+xfer_ps_quote() { printf '%s' "${1//\'/\'\'}"; }
+
+# xfer_empty_guest_dirs PATTERN... -- sync's cleanup rules, run inside the guest.
+#
+# The disk transport does this host-side through the mount, where a pattern is a
+# glob over a filesystem we can see. The live transports cannot: the staging
+# volume and the share hold what we are *sending*, not the guest's C:, so a
+# delete there would remove our own payload and leave the guest untouched.
+#
+# The two-levels-down rule from the host-side version is kept, and kept
+# host-side: a mistyped pattern must not be able to empty C:\ or a top-level
+# directory, and that check is worth making before the script is even built.
+xfer_empty_guest_dirs() {
+    local pat script rel sep=""
+    script='$ErrorActionPreference = "Stop"
+foreach ($p in @('
+    for pat in "$@"; do
+        rel="${pat#/}"; rel="${rel%/}"
+        [[ "$rel" == */* ]] \
+            || { warn "refusing unsafe cleanup pattern (too shallow): $pat"; continue; }
+        [[ "$rel" == *..* ]] \
+            && { warn "refusing unsafe cleanup pattern: $pat"; continue; }
+        script+="$sep'$(xfer_ps_quote "${rel//\//\\}")'"; sep=","
+    done
+    script+=')) {
+  foreach ($d in @(Get-Item -Path (Join-Path "C:\" $p) -ErrorAction SilentlyContinue)) {
+    if (-not $d.PSIsContainer) { continue }
+    $n = @(Get-ChildItem -LiteralPath $d.FullName -Force -Recurse -ErrorAction SilentlyContinue).Count
+    Get-ChildItem -LiteralPath $d.FullName -Force -ErrorAction SilentlyContinue |
+      Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Output "   emptied $($d.FullName) ($n entries)"
+  }
+}
+exit 0'
+    xfer_ps "$script" || warn "some cleanup rules failed inside $DOMAIN"
+}
+
+# A powershell fragment that leaves the staging disk in $disk, or $null. Three
+# ways of finding it, because none of them holds on its own: virtio-blk does not
+# always surface libvirt's <serial> (this host's own guest reports an empty one),
+# a freshly created image has no label yet because it has no filesystem yet, and
+# 'the raw one' is only unambiguous while it is unformatted. Together they cover
+# the whole lifecycle of the volume.
+xfer_ps_find_disk() {
+    printf '%s' '
+$disk = Get-Disk | Where-Object { $_.SerialNumber -like "*'"$XFER_LABEL"'*" } | Select-Object -First 1
+if (-not $disk) {
+  $v = Get-Volume -FileSystemLabel "'"$XFER_LABEL"'" -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($v -and $v.DriveLetter) {
+    $disk = Get-Partition -DriveLetter $v.DriveLetter -ErrorAction SilentlyContinue |
+            Get-Disk -ErrorAction SilentlyContinue | Select-Object -First 1
+  }
+}
+if (-not $disk) {
+  $disk = Get-Disk | Where-Object { $_.PartitionStyle -eq "RAW" } | Select-Object -First 1
+}
+'
+}
+
+# xfer_robocopy SRC DST [EXTRA...] -- a whole-tree copy inside the guest.
+# robocopy's exit codes are a bit field, not a status: anything under 8 is some
+# flavour of success (0 nothing to do, 1 files copied, 2 extras, 4 mismatches),
+# and 8 and up are real failures. Left untranslated it looks like every
+# successful copy failed.
+xfer_robocopy() {
+    local src="$1" dst="$2"; shift 2
+    local extra="" a
+    for a in "$@"; do extra+=" '$a'"; done
+    xfer_ps '
+$out = robocopy "'"$src"'" "'"$dst"'" /E /NJH /NJS /NP /NDL /R:1 /W:1 /XD "System Volume Information" "$RECYCLE.BIN"'"$extra"'
+$rc = $LASTEXITCODE
+$out | Where-Object { $_ -match "\S" } | Select-Object -Last 12
+if ($rc -ge 8) { throw "robocopy failed with code $rc" }
+exit 0'
+}
