@@ -607,6 +607,7 @@ host, which is the case this repo exists for. Everything is overridable.
 | `--no-virtio` | — | Attach no driver ISO. |
 | `--network SPEC` | `user,model=virtio` | Passed to `virt-install --network`. |
 | `--bios` | — | SeaBIOS instead of UEFI. |
+| `--no-shared-memory` | — | Do not back guest RAM with a shared memfd. |
 | `--dry-run` | — | Print the domain XML and define nothing. |
 
 What the profile actually sets, and why:
@@ -635,6 +636,15 @@ What the profile actually sets, and why:
 - **No balloon, no HPET, `rtc_tickpolicy=catchup`.** Two emulated devices a
    Windows guest does not need, and a clock policy that replays missed ticks
    rather than dropping them.
+- **Guest RAM backed by a shared memfd**
+   (`<memoryBacking><access mode='shared'/><source type='memfd'/>`). Nothing in
+   the default profile uses it, but a vhost-user device — **virtio-fs** above all
+   — cannot attach to a guest whose memory the host cannot map, and
+   `memoryBacking` is a *cold* setting: adding it to an existing domain costs a
+   full shutdown and start. Carrying it is free (the memfd is sized, not
+   preallocated, so an idle guest uses no more host memory than before), so every
+   new domain gets it and stays one hotplug away from a live host↔guest share
+   instead of one power cycle away. `--no-shared-memory` opts out.
 - **`--network user,model=virtio`.** SLIRP needs no host-side setup, which
    matters on WSL2 where the default NAT network usually is not there and the
    `nf_nat` modules may not be either. It has no inbound path; for RDP, add

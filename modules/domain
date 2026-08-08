@@ -13,7 +13,9 @@
 # create wraps virt-install with a KVM-tuned profile rather than libvirt's
 # defaults: host-passthrough CPU with a real core/thread topology, virtio-blk on
 # a dedicated iothread with cache=none and io_uring, the Hyper-V enlightenments
-# a Windows guest needs to stop burning CPU on timers, no balloon and no HPET.
+# a Windows guest needs to stop burning CPU on timers, no balloon and no HPET,
+# and guest RAM on a shared memfd so a virtio-fs share can be hotplugged later
+# without the cold restart memoryBacking would otherwise cost.
 # On a WSL2 host these are the difference between a usable guest and a sluggish
 # one -- the storage path especially, since the qcow2 already sits on a virtual
 # disk inside Hyper-V.
@@ -59,6 +61,8 @@ domain_usage() {
         "  --no-virtio       do not attach a virtio-win ISO" \
         "  --network SPEC    virt-install --network value (default network=default,model=virtio)" \
         "  --bios            seabios instead of UEFI" \
+        "  --no-shared-memory  do not back guest RAM with a shared memfd" \
+        "                    (virtio-fs will then need a cold restart to enable)" \
         "  --dry-run         print the domain XML and define nothing" \
         "" \
         "delete options:" \
@@ -208,6 +212,7 @@ domain_readable_by_qemu() {
 domain_create() {
     local VM="" ISO="" SIZE=64 MEM="" VCPUS="" IMG="" OSINFO=win11
     local VIRTIO="" NO_VIRTIO=0 NETWORK="network=default,model=virtio" BIOS=0 DRYRUN=0
+    local SHAREMEM=1
 
     while (( $# )); do
         case "$1" in
@@ -220,6 +225,7 @@ domain_create() {
             --no-virtio) NO_VIRTIO=1; shift ;;
             --network)  NETWORK="${2:?--network needs a value}"; shift 2 ;;
             --bios)     BIOS=1; shift ;;
+            --no-shared-memory) SHAREMEM=0; shift ;;
             --dry-run)  DRYRUN=1; shift ;;
             -h|--help)  domain_usage 0 ;;
             -*)         die "virutil domain create: unknown option: $1" ;;
@@ -295,6 +301,17 @@ domain_create() {
         --rng /dev/urandom
         --noautoconsole
     )
+
+    # Back guest RAM with a shared memfd. Nothing here needs it today, but a
+    # vhost-user device -- virtio-fs above all -- cannot attach to a guest whose
+    # memory the host cannot map, and memoryBacking is a cold setting: adding it
+    # later costs a full shutdown and start. It is free to carry (the memfd is
+    # sized, not preallocated, so an idle guest uses no more host memory than
+    # before), so every new domain gets it and stays one hotplug away from a
+    # live host<->guest share instead of one power cycle away.
+    if (( SHAREMEM )); then
+        ARGS+=(--memorybacking access.mode=shared,source.type=memfd)
+    fi
 
     if (( BIOS )); then
         ARGS+=(--boot cdrom,hd)
@@ -376,7 +393,9 @@ domain_create() {
 
     say "domain:  $VM ($OSINFO)"
     say "cpu:     $VCPUS vcpus (1 socket x $cores cores x $threads threads)"
-    say "memory:  ${MEM} MiB"
+    local memnote=""
+    (( SHAREMEM )) && memnote=" (shared memfd)"
+    say "memory:  ${MEM} MiB$memnote"
     say "disk:    $IMG (${SIZE} GiB)"
     say "iso:     $ISO"
     [[ -n "$VIRTIO" ]] && say "virtio:  $VIRTIO"
