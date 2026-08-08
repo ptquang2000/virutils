@@ -694,7 +694,8 @@ operate on, removes it again along with the disks nobody else cleans up, and
 covers the everyday operations in between.
 
 ```
-virutil domain create VM ISO [-s GiB] [-m MiB] [-c N] [-d PATH] [-o ID] [-n]
+virutil domain create VM ISO [-s GiB] [-m MiB] [-c N] [-d PATH] [-o ID]
+                             [-v ISO|none] [-n]
 virutil domain delete VM [-y] [-k]
 virutil domain list
 virutil domain start    VM [-s GiB] [-m MiB] [-c N]
@@ -709,8 +710,8 @@ defaults. The defaults it does pick — half the host's RAM, half its CPUs cappe
 at 8, a 64 GiB disk, UEFI — are aimed at a Windows guest on a WSL2 host, which
 is the case this repo exists for. Everything is overridable.
 
-The flags are the four things you actually vary per domain. Everything else is
-a property of the *host* rather than of one guest, so it is set once in the
+The flags are what you vary per domain. Everything else is a property of the
+*host* rather than of one guest, so it is set once in the
 [environment](#environment) instead of retyped on every `create`.
 
 | Option | Default | Description |
@@ -720,6 +721,7 @@ a property of the *host* rather than of one guest, so it is set once in the
 | `-c`, `--vcpus N` | half the host's, max 8 | Virtual CPUs. |
 | `-d`, `--disk PATH` | `/var/lib/libvirt/images/VM.qcow2` | Disk image path. |
 | `-o`, `--osinfo ID` | **detected from the ISO** | libosinfo id; see `osinfo-query os`. |
+| `-v`, `--virtio ISO` | `virtio-win*.iso` beside the install ISO | Driver ISO to attach as a second cdrom. `none` attaches none. |
 | `-n`, `--dry-run` | — | Print the domain XML and define nothing. |
 
 **`--osinfo` is detected, not guessed.** `osinfo-detect` reads the ISO's own
@@ -787,7 +789,7 @@ What the profile actually sets, and why:
 
 ```
 virutil domain create win11 ~/Work/iso/Win11_24H2_tiny.iso
-virutil domain create dev ~/iso/f40.iso -s 40 -m 4096
+virutil domain create dev ~/iso/f40.iso -s 40 -m 4096 -v none
 virutil domain create win11 ~/iso/win11.iso -n | less
 ```
 
@@ -805,7 +807,7 @@ profile once, or prefix a single `create` with them.
 | --- | --- | --- |
 | `VIRUTIL_IMAGE_DIR` | `/var/lib/libvirt/images` | Where a disk image goes when `-d` is not given. Also where `snapshot` writes overlays. |
 | `VIRUTIL_OSINFO` | `win11` | Fallback libosinfo id when the ISO is not recognised. |
-| `VIRUTIL_VIRTIO` | `virtio-win*.iso` beside the install ISO | Driver ISO to attach as a second cdrom. `none` attaches none. |
+| `VIRUTIL_VIRTIO` | `virtio-win*.iso` beside the install ISO | Default for `-v`: driver ISO to attach as a second cdrom, or `none`. |
 | `VIRUTIL_NETWORK` | `network=default,model=virtio` | Passed to `virt-install --network`. |
 | `VIRUTIL_FIRMWARE` | `uefi` | `bios` selects SeaBIOS instead. Windows 11 will not install without UEFI. |
 | `VIRUTIL_SHARED_MEMORY` | `1` | `0` leaves guest RAM on private anonymous memory, which makes virtio-fs impossible without a later cold restart. |

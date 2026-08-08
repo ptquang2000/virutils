@@ -255,8 +255,9 @@ _virutil_domain() {
            # the value-taking flags read the next word, so complete for the flag
            # behind us before offering another flag
            case $words[CURRENT-1] in
-             -d|--disk)   _files;          return ;;
-             -o|--osinfo) _virutil_osinfo; return ;;
+             -d|--disk)   _files;               return ;;
+             -o|--osinfo) _virutil_osinfo;      return ;;
+             -v|--virtio) _files -g '*.iso';    return ;;
              -s|--size)   _virutil_size;   return ;;
              -m|--memory) _virutil_memory; return ;;
              -c|--vcpus)  _virutil_vcpus;  return ;;
@@ -267,6 +268,7 @@ _virutil_domain() {
              '(-c --vcpus)'{-c,--vcpus}'[virtual CPUs]' \
              '(-d --disk)'{-d,--disk}'[disk image path]' \
              '(-o --osinfo)'{-o,--osinfo}'[libosinfo id; detected from the ISO by default]' \
+             '(-v --virtio)'{-v,--virtio}'[virtio-win ISO to attach, or none]' \
              '(-n --dry-run)'{-n,--dry-run}'[print the domain XML and define nothing]'
            ;;
       esac

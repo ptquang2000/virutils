@@ -33,6 +33,8 @@ domain_usage() {
         "  -c, --vcpus N     virtual CPUs (default: half the host's, max 8)" \
         "  -d, --disk PATH   disk image path (default $DOMAIN_IMAGE_DIR/VM.qcow2)" \
         "  -o, --osinfo ID   libosinfo id (default: detected from ISO)" \
+        "  -v, --virtio ISO  virtio-win ISO to attach as a second cdrom, or" \
+        "                    'none' (default: found beside ISO)" \
         "  -n, --dry-run     print the domain XML and define nothing" \
         "" \
         "start options (domain must be shut off; each is written to the config):" \
@@ -238,6 +240,7 @@ domain_create() {
             -c|--vcpus)   VCPUS="${2:?$1 needs a value}";  shift 2 ;;
             -d|--disk)    IMG="${2:?$1 needs a value}";    shift 2 ;;
             -o|--osinfo)  OSINFO="${2:?$1 needs a value}"; shift 2 ;;
+            -v|--virtio)  VIRTIO="${2:?$1 needs a value}"; shift 2 ;;
             -n|--dry-run) DRYRUN=1; shift ;;
             -h|--help)    domain_usage 0 ;;
             -*)           die "virutil domain create: unknown option: $1" ;;
@@ -365,8 +368,7 @@ domain_create() {
         done
     fi
     [[ "$VIRTIO" == none ]] && VIRTIO=""
-    [[ -n "$VIRTIO" && ! -f "$VIRTIO" ]] && die "virtio-win ISO not found: $VIRTIO" \
-                                                "(from VIRUTIL_VIRTIO)"
+    [[ -n "$VIRTIO" && ! -f "$VIRTIO" ]] && die "virtio-win ISO not found: $VIRTIO"
 
     domain_readable_by_qemu "$ISO"
     [[ -n "$VIRTIO" ]] && domain_readable_by_qemu "$VIRTIO"
