@@ -146,12 +146,14 @@ domain_in_use() {
 # libvirt relabels the file but never the directories above it, so an ISO under
 # a 0700 home fails at domain start with a bare "Permission denied".
 domain_readable_by_qemu() {
-    local file="$1" dir missing=() qemu_user
+    local file="$1" dir up missing=() qemu_user
     qemu_user="$(awk -F'"' '/^[[:space:]]*user[[:space:]]*=/ {print $2}' \
                  /etc/libvirt/qemu.conf 2>/dev/null | tail -1)"
     qemu_user="${qemu_user:-libvirt-qemu}"
     [[ "$qemu_user" == root ]] && return 0
 
+    # Absolute, or the walk up never reaches / -- dirname of "." is ".".
+    file="$(realpath -- "$file" 2>/dev/null || printf '%s' "$PWD/$file")"
     dir="$(dirname -- "$file")"
     while :; do
         # The tenth character of the mode string is other-execute: 'x', or 't'
@@ -162,7 +164,9 @@ domain_readable_by_qemu() {
             missing+=("$dir")
         fi
         [[ "$dir" == / ]] && break
-        dir="$(dirname -- "$dir")"
+        up="$(dirname -- "$dir")"
+        [[ "$up" == "$dir" ]] && break
+        dir="$up"
     done
 
     (( ${#missing[@]} )) || return 0
@@ -260,6 +264,9 @@ domain_create() {
     [[ -e /dev/kvm ]] || die "/dev/kvm is missing -- no hardware virtualisation." \
                              "Under WSL2 this usually means nested virtualisation is off."
     [[ -f "$ISO" ]] || die "install ISO not found: $ISO"
+    # libvirt stores disk sources as absolute paths; resolve before anything
+    # derives a directory from them.
+    ISO="$(realpath -- "$ISO")"
     domain_exists "$VM" && die "domain '$VM' already exists" \
                                "  virutil domain delete $VM"
 
@@ -369,6 +376,7 @@ domain_create() {
     fi
     [[ "$VIRTIO" == none ]] && VIRTIO=""
     [[ -n "$VIRTIO" && ! -f "$VIRTIO" ]] && die "virtio-win ISO not found: $VIRTIO"
+    [[ -n "$VIRTIO" ]] && VIRTIO="$(realpath -- "$VIRTIO")"
 
     domain_readable_by_qemu "$ISO"
     [[ -n "$VIRTIO" ]] && domain_readable_by_qemu "$VIRTIO"
