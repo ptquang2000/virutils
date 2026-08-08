@@ -53,6 +53,14 @@ _virutil_domains() {
   _describe -t domain 'domain' doms
 }
 
+_virutil_osinfo() {
+  local -a ids
+  if command -v osinfo-query >/dev/null 2>&1; then
+    ids=(${(f)"$(osinfo-query --fields=short-id os 2>/dev/null | awk 'NR>2 {print $1}')"})
+  fi
+  _describe -t osinfo 'osinfo id' ids
+}
+
 _virutil_exec() {
   local -a cmds=(
     'setup:add the org.qemu.guest_agent.0 channel'
@@ -201,7 +209,16 @@ _virutil_domain() {
         3) _describe -t command 'command' cmds ;;
         4) ;;                       # the new domain's name: nothing to complete
         5) _files -g '*.iso' ;;
-        *) _values 'option' \
+        *)
+           # the value-taking flags read the next word, so complete for the flag
+           # behind us before offering another flag
+           case $words[CURRENT-1] in
+             --disk)   _files; return ;;
+             --virtio) _files -g '*.iso'; return ;;
+             --osinfo) _virutil_osinfo; return ;;
+             --size|--memory|--vcpus|--network) return ;;
+           esac
+           _values 'option' \
              '--size[disk size in GiB]' \
              '--memory[guest RAM in MiB]' \
              '--vcpus[virtual CPUs]' \

@@ -57,7 +57,7 @@ domain_usage() {
         "  --osinfo ID       libosinfo id (default win11; see osinfo-query os)" \
         "  --virtio ISO      virtio-win ISO to attach (default: found next to ISO)" \
         "  --no-virtio       do not attach a virtio-win ISO" \
-        "  --network SPEC    virt-install --network value (default user,model=virtio)" \
+        "  --network SPEC    virt-install --network value (default network=default,model=virtio)" \
         "  --bios            seabios instead of UEFI" \
         "  --dry-run         print the domain XML and define nothing" \
         "" \
@@ -207,7 +207,7 @@ domain_readable_by_qemu() {
 
 domain_create() {
     local VM="" ISO="" SIZE=64 MEM="" VCPUS="" IMG="" OSINFO=win11
-    local VIRTIO="" NO_VIRTIO=0 NETWORK="user,model=virtio" BIOS=0 DRYRUN=0
+    local VIRTIO="" NO_VIRTIO=0 NETWORK="network=default,model=virtio" BIOS=0 DRYRUN=0
 
     while (( $# )); do
         case "$1" in

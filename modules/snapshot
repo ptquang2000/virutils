@@ -3,7 +3,7 @@
 #   virutil snapshot create    VM [SNAP]   create an external snapshot (default name: snap-<timestamp>)
 #   virutil snapshot list      VM          list snapshots as a tree
 #   virutil snapshot revert    VM SNAP     revert to a snapshot and leave the VM running
-#   virutil snapshot delete    VM SNAP     delete a snapshot and its children
+#   virutil snapshot delete    VM SNAP     delete a snapshot, keeping the current state
 
 DIR=/var/lib/libvirt/images
 
@@ -57,7 +57,8 @@ snapshot_main() {
         ;;
     delete)
         SNAP="${3:?usage: virutil snapshot delete VM_NAME SNAP_NAME}"
-        "${VIRSH[@]}" snapshot-delete --domain "$VM" --snapshotname "$SNAP" --children
+
+        "${VIRSH[@]}" snapshot-delete --domain "$VM" --snapshotname "$SNAP"
         echo "deleted: $SNAP"
         ;;
     *)
