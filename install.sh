@@ -70,6 +70,7 @@ OPTIONAL=(
     "domain: TPM 2.0 device, which a stock Windows 11 installer requires|swtpm"
     "domain: detecting --osinfo from an install ISO|osinfo-detect"
     "domain: fixing ISO permissions under a 0700 home|setfacl"
+    "domain port: the relay that carries a guest port to the host|socat"
     "sync pull: NTFS volumes on the guest disk|mount.ntfs-3g"
     "volume transport: host-side formatting of the staging image (the guest formats it otherwise)|mkfs.exfat"
 )

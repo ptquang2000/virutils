@@ -37,6 +37,7 @@ step and no dependencies beyond the utilities it calls.
    - [delete](#delete)
    - [start](#start)
    - [list, shutdown, addr](#list-shutdown-addr)
+   - [port](#port)
 - [Requirements](#requirements)
 - [See also](#see-also)
 
@@ -87,7 +88,7 @@ The seven modules fall into four groups, which is also the order
 
 | Module | Purpose | Usage |
 | --- | --- | --- |
-| `domain` | The domain lifecycle: create one from an install ISO with a KVM-tuned profile, delete one along with its disks, and the everyday operations in between. | `virutil domain {create\|delete\|list\|start\|shutdown\|addr} [VM] [ISO] [OPTIONS]` |
+| `domain` | The domain lifecycle: create one from an install ISO with a KVM-tuned profile, delete one along with its disks, and the everyday operations in between. | `virutil domain {create\|delete\|list\|start\|shutdown\|addr\|port} [VM] [ISO] [OPTIONS]` |
 | `snapshot` | External snapshots (disk and memory) for libvirt domains. | `virutil snapshot {create\|list\|revert\|delete} VM [SNAP]` |
 
 ### transfer
@@ -918,6 +919,49 @@ guest-agent path that `sync` and `push` use, see `modules/guest`.
 
 Note that `addr` is `virsh domifaddr`; the shorter name is deliberate, since the
 `dom` prefix is redundant under a module already called `domain`.
+
+### port
+
+```
+virutil domain port VM [SPEC] [-c PORT]
+```
+
+Forward a TCP port into a running guest, so that the Windows host reaches the
+service at `localhost:HOSTPORT`. `SPEC` is a bare `PORT` for the same number on
+both sides, or `HOSTPORT:GUESTPORT` when they differ:
+
+```sh
+virutil domain port win11 8080         # host 8080 -> guest 8080
+virutil domain port win11 8080:80      # host 8080 -> guest 80
+virutil domain port win11               # what is currently forwarded
+virutil domain port win11 -c 8080       # close that one
+```
+
+The guest address comes from `virsh domifaddr`, trying the DHCP lease, then the
+guest agent, then the host's ARP cache — so a statically configured guest needs
+[`qemu-guest-agent`](#guest-prerequisites) running for this to find it.
+
+The forward is a detached `socat` relay. It survives the shell that started it
+and lives until it is closed or WSL shuts down; the pid is printed, and the
+listing shows it again later. Nothing needs root as long as the host port is
+≥ 1024. Opening a forward that already exists is a no-op, and reopening one
+whose guest address has since changed repoints it.
+
+State lives in `$XDG_RUNTIME_DIR/virutil/ports`, one file per forward. A file
+whose relay has died is dropped the next time the list is read, so a reboot
+cannot leave the two out of step.
+
+**Why a relay and not a firewall rule.** Two hops separate a guest service from
+a browser on Windows: guest → WSL, then WSL → Windows. This command is the first
+hop; WSL's own localhost forwarding is the second, and comes for free — no
+firewall rule, no `.wslconfig` change. But that second hop only publishes ports
+that have a *real listening socket* in the WSL namespace, and an nftables `DNAT`
+rule has none. That is the whole reason a userspace process is involved, and the
+reason the relay always binds `0.0.0.0` rather than offering a choice.
+
+If the forward connects but the guest never answers, check that the service in
+the guest listens on `0.0.0.0` rather than `127.0.0.1`, and that the guest's
+own firewall allows the port — no host-side plumbing works around either.
 
 ## Requirements
 

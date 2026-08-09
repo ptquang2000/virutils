@@ -19,6 +19,11 @@ domain_usage() {
         "       virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]" \
         "       virutil domain shutdown VM" \
         "       virutil domain addr     VM" \
+        "       virutil domain port     VM [SPEC] [-c PORT]" \
+        "" \
+        "port options (SPEC is PORT, or HOSTPORT:GUESTPORT when the two differ;" \
+        "with no SPEC it lists the open forwards for VM):" \
+        "  -c, --close PORT  close the forward on host PORT" \
         "" \
         "create options:" \
         "  -s, --size GiB    disk size (default 64)" \
@@ -73,6 +78,7 @@ domain_main() {
         list)     "${VIRSH[@]}" list --all ;;
         shutdown) domain_need_vm shutdown "$@"; "${VIRSH[@]}" shutdown  "$1" ;;
         addr)     domain_need_vm addr     "$@"; "${VIRSH[@]}" domifaddr "$1" --full ;;
+        port)     domain_port   "$@" ;;
         *)        die "virutil domain: unknown command: $CMD (see: virutil domain -h)" ;;
     esac
 }
@@ -490,6 +496,228 @@ domain_start() {
     fi
 
     (( CONSOLE )) && domain_console "$VM"
+    return 0
+}
+
+# The guest's address, from whichever source knows it. The lease is
+# authoritative when libvirt handed the address out itself, a guest configured
+# statically only shows up to the agent, and a guest whose agent is not running
+# only shows up in the host's ARP cache.
+domain_ip() {
+    local src ip
+    for src in lease agent arp; do
+        ip="$("${VIRSH[@]}" domifaddr "$1" --source "$src" 2>/dev/null |
+            awk '{ for (i = 1; i <= NF; i++)
+                       if ($i ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}\/[0-9]+$/) {
+                           split($i, a, "/")
+                           if (a[1] !~ /^127\./) { print a[1]; exit }
+                       } }')"
+        [[ -n "$ip" ]] && { printf '%s' "$ip"; return 0; }
+    done
+    return 1
+}
+
+# Forwards are tracked here, one file per forward, keyed on the host port --
+# which is the only thing that has to be unique. The runtime dir is cleared on
+# reboot, and so are the relays, so the two cannot drift apart across one.
+DOMAIN_PORT_DIR="${XDG_RUNTIME_DIR:-/tmp/virutil-$(id -u)}/virutil/ports"
+
+domain_port_file() { printf '%s/%s-%s' "$DOMAIN_PORT_DIR" "$1" "$2"; }
+
+# A pid alone proves nothing once it has been recycled, so the command behind it
+# is checked too. cmdline is NUL-separated, hence -a.
+domain_port_alive() {
+    [[ -n "$1" && -r "/proc/$1/cmdline" ]] && grep -qa socat "/proc/$1/cmdline"
+}
+
+# Every live forward as "PROTO HOSTPORT VM IP GUESTPORT BIND PID", dropping the
+# state files whose relay has since died. Reading is the only thing that
+# garbage-collects, which is enough: nothing else trusts a stale file.
+domain_port_entries() {
+    local f base proto hostport vm ip gport bind pid
+    [[ -d "$DOMAIN_PORT_DIR" ]] || return 0
+    for f in "$DOMAIN_PORT_DIR"/*-*; do
+        [[ -f "$f" ]] || continue
+        # socat's stderr sits beside the state file and matches the same glob
+        case "$f" in *.log) continue ;; esac
+        read -r vm ip gport bind pid <"$f" || continue
+        if ! domain_port_alive "$pid"; then rm -f "$f"; continue; fi
+        base="${f##*/}"; proto="${base%%-*}"; hostport="${base#*-}"
+        printf '%s %s %s %s %s %s %s\n' \
+            "$proto" "$hostport" "$vm" "$ip" "$gport" "$bind" "$pid"
+    done
+}
+
+# domain_port_kill PID -- stop a relay and every connection it forked.
+#
+# socat's `fork` leaves one child per live connection, and those are reparented
+# to init when the listener dies: killing the pid alone would leave a guest
+# connection open with nothing tracking it. setsid put the relay in a session of
+# its own, so the process group is exactly the relay and its children.
+domain_port_kill() {
+    local pgid mine
+    pgid="$(ps -o pgid= -p "$1" 2>/dev/null | tr -d ' ')"
+    mine="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
+    # Never signal our own group: that would take virutil down with it.
+    if [[ -n "$pgid" && "$pgid" != "$mine" ]]; then
+        kill -- "-$pgid" 2>/dev/null || true
+    else
+        kill "$1" 2>/dev/null || true
+    fi
+}
+
+domain_port_show() {
+    local proto hostport vm ip gport bind pid n=0
+    while read -r proto hostport vm ip gport bind pid; do
+        (( n++ == 0 )) && printf '%-5s %-21s %-21s %-16s %s\n' \
+            PROTO LISTEN GUEST VM PID
+        printf '%-5s %-21s %-21s %-16s %s\n' \
+            "$proto" "$bind:$hostport" "$ip:$gport" "$vm" "$pid"
+    done < <(domain_port_entries | awk -v vm="${1:-}" \
+                 'vm == "" || $3 == vm' | sort -k1,1 -k2,2n)
+    (( n )) || say "no forwards${1:+ for $1}"
+}
+
+# domain_port_spec SPEC -- sets HOSTPORT and GUESTPORT in the caller. A bare
+# port means the same number on both sides, which is what you want often enough
+# to be the default.
+#
+# Assigns rather than prints: die() inside a command substitution would only
+# exit the subshell, leaving a rejected port to carry on as an empty string.
+domain_port_spec() {
+    local p
+    case "$1" in
+        *:*:*) die "port wants PORT or HOSTPORT:GUESTPORT, got '$1'" ;;
+        *:*)   HOSTPORT="${1%%:*}"; GUESTPORT="${1#*:}" ;;
+        *)     HOSTPORT="$1";       GUESTPORT="$1" ;;
+    esac
+    for p in "$HOSTPORT" "$GUESTPORT"; do
+        [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 )) \
+            || die "not a port number: '$p' (in '$1')"
+    done
+}
+
+# domain_port -- relay a host port into a running guest.
+#
+# Two hops separate a guest service from a browser on Windows: guest -> WSL, and
+# WSL -> Windows. WSL's own localhost forwarding covers the second for free, but
+# only for a real listening socket in this network namespace -- it does not see
+# nftables DNAT. So the first hop is a userspace relay, which is also why this
+# needs no privilege and no host firewall change.
+domain_port() {
+    local VM="" SPEC="" CLOSE=""
+    local HOSTPORT GUESTPORT IP LISTEN REMOTE
+
+    while (( $# )); do
+        case "$1" in
+            -c|--close)     CLOSE="${2:?$1 needs a port}"; shift 2 ;;
+            -h|--help)      domain_usage 0 ;;
+            -*)             die "virutil domain port: unknown option: $1" ;;
+            *)              if   [[ -z "$VM"   ]]; then VM="$1"
+                            elif [[ -z "$SPEC" ]]; then SPEC="$1"
+                            else die "unexpected argument: $1"
+                            fi
+                            shift ;;
+        esac
+    done
+    [[ -n "$VM" ]] || domain_usage
+    [[ -n "$SPEC" && -n "$CLOSE" ]] && die "port opens or closes, not both"
+    domain_exists "$VM" || die "no such domain: $VM (see: virutil domain list)"
+
+    local proto hostport vm ip gport bind pid
+
+    if [[ -n "$CLOSE" ]]; then
+        domain_port_spec "$CLOSE"
+        # No match leaves read empty and failing, which set -e would take as
+        # fatal before the message below could explain it.
+        read -r proto hostport vm ip gport bind pid < <(
+            domain_port_entries |
+                awk -v p="$HOSTPORT" '$2 == p') || true
+        [[ -n "${hostport:-}" ]] \
+            || die "no forward on $HOSTPORT (see: virutil domain port $VM)"
+        # The host port is the key, so a mistyped VM would otherwise close a
+        # forward belonging to another domain.
+        [[ "$vm" == "$VM" ]] \
+            || die "port $HOSTPORT is forwarded to $vm, not to $VM"
+        domain_port_kill "$pid"
+        rm -f "$(domain_port_file tcp "$HOSTPORT")" \
+              "$(domain_port_file tcp "$HOSTPORT").log"
+        say "closed $HOSTPORT -> $VM ($ip:$gport)"
+        return 0
+    fi
+
+    # No spec: the listing is what you want most often after opening one.
+    [[ -n "$SPEC" ]] || { domain_port_show "$VM"; return 0; }
+
+    domain_port_spec "$SPEC"
+
+    command -v socat >/dev/null \
+        || die "socat not installed; the forward is a socat relay"
+
+    local state; state="$("${VIRSH[@]}" domstate "$VM" 2>/dev/null || true)"
+    [[ "$state" == running ]] \
+        || die "$VM is '$state'; a domain that is not running has no address" \
+               "to forward to."
+
+    IP="$(domain_ip "$VM")" || die \
+        "could not find an address for $VM. A guest on the default NAT network" \
+        "gets one from libvirt's DHCP; a guest configured statically needs the" \
+        "QEMU guest agent running for libvirt to see it." \
+        "  virutil domain addr $VM"
+
+    # As above: an unmatched read fails, and that is the normal case here.
+    read -r proto hostport vm ip gport bind pid < <(
+        domain_port_entries |
+            awk -v p="$HOSTPORT" '$2 == p') || true
+    if [[ -n "${hostport:-}" ]]; then
+        if [[ "$vm" == "$VM" && "$gport" == "$GUESTPORT" && "$ip" == "$IP" ]]; then
+            say "$HOSTPORT -> $VM ($IP:$GUESTPORT) is already open (pid $pid)"
+            return 0
+        fi
+        # Silently repointing a forward another domain is using is worse than
+        # refusing to; a stale one of our own is just replaced.
+        [[ "$vm" == "$VM" ]] \
+            || die "port $HOSTPORT is already forwarded to $vm ($ip:$gport)" \
+                   "  virutil domain port $vm -c $HOSTPORT"
+        say "$HOSTPORT: repointing from $ip:$gport to $IP:$GUESTPORT"
+        domain_port_kill "$pid"
+    fi
+
+    # bind=0.0.0.0 is not a default so much as the whole point: WSL only
+    # publishes a port to Windows when something listens on the wildcard.
+    LISTEN="TCP4-LISTEN:$HOSTPORT,fork,reuseaddr,bind=0.0.0.0"
+    REMOTE="TCP4:$IP:$GUESTPORT"
+
+    (( HOSTPORT < 1024 && EUID != 0 )) \
+        && warn "note: binding $HOSTPORT needs root; expect socat to fail"
+
+    mkdir -p "$DOMAIN_PORT_DIR"
+    local log="$DOMAIN_PORT_DIR/tcp-$HOSTPORT.log"
+
+    # setsid so the relay outlives this shell, and the inner shell reports the
+    # pid of socat itself rather than of whatever wrapper happened to fork.
+    # socat's stderr is the only diagnosis available when a relay will not
+    # start, so it is kept until the forward is closed.
+    pid=$(setsid bash -c 'socat "$1" "$2" >>"$3" 2>&1 & echo $!' \
+              _ "$LISTEN" "$REMOTE" "$log")
+
+    # A relay that cannot bind dies at once, and saying so here beats leaving a
+    # state file behind for a process that never existed.
+    sleep 0.3
+    if ! domain_port_alive "$pid"; then
+        warn "socat could not start the forward on $HOSTPORT:"
+        sed 's/^/  /' "$log" >&2
+        rm -f "$log"
+        die "nothing is listening on $HOSTPORT; is the port already taken?" \
+            "  ss -lnt 'sport = :$HOSTPORT'"
+    fi
+
+    printf '%s %s %s %s %s\n' "$VM" "$IP" "$GUESTPORT" 0.0.0.0 "$pid" \
+        >"$(domain_port_file tcp "$HOSTPORT")"
+
+    say "$HOSTPORT -> $VM ($IP:$GUESTPORT), pid $pid"
+    say "  Windows: localhost:$HOSTPORT"
+    say "  close with: virutil domain port $VM -c $HOSTPORT"
     return 0
 }
 

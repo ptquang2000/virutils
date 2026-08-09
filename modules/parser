@@ -11,7 +11,7 @@ top_usage() {
 usage: virutil MODULE [ARGS]
 
 domains
-  domain     the domain lifecycle: create, delete, list, start, shutdown, addr
+  domain     the domain lifecycle: create, delete, list, start, shutdown, addr, port
   snapshot   external snapshots (disk and memory) for libvirt domains
 
 transfer

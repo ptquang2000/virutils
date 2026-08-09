@@ -6,7 +6,7 @@ _virutil() {
   # as separate blocks.
   local -a domains transfer guest hardware other
   domains=(
-    'domain:the domain lifecycle: create, delete, list, start, shutdown, addr'
+    'domain:the domain lifecycle: create, delete, list, start, shutdown, addr, port'
     'snapshot:external snapshots (disk and memory) for libvirt domains'
   )
   transfer=(
@@ -53,6 +53,18 @@ _virutil_domains() {
                         print name ":" $0 }')"})
   fi
   _describe -t domain 'domain' doms
+}
+
+# The host ports this domain currently forwards, read from the same runtime dir
+# the module writes; the guest side becomes the description.
+_virutil_domain_ports() {
+  local dir=${XDG_RUNTIME_DIR:-/tmp/virutil-$UID}/virutil/ports
+  local -a ports
+  local f
+  for f in $dir/tcp-*(N); do
+    ports+=("${f:t:s/tcp-/}:-> $(<$f)")
+  done
+  _describe -t port 'forward' ports
 }
 
 _virutil_osinfo() {
@@ -226,10 +238,26 @@ _virutil_domain() {
     'start:power on a domain and open its console'
     'shutdown:request a graceful shutdown (ACPI)'
     'addr:show guest interface addresses'
+    'port:forward a host port into a running guest'
   )
   case $words[3] in
     shutdown|addr)
       (( CURRENT == 4 )) && _virutil_domains
+      ;;
+    port)
+      case $CURRENT in
+        4) _virutil_domains ;;
+        5) ;;                       # PORT or HOSTPORT:GUESTPORT: free-form
+        *)
+           # -c takes a host port, and the open forwards are the only ones worth
+           # offering
+           case $words[CURRENT-1] in
+             -c|--close) _virutil_domain_ports $words[4]; return ;;
+           esac
+           _values 'option' \
+             '(-c --close)'{-c,--close}'[close the forward on host PORT]'
+           ;;
+      esac
       ;;
     list) ;;                        # takes no arguments
     start)
