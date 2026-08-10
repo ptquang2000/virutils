@@ -263,6 +263,7 @@ domain_create() {
 
     [[ "$SIZE" =~ ^[0-9]+$ ]] || die "--size wants a whole number of GiB, got '$SIZE'"
     IMG="${IMG:-$DOMAIN_IMAGE_DIR/$VM.qcow2}"
+    [[ -d "$IMG" ]] && IMG="$IMG/$VM.qcow2"
     [[ -e "$IMG" ]] && die "disk image already exists: $IMG" \
                            "Pass --disk to put it elsewhere, or remove it first."
 
