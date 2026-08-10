@@ -27,7 +27,7 @@ VIRTIOFS_BINARY=(
 )
 
 virtiofs_host_dir() {
-    printf '%s/virutil-%s' "${XDG_CACHE_HOME:-$HOME/.cache}" "$DOMAIN"
+    printf '%s/virutil-%s' "${VIRUTILS_SHARE_ROOT:-$VIRUTILS_ROOT/share}" "$DOMAIN"
 }
 
 virtiofs_binary() {

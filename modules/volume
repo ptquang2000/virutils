@@ -19,7 +19,7 @@
 #
 # The image is created once per domain and kept: formatting is the slow part.
 
-VOLUME_DIR=/var/lib/libvirt/images
+VOLUME_DIR="$VIRUTILS_IMAGE_DIR"
 VOLUME_SIZE=16                 # GiB, sparse -- an upper bound, not an allocation
 VOLUME_IMG=""
 VOLUME_TARGET=""               # the vdX the disk is attached as
@@ -89,6 +89,8 @@ EOF
 volume_create() {
     local created=0
     if [[ ! -e "$VOLUME_IMG" ]]; then
+        mkdir -p "$VOLUME_DIR"
+        paths_qemu_warn "$VOLUME_DIR"
         say "staging volume: creating $VOLUME_IMG (${VOLUME_SIZE} GiB, sparse)"
         local -a imgsudo=()
         [[ -w "$(dirname -- "$VOLUME_IMG")" ]] || imgsudo=("${SUDO[@]}")
@@ -182,7 +184,7 @@ volume_open() {
     fi
 
     VOLUME_IMG="$(volume_image)"
-    MNT="${MNT:-/mnt/$DOMAIN-xfer}"
+    MNT="${MNT:-$(virutils_mnt "$DOMAIN-xfer")}"
 
     # A stale nbd or mount from a failed run is not ours to tear down.
     nbd_attached && die "$NBD is already attached; free it or set @nbd elsewhere" \

@@ -95,7 +95,7 @@ guest_open() {
 
     xfer_privilege
 
-    MNT="${MNT:-/mnt/$DOMAIN}"
+    MNT="${MNT:-$(virutils_mnt "$DOMAIN")}"
     command -v rsync >/dev/null || die "rsync not installed"
 
     # Authenticate before the guest is shut down rather than partway through.

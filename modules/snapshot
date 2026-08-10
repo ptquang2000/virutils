@@ -1,6 +1,6 @@
 # snapshot -- external snapshots (disk + memory) for libvirt domains
 
-DIR="${VIRUTIL_IMAGE_DIR:-/var/lib/libvirt/images}"
+DIR="${VIRUTIL_IMAGE_DIR:-$VIRUTILS_IMAGE_DIR}"
 
 snapshot_usage() {
     printf '%s\n' \
@@ -26,6 +26,8 @@ snapshot_main() {
         # Disk targets vary by bus, so ask the domain. cdroms are read-only.
         local -a DISKSPECS=()
         local target
+        mkdir -p "$DIR"
+        paths_qemu_warn "$DIR"
         while read -r target; do
             [ -n "$target" ] || continue
             DISKSPECS+=(--diskspec

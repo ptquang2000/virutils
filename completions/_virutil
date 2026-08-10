@@ -55,10 +55,11 @@ _virutil_domains() {
   _describe -t domain 'domain' doms
 }
 
-# The host ports this domain currently forwards, read from the same runtime dir
+# The host ports this domain currently forwards, read from the same state dir
 # the module writes; the guest side becomes the description.
 _virutil_domain_ports() {
-  local dir=${XDG_RUNTIME_DIR:-/tmp/virutil-$UID}/virutil/ports
+  local root=${VIRUTILS_DIR:-$HOME/.virutils}
+  local dir=${VIRUTILS_PORT_DIR:-$root/ports}
   local -a ports
   local f
   for f in $dir/tcp-*(N); do
@@ -113,7 +114,12 @@ _virutil_sync() {
         _files
       else
         local -a confs
-        confs=(${~HOME}/.config/virutils/*.conf(N:t:r))
+        local root=${VIRUTILS_DIR:-$HOME/.virutils}
+        local dirs=($root/conf $HOME/.config/virutils)
+        local d
+        for d in $dirs; do
+          confs+=(${~d}/*.conf(N:t:r))
+        done
         _describe -t config 'config' confs
       fi
       ;;

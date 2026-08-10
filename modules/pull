@@ -95,7 +95,7 @@ pull_norm_src() {
 # page cache is absent and the NTFS journal may be mid-transaction. Fine for
 # build output; do not audit a live database this way.
 pull_open_disk() {
-    MNT="${MNT:-/mnt/$DOMAIN}"
+    MNT="${MNT:-$(virutils_mnt "$DOMAIN")}"
 
     if (( ${#SUDO[@]} )); then
         command -v sudo >/dev/null || die "sudo not installed; nbd and mount need it"
@@ -124,7 +124,9 @@ pull_open_disk() {
     trap pull_finish EXIT
 
     local snap_name="pull-$(date +%Y%m%d-%H%M%S)"
-    OVERLAY="${IMG%.*}.$snap_name.qcow2"
+    OVERLAY="$VIRUTILS_IMAGE_DIR/$DOMAIN.$snap_name.qcow2"
+    mkdir -p "$(dirname -- "$OVERLAY")"
+    paths_qemu_warn "$(dirname -- "$OVERLAY")"
     echo "snapshot: $snap_name"
     "${VIRSH[@]}" snapshot-create-as --domain "$DOMAIN" --name "$snap_name" \
         --disk-only --atomic \

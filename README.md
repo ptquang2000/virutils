@@ -9,6 +9,7 @@ step and no dependencies beyond the utilities it calls.
 ## Contents
 
 - [Installation](#installation)
+- [Artifacts and state](#artifacts-and-state)
 - [Modules](#modules)
    - [domains](#domains)
    - [transfer](#transfer)
@@ -77,6 +78,66 @@ fpath+=( "${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions" )
 Installed as part of [the dotfiles](https://github.com/ptquang2000/.dotfiles),
 none of this is needed: `setup.sh` links `virutils/vir*` into `~/.local/bin`
 itself and `.zshrc` puts `virutils/completions` on `fpath` directly.
+
+## Artifacts and state
+
+Everything `virutil` leaves on the host lives under one root, `~/.virutils/`,
+so the whole footprint is a single directory you can inspect, back up, or move
+in one go. The layout, and what fills each subdirectory:
+
+| Path | Filled by |
+| --- | --- |
+| `~/.virutils/conf/` | sync configs (`sync.conf`, `NAME.conf`) |
+| `~/.virutils/images/` | domain disks (`domain create`), snapshot overlays and memory files (`snapshot`, `pull`), and the volume transport's staging image (`VM-xfer.qcow2`) |
+| `~/.virutils/staging/` | sync's incremental staging trees (`@staging` names) |
+| `~/.virutils/share/` | the virtiofs share directory (`virutil-<VM>`) |
+| `~/.virutils/ports/` | `domain port` forward state and relay logs |
+| `~/.virutils/mnt/` | host mount points for guest filesystems (`<VM>`, `<VM>-xfer`) |
+
+Installation links are the exception and follow the [installation
+above](#installation): `virutil` in `~/.local/bin` and `_virutil` in the zsh
+`site-functions` directory — symlinks into the checkout, not copies.
+
+### Relocating the root
+
+Set `VIRUTILS_DIR` to move everything at once — configs, images, staging,
+shares, port state and mount points:
+
+```sh
+export VIRUTILS_DIR=/mnt/big/virutils
+```
+
+Each piece can also be moved on its own (`VIRUTILS_CONF_DIR`,
+`VIRUTILS_IMAGE_DIR`, `VIRUTILS_STAGING_ROOT`, `VIRUTILS_SHARE_ROOT`,
+`VIRUTILS_PORT_DIR`, `VIRUTILS_MNT_ROOT`), each defaulting under the root. The
+legacy `VIRUTIL_IMAGE_DIR` is still honoured for image placement. Existing
+configs in `~/.config/virutils/` keep working — see [virutil sync](#virutil-sync).
+
+### A note on who owns the files
+
+Everything here is owned by you, and most of it never leaves the host. The one
+exception is anything qemu has to read or write: the domain disks, the snapshot
+overlays and memory files, and the volume staging image are all opened by the
+`qemu` process (usually running as `libvirt-qemu`), not just by you.
+
+libvirt relabels the *files* it opens, but never the directories above them, so
+a home directory with mode `0700` makes a domain fail to start with a bare
+"Permission denied" — and now that images default into `~/.virutils/`, that is
+the default configuration, not an edge case. `virutil` checks this up front
+(whenever it is about to create an image qemu must reach) and prints the fix:
+
+```
+libvirt-qemu cannot traverse to /home/you/.virutils/images:
+  /home/you/.virutils
+  /home/you
+The domain will fail to start with 'permission denied'. Fix it with:
+  sudo setfacl -m u:libvirt-qemu:x /home/you/.virutils /home/you
+```
+
+When qemu runs as `root` (the WSL2 default) the check is skipped: root needs
+nothing. If you moved `VIRUTILS_IMAGE_DIR` to a directory qemu can already
+reach — the old `/var/lib/libvirt/images`, or anywhere else world-traversable —
+the warning simply never fires.
 
 ## Modules
 
@@ -171,7 +232,7 @@ the channel needs a cold plug and `memoryBacking` a full stop and start.
 
 Everything else is hotplugged per run, so a domain that never moves a file
 carries nothing for one. The virtio-fs share device is attached live on first
-use (`~/.cache/virutil-VM`, created then); the `volume` transport's staging disk
+use (`~/.virutils/share/virutil-VM`, created then); the `volume` transport's staging disk
 must be, since a permanently attached one would be a second writer on an image
 the host has to mount. Neither needs domain preparation — `q35` comes with
 fourteen `pcie-root-port`s and a Windows guest uses six.
@@ -182,7 +243,7 @@ virtio-win MSI), and WinFsp plus the viofs driver for `virtiofs`.
 ### The staging volume
 
 `volume` keeps one scratch image per domain at
-`/var/lib/libvirt/images/VM-xfer.qcow2`, 16 GiB and sparse, created and
+`~/.virutils/images/VM-xfer.qcow2`, 16 GiB and sparse, created and
 formatted on first use and kept afterwards. It is formatted exFAT when the host
 has `mkfs.exfat` — an in-kernel driver on both sides, where NTFS on the host is
 FUSE — NTFS when it has `mkfs.ntfs`, and by **Windows itself** when it has
@@ -197,18 +258,21 @@ assigns the highest free one and that moves.
 
 ## Guest prerequisites
 
-Three pieces of software go **inside** the Windows guest. All of them come off
-the `virtio-win` ISO, except WinFsp. `virutil domain create` attaches that ISO
-as a second cdrom automatically, so on a fresh install it is already in the
-guest's drive list; otherwise download it once:
+Four pieces of software go **inside** the Windows guest. Three of them come off
+the `virtio-win` ISO; WinFsp and the SPICE guest tools are downloaded
+separately. `virutil domain create` attaches that ISO as a second cdrom
+automatically, so on a fresh install it is already in the guest's drive list;
+otherwise download it once:
 
 - `virtio-win.iso` — <https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso>
 - WinFsp — <https://winfsp.dev>
+- SPICE guest tools — <https://www.spice-space.org/download/windows/spice-guest-tools/spice-guest-tools-latest.exe>
 
 | What | Where it comes from | Needed by |
 | --- | --- | --- |
 | **virtio drivers** (`viostor`, `NetKVM`) | `virtio-win` ISO, or `virtio-win-guest-tools.exe` on it | booting at all — the installer cannot see a virtio disk without `viostor` |
 | **QEMU guest agent** (`qemu-ga`) | `virtio-win-guest-tools.exe`, or `guest-agent\qemu-ga-x86_64.msi` on the ISO | `virutil exec`, and the `volume` and `virtiofs` transports |
+| **SPICE guest agent** (`spice-vdagent`) | [spice-guest-tools](https://www.spice-space.org/download/windows/spice-guest-tools/spice-guest-tools-latest.exe) | the `spice` display and `spicevmc` channel of every `virutil domain create` domain — clipboard sharing and display auto-resize |
 | **WinFsp** | <https://winfsp.dev> — install this **first** | `virtiofs` |
 | **viofs driver + `VirtioFsSvc`** | `viofs\<os>\amd64\` on the `virtio-win` ISO | `virtiofs` |
 
@@ -225,7 +289,10 @@ driver and will not install usefully without WinFsp already there.
 E:\virtio-win-guest-tools.exe /install /quiet
 ```
 
-That single installer covers the drivers and `qemu-ga`. Then, for `virtiofs`:
+That single installer covers the drivers and `qemu-ga`. Then install the SPICE
+guest tools (`spice-guest-tools-latest.exe`) from an elevated prompt — without
+the `spice-vdagent` there is no clipboard sharing and the display does not
+auto-resize. Then, for `virtiofs`:
 
 1. Install WinFsp (`winfsp-<version>.msi`), keeping the default components.
 2. Install the viofs driver: right-click `E:\viofs\<os>\amd64\viofs.inf` →
@@ -276,7 +343,7 @@ Windows build tree --(fetch)--> staging dir --(map)--> guest NTFS
 ```
 
 **Fetch** mirrors selected directories out of the build tree into a staging
-directory under `~/.cache/virutil/`, applying the exclude patterns. The staging layout is
+directory under `~/.virutils/staging/`, applying the exclude patterns. The staging layout is
 normally arranged to mirror what will land in the guest, so the map rules stay
 trivial.
 
@@ -303,7 +370,7 @@ need no privilege of their own.
 
 | Option | Description |
 | --- | --- |
-| `-c`, `--config NAME\|PATH` | Config to use. A value containing `/` is a path, taken as given. Anything else names a config in `~/.config/virutils/`, with `.conf` appended when absent — so `-c win11` reads `~/.config/virutils/win11.conf`. Defaults to `~/.config/virutils/sync.conf`. |
+| `-c`, `--config NAME\|PATH` | Config to use. A value containing `/` is a path, taken as given. Anything else names a config, looked up in `~/.virutils/conf/` first and then `~/.config/virutils/`, with `.conf` appended when absent — so `-c win11` reads `~/.virutils/conf/win11.conf` if it exists, else `~/.config/virutils/win11.conf`. Defaults to `sync.conf`, resolved the same way. |
 | `-t`, `--transport T` | How to move the files: `virtiofs` (default), `volume` or `disk`. See [Transports](#transports). Overrides `@transport` in the config. |
 | `-h`, `--help` | Print usage and exit. |
 
@@ -323,10 +390,11 @@ config.
 
 | Path | Description |
 | --- | --- |
-| `~/.config/virutils/sync.conf` | Default config. This is the only location searched; there is no fallback beside the script. |
-| `~/.config/virutils/NAME.conf` | Additional configs, selected with `-c NAME`. |
-| `~/.cache/virutil/<@staging>` | Staging directory, refreshed from `@repo` on every run. |
-| `/mnt/<VM>` | Default mount point for the guest filesystem, overridable with `@mnt`. |
+| `~/.virutils/conf/sync.conf` | Default config. Also the first place a missing one is looked for. |
+| `~/.config/virutils/sync.conf` | Legacy location, searched when the new one has no `sync.conf` — so existing installs keep working untouched. |
+| `~/.virutils/conf/NAME.conf` | Additional configs, selected with `-c NAME` (searched before the legacy `~/.config/virutils/NAME.conf`). |
+| `~/.virutils/staging/<@staging>` | Staging directory, refreshed from `@repo` on every run. |
+| `~/.virutils/mnt/<VM>` | Default mount point for the guest filesystem, overridable with `@mnt`. |
 
 A missing config is a fatal error naming the exact path that was looked for.
 Nothing is generated for you, and nothing else is touched first.
@@ -355,10 +423,10 @@ and is rejected.
 | Setting | Required | Default | Description |
 | --- | --- | --- | --- |
 | `@repo` | yes | — | Root of the build tree on the host. Fetch sources are relative to it. |
-| `@staging` | yes | — | Staging directory *name*. Always placed under `~/.cache/virutil/` (`$XDG_CACHE_HOME/virutil/`), whatever is written here. |
+| `@staging` | yes | — | Staging directory *name*. Always placed under `~/.virutils/staging/`, whatever is written here. |
 | `@dest` | no | *(empty)* | Install directory in the guest, relative to `C:\`. Every map destination hangs off it, so the install path is spelled once. Empty means the root of `C:`. |
 | `@nbd` | no | `/dev/nbd0` | NBD device used to attach the disk image. |
-| `@mnt` | no | `/mnt/<VM>` | Host mount point for the guest filesystem. |
+| `@mnt` | no | `~/.virutils/mnt/<VM>` | Host mount point for the guest filesystem. |
 | `@transport` | no | `virtiofs` | Default transport for this config. `-t` on the command line wins. |
 | `@shutdown_timeout` | no | `180` | Seconds to wait for the guest to shut down before aborting the run. The guest is never forced off. |
 
@@ -419,7 +487,7 @@ least two levels deep.
 
 ### Example
 
-`~/.config/virutils/sync.conf`:
+`~/.virutils/conf/sync.conf`:
 
 ```
 @repo=/mnt/c/Users/me/work/myproject
@@ -519,7 +587,7 @@ refreshes the `sudo` timestamp while they run. On a copy longer than
 again at teardown. If nobody answers, teardown fails and the guest is left off,
 per the rule above.
 
-**The staging directory is always under `~/.cache/virutil/`.** Whatever
+**The staging directory is always under `~/.virutils/staging/`.** Whatever
 `@staging` says is treated as a name relative to that root, including an
 absolute path — so a mistyped `@staging` can only ever name a directory virutil
 owns.
@@ -528,8 +596,9 @@ It lives there rather than in `/tmp` because the fetch is an *incremental*
 rsync: a staging tree that survives a reboot means the next run copies only what
 changed out of the Windows build tree, instead of all of it again. It also keeps
 a multi-gigabyte build output off a tmpfs. Existing configs need no change —
-`@staging=foo` simply moves from `/tmp/foo` to `~/.cache/virutil/foo`, and the
-first run after this refetches into the new location.
+`@staging=foo` simply moves from the old `~/.cache/virutil/foo` to
+`~/.virutils/staging/foo`, and the first run after this refetches into the new
+location.
 
 ## virutil pull
 
@@ -719,7 +788,7 @@ The flags are what you vary per domain. Everything else is a property of the
 | `-s`, `--size GiB` | `64` | Disk size. |
 | `-m`, `--memory MiB` | half the host's | Guest RAM, rounded down to 512 MiB, floor 2048. |
 | `-c`, `--vcpus N` | half the host's, max 8 | Virtual CPUs. |
-| `-d`, `--disk PATH` | `/var/lib/libvirt/images/VM.qcow2` | Disk image path. |
+| `-d`, `--disk PATH` | `~/.virutils/images/VM.qcow2` | Disk image path. |
 | `-o`, `--osinfo ID` | **detected from the ISO** | libosinfo id; see `osinfo-query os`. |
 | `-v`, `--virtio ISO` | `virtio-win*.iso` beside the install ISO | Driver ISO to attach as a second cdrom. `none` attaches none. |
 | `-n`, `--dry-run` | — | Print the domain XML and define nothing. |
@@ -804,7 +873,9 @@ profile once, or prefix a single `create` with them.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `VIRUTIL_IMAGE_DIR` | `/var/lib/libvirt/images` | Where a disk image goes when `-d` is not given. Also where `snapshot` writes overlays. |
+| `VIRUTILS_DIR` | `~/.virutils` | Root of everything virutil leaves on the host. Moves configs, images, staging, shares, port state and mount points at once. See [Artifacts and state](#artifacts-and-state). |
+| `VIRUTILS_IMAGE_DIR` | `$VIRUTILS_DIR/images` | The images directory. |
+| `VIRUTIL_IMAGE_DIR` | `$VIRUTILS_IMAGE_DIR` | Legacy name, still honoured: where a disk image goes when `-d` is not given, and where `snapshot` writes overlays. |
 | `VIRUTIL_OSINFO` | `win11` | Fallback libosinfo id when the ISO is not recognised. |
 | `VIRUTIL_VIRTIO` | `virtio-win*.iso` beside the install ISO | Default for `-v`: driver ISO to attach as a second cdrom, or `none`. |
 | `VIRUTIL_NETWORK` | `network=default,model=virtio` | Passed to `virt-install --network`. |
@@ -836,7 +907,8 @@ from the domain XML instead, and:
 
 - **Backing chains are followed.** An overlay left by `virutil snapshot create`
    names its base; deleting only the top of the chain would orphan the base in
-   `/var/lib/libvirt/images`. Every file in the chain is listed and removed.
+   the images directory (`~/.virutils/images/` by default). Every file in the
+   chain is listed and removed.
 - **Images another domain uses are kept.** Sharing one base image between
    domains is a normal way to run a golden image, and deleting it out from under
    the other domain is unrecoverable, so every candidate is checked against every
@@ -947,7 +1019,7 @@ listing shows it again later. Nothing needs root as long as the host port is
 ≥ 1024. Opening a forward that already exists is a no-op, and reopening one
 whose guest address has since changed repoints it.
 
-State lives in `$XDG_RUNTIME_DIR/virutil/ports`, one file per forward. A file
+State lives in `~/.virutils/ports`, one file per forward. A file
 whose relay has died is dropped the next time the list is read, so a reboot
 cannot leave the two out of step.
 
@@ -1006,6 +1078,9 @@ these comes from and how to install it:
    transports, which run the guest-side copy through it. Strongly recommended
    for `disk` too, where without it the shutdown falls back to ACPI and Windows
    may sit on it until `@shutdown_timeout` expires
+- The SPICE guest tools, for the `spice` display and `spicevmc` channel every
+   `virutil domain create` guest has — without the vdagent there is no
+   clipboard sharing and the display does not auto-resize
 - For the `disk` transport only: Windows with Fast Startup disabled, and a
    single disk whose system volume is the largest NTFS partition on it
 

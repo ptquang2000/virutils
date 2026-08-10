@@ -2,14 +2,27 @@
 # into a Windows guest's C: drive. Config format: see README.md.
 
 # Prefixed per module: every module is sourced into one shell.
-CONF_DIR="$HOME/.config/virutils"
-SYNC_DEFAULT_CONF="$CONF_DIR/sync.conf"
+# Configs are looked up in $VIRUTILS_CONF_DIR first, then the legacy
+# ~/.config/virutils, so an existing setup keeps working untouched.
+CONF_DIR="${VIRUTILS_CONF_DIR:-$HOME/.virutils/conf}"
+SYNC_LEGACY_CONF_DIR="$HOME/.config/virutils"
+SYNC_DEFAULT_CONF="sync.conf"
+
+# The first existing file wins; a name that exists in neither is reported at
+# the primary location, where a new one belongs.
+sync_config_lookup() {
+    local name="$1"
+    [[ -f "$CONF_DIR/$name" ]] && { printf '%s' "$CONF_DIR/$name"; return 0; }
+    [[ -f "$SYNC_LEGACY_CONF_DIR/$name" ]] \
+        && { printf '%s' "$SYNC_LEGACY_CONF_DIR/$name"; return 0; }
+    printf '%s' "$CONF_DIR/$name"
+}
 
 # Not /tmp: the fetch is an incremental rsync, so a staging tree that survives a
 # reboot copies only what changed, and a tmpfs /tmp would hold a multi-gigabyte
 # build tree in RAM. @staging is a name under a fixed root, so a mistyped one
 # can only name a directory virutil owns.
-SYNC_STAGING_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/virutil"
+SYNC_STAGING_ROOT="${VIRUTILS_STAGING_ROOT:-$VIRUTILS_ROOT/staging}"
 
 REPO=""; STAGING=""; DEST=""
 FETCH=(); MAPPINGS=(); EXCLUDES=(); CLEANUP=()
@@ -22,7 +35,8 @@ sync_usage() {
         "  VM                      libvirt domain whose disk is written" \
         "  -c, --config NAME|PATH  config to use. A value containing '/' is a" \
         "                          path, taken as given; anything else names a" \
-        "                          config in $CONF_DIR" \
+        "                          config looked up in $CONF_DIR first, then" \
+        "                          $SYNC_LEGACY_CONF_DIR" \
         "                          ('.conf' is appended when absent)." \
         "                          default: $SYNC_DEFAULT_CONF" \
         "$(xfer_transport_help)" \
@@ -83,10 +97,11 @@ sync_main() {
     DOMAIN="$VM"
 
     # Decided on spelling alone, never on what exists: the same command must
-    # mean the same config from any directory.
-    if   [[ -z "$CONF_ARG"    ]]; then CONF="$SYNC_DEFAULT_CONF"
+    # mean the same config from any directory. A name is looked up in the new
+    # location first, then the legacy ~/.config/virutils.
+    if   [[ -z "$CONF_ARG"    ]]; then CONF="$(sync_config_lookup "$SYNC_DEFAULT_CONF")"
     elif [[ "$CONF_ARG" == */* ]]; then CONF="$CONF_ARG"
-    else                               CONF="$CONF_DIR/${CONF_ARG%.conf}.conf"
+    else                               CONF="$(sync_config_lookup "${CONF_ARG%.conf}.conf")"
     fi
 
     [[ -f "$CONF" ]] || die "config not found: $CONF" \

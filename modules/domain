@@ -1,6 +1,6 @@
 # domain -- libvirt domain lifecycle
 
-DOMAIN_IMAGE_DIR="${VIRUTIL_IMAGE_DIR:-/var/lib/libvirt/images}"
+DOMAIN_IMAGE_DIR="${VIRUTIL_IMAGE_DIR:-$VIRUTILS_IMAGE_DIR}"
 
 DOMAIN_OVMF=(
     /usr/share/OVMF/x64/OVMF_CODE.4m.fd:/usr/share/OVMF/x64/OVMF_VARS.4m.fd
@@ -48,6 +48,7 @@ domain_usage() {
         "  -h, --help        this message" \
         "" \
         "create reads these from the environment:" \
+        "  VIRUTILS_DIR           $VIRUTILS_ROOT   root for all state (default ~/.virutils)" \
         "  VIRUTIL_IMAGE_DIR      $DOMAIN_IMAGE_DIR" \
         "  VIRUTIL_OSINFO         win11        fallback when the ISO is not recognised" \
         "  VIRUTIL_VIRTIO         (auto)       virtio-win ISO path, or 'none'" \
@@ -141,38 +142,11 @@ domain_in_use() {
     return 1
 }
 
-# domain_readable_by_qemu FILE -- warn if the qemu user cannot traverse to FILE.
-# libvirt relabels the file but never the directories above it, so an ISO under
-# a 0700 home fails at domain start with a bare "Permission denied".
+# domain_readable_by_qemu FILE... -- warn if the qemu user cannot traverse to
+# any of the paths. The walk lives in modules/paths; this is the domain module's
+# spelling of it.
 domain_readable_by_qemu() {
-    local file="$1" dir up missing=() qemu_user
-    qemu_user="$(awk -F'"' '/^[[:space:]]*user[[:space:]]*=/ {print $2}' \
-                 /etc/libvirt/qemu.conf 2>/dev/null | tail -1)"
-    qemu_user="${qemu_user:-libvirt-qemu}"
-    [[ "$qemu_user" == root ]] && return 0
-
-    # Absolute, or the walk up never reaches / -- dirname of "." is ".".
-    file="$(realpath -- "$file" 2>/dev/null || printf '%s' "$PWD/$file")"
-    dir="$(dirname -- "$file")"
-    while :; do
-        # Tenth character of the mode string is other-execute: 'x', or 't' when
-        # sticky. Read from the bits, not -x, which answers for the invoking
-        # user rather than for qemu.
-        if [[ ! "$(stat -c '%A' "$dir")" =~ ^.{9}[xt] ]] \
-           && ! getfacl -pc -- "$dir" 2>/dev/null | grep -q "^user:$qemu_user:..x"; then
-            missing+=("$dir")
-        fi
-        [[ "$dir" == / ]] && break
-        up="$(dirname -- "$dir")"
-        [[ "$up" == "$dir" ]] && break
-        dir="$up"
-    done
-
-    (( ${#missing[@]} )) || return 0
-    warn "$qemu_user cannot traverse to $file:" \
-         "  ${missing[*]}" \
-         "The domain will fail to start with 'permission denied'. Fix it with:" \
-         "  sudo setfacl -m u:$qemu_user:x ${missing[*]}"
+    paths_qemu_warn "$@"
 }
 
 # domain_detect_osinfo ISO -- a libosinfo short-id read from the ISO's own
@@ -382,6 +356,8 @@ domain_create() {
     # cached; preallocation=metadata stops the guest's first write into a region
     # stalling behind table allocation. lazy_refcounts trades a
     # `qemu-img check -r all` after an unclean shutdown for faster writes.
+    mkdir -p "$(dirname -- "$IMG")"
+    paths_qemu_warn "$(dirname -- "$IMG")"
     local -a IMGSUDO=()
     [[ -w "$(dirname -- "$IMG")" ]] || IMGSUDO=("${SUDO[@]}")
 
@@ -519,9 +495,10 @@ domain_ip() {
 }
 
 # Forwards are tracked here, one file per forward, keyed on the host port --
-# which is the only thing that has to be unique. The runtime dir is cleared on
-# reboot, and so are the relays, so the two cannot drift apart across one.
-DOMAIN_PORT_DIR="${XDG_RUNTIME_DIR:-/tmp/virutil-$(id -u)}/virutil/ports"
+# which is the only thing that has to be unique. The relays die with WSL; the
+# state files survive, but reading is what garbage-collects them (below), so
+# the two cannot stay out of step.
+DOMAIN_PORT_DIR="${VIRUTILS_PORT_DIR:-$VIRUTILS_ROOT/ports}"
 
 domain_port_file() { printf '%s/%s-%s' "$DOMAIN_PORT_DIR" "$1" "$2"; }
 

@@ -1,0 +1,67 @@
+# paths -- where virutil keeps its state: one root, every artifact under it, so
+# a single variable relocates the whole lot and a single directory holds
+# everything virutil leaves behind.
+#
+#   $VIRUTILS_DIR          the root, one directory for all of it
+#   $VIRUTILS_CONF_DIR     sync configs (looked up here first)
+#   $VIRUTILS_IMAGE_DIR    domain disks, snapshot overlays and memory files,
+#                          and the volume transport's staging image
+#   $VIRUTILS_STAGING_ROOT sync's incremental staging trees
+#   $VIRUTILS_SHARE_ROOT   the virtiofs share directories
+#   $VIRUTILS_PORT_DIR     domain port forward state and logs
+#   $VIRUTILS_MNT_ROOT     host mount points for guest filesystems
+
+# The default is ~/.virutils rather than an XDG directory: the staging tree has
+# to survive reboots, qemu has to reach the images, and config discovery reads
+# here first. VIRUTILS_DIR moves everything at once.
+VIRUTILS_ROOT="${VIRUTILS_DIR:-$HOME/.virutils}"
+
+# Each piece can be moved on its own; each defaults under the root.
+VIRUTILS_CONF_DIR="${VIRUTILS_CONF_DIR:-$VIRUTILS_ROOT/conf}"
+VIRUTILS_IMAGE_DIR="${VIRUTILS_IMAGE_DIR:-$VIRUTILS_ROOT/images}"
+VIRUTILS_STAGING_ROOT="${VIRUTILS_STAGING_ROOT:-$VIRUTILS_ROOT/staging}"
+VIRUTILS_SHARE_ROOT="${VIRUTILS_SHARE_ROOT:-$VIRUTILS_ROOT/share}"
+VIRUTILS_PORT_DIR="${VIRUTILS_PORT_DIR:-$VIRUTILS_ROOT/ports}"
+VIRUTILS_MNT_ROOT="${VIRUTILS_MNT_ROOT:-$VIRUTILS_ROOT/mnt}"
+
+virutils_mnt() { printf '%s/%s' "$VIRUTILS_MNT_ROOT" "$1"; }
+
+# paths_qemu_warn PATH... -- warn if the qemu user cannot traverse to each path.
+# libvirt relabels the files qemu opens but never the directories above them, so
+# a path under a 0700 home fails at domain start with a bare "Permission denied"
+# -- say so up front, with the exact setfacl fix, instead of letting the guest
+# fail the run. Silently skips a host where qemu runs as root, which is the WSL2
+# case and needs none of this.
+paths_qemu_warn() {
+    local p qemu_user missing=() dir up
+    command -v stat >/dev/null || return 0
+
+    qemu_user="$(awk -F'"' '/^[[:space:]]*user[[:space:]]*=/ {print $2}' \
+                 /etc/libvirt/qemu.conf 2>/dev/null | tail -1)"
+    qemu_user="${qemu_user:-libvirt-qemu}"
+    [[ "$qemu_user" == root ]] && return 0
+
+    for p in "$@"; do
+        # Absolute, or the walk up never reaches / -- dirname of "." is ".".
+        dir="$(realpath -- "$p" 2>/dev/null || printf '%s' "$PWD/$p")"
+        while :; do
+            # Tenth character of the mode string is other-execute: 'x', or 't'
+            # when sticky. Read from the bits, not -x, which answers for the
+            # invoking user rather than for qemu.
+            if [[ ! "$(stat -c '%A' "$dir" 2>/dev/null)" =~ ^.{9}[xt] ]] \
+               && ! getfacl -pc -- "$dir" 2>/dev/null | grep -q "^user:$qemu_user:..x"; then
+                missing+=("$dir")
+            fi
+            [[ "$dir" == / ]] && break
+            up="$(dirname -- "$dir")"
+            [[ "$up" == "$dir" ]] && break
+            dir="$up"
+        done
+    done
+
+    (( ${#missing[@]} )) || return 0
+    warn "$qemu_user cannot traverse to ${*}:"
+    warn "  ${missing[*]}"
+    warn "The domain will fail to start with 'permission denied'. Fix it with:"
+    warn "  sudo setfacl -m u:$qemu_user:x ${missing[*]}"
+}
