@@ -278,7 +278,7 @@ xfer_robocopy() {
     local extra="" a
     for a in "$@"; do extra+=" '$a'"; done
     xfer_ps '
-$out = robocopy "'"$src"'" "'"$dst"'" /E /NJH /NJS /NP /NDL /R:1 /W:1 /XD "System Volume Information" "$RECYCLE.BIN"'"$extra"'
+$out = robocopy "'"$src"'" "'"$dst"'" /E /NJH /NJS /NP /NDL /R:1 /W:1 /XD "System Volume Information" "`$RECYCLE.BIN"'"$extra"'
 $rc = $LASTEXITCODE
 $out | Where-Object { $_ -match "\S" } | Select-Object -Last 12
 if ($rc -ge 8) { throw "robocopy failed with code $rc" }

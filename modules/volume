@@ -312,7 +312,8 @@ volume_deliver() {
     local letter
     volume_handoff readonly
 
-    letter="$(xfer_drive_letter 30)"
+    # || true: see virtiofs_open -- set -e would take the run down silently.
+    letter="$(xfer_drive_letter 30 || true)"
     [[ -n "$letter" ]] || die "the staging volume never got a drive letter in $DOMAIN." \
                               "Check it with: virutil exec ps $DOMAIN Get-Volume"
     say "guest: $letter: -> C:\\"
@@ -331,7 +332,7 @@ volume_collect() {
     local letter pat script sep
     volume_handoff ""
 
-    letter="$(xfer_drive_letter 30)"
+    letter="$(xfer_drive_letter 30 || true)"
     [[ -n "$letter" ]] || die "the staging volume never got a drive letter in $DOMAIN"
     say "guest: C:\\ -> $letter:"
 

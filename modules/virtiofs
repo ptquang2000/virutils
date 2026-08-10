@@ -205,7 +205,9 @@ virtiofs_open() {
     # The marker the guest finds the drive letter by, rewritten every run.
     printf '%s\n' "$DOMAIN" > "$MNT/$VIRTIOFS_SENTINEL"
 
-    VIRTIOFS_LETTER="$(virtiofs_letter)"
+    # || true: the probe exits 1 when it finds nothing, and under set -e a bare
+    # assignment from it would end the run silently, before the message below.
+    VIRTIOFS_LETTER="$(virtiofs_letter || true)"
     [[ -n "$VIRTIOFS_LETTER" ]] \
         || die "the share is attached and VirtioFsSvc is running, but no drive" \
                "letter in $DOMAIN maps to '$XFER_TAG'. Check it in the guest:" \
