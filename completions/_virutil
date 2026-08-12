@@ -154,6 +154,14 @@ _virutil_size() {
   _values -w 'GiB' 32 64 128 256 512
 }
 
+_virutil_fs() {
+  _values -w 'filesystem' \
+    'exfat:Windows-native removable media format (needs exfatprogs)' \
+    'ntfs:NTFS (needs ntfs-3g)' \
+    'fat32:universal, 4 GiB file limit (needs dosfstools)' \
+    'guest:let Windows format the drive'
+}
+
 _virutil_memory() {
   _values -w 'MiB' 2048 4096 8192 12288 16384 24576 32768
 }
@@ -200,12 +208,14 @@ _virutil_usb() {
         media)
           case $words[CURRENT-1] in
             -s|--size) _virutil_size; return ;;
+            -f|--fs)   _virutil_fs; return ;;
           esac
           case $CURRENT in
             4) _virutil_domains ;;
             5) _files ;;
             *) _values 'option' \
                  '(-s --size)'{-s,--size}'[drive size in GiB when first created]' \
+                 '(-f --fs)'{-f,--fs}'[filesystem when first created: exfat, ntfs, fat32 or guest]' \
                  '(--mount)'--mount'[mount the drive image on the host to fill it]' \
                  '(--eject)'--eject'[flush and detach the drive in the guest]' \
                  '(--detach)'--detach'[unmount and release the drive image on the host]'

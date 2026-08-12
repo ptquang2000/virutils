@@ -1067,7 +1067,7 @@ the host fills over qemu-nbd and hands to the guest as a `usb-storage` device,
 which Windows lists under **removable media**.
 
 ```
-virutil usb media VM [-s GiB] [SRC...]
+virutil usb media VM [-s GiB] [-f TYPE] [SRC...]
 virutil usb media VM --mount
 virutil usb media VM --eject
 virutil usb media VM --detach
@@ -1077,6 +1077,7 @@ virutil usb media VM --detach
 | --- | --- |
 | `SRC...` | Host files and directories to copy into the drive before it is attached; each keeps its basename at the drive's root. |
 | `-s`, `--size` | Drive size in GiB, honored only when the image is first created (default 4). Ignored once it exists. |
+| `-f`, `--fs` | Filesystem when the image is first created: `exfat`, `ntfs`, `fat32`, or `guest` (let Windows format it). Defaults to exfat when the host can, else ntfs, else guest. Ignored once it exists. |
 
 Run with no options: the drive is created once per VM and kept, filled from
 `SRC` (empty if none), and attached to the **running** VM as removable media.
@@ -1095,10 +1096,12 @@ probe still holds the image. The image lives at
 Formatting is the same policy as the [staging volume](#the-staging-volume):
 one GPT partition spanning the disk, exFAT when the host can, NTFS otherwise,
 and Windows itself when neither exists — the last attaches the blank drive
-once and runs `Initialize-Disk`/`Format-Volume` inside the guest. The guest
+once and runs `Initialize-Disk`/`Format-Volume` inside the guest, which always
+formats NTFS. `-f`/`--fs` overrides the policy with one of `exfat`, `ntfs`,
+`fat32` or `guest`, and the choice sticks to the image once made. The guest
 must be running with the [QEMU guest agent](#guest-prerequisites) answering
-for both that fallback and `--eject`, since the agent is what flushes the drive
-before it is detached.
+for both the in-guest fallback and `--eject`, since the agent is what flushes
+the drive before it is detached.
 
 ## Requirements
 

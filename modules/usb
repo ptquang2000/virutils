@@ -19,6 +19,7 @@ DISTRO=archlinux
 
 # Removable media state, module scope for the EXIT trap.
 USB_MEDIA_SIZE=4              # GiB, sparse -- an upper bound, not an allocation
+USB_MEDIA_FS=""               # ''=auto (exfat>ntfs>guest); else exfat|ntfs|fat32|guest
 USB_IMG=""                    # the drive image
 USB_TARGET=""                 # the sdX the usb-storage device attaches as
 USB_ATTACHED=0                # attached to the guest
@@ -42,6 +43,10 @@ usb_usage() {
         "                running VM as removable media; empty if no SRC" \
         "  -s, --size GiB  drive size when the image is first created" \
         "                  (default $USB_MEDIA_SIZE; ignored once it exists)" \
+        "  -f, --fs TYPE   filesystem when the image is first created:" \
+        "                  exfat, ntfs, fat32, or guest (let Windows format it;" \
+        "                  needs the matching host mkfs otherwise)" \
+        "                  (default: exfat if the host can, else ntfs, else guest)" \
         "  --mount        mount the drive image on the host for hand-filling" \
         "  --eject        flush and detach the drive in the guest" \
         "  --detach       unmount and release the image on the host" \
@@ -268,10 +273,21 @@ usb_media_xml() {
 EOF
 }
 
+# The host half that can format TYPE, or nothing if it cannot. guest never gets
+# here -- that branch needs no host mkfs at all.
+usb_media_fs_ok() {
+    case "$1" in
+    exfat) command -v mkfs.exfat || true ;;
+    ntfs)  command -v mkfs.ntfs || command -v mkntfs || true ;;
+    fat32) command -v mkfs.vfat || command -v mkfs.fat || true ;;
+    esac
+}
+
 # usb_media_create -- make the drive image and format it by whichever half of
 # the machine can, exactly as the volume transport does for its staging image:
 # one GPT partition spanning the disk, exFAT when the host can, NTFS otherwise,
-# and Windows itself when neither exists. Idempotent; ends with $NBD detached.
+# and Windows itself when neither exists. --fs narrows the choice to the named
+# type, which still needs its host mkfs. Idempotent; ends with $NBD detached.
 usb_media_create() {
     local created=0
     if [[ ! -e "$USB_IMG" ]]; then
@@ -286,13 +302,22 @@ usb_media_create() {
         created=1
     fi
 
-    volume_pick_fs
     nbd_connect "$USB_IMG"
 
-    local part; part="$(nbd_find_part exfat ntfs)"
+    local part; part="$(nbd_find_part exfat ntfs vfat)"
     if [[ -n "$part" ]]; then
         "${SUDO[@]}" qemu-nbd -d "$NBD" >/dev/null 2>&1 || true
         return 0
+    fi
+
+    volume_pick_fs
+    if [[ -n "$USB_MEDIA_FS" && "$USB_MEDIA_FS" != guest ]]; then
+        local mk; mk="$(usb_media_fs_ok "$USB_MEDIA_FS")"
+        [[ -n "$mk" ]] || die "--fs $USB_MEDIA_FS needs its mkfs on the host (or" \
+                               "--fs guest, to let Windows format the drive)"
+        VOLUME_FS="$USB_MEDIA_FS"
+    elif [[ "$USB_MEDIA_FS" == guest ]]; then
+        VOLUME_FS=guest
     fi
 
     (( created )) || warn "usb media $USB_IMG has no readable filesystem;" \
@@ -311,11 +336,17 @@ usb_media_create() {
         "${SUDO[@]}" "$mk" --quick --label "$USB_MEDIA_LABEL" "${NBD}p1" >/dev/null \
             || die "$mk failed on ${NBD}p1"
         ;;
+    fat32)
+        say "usb media: formatting FAT32"
+        local mk; mk="$(command -v mkfs.vfat || command -v mkfs.fat)"
+        "${SUDO[@]}" "$mk" -n "$USB_MEDIA_LABEL" "${NBD}p1" >/dev/null \
+            || die "$mk failed on ${NBD}p1"
+        ;;
     guest)
         [[ "$(domstate)" == running ]] || die \
-            "no host mkfs for exFAT or NTFS, and $DOMAIN is not running, so the" \
-            "drive cannot be formatted in the guest. Install exfatprogs (or" \
-            "ntfs-3g), or start $DOMAIN."
+            "$DOMAIN is not running, so the drive cannot be formatted in the" \
+            "guest. Start it, or install a host mkfs (exfatprogs, ntfs-3g or" \
+            "dosfstools) to format here."
         "${SUDO[@]}" qemu-nbd -d "$NBD" >/dev/null 2>&1 || true
         usb_format_in_guest
         return 0
@@ -329,7 +360,7 @@ usb_media_create() {
 # handed to the guest once, Initialize-Disk and Format-Volume run inside it, and
 # it comes back ready.
 usb_format_in_guest() {
-    say "usb media: no host mkfs for exFAT or NTFS -- formatting the drive in $DOMAIN"
+    say "usb media: formatting the drive in $DOMAIN"
     usb_attach_device
 
     xfer_ps '
@@ -383,8 +414,8 @@ usb_media_open() {
 
     usb_media_create
     nbd_connect "$USB_IMG"
-    local part; part="$(nbd_find_part exfat ntfs)"
-    [[ -n "$part" ]] || die "no exFAT or NTFS partition on the usb media" \
+    local part; part="$(nbd_find_part exfat ntfs vfat)"
+    [[ -n "$part" ]] || die "no exFAT, NTFS or FAT32 partition on the usb media" \
                             "-- remove $USB_IMG and run again to rebuild it"
     local fstype; fstype="$("${SUDO[@]}" blkid -o value -s TYPE "$part")"
     "${SUDO[@]}" mkdir -p "$MNT"
@@ -550,12 +581,13 @@ usb_media_attach() {
 }
 
 usb_media_main() {
-    local VM="" SIZE="" CMD=attach
+    local VM="" SIZE="" FS="" CMD=attach
     local -a SRC=()
 
     while (( $# )); do
         case "$1" in
         -s|--size)  SIZE="${2:?$1 needs a value}"; shift 2 ;;
+        -f|--fs)    FS="${2:?$1 needs a value}"; shift 2 ;;
         --mount)    CMD=mount; shift ;;
         --eject)    CMD=eject; shift ;;
         --detach)   CMD=detach; shift ;;
@@ -571,6 +603,12 @@ usb_media_main() {
     if [[ -n "$SIZE" ]]; then
         [[ "$SIZE" =~ ^[0-9]+$ ]] || die "--size wants a whole number of GiB, got '$SIZE'"
         USB_MEDIA_SIZE="$SIZE"
+    fi
+    if [[ -n "$FS" ]]; then
+        case "$FS" in
+        exfat|ntfs|fat32|guest) USB_MEDIA_FS="$FS" ;;
+        *) die "--fs wants exfat, ntfs, fat32 or guest, got '$FS'" ;;
+        esac
     fi
 
     DOMAIN="$VM"
