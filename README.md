@@ -39,6 +39,8 @@ step and no dependencies beyond the utilities it calls.
    - [start](#start)
    - [list, shutdown, addr](#list-shutdown-addr)
    - [port](#port)
+- [virutil usb](#virutil-usb)
+   - [usb media](#usb-media)
 - [Requirements](#requirements)
 - [See also](#see-also)
 
@@ -170,7 +172,7 @@ The seven modules fall into four groups, which is also the order
 
 | Module | Purpose | Usage |
 | --- | --- | --- |
-| `usb` | USB passthrough end to end from a Windows host under WSL: `usbipd` bind, import over `vhci_hcd`, then attach to the domain. | `virutil usb {list\|show\|attach\|detach\|unbind} [VM] [BUSID]` |
+| `usb` | USB passthrough end to end from a Windows host under WSL: `usbipd` bind, import over `vhci_hcd`, then attach to the domain. `usb media` is the virtual counterpart: a qcow2 handed to the guest as a removable drive. | `virutil usb {list\|show\|attach\|detach\|unbind} [VM] [BUSID]`; `virutil usb media VM [-s GiB] [SRC...]` |
 
 All three take `-t`/`--transport`, and all three write the same C:-shaped tree
 whichever one is chosen — see [Transports](#transports).
@@ -1034,6 +1036,69 @@ reason the relay always binds `0.0.0.0` rather than offering a choice.
 If the forward connects but the guest never answers, check that the service in
 the guest listens on `0.0.0.0` rather than `127.0.0.1`, and that the guest's
 own firewall allows the port — no host-side plumbing works around either.
+
+## virutil usb
+
+Two families under one command. The passthrough half manages physical devices
+shared from Windows: `usbipd` binds a device on Windows, imports it into WSL
+over `vhci_hcd`, and attaches it to the domain as a USB host controller device;
+`detach` and `unbind` hand it back.
+
+```
+virutil usb list
+virutil usb show   VM
+virutil usb attach VM BUSID
+virutil usb detach VM BUSID|VENDOR:PRODUCT
+virutil usb unbind BUSID
+```
+
+`BUSID` is the first column of `virutil usb list`. It names a port, so it is
+only meaningful while something is plugged into it; `VENDOR:PRODUCT` (lowercase
+hex, from the device's hardware id) names a device that is currently unplugged,
+which `detach` needs to clear a leftover hostdev. Only `bind` and `unbind` need
+Administrator on Windows, and a bind is persistent — expect one UAC prompt per
+physical device ever. A `detach` stops short of unbinding: the device stays
+usable in Windows.
+
+### usb media
+
+`usb media` is the virtual counterpart: no physical device, just a sparse qcow2
+the host fills over qemu-nbd and hands to the guest as a `usb-storage` device,
+which Windows lists under **removable media**.
+
+```
+virutil usb media VM [-s GiB] [SRC...]
+virutil usb media VM --mount
+virutil usb media VM --eject
+virutil usb media VM --detach
+```
+
+| Argument | Meaning |
+| --- | --- |
+| `SRC...` | Host files and directories to copy into the drive before it is attached; each keeps its basename at the drive's root. |
+| `-s`, `--size` | Drive size in GiB, honored only when the image is first created (default 4). Ignored once it exists. |
+
+Run with no options: the drive is created once per VM and kept, filled from
+`SRC` (empty if none), and attached to the **running** VM as removable media.
+Idempotent: if the drive is already attached, nothing happens. `--mount` is the
+host half for hand-filling — it works with the domain shut off, mounts the
+image at `~/.virutils/mnt/VM-usb`, and prints the command that hands it over
+afterwards. `--eject` flushes and detaches the drive in the guest, keeping the
+image; `--detach` unmounts and releases it on the host, refusing while the
+guest still has it.
+
+The drive follows the volume transport's strict turn: it is never mounted on
+the host while it is attached in the guest, and the handover refuses if either
+probe still holds the image. The image lives at
+`$VOLUME_DIR/$DOMAIN-usb.qcow2`.
+
+Formatting is the same policy as the [staging volume](#the-staging-volume):
+one GPT partition spanning the disk, exFAT when the host can, NTFS otherwise,
+and Windows itself when neither exists — the last attaches the blank drive
+once and runs `Initialize-Disk`/`Format-Volume` inside the guest. The guest
+must be running with the [QEMU guest agent](#guest-prerequisites) answering
+for both that fallback and `--eject`, since the agent is what flushes the drive
+before it is detached.
 
 ## Requirements
 

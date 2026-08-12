@@ -184,6 +184,7 @@ _virutil_usb() {
     'attach:share on Windows, import into WSL, attach to the VM'
     'detach:return a device to the Windows host'
     'unbind:stop sharing a device on Windows'
+    'media:create a virtual removable USB drive'
   )
   case $CURRENT in
     3) _describe -t command 'command' cmds ;;
@@ -195,6 +196,21 @@ _virutil_usb() {
           ;;
         unbind)
           _virutil_usb_busids
+          ;;
+        media)
+          case $words[CURRENT-1] in
+            -s|--size) _virutil_size; return ;;
+          esac
+          case $CURRENT in
+            4) _virutil_domains ;;
+            5) _files ;;
+            *) _values 'option' \
+                 '(-s --size)'{-s,--size}'[drive size in GiB when first created]' \
+                 '(--mount)'--mount'[mount the drive image on the host to fill it]' \
+                 '(--eject)'--eject'[flush and detach the drive in the guest]' \
+                 '(--detach)'--detach'[unmount and release the drive image on the host]'
+               ;;
+          esac
           ;;
       esac
       ;;

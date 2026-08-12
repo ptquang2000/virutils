@@ -7,10 +7,25 @@
 # one UAC prompt per physical device ever -- twice at worst, if the first bind
 # has to be redone with --force. detach stops short of unbinding: a bound but
 # detached device is still usable in Windows.
+#
+# `usb media` is the virtual counterpart: no physical device, just a qcow2 the
+# host fills over qemu-nbd and hands to the guest as a usb-storage device, which
+# Windows lists under removable media. It follows the volume transport's strict
+# turn: the image is never mounted here while it is attached there.
 
 USBIPD="/mnt/c/Program Files/usbipd-win/usbipd.exe"
 USBIPD_WIN='C:\Program Files\usbipd-win\usbipd.exe'
 DISTRO=archlinux
+
+# Removable media state, module scope for the EXIT trap.
+USB_MEDIA_SIZE=4              # GiB, sparse -- an upper bound, not an allocation
+USB_IMG=""                    # the drive image
+USB_TARGET=""                 # the sdX the usb-storage device attaches as
+USB_ATTACHED=0                # attached to the guest
+USB_ABORTED=0                 # a failed run undoes the guest attach too
+# Serial and filesystem label both. 10 chars, under exFAT's 11-char limit, and
+# distinct from XFER_LABEL so a staging volume can never be mistaken for it.
+USB_MEDIA_LABEL="VIRUTILUSB"
 
 usb_usage() {
     printf '%s\n' \
@@ -19,6 +34,17 @@ usb_usage() {
         "       virutil usb attach VM BUSID" \
         "       virutil usb detach VM BUSID|VENDOR:PRODUCT" \
         "       virutil usb unbind BUSID" \
+        "       virutil usb media  VM [-s GiB] [SRC...]" \
+        "       virutil usb media  VM --mount|--eject|--detach" \
+        "" \
+        "media -- a virtual USB flash drive, created once per VM and kept:" \
+        "  (no options)  fill the drive from SRC (if any) and attach it to the" \
+        "                running VM as removable media; empty if no SRC" \
+        "  -s, --size GiB  drive size when the image is first created" \
+        "                  (default $USB_MEDIA_SIZE; ignored once it exists)" \
+        "  --mount        mount the drive image on the host for hand-filling" \
+        "  --eject        flush and detach the drive in the guest" \
+        "  --detach       unmount and release the image on the host" \
         "" \
         "BUSID is the first column of 'virutil usb list'." >&2
     exit "${1:-1}"
@@ -206,6 +232,428 @@ detach_scope() {
     die "$out"
 }
 
+# --- removable media --------------------------------------------------------
+
+usb_media_image() { printf '%s/%s-usb.qcow2' "$VOLUME_DIR" "$1"; }
+
+usb_media_mnt() { virutils_mnt "$1-usb"; }
+
+# libvirt attaches a usb-storage device at a SCSI target name; the first free
+# one is picked so a real SCSI disk, or a second drive, is never shadowed.
+usb_media_free_target() {
+    local used letter
+    used="$("${VIRSH[@]}" domblklist "$DOMAIN" 2>/dev/null | awk 'NR>2 {print $1}')"
+    for letter in a b c d e f g h i j k l m n o p q r s t u v w x y z; do
+        grep -qx "sd$letter" <<<"$used" || { printf 'sd%s' "$letter"; return 0; }
+    done
+    die "no free SCSI target on $DOMAIN"
+}
+
+# libvirt matches a disk by its source; anything under the image path is ours.
+usb_media_attached() {
+    "${VIRSH[@]}" domblklist "$DOMAIN" 2>/dev/null \
+        | awk -v img="$USB_IMG" '$2 == img { found = 1 } END { exit !found }'
+}
+
+# removable='on' is what QEMU's usb-storage needs to present the RMB bit, which
+# is what makes Windows call the drive removable media at all.
+usb_media_xml() {
+    cat <<EOF
+<disk type='file' device='disk'>
+  <driver name='qemu' type='qcow2' cache='none' io='io_uring' discard='unmap'/>
+  <source file='$USB_IMG'/>
+  <target dev='$USB_TARGET' bus='usb' removable='on'/>
+  <serial>$USB_MEDIA_LABEL</serial>
+</disk>
+EOF
+}
+
+# usb_media_create -- make the drive image and format it by whichever half of
+# the machine can, exactly as the volume transport does for its staging image:
+# one GPT partition spanning the disk, exFAT when the host can, NTFS otherwise,
+# and Windows itself when neither exists. Idempotent; ends with $NBD detached.
+usb_media_create() {
+    local created=0
+    if [[ ! -e "$USB_IMG" ]]; then
+        mkdir -p "$VOLUME_DIR"
+        paths_qemu_warn "$VOLUME_DIR"
+        say "usb media: creating $USB_IMG (${USB_MEDIA_SIZE} GiB, sparse)"
+        local -a imgsudo=()
+        [[ -w "$(dirname -- "$USB_IMG")" ]] || imgsudo=("${SUDO[@]}")
+        "${imgsudo[@]}" qemu-img create -f qcow2 -o cluster_size=1M \
+            -- "$USB_IMG" "${USB_MEDIA_SIZE}G" >/dev/null \
+            || die "could not create $USB_IMG"
+        created=1
+    fi
+
+    volume_pick_fs
+    nbd_connect "$USB_IMG"
+
+    local part; part="$(nbd_find_part exfat ntfs)"
+    if [[ -n "$part" ]]; then
+        "${SUDO[@]}" qemu-nbd -d "$NBD" >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    (( created )) || warn "usb media $USB_IMG has no readable filesystem;" \
+                          "reformatting it (nothing on it is worth keeping)"
+    volume_partition
+
+    case "$VOLUME_FS" in
+    exfat)
+        say "usb media: formatting exFAT"
+        "${SUDO[@]}" mkfs.exfat -n "$USB_MEDIA_LABEL" "${NBD}p1" >/dev/null \
+            || die "mkfs.exfat failed on ${NBD}p1"
+        ;;
+    ntfs)
+        say "usb media: formatting NTFS"
+        local mk; mk="$(command -v mkfs.ntfs || command -v mkntfs)"
+        "${SUDO[@]}" "$mk" --quick --label "$USB_MEDIA_LABEL" "${NBD}p1" >/dev/null \
+            || die "$mk failed on ${NBD}p1"
+        ;;
+    guest)
+        [[ "$(domstate)" == running ]] || die \
+            "no host mkfs for exFAT or NTFS, and $DOMAIN is not running, so the" \
+            "drive cannot be formatted in the guest. Install exfatprogs (or" \
+            "ntfs-3g), or start $DOMAIN."
+        "${SUDO[@]}" qemu-nbd -d "$NBD" >/dev/null 2>&1 || true
+        usb_format_in_guest
+        return 0
+        ;;
+    esac
+
+    "${SUDO[@]}" qemu-nbd -d "$NBD" >/dev/null 2>&1 || true
+}
+
+# The fallback for a host with no mkfs the guest could read: the blank drive is
+# handed to the guest once, Initialize-Disk and Format-Volume run inside it, and
+# it comes back ready.
+usb_format_in_guest() {
+    say "usb media: no host mkfs for exFAT or NTFS -- formatting the drive in $DOMAIN"
+    usb_attach_device
+
+    xfer_ps '
+$disk = $null
+$deadline = (Get-Date).AddSeconds(30)
+do {
+  $disk = Get-Disk | Where-Object { $_.SerialNumber -like "*'"$USB_MEDIA_LABEL"'*" } | Select-Object -First 1
+  if (-not $disk) {
+    $disk = Get-Disk | Where-Object { $_.PartitionStyle -eq "RAW" } | Select-Object -First 1
+  }
+  if ($disk) { break }
+  Start-Sleep -Milliseconds 500
+} while ((Get-Date) -lt $deadline)
+if (-not $disk) { throw "the usb drive never appeared in the guest" }
+if ($disk.IsOffline)  { Set-Disk -Number $disk.Number -IsOffline $false }
+if ($disk.IsReadOnly) { Set-Disk -Number $disk.Number -IsReadOnly $false }
+if ($disk.PartitionStyle -eq "RAW") { Initialize-Disk -Number $disk.Number -PartitionStyle GPT }
+$part = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue |
+        Where-Object { $_.Type -ne "Reserved" } | Select-Object -First 1
+if (-not $part) { $part = New-Partition -DiskNumber $disk.Number -UseMaximumSize -AssignDriveLetter }
+Format-Volume -Partition $part -FileSystem NTFS -FileSystemLabel "'"$USB_MEDIA_LABEL"'" -Full:$false -Confirm:$false | Out-Null
+Write-Output "formatted"' \
+        || die "formatting the usb media inside $DOMAIN failed"
+
+    usb_release_in_guest
+    usb_detach_device
+}
+
+# The gate on every host-side mount: the drive must be the host's alone. Usable
+# with the guest running or not -- mounting a drive is purely a host action.
+usb_media_open() {
+    xfer_privilege
+    command -v sfdisk >/dev/null || die "sfdisk not installed (util-linux)"
+    if (( ${#SUDO[@]} )); then
+        command -v sudo >/dev/null || die "sudo not installed; nbd and mount need it"
+        sudo -v || die "sudo authentication failed"
+    fi
+
+    USB_IMG="$(usb_media_image "$DOMAIN")"
+    MNT="${MNT:-$(usb_media_mnt "$DOMAIN")}"
+
+    usb_media_attached \
+        && die "the usb media is attached to $DOMAIN; eject it first" \
+               "  virutil usb media $DOMAIN --eject"
+    nbd_attached && die "$NBD is already attached; free it or set @nbd elsewhere" \
+                        "  sudo qemu-nbd -d $NBD"
+    if mnt_mounted; then
+        say "usb media: already mounted at $MNT, reusing it"
+        return 0
+    fi
+
+    usb_media_create
+    nbd_connect "$USB_IMG"
+    local part; part="$(nbd_find_part exfat ntfs)"
+    [[ -n "$part" ]] || die "no exFAT or NTFS partition on the usb media" \
+                            "-- remove $USB_IMG and run again to rebuild it"
+    local fstype; fstype="$("${SUDO[@]}" blkid -o value -s TYPE "$part")"
+    "${SUDO[@]}" mkdir -p "$MNT"
+    # uid=/gid= hand the tree to the invoking user.
+    "${SUDO[@]}" mount -t "$fstype" -o "uid=$(id -u),gid=$(id -g)" "$part" "$MNT" \
+        || die "could not mount the usb media ($fstype) at $MNT"
+    mnt_writable || die "the usb media mounted read-only at $MNT"
+    say "usb media: $MNT ($fstype, $(nbd_part_size "$part") GiB)"
+}
+
+# Copy a host path onto the drive, keeping its basename at the root; a trailing
+# slash on a directory means its contents, rsync-style.
+usb_media_copy_in() {
+    local src="$1"
+    [[ -e "$src" ]] || die "no such file or directory: $src"
+    if [[ -d "$src" ]]; then
+        command -v rsync >/dev/null || die "rsync not installed"
+        say "usb media: copying $src into the drive"
+        rsync -rlt --info=progress2 --no-perms --no-owner --no-group -- "$src" "$MNT/"
+    else
+        say "usb media: copying $src into the drive"
+        cp -f -- "$src" "$MNT/"
+    fi
+}
+
+# Release the image host-side -- verified from /proc/mounts and sysfs, not exit
+# codes -- then hotplug it into the guest. Two writers on one image is the one
+# mistake nothing can undo, so the handover refuses if either probe still holds.
+usb_media_handoff() {
+    sync
+    if mnt_mounted; then
+        "${SUDO[@]}" umount "$MNT" || die "could not unmount $MNT"
+    fi
+    if nbd_attached; then
+        "${SUDO[@]}" qemu-nbd -d "$NBD" >/dev/null 2>&1 || true
+    fi
+    sync
+
+    if mnt_mounted || nbd_attached; then
+        die "the usb media is still held by the host ($MNT / $NBD); refusing to" \
+            "hand it to $DOMAIN -- two writers on one image is the one mistake" \
+            "nothing here can undo"
+    fi
+
+    usb_attach_device
+}
+
+usb_attach_device() {
+    USB_TARGET="$(usb_media_free_target)"
+    usb_media_xml | "${VIRSH[@]}" attach-device "$DOMAIN" --live /dev/stdin \
+        || die "could not attach the usb media to $DOMAIN"
+    USB_ATTACHED=1
+    say "usb media: handed to $DOMAIN as removable media (${USB_TARGET})"
+}
+
+usb_detach_device() {
+    (( USB_ATTACHED )) || return 0
+    usb_media_xml | "${VIRSH[@]}" detach-device "$DOMAIN" --live /dev/stdin \
+        >/dev/null 2>&1 \
+        || warn "could not detach the usb media from $DOMAIN; remove it by hand:" \
+                "  ${VIRSH[*]} detach-disk $DOMAIN $USB_TARGET --live"
+
+    # The detach is asynchronous: libvirt returns once the guest has been asked.
+    local i
+    for (( i = 0; i < 30; i++ )); do
+        usb_media_attached || { USB_ATTACHED=0; return 0; }
+        sleep 0.5
+    done
+    warn "$DOMAIN has not released the usb media after 15s"
+    USB_ATTACHED=0
+}
+
+# Flush the guest's cache and take the drive offline, so the filesystem is
+# closed before the device disappears underneath it. Mirrors the volume
+# transport's release, matching the drive by its own serial and label so a
+# staging volume can never be offlined instead. The drive letter goes back
+# first: Windows remembers an assignment long after the disk behind it has gone.
+usb_release_in_guest() {
+    xfer_ps '
+try { Get-Volume -FileSystemLabel "'"$USB_MEDIA_LABEL"'" -ErrorAction SilentlyContinue |
+      Write-VolumeCache -ErrorAction SilentlyContinue } catch {}
+try {
+  $lv = Get-Volume -FileSystemLabel "'"$USB_MEDIA_LABEL"'" -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+  if ($lv -and $lv.DriveLetter) {
+    Get-Partition -DriveLetter $lv.DriveLetter -ErrorAction Stop |
+      Remove-PartitionAccessPath -AccessPath ($lv.DriveLetter + ":\") -ErrorAction Stop
+  }
+} catch {}
+$d = Get-Disk | Where-Object { $_.SerialNumber -like "*'"$USB_MEDIA_LABEL"'*" } | Select-Object -First 1
+if (-not $d) {
+  $v = Get-Volume -FileSystemLabel "'"$USB_MEDIA_LABEL"'" -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($v -and $v.DriveLetter) {
+    $d = Get-Partition -DriveLetter $v.DriveLetter -ErrorAction SilentlyContinue |
+         Get-Disk -ErrorAction SilentlyContinue | Select-Object -First 1
+  }
+}
+if ($d) { try { Set-Disk -Number $d.Number -IsOffline $true -ErrorAction Stop } catch {} }
+exit 0' >/dev/null 2>&1 || true
+}
+
+# The letter Windows gave the drive, by label, or nothing. Polled: a hotplugged
+# USB device takes a moment to enumerate and be assigned one.
+usb_drive_letter() {
+    local tries="${1:-30}"
+    xfer_ps '
+$deadline = (Get-Date).AddSeconds('"$tries"')
+do {
+  $v = Get-Volume -FileSystemLabel "'"$USB_MEDIA_LABEL"'" -ErrorAction SilentlyContinue |
+       Select-Object -First 1
+  if ($v -and $v.DriveLetter) { Write-Output $v.DriveLetter; exit 0 }
+  $disk = Get-Disk -ErrorAction SilentlyContinue |
+          Where-Object { $_.SerialNumber -like "*'"$USB_MEDIA_LABEL"'*" } | Select-Object -First 1
+  if ($disk -and $v -and -not $v.DriveLetter) {
+    try {
+      Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue |
+        Where-Object { -not $_.DriveLetter -and $_.Type -ne "Reserved" } |
+        Add-PartitionAccessPath -AssignDriveLetter -ErrorAction Stop
+    } catch {}
+  }
+  Start-Sleep -Milliseconds 500
+} while ((Get-Date) -lt $deadline)
+exit 1' 2>/dev/null | tr -d '[:space:]'
+}
+
+# Teardown, from the EXIT trap of the attach flow: nothing the host holds may
+# survive the run. A run that failed after reaching the guest undoes the attach
+# there too; a successful one leaves the drive where the user asked for it.
+usb_media_trap() {
+    if [[ -n "$MNT" ]] && mnt_mounted; then
+        sync
+        "${SUDO[@]}" umount "$MNT" 2>/dev/null || true
+    fi
+    if [[ -n "$NBD" ]] && nbd_attached; then
+        "${SUDO[@]}" qemu-nbd -d "$NBD" >/dev/null 2>&1 || true
+    fi
+    if (( USB_ATTACHED && USB_ABORTED )); then
+        usb_release_in_guest >/dev/null 2>&1 || true
+        usb_detach_device >/dev/null 2>&1 || true
+    fi
+    sync
+}
+
+usb_media_attach() {
+    local letter src
+    trap usb_media_trap EXIT
+    USB_ABORTED=1
+
+    usb_media_open
+    for src in "$@"; do
+        usb_media_copy_in "$src"
+    done
+    usb_media_handoff
+
+    letter="$(usb_drive_letter 30 || true)"
+    if [[ -n "$letter" ]]; then
+        say "usb media: $letter: in $DOMAIN"
+    else
+        warn "the drive is attached, but no drive letter has appeared yet; check" \
+             "it with:  virutil exec ps $DOMAIN Get-Volume"
+    fi
+    USB_ABORTED=0
+}
+
+usb_media_main() {
+    local VM="" SIZE="" CMD=attach
+    local -a SRC=()
+
+    while (( $# )); do
+        case "$1" in
+        -s|--size)  SIZE="${2:?$1 needs a value}"; shift 2 ;;
+        --mount)    CMD=mount; shift ;;
+        --eject)    CMD=eject; shift ;;
+        --detach)   CMD=detach; shift ;;
+        -h|--help)  usb_usage 0 ;;
+        -*)         die "virutil usb media: unknown option: $1" ;;
+        *)          if [[ -z "$VM" ]]; then VM="$1"
+                    else SRC+=("$1")
+                    fi
+                    shift ;;
+        esac
+    done
+    [[ -n "$VM" ]] || usb_usage
+    if [[ -n "$SIZE" ]]; then
+        [[ "$SIZE" =~ ^[0-9]+$ ]] || die "--size wants a whole number of GiB, got '$SIZE'"
+        USB_MEDIA_SIZE="$SIZE"
+    fi
+
+    DOMAIN="$VM"
+    require_domain
+
+    case "$CMD" in
+    mount)
+        # Only the host is touched, so this works with the domain shut off. The
+        # trap undoes a half-finished open, then is dropped so the mount is the
+        # caller's to keep, fill and hand over.
+        trap usb_media_trap EXIT
+        usb_media_open
+        trap - EXIT
+        say "fill the drive at $MNT, then hand it over with:" \
+            "  virutil usb media $VM" \
+            "(or unmount it again with: virutil usb media $VM --detach)"
+        ;;
+    eject)
+        local st; st="$(domstate)"
+        [[ "$st" == running ]] \
+            || die "$VM is '$st'; nothing to eject"
+        xfer_agent_ok "$VM" || die "the qemu guest agent is not answering in $VM," \
+            "which is what flushes the drive before it is detached. Install it" \
+            "(see the guest prerequisites in README.md)."
+        USB_IMG="$(usb_media_image "$VM")"
+        usb_media_attached || die "the usb media is not attached to $VM"
+        USB_TARGET="$("${VIRSH[@]}" domblklist "$VM" 2>/dev/null \
+                      | awk -v img="$USB_IMG" '$2 == img {print $1; exit}')"
+        USB_ATTACHED=1
+        usb_release_in_guest
+        usb_detach_device
+        if usb_media_attached; then
+            say "usb media: the guest still holds $USB_IMG; remove it by hand (see above)"
+        else
+            say "usb media: removed from $VM; the image is kept at $USB_IMG"
+        fi
+        ;;
+    detach)
+        USB_IMG="$(usb_media_image "$VM")"
+        MNT="$(usb_media_mnt "$VM")"
+        xfer_privilege
+        usb_media_attached && die "the usb media is attached to $VM; eject it first" \
+                                  "  virutil usb media $VM --eject"
+        if mnt_mounted; then
+            sync
+            "${SUDO[@]}" umount "$MNT" || die "could not unmount $MNT"
+        fi
+        if nbd_attached; then
+            "${SUDO[@]}" qemu-nbd -d "$NBD" >/dev/null 2>&1 || true
+        fi
+        sync
+        if mnt_mounted || nbd_attached; then
+            die "the host still holds the usb media ($MNT / $NBD); free it by hand:" \
+                "  sudo umount $MNT" \
+                "  sudo qemu-nbd -d $NBD"
+        fi
+        say "usb media: released on the host"
+        ;;
+    *)
+        # The headline flow: create if needed, fill from SRC, attach to the
+        # running guest. Idempotent: an already-attached drive is reported and
+        # left alone.
+        local st; st="$(domstate)"
+        [[ "$st" == running ]] \
+            || die "$VM is '$st'; a USB device can only hotplug into a running" \
+                   "guest." \
+                   "  virutil domain start $VM"
+        xfer_agent_ok "$VM" || die "the qemu guest agent is not answering in $VM," \
+            "which is what formats and releases the drive inside it. Install it" \
+            "(see the guest prerequisites in README.md)."
+        USB_IMG="$(usb_media_image "$VM")"
+        MNT="$(usb_media_mnt "$VM")"
+        if usb_media_attached; then
+            say "usb media is already attached to $VM"
+            return 0
+        fi
+        usb_media_attach "${SRC[@]}"
+        say "remove it from the guest again with:" \
+            "  virutil usb media $VM --eject"
+        ;;
+    esac
+}
+
 usb_main() {
     local CMD VM DEV ID STATE BUSID STUB GUID CLIENT FORCED REMOVED
     CMD="${1:-}"
@@ -224,6 +672,16 @@ usb_main() {
         hostdevs "$VM"
         echo "=== persistent ==="
         hostdevs --inactive "$VM"
+        echo "=== usb media ==="
+        local img; img="$(usb_media_image "$VM")"
+        if "${VIRSH[@]}" domblklist "$VM" 2>/dev/null \
+            | awk -v i="$img" '$2 == i { found = 1 } END { exit !found }'; then
+            echo "  $img (attached)"
+        elif [[ -e "$img" ]]; then
+            echo "  $img (not attached)"
+        else
+            echo "  none -- create one with: virutil usb media $VM"
+        fi
         ;;
     attach)
         VM="${2:?usage: virutil usb attach VM BUSID}"
@@ -319,6 +777,10 @@ usb_main() {
             IFS='|' read -r ID BUSID STUB GUID CLIENT FORCED <<<"$(usbipd_state "$DEV")"
             [ -z "$STUB$GUID" ] || die "unbind did not take effect; was the UAC prompt declined?"
         fi
+        ;;
+    media)
+        shift
+        usb_media_main "$@"
         ;;
     *)
         usb_usage
