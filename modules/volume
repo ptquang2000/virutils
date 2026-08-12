@@ -81,7 +81,8 @@ label: gpt
 type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
 EOF
     "${SUDO[@]}" partx -u "$NBD" 2>/dev/null || true
-    udevadm settle
+    # The mkfs below opens ${NBD}p1 directly, so the node has to be there.
+    nbd_settle
 }
 
 # volume_create -- make the staging image and format it by whichever half of the

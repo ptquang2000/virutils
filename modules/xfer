@@ -142,8 +142,53 @@ nbd_connect() {
     local img="$1" ro="${2:-}"
     nbd_reload
     "${SUDO[@]}" qemu-nbd ${ro:+-r} -c "$NBD" "$img"
-    "${SUDO[@]}" partx -a "$NBD" 2>/dev/null || true   # force a partition rescan
-    udevadm settle
+    nbd_settle
+}
+
+# Does $NBD have at least one partition node yet?
+nbd_has_parts() {
+    local dev
+    for dev in "$NBD"p*; do [[ -b "$dev" ]] && return 0; done
+    return 1
+}
+
+# Is $NBD serving reads? Straight after qemu-nbd -c it may be sized but not yet
+# answering: that is what makes partx report "failed to read partition table".
+nbd_readable() {
+    "${SUDO[@]}" dd if="$NBD" bs=512 count=1 status=none >/dev/null 2>&1
+}
+
+nbd_has_table() {
+    [[ -n "$("${SUDO[@]}" blkid -p -s PTTYPE -o value "$NBD" 2>/dev/null)" ]]
+}
+
+# nbd_settle -- wait for the kernel's partition scan to land.
+#
+# qemu-nbd -c returns as soon as the device is sized, but the scan is
+# asynchronous and udevadm settle cannot wait for a uevent that has not been
+# queued yet. A deep backing chain opens slowly enough that the nodes appear
+# after the caller has already globbed for them, which reads as "no partition
+# found" on a perfectly good image.
+#
+# The wait is gated on a partition table actually being there: volume_create
+# probes a freshly made, still-unpartitioned image, and that must not stall for
+# the whole timeout.
+NBD_SETTLE_TRIES=50          # x 0.2s
+nbd_settle() {
+    local i
+    for (( i = 0; i < NBD_SETTLE_TRIES; i++ )); do
+        "${SUDO[@]}" partx -a "$NBD" >/dev/null 2>&1 || true   # force a rescan
+        udevadm settle
+
+        nbd_has_parts && return 0
+        # Readable with no table: an unpartitioned image, nothing to wait for.
+        nbd_readable && ! nbd_has_table && return 0
+
+        sleep 0.2
+    done
+    # Not fatal here: the caller reports the layout it actually found.
+    warn "$NBD still shows no partitions after" \
+         "$(( NBD_SETTLE_TRIES / 5 ))s of waiting for the kernel to scan it"
 }
 
 # nbd_find_part TYPE... -- the largest partition on $NBD whose filesystem is one
