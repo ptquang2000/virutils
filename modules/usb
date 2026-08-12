@@ -4,8 +4,9 @@
 # rerunning after a failure is safe.
 #
 # Only bind and unbind need Administrator, and a bind is persistent, so expect
-# one UAC prompt per physical device ever. detach stops short of unbinding: a
-# bound but detached device is still usable in Windows.
+# one UAC prompt per physical device ever -- twice at worst, if the first bind
+# has to be redone with --force. detach stops short of unbinding: a bound but
+# detached device is still usable in Windows.
 
 USBIPD="/mnt/c/Program Files/usbipd-win/usbipd.exe"
 USBIPD_WIN='C:\Program Files\usbipd-win\usbipd.exe'
@@ -37,7 +38,8 @@ read_dev() {
 }
 
 # usbipd's view of one device as
-# VendProd|BusId|StubInstanceId|PersistedGuid|ClientIPAddress, or none/many.
+# VendProd|BusId|StubInstanceId|PersistedGuid|ClientIPAddress|IsForced, or
+# none/many.
 # The hardware id only appears in InstanceId: USB\VID_0951&PID_1666\<serial>.
 usbipd_state() {
     local busid="" key=""
@@ -55,7 +57,8 @@ usbipd_state() {
         | if length == 0 then "none"
           elif length > 1 then "many"
           else .[0] | [vendprod, (.BusId // ""), (.StubInstanceId // ""),
-                       (.PersistedGuid // ""), (.ClientIPAddress // "")] | join("|")
+                       (.PersistedGuid // ""), (.ClientIPAddress // ""),
+                       (.IsForced | tostring)] | join("|")
           end'
 }
 
@@ -66,7 +69,7 @@ resolve_dev() {
     none) die "no connected USB device at $1 (see: virutil usb list)" ;;
     many) die "several connected devices share hardware id $1; unplug one" ;;
     esac
-    IFS='|' read -r ID BUSID STUB GUID CLIENT <<<"$STATE"
+    IFS='|' read -r ID BUSID STUB GUID CLIENT FORCED <<<"$STATE"
     [ -n "$ID" ] || die "could not read the vendor:product of $1 from usbipd state"
 }
 
@@ -105,6 +108,54 @@ wait_sysfs() {
         sleep 0.2
     done
     return 1
+}
+
+# An import is two steps -- usbipd exports the device on the Windows side, then
+# the in-WSL usbip client claims it -- and a failure between them leaves the
+# export standing with nothing holding it. Every later attempt then dies on
+# "Device busy (exported)", which usbipd reports as Windows using the device even
+# though it is usbipd's own leftover. Returns 2 for that case, the recoverable
+# one, so the caller can clear the export and try again.
+usbipd_attach() {
+    local out rc=0
+    out=$("$USBIPD" attach --wsl "$DISTRO" -b "$BUSID" 2>&1 | tr -d '\r') || rc=$?
+    printf '%s\n' "$out" >&2
+    [ "$rc" = 0 ] && return 0
+    case "$out" in
+    *"Device busy"* | *"used by Windows"*) return 2 ;;
+    esac
+    return 1
+}
+
+# Dropping a stale export costs nothing, so it is tried before concluding that
+# Windows is at fault. When it really is -- a plain bind leaves the Windows
+# driver in place, and for a mass storage device an open Explorer window is
+# enough to lose the race -- only `bind --force` settles it, by swapping in the
+# stub driver for good. That needs Administrator, hence last.
+wsl_import() {
+    local rc=0
+    usbipd_attach || rc=$?
+    [ "$rc" = 0 ] && return 0
+    [ "$rc" = 2 ] || exit 1
+
+    say "wsl: $BUSID is still exported from an earlier import, dropping it and retrying"
+    "$USBIPD" detach -b "$BUSID"
+    rc=0
+    usbipd_attach || rc=$?
+    [ "$rc" = 0 ] && return 0
+    [ "$rc" = 2 ] || exit 1
+
+    [ "$FORCED" != true ] ||
+        die "$BUSID ($ID) is force-shared yet still busy; unplug it and plug it back in"
+
+    say "bind: Windows is holding $BUSID ($ID), resharing it with --force, expect a UAC prompt"
+    elevate bind --force -b "$BUSID"
+    IFS='|' read -r ID BUSID STUB GUID CLIENT FORCED <<<"$(usbipd_state "$BUSID")"
+    [ "$FORCED" = true ] ||
+        die "force bind did not take effect; was the UAC prompt declined?"
+
+    say "wsl: retrying the import of $BUSID ($ID) into $DISTRO"
+    usbipd_attach
 }
 
 domstate() { "${VIRSH[@]}" domstate "$VM" 2>/dev/null | head -1; }
@@ -156,7 +207,7 @@ detach_scope() {
 }
 
 usb_main() {
-    local CMD VM DEV ID STATE BUSID STUB GUID CLIENT REMOVED
+    local CMD VM DEV ID STATE BUSID STUB GUID CLIENT FORCED REMOVED
     CMD="${1:-}"
     [ -n "$CMD" ] || usb_usage
     case "$CMD" in -h|--help) usb_usage 0 ;; esac
@@ -185,18 +236,24 @@ usb_main() {
         else
             say "bind: sharing $BUSID ($ID) on the Windows host, expect a UAC prompt"
             elevate bind -b "$BUSID"
-            IFS='|' read -r ID BUSID STUB GUID CLIENT <<<"$(usbipd_state "$BUSID")"
+            IFS='|' read -r ID BUSID STUB GUID CLIENT FORCED <<<"$(usbipd_state "$BUSID")"
             [ -n "$STUB$GUID" ] || die "bind did not take effect; was the UAC prompt declined?"
         fi
 
         IP=$(wsl_ip)
-        if [ -n "$CLIENT" ]; then
-            [ "$CLIENT" = "$IP" ] ||
-                die "$BUSID is attached to $CLIENT, not to this WSL instance ($IP)"
+        [ -z "$CLIENT" ] || [ "$CLIENT" = "$IP" ] ||
+            die "$BUSID is attached to $CLIENT, not to this WSL instance ($IP)"
+
+        # usbipd records the export the moment it hands the device out, so
+        # ClientIPAddress cannot tell a live import from one that died half way.
+        # sysfs is the only witness that the device really arrived, and skipping
+        # on the record alone is what turns a stale export into a wait_sysfs
+        # timeout blaming the import.
+        if [ -n "$CLIENT" ] && in_sysfs "$ID"; then
             say "wsl: $BUSID already attached here, skipping"
         else
             say "wsl: importing $BUSID ($ID) into $DISTRO"
-            "$USBIPD" attach --wsl "$DISTRO" -b "$BUSID"
+            wsl_import
         fi
 
         wait_sysfs "$ID" || die "$ID never appeared in WSL; the usbipd import did not land"
@@ -233,7 +290,7 @@ usb_main() {
             *) die "nothing is connected at busid $DEV; name the device as VENDOR:PRODUCT to remove a leftover hostdev (see: virutil usb show $VM)" ;;
             esac
             ;;
-        *) IFS='|' read -r ID BUSID STUB GUID CLIENT <<<"$STATE" ;;
+        *) IFS='|' read -r ID BUSID STUB GUID CLIENT FORCED <<<"$STATE" ;;
         esac
 
         REMOVED=0
@@ -259,7 +316,7 @@ usb_main() {
         else
             say "unbind: unsharing $BUSID ($ID), expect a UAC prompt"
             elevate unbind -b "$BUSID"
-            IFS='|' read -r ID BUSID STUB GUID CLIENT <<<"$(usbipd_state "$DEV")"
+            IFS='|' read -r ID BUSID STUB GUID CLIENT FORCED <<<"$(usbipd_state "$DEV")"
             [ -z "$STUB$GUID" ] || die "unbind did not take effect; was the UAC prompt declined?"
         fi
         ;;
