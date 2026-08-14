@@ -765,9 +765,8 @@ operate on, removes it again along with the disks nobody else cleans up, and
 covers the everyday operations in between.
 
 ```
-virutil domain create VM ISO [-s GiB] [-m MiB] [-c N] [-d PATH] [-o ID]
-                             [-v ISO|none] [-n]
-virutil domain delete VM [-y] [-k]
+virutil domain create VM ISO [-s GiB] [-m MiB] [-c N] [-o ID] [-v ISO|none]
+virutil domain delete VM
 virutil domain list
 virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]
 virutil domain shutdown VM
@@ -790,10 +789,13 @@ The flags are what you vary per domain. Everything else is a property of the
 | `-s`, `--size GiB` | `64` | Disk size. |
 | `-m`, `--memory MiB` | half the host's | Guest RAM, rounded down to 512 MiB, floor 2048. |
 | `-c`, `--vcpus N` | half the host's, max 8 | Virtual CPUs. |
-| `-d`, `--disk PATH` | `~/.virutils/images/VM.qcow2` | Disk image path. |
 | `-o`, `--osinfo ID` | **detected from the ISO** | libosinfo id; see `osinfo-query os`. |
 | `-v`, `--virtio ISO` | `virtio-win*.iso` beside the install ISO | Driver ISO to attach as a second cdrom. `none` attaches none. |
-| `-n`, `--dry-run` | — | Print the domain XML and define nothing. |
+
+The disk image is always `$VIRUTIL_IMAGE_DIR/VM.qcow2` (default
+`~/.virutils/images/VM.qcow2`). It is not an option: one domain, one disk, in
+the one directory every other module already looks in. Move the whole lot with
+[`VIRUTIL_IMAGE_DIR`](#environment).
 
 **`--osinfo` is detected, not guessed.** `osinfo-detect` reads the ISO's own
 volume descriptors and reports the short-id, so a Windows 11 media identifies
@@ -877,7 +879,7 @@ profile once, or prefix a single `create` with them.
 | --- | --- | --- |
 | `VIRUTILS_DIR` | `~/.virutils` | Root of everything virutil leaves on the host. Moves configs, images, staging, shares, port state and mount points at once. See [Artifacts and state](#artifacts-and-state). |
 | `VIRUTILS_IMAGE_DIR` | `$VIRUTILS_DIR/images` | The images directory. |
-| `VIRUTIL_IMAGE_DIR` | `$VIRUTILS_IMAGE_DIR` | Legacy name, still honoured: where a disk image goes when `-d` is not given, and where `snapshot` writes overlays. |
+| `VIRUTIL_IMAGE_DIR` | `$VIRUTILS_IMAGE_DIR` | Legacy name, still honoured: where a domain's disk image goes, and where `snapshot` writes overlays. |
 | `VIRUTIL_OSINFO` | `win11` | Fallback libosinfo id when the ISO is not recognised. |
 | `VIRUTIL_VIRTIO` | `virtio-win*.iso` beside the install ISO | Default for `-v`: driver ISO to attach as a second cdrom, or `none`. |
 | `VIRUTIL_NETWORK` | `network=default,model=virtio` | Passed to `virt-install --network`. |
@@ -894,13 +896,34 @@ VIRUTIL_FIRMWARE=bios VIRUTIL_VIRTIO=none \
 ### delete
 
 ```
-virutil domain delete VM [-y] [-k]
+virutil domain delete VM
 ```
 
 Stops the domain if it is running, undefines it with `--nvram` and
-`--snapshots-metadata`, and deletes its disks. `-y`/`--yes` skips the
-confirmation; without it you are asked to type the domain name back.
-`-k`/`--keep-disk` undefines and leaves every image in place.
+`--snapshots-metadata`, and removes everything virutil ever wrote for it. There
+are no options: **it does not ask, and there is no way to keep the disks.** The
+name is the whole confirmation, so a typo that happens to name a real domain
+destroys it.
+
+Beyond the disks, a delete also takes the artifacts the other modules leave
+under `~/.virutils/`, each found by the same name the module that wrote it uses:
+
+| Artifact | Path |
+| --- | --- |
+| Snapshot overlays and memory files | `images/VM.SNAP.*.qcow2`, `images/VM.SNAP.mem` |
+| `volume` transport scratch disk | `images/VM-xfer.qcow2` |
+| `usb media` drive image | `images/VM-usb.qcow2` |
+| `virtiofs` share directory | `share/virutil-VM/` |
+| Host mount points | `mnt/VM`, `mnt/VM-xfer`, `mnt/VM-usb` |
+| Open port forwards | the `socat` relay, plus `ports/tcp-PORT` and its `.log` |
+
+A still-mounted mount point is unmounted lazily first, and only ever `rmdir`'d —
+never recursed into — so a umount that fails leaves the guest's files alone and
+reports the directory instead.
+
+`sync`'s staging trees are the one exception: they are named by `@staging` in a
+config rather than after a domain, are shared between domains by design, and so
+are never touched by a delete.
 
 This exists because `virsh undefine --remove-all-storage` only removes volumes
 libvirt knows about through a **storage pool**, and a host with no pools defined
@@ -916,17 +939,17 @@ from the domain XML instead, and:
    the other domain is unrecoverable, so every candidate is checked against every
    other domain's disks and backing chains first. Anything shared is reported and
    left alone.
-- **The list is printed before anything is destroyed**, because unlinking a
-   qcow2 is the one step here that nothing undoes.
+- **The list is printed as it goes.** Nothing here is undoable and nothing is
+   confirmed, so the output is the only record of what was unlinked.
 - **An unreadable image counts as a file to delete, not as no file.** If the
    backing chain cannot be read, the disk itself is still removed and the
    backing files it may have had are called out — the alternative is a delete
    that quietly turns into a keep.
 
-Privilege is escalated only where the path calls for it: the default image
-directory is root-owned, but a `--disk` in a directory of your own costs no
-password, and undefining a domain hands its images back to their original owner
-before the removal runs.
+Privilege is escalated only where the path calls for it: a root-owned image
+directory costs a password, an image directory of your own costs none, and
+undefining a domain hands its images back to their original owner before the
+removal runs.
 
 ### start
 

@@ -14,7 +14,7 @@ DOMAIN_OVMF=(
 domain_usage() {
     printf '%s\n' \
         "usage: virutil domain create VM ISO [OPTIONS]" \
-        "       virutil domain delete VM [-y] [-k]" \
+        "       virutil domain delete VM" \
         "       virutil domain list" \
         "       virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]" \
         "       virutil domain shutdown VM" \
@@ -29,11 +29,12 @@ domain_usage() {
         "  -s, --size GiB    disk size (default 64)" \
         "  -m, --memory MiB  guest RAM (default: half the host's)" \
         "  -c, --vcpus N     virtual CPUs (default: half the host's, max 8)" \
-        "  -d, --disk PATH   disk image path (default $DOMAIN_IMAGE_DIR/VM.qcow2)" \
         "  -o, --osinfo ID   libosinfo id (default: detected from ISO)" \
         "  -v, --virtio ISO  virtio-win ISO to attach as a second cdrom, or" \
         "                    'none' (default: found beside ISO)" \
-        "  -n, --dry-run     print the domain XML and define nothing" \
+        "" \
+        "The disk is always $DOMAIN_IMAGE_DIR/VM.qcow2;" \
+        "VIRUTIL_IMAGE_DIR moves it." \
         "" \
         "start options (-s/-m/-c need the domain shut off; each is written to the config):" \
         "  -s, --size GiB    grow the disk image (never shrinks)" \
@@ -41,9 +42,10 @@ domain_usage() {
         "  -c, --vcpus N     virtual CPUs" \
         "  -G, --no-gui      start it without opening the console" \
         "" \
-        "delete options:" \
-        "  -y, --yes         do not ask for confirmation" \
-        "  -k, --keep-disk   undefine the domain but leave its disks in place" \
+        "delete takes no options. It never asks, and it removes everything the" \
+        "domain has: disks and their backing chain, snapshot overlays and memory" \
+        "files, the volume and usb images, the virtio-fs share, mount points," \
+        "and any open port forwards. Files another domain uses are kept." \
         "" \
         "  -h, --help        this message" \
         "" \
@@ -192,7 +194,7 @@ domain_default_vcpus() {
 }
 
 domain_create() {
-    local VM="" ISO="" SIZE=64 MEM="" VCPUS="" IMG="" OSINFO="" DRYRUN=0
+    local VM="" ISO="" SIZE=64 MEM="" VCPUS="" IMG="" OSINFO=""
     local VIRTIO NETWORK BIOS=0 SHAREMEM=1 candidate
 
     VIRTIO="${VIRUTIL_VIRTIO:-}"
@@ -205,10 +207,8 @@ domain_create() {
             -s|--size)    SIZE="${2:?$1 needs a value}";   shift 2 ;;
             -m|--memory)  MEM="${2:?$1 needs a value}";    shift 2 ;;
             -c|--vcpus)   VCPUS="${2:?$1 needs a value}";  shift 2 ;;
-            -d|--disk)    IMG="${2:?$1 needs a value}";    shift 2 ;;
             -o|--osinfo)  OSINFO="${2:?$1 needs a value}"; shift 2 ;;
             -v|--virtio)  VIRTIO="${2:?$1 needs a value}"; shift 2 ;;
-            -n|--dry-run) DRYRUN=1; shift ;;
             -h|--help)    domain_usage 0 ;;
             -*)           die "virutil domain create: unknown option: $1" ;;
             *)
@@ -236,10 +236,9 @@ domain_create() {
     [[ -n "$OSINFO" ]] || OSINFO="$(domain_detect_osinfo "$ISO")"
 
     [[ "$SIZE" =~ ^[0-9]+$ ]] || die "--size wants a whole number of GiB, got '$SIZE'"
-    IMG="${IMG:-$DOMAIN_IMAGE_DIR/$VM.qcow2}"
-    [[ -d "$IMG" ]] && IMG="$IMG/$VM.qcow2"
+    IMG="$DOMAIN_IMAGE_DIR/$VM.qcow2"
     [[ -e "$IMG" ]] && die "disk image already exists: $IMG" \
-                           "Pass --disk to put it elsewhere, or remove it first."
+                           "Remove it, or set VIRUTIL_IMAGE_DIR elsewhere."
 
     MEM="${MEM:-$(domain_default_memory)}"
     VCPUS="${VCPUS:-$(domain_default_vcpus)}"
@@ -329,19 +328,11 @@ domain_create() {
     domain_readable_by_qemu "$ISO"
     [[ -n "$VIRTIO" ]] && domain_readable_by_qemu "$VIRTIO"
 
-    # virt-install only accepts a sizeless --disk for an image that already
-    # exists, and a dry run creates nothing.
-    local DISKSPEC="path=$IMG,$DISKOPTS"
-    (( DRYRUN )) && DISKSPEC="path=$IMG,size=$SIZE,$DISKOPTS"
-
-    ARGS+=(--disk "$DISKSPEC")
+    # Sizeless: qemu-img below creates the image, and virt-install only accepts a
+    # sizeless --disk for one that already exists.
+    ARGS+=(--disk "path=$IMG,$DISKOPTS")
     ARGS+=(--disk "path=$ISO,device=cdrom,bus=sata,readonly=on")
     [[ -n "$VIRTIO" ]] && ARGS+=(--disk "path=$VIRTIO,device=cdrom,bus=sata,readonly=on")
-
-    if (( DRYRUN )); then
-        virt-install "${ARGS[@]}" --dry-run --print-xml 1
-        return
-    fi
 
     say "domain:  $VM ($OSINFO)"
     say "cpu:     $VCPUS vcpus (1 socket x $cores cores x $threads threads)"
@@ -356,10 +347,10 @@ domain_create() {
     # cached; preallocation=metadata stops the guest's first write into a region
     # stalling behind table allocation. lazy_refcounts trades a
     # `qemu-img check -r all` after an unclean shutdown for faster writes.
-    mkdir -p "$(dirname -- "$IMG")"
-    paths_qemu_warn "$(dirname -- "$IMG")"
+    mkdir -p "$DOMAIN_IMAGE_DIR"
+    paths_qemu_warn "$DOMAIN_IMAGE_DIR"
     local -a IMGSUDO=()
-    [[ -w "$(dirname -- "$IMG")" ]] || IMGSUDO=("${SUDO[@]}")
+    [[ -w "$DOMAIN_IMAGE_DIR" ]] || IMGSUDO=("${SUDO[@]}")
 
     "${IMGSUDO[@]}" qemu-img create -f qcow2 \
         -o cluster_size=1M,preallocation=metadata,lazy_refcounts=on \
@@ -699,13 +690,89 @@ domain_port() {
     return 0
 }
 
+# domain_rm PATH -- unlink as ourselves, then as root. The image directory may
+# be root-owned while the file is ours, or the reverse, so neither attempt alone
+# is enough.
+domain_rm() {
+    if rm -f -- "$1" 2>/dev/null || "${SUDO[@]}" rm -f -- "$1"; then
+        say "removed $1"
+    else
+        warn "could not remove $1"
+        return 1
+    fi
+}
+
+# domain_purge VM -- everything else virutil names after a domain, so a delete
+# leaves nothing behind for the next domain of the same name to inherit. Each
+# path is derived exactly as the module that writes it does; keep them in step:
+#
+#   forwards      domain_port_file      relay pid plus state and log file
+#   share dir     virtiofs_host_dir     the virtio-fs export directory
+#   mount points  virutils_mnt          bare, -xfer (volume), -usb (usb media)
+#   images        $DOMAIN_IMAGE_DIR     snapshot overlays and memory files,
+#                                       the volume scratch disk, the usb drive
+#
+# sync's staging trees are named by @staging in a config, not after the domain,
+# so nothing here can find them -- they are shared between domains by design.
+domain_purge() {
+    local vm="$1" p rc=0
+    local proto hostport pvm ip gport bind pid
+
+    while read -r proto hostport pvm ip gport bind pid; do
+        [[ "$pvm" == "$vm" ]] || continue
+        domain_port_kill "$pid"
+        rm -f "$(domain_port_file "$proto" "$hostport")" \
+              "$(domain_port_file "$proto" "$hostport").log"
+        say "closed forward $hostport"
+    done < <(domain_port_entries)
+
+    # Unmounted before the directory goes, or an rm would walk into the guest's
+    # own filesystem. Lazy, since a copy that just finished can still hold it,
+    # and rmdir only -- refusing to recurse is what keeps a failed umount from
+    # turning into a delete of live guest files.
+    for p in "$(virutils_mnt "$vm")" "$(virutils_mnt "$vm-xfer")" \
+             "$(virutils_mnt "$vm-usb")"; do
+        [[ -d "$p" ]] || continue
+        if awk -v m="$p" '$2 == m { found = 1 } END { exit !found }' /proc/mounts; then
+            sync
+            "${SUDO[@]}" umount -l "$p" 2>/dev/null || true
+        fi
+        if rmdir "$p" 2>/dev/null || "${SUDO[@]}" rmdir "$p" 2>/dev/null; then
+            say "removed $p"
+        else
+            warn "could not remove $p -- still mounted or not empty"
+            rc=1
+        fi
+    done
+
+    p="${VIRUTILS_SHARE_ROOT:-$VIRUTILS_ROOT/share}/virutil-$vm"
+    if [[ -d "$p" ]]; then
+        if rm -rf -- "$p" 2>/dev/null || "${SUDO[@]}" rm -rf -- "$p"; then
+            say "removed $p"
+        else
+            warn "could not remove $p"
+            rc=1
+        fi
+    fi
+
+    # An unmatched glob stays literal, which -e then filters out. Every name is
+    # prefixed with the domain, so a backing file shared with another domain --
+    # named after that one -- is out of reach here.
+    for p in "$DOMAIN_IMAGE_DIR/$vm".qcow2    "$DOMAIN_IMAGE_DIR/$vm".*.qcow2 \
+             "$DOMAIN_IMAGE_DIR/$vm".*.mem    "$DOMAIN_IMAGE_DIR/$vm"-xfer.qcow2 \
+             "$DOMAIN_IMAGE_DIR/$vm"-usb.qcow2; do
+        [[ -e "$p" ]] || continue
+        domain_rm "$p" || rc=1
+    done
+
+    return "$rc"
+}
+
 domain_delete() {
-    local VM="" YES=0 KEEP=0
+    local VM=""
 
     while (( $# )); do
         case "$1" in
-            -y|--yes)       YES=1; shift ;;
-            -k|--keep-disk) KEEP=1; shift ;;
             -h|--help)      domain_usage 0 ;;
             -*)             die "virutil domain delete: unknown option: $1" ;;
             *)              [[ -z "$VM" ]] || die "unexpected argument: $1"
@@ -715,40 +782,31 @@ domain_delete() {
     [[ -n "$VM" ]] || domain_usage
     domain_exists "$VM" || die "no such domain: $VM"
 
-    # Built while the XML still exists and shown before anything is destroyed:
-    # unlinking a qcow2 is the one step here nothing undoes.
+    # Built while the XML still exists, and printed as it goes: the delete is
+    # unconditional, so the output is the only record of what was unlinked.
     local -a REMOVE=() SHARED=()
     local disk member
-    if (( ! KEEP )); then
-        while read -r disk; do
-            [[ -n "$disk" ]] || continue
-            while read -r member; do
-                [[ -n "$member" && -e "$member" ]] || continue
-                if domain_in_use "$member" "$VM"; then SHARED+=("$member")
-                else REMOVE+=("$member")
-                fi
-            done < <(domain_chain "$disk")
-        done < <(domain_disks "$VM")
-    fi
+    while read -r disk; do
+        [[ -n "$disk" ]] || continue
+        while read -r member; do
+            [[ -n "$member" && -e "$member" ]] || continue
+            if domain_in_use "$member" "$VM"; then SHARED+=("$member")
+            else REMOVE+=("$member")
+            fi
+        done < <(domain_chain "$disk")
+    done < <(domain_disks "$VM")
 
     local state; state="$("${VIRSH[@]}" domstate "$VM" 2>/dev/null || true)"
     say "domain: $VM ($state)"
     if (( ${#REMOVE[@]} )); then
-        say "these files will be deleted:"
+        say "deleting:"
         printf '  %s\n' "${REMOVE[@]}" >&2
     else
-        say "no disk files will be deleted"
+        say "no disk files to delete"
     fi
     (( ${#SHARED[@]} )) && warn \
         "kept -- another domain uses them:" \
         "$(printf '  %s\n' "${SHARED[@]}")"
-
-    if (( ! YES )); then
-        [[ -t 0 ]] || die "not a terminal; pass -y to confirm"
-        local reply
-        read -r -p "type the domain name to confirm: " reply
-        [[ "$reply" == "$VM" ]] || die "aborted"
-    fi
 
     if [[ "$state" != "shut off" ]]; then
         "${VIRSH[@]}" destroy "$VM" >/dev/null || die "could not stop $VM"
@@ -764,12 +822,8 @@ domain_delete() {
 
     local f rc=0
     for f in ${REMOVE[@]+"${REMOVE[@]}"}; do
-        if rm -f -- "$f" 2>/dev/null || "${SUDO[@]}" rm -f -- "$f"; then
-            say "removed $f"
-        else
-            warn "could not remove $f"
-            rc=1
-        fi
+        domain_rm "$f" || rc=1
     done
+    domain_purge "$VM" || rc=1
     return "$rc"
 }

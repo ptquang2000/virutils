@@ -319,7 +319,6 @@ _virutil_domain() {
            # the value-taking flags read the next word, so complete for the flag
            # behind us before offering another flag
            case $words[CURRENT-1] in
-             -d|--disk)   _files;               return ;;
              -o|--osinfo) _virutil_osinfo;      return ;;
              -v|--virtio) _files -g '*.iso';    return ;;
              -s|--size)   _virutil_size;   return ;;
@@ -330,20 +329,15 @@ _virutil_domain() {
              '(-s --size)'{-s,--size}'[disk size, GiB]' \
              '(-m --memory)'{-m,--memory}'[guest RAM, MiB]' \
              '(-c --vcpus)'{-c,--vcpus}'[virtual CPUs]' \
-             '(-d --disk)'{-d,--disk}'[disk image path]' \
              '(-o --osinfo)'{-o,--osinfo}'[libosinfo id; detected from the ISO by default]' \
-             '(-v --virtio)'{-v,--virtio}'[virtio-win ISO to attach, or none]' \
-             '(-n --dry-run)'{-n,--dry-run}'[print the domain XML and define nothing]'
+             '(-v --virtio)'{-v,--virtio}'[virtio-win ISO to attach, or none]'
            ;;
       esac
       ;;
     delete)
+      # takes a domain and nothing else
       case $CURRENT in
         4) _virutil_domains ;;
-        *) _values 'option' \
-             '(-y --yes)'{-y,--yes}'[do not ask for confirmation]' \
-             '(-k --keep-disk)'{-k,--keep-disk}'[undefine but leave the disks in place]'
-           ;;
       esac
       ;;
     *) (( CURRENT == 3 )) && _describe -t command 'command' cmds ;;
