@@ -15,6 +15,7 @@ VIRTIOFS_SENTINEL=".virutil-xfer"   # how the guest recognises the share; see be
 
 # Read by the EXIT trap, so module scope: set -u must not trip on them.
 VIRTIOFS_OURS=0
+VIRTIOFS_PERSISTENT=0    # the share is part of the domain, not this run's doing
 VIRTIOFS_SVC_PRIOR=""
 
 # The path goes into the XML explicitly: libvirt only finds virtiofsd where it
@@ -26,8 +27,11 @@ VIRTIOFS_BINARY=(
     /usr/local/libexec/virtiofsd
 )
 
+# virtiofs_host_dir [VM] -- the host side of VM's share; $DOMAIN by default, so
+# the transport's callers need not pass what they have already set.
 virtiofs_host_dir() {
-    printf '%s/virutil-%s' "${VIRUTILS_SHARE_ROOT:-$VIRUTILS_ROOT/share}" "$DOMAIN"
+    printf '%s/virutil-%s' \
+        "${VIRUTILS_SHARE_ROOT:-$VIRUTILS_ROOT/share}" "${1:-$DOMAIN}"
 }
 
 virtiofs_binary() {
@@ -84,14 +88,46 @@ virtiofs_attached() {
     "${VIRSH[@]}" dumpxml "$@" 2>/dev/null | grep -q "<target dir='$XFER_TAG'/>"
 }
 
-# virtiofs_setup -- attach the share for the duration of the run. Idempotent.
-# --live only: a device in the persisted XML would leave a drive letter in the
-# guest for the rest of its life. Unplug costs under a second.
+# virtiofs_configured_dir [--inactive] VM -- the source directory of the share
+# in that XML, or nothing when there is none. The XML is what says where the
+# share points: a domain defined by an older virutil, or by hand, need not use
+# the directory virtiofs_host_dir would pick, and the guest has mounted whatever
+# the XML said. Read forwards, printing the last <source dir=...> seen before
+# our target: libvirt writes source before target within a device.
+virtiofs_configured_dir() {
+    "${VIRSH[@]}" dumpxml "$@" 2>/dev/null | awk -v tag="$XFER_TAG" '
+        /<filesystem/ { dir = ""; next }
+        match($0, /<source dir='"'"'[^'"'"']*'"'"'/) {
+            dir = substr($0, RSTART + 13, RLENGTH - 14); next }
+        $0 ~ ("<target dir='"'"'" tag "'"'"'/>") { if (dir != "") print dir; exit }'
+}
+
+# virtiofs_setup -- make sure the share is live. Idempotent.
+#
+# Two shapes, and which one this is decides the teardown as much as the setup:
+#
+#   persisted  the domain was defined with the device (virutil domain create).
+#              It comes up with the guest, holds one drive letter for the life
+#              of the domain, and survives a snapshot revert. Nothing here
+#              unplugs it -- it is the domain's, not this run's.
+#   hotplugged no device in the definition, so one is attached --live for the
+#              run and detached by the EXIT trap. A drive letter that outlived
+#              the command would be a permanent change to a guest that only
+#              asked for a file copy.
 virtiofs_setup() {
     local dir="$1" binary xml
-    binary="$(virtiofs_binary)" || exit 1
 
     mkdir -p "$dir"
+
+    if virtiofs_attached "$DOMAIN"; then
+        # Already live: the persisted device, or residue from a run that died
+        # before its trap. The tag is virutil's own either way, so adopt it --
+        # and take the residue with us at close rather than leave it stranded.
+        (( VIRTIOFS_PERSISTENT )) || VIRTIOFS_OURS=1
+        return 0
+    fi
+
+    binary="$(virtiofs_binary)" || exit 1
 
     if ! virtiofs_shared_mem "$DOMAIN"; then
         die "$DOMAIN is running without shared memory backing, so a virtio-fs" \
@@ -104,22 +140,13 @@ virtiofs_setup() {
             "Or use --transport volume, which needs no restart at all."
     fi
 
-    # One already attached is residue from a run that died before its trap --
-    # the tag is virutil's own -- so adopt it rather than leave it stranded.
-    if ! virtiofs_attached "$DOMAIN"; then
-        xml="$(virtiofs_fs_xml "$binary" "$dir")"
-        printf '%s\n' "$xml" | "${VIRSH[@]}" attach-device "$DOMAIN" --live /dev/stdin \
-            || die "could not attach the virtio-fs share to $DOMAIN"
-    fi
-    VIRTIOFS_OURS=1
+    xml="$(virtiofs_fs_xml "$binary" "$dir")"
+    printf '%s\n' "$xml" | "${VIRSH[@]}" attach-device "$DOMAIN" --live /dev/stdin \
+        || die "could not attach the virtio-fs share to $DOMAIN"
 
-    # Left by an older virutil, which persisted it: it would come back on boot.
-    if virtiofs_attached --inactive "$DOMAIN"; then
-        virtiofs_match_xml "$dir" \
-            | "${VIRSH[@]}" detach-device "$DOMAIN" --config /dev/stdin >/dev/null 2>&1 \
-            || warn "could not remove the stale virtio-fs share from $DOMAIN's" \
-                    "persisted config; it will reappear on the next boot"
-    fi
+    # A domain defined with the share but running from before it was: the
+    # definition already says the device belongs here, so it stays plugged in.
+    (( VIRTIOFS_PERSISTENT )) || VIRTIOFS_OURS=1
 }
 
 # VirtioFsSvc is the virtio-win viofs service; it maps each tag to a drive
@@ -151,6 +178,11 @@ virtiofs_start_service() {
 # Automatic is the viofs installer's own default, so restoring it would be a
 # guest round trip that changes nothing.
 virtiofs_restore_service() {
+    # A share the domain is defined with is there at every boot, so the service
+    # that maps it belongs on automatic: putting it back the way it was would
+    # only make the next run start it again.
+    (( VIRTIOFS_PERSISTENT )) && return 0
+
     case "$VIRTIOFS_SVC_PRIOR" in
         ""|Automatic) return 0 ;;
         Manual|Disabled|Boot|System) ;;
@@ -192,7 +224,16 @@ virtiofs_open() {
     xfer_privilege
     command -v rsync >/dev/null || die "rsync not installed"
 
-    VIRTIOFS_DIR="$(virtiofs_host_dir)"
+    # The domain's own definition wins on where the share points: a persisted
+    # device is what the guest already has mounted, and it may name a directory
+    # from before VIRUTILS_SHARE_ROOT moved.
+    VIRTIOFS_DIR="$(virtiofs_configured_dir --inactive "$DOMAIN")"
+    if [[ -n "$VIRTIOFS_DIR" ]]; then
+        VIRTIOFS_PERSISTENT=1
+    else
+        VIRTIOFS_DIR="$(virtiofs_host_dir)"
+    fi
+
     virtiofs_setup "$VIRTIOFS_DIR"
     virtiofs_start_service
 
@@ -266,6 +307,10 @@ if ($copied -eq 0) { throw "nothing matched in the guest" }'
 # Teardown, from the EXIT trap: nothing transferred stays readable at a drive
 # letter once the command has returned. Unplug first, so the guest has lost the
 # mapping before the directory empties underneath it.
+#
+# A persisted share is not unplugged -- the drive letter is the domain's, and
+# the point of defining it was that it does not come and go. Emptying it still
+# applies: what the share holds is one run's payload either way.
 virtiofs_close() {
     (( XFER_ARMED )) || return 0
 

@@ -270,10 +270,11 @@ _virutil_domain() {
     'start:power on a domain and open its console'
     'shutdown:request a graceful shutdown (ACPI)'
     'addr:show guest interface addresses'
+    'time:set the guest clock from the host'\''s'
     'port:forward a host port into a running guest'
   )
   case $words[3] in
-    shutdown|addr)
+    shutdown|addr|time)
       (( CURRENT == 4 )) && _virutil_domains
       ;;
     port)

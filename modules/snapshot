@@ -212,6 +212,13 @@ snapshot_main() {
         SNAP="${3:?usage: virutil snapshot revert VM_NAME SNAP_NAME}"
         "${VIRSH[@]}" snapshot-revert --domain "$VM" --snapshotname "$SNAP" --running
         echo "reverted: $SNAP"
+
+        # The restored memory carries the clock the guest had when the snapshot
+        # was taken, so it wakes up exactly as far behind as the snapshot is old.
+        # Left alone that skew reaches every file the guest writes, and every
+        # transfer that compares one against the host. The wait is for the agent
+        # to come back up with the guest.
+        guest_time_sync "$VM" "$TIME_SYNC_WAIT"
         ;;
     delete)
         SNAP="${3:?usage: virutil snapshot delete VM_NAME SNAP_NAME}"

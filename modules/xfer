@@ -72,6 +72,12 @@ xfer_select() {
                        "prerequisites in README.md), or use --transport disk."
             command -v jq >/dev/null \
                 || die "jq not installed; --transport $want talks to the guest agent"
+
+            # Before a byte moves: both directions compare timestamps to decide
+            # what to skip, so a guest whose clock is off silently copies the
+            # wrong set of files. The agent is known to answer by here, so this
+            # costs one round trip and never waits.
+            guest_time_sync "$dom"
             ;;
     esac
 

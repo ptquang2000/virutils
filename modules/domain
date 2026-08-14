@@ -19,7 +19,13 @@ domain_usage() {
         "       virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]" \
         "       virutil domain shutdown VM" \
         "       virutil domain addr     VM" \
+        "       virutil domain time     VM" \
         "       virutil domain port     VM [SPEC] [-c PORT]" \
+        "" \
+        "time sets the guest's clock from the host's, through the guest agent." \
+        "It happens on its own after 'snapshot revert' and before every transfer;" \
+        "this is for the times you want it in between. VIRUTIL_TIME_SYNC=0 turns" \
+        "the automatic ones off." \
         "" \
         "port options (SPEC is PORT, or HOSTPORT:GUESTPORT when the two differ;" \
         "with no SPEC it lists the open forwards for VM):" \
@@ -56,7 +62,9 @@ domain_usage() {
         "  VIRUTIL_VIRTIO         (auto)       virtio-win ISO path, or 'none'" \
         "  VIRUTIL_NETWORK        network=default,model=virtio" \
         "  VIRUTIL_FIRMWARE       uefi         or 'bios'" \
-        "  VIRUTIL_SHARED_MEMORY  1            or '0'; virtio-fs needs 1" >&2
+        "  VIRUTIL_SHARED_MEMORY  1            or '0'; the virtio-fs share needs" \
+        "                                      it, and turning it off drops the" \
+        "                                      share from the domain too" >&2
     exit "${1:-1}"
 }
 
@@ -81,6 +89,7 @@ domain_main() {
         list)     "${VIRSH[@]}" list --all ;;
         shutdown) domain_need_vm shutdown "$@"; "${VIRSH[@]}" shutdown  "$1" ;;
         addr)     domain_need_vm addr     "$@"; "${VIRSH[@]}" domifaddr "$1" --full ;;
+        time)     domain_time   "$@" ;;
         port)     domain_port   "$@" ;;
         *)        die "virutil domain: unknown command: $CMD (see: virutil domain -h)" ;;
     esac
@@ -270,11 +279,31 @@ domain_create() {
     )
 
     # memoryBacking is a cold setting: without a shared memfd here, virtio-fs
-    # later costs a full stop and start, not a reboot. The share device itself
-    # is not provisioned -- it hotplugs, and one in the XML would put a drive
-    # letter in every guest whether or not it ever moves a file.
+    # later costs a full stop and start, not a reboot.
+    #
+    # The share device goes in with it. Hotplugging one per transfer works, but
+    # every run then re-enumerates the device in the guest, takes whichever
+    # drive letter happens to be free, and leaves the device behind when a run
+    # dies before its trap. Defined here it is part of the domain: present from
+    # boot, the same letter every time, and unaffected by a snapshot revert --
+    # which is what makes a transfer mean the same thing twice.
+    local SHARE_DIR="" SHARE_BIN=""
     if (( SHAREMEM )); then
         ARGS+=(--memorybacking access.mode=shared,source.type=memfd)
+
+        if SHARE_BIN="$(virtiofs_binary 2>/dev/null)" && [[ -n "$SHARE_BIN" ]]; then
+            SHARE_DIR="$(virtiofs_host_dir "$VM")"
+            mkdir -p "$SHARE_DIR"
+            paths_qemu_warn "$SHARE_DIR"
+            # No binary.cache.mode: virtiofsd's own default is 'auto', and
+            # libvirt's <cache> enum has no spelling for it -- saying nothing is
+            # how you ask for it.
+            ARGS+=(--filesystem "type=mount,accessmode=passthrough,driver.type=virtiofs,driver.queue=$VIRTIOFS_QUEUE,binary.path=$SHARE_BIN,source.dir=$SHARE_DIR,target.dir=$XFER_TAG")
+        else
+            warn "virtiofsd was not found, so $VM gets no virtio-fs share." \
+                 "Transfers still work -- the share hotplugs per run once" \
+                 "virtiofsd is installed, or use --transport volume."
+        fi
     fi
 
     if (( BIOS )); then
@@ -340,6 +369,7 @@ domain_create() {
     (( SHAREMEM )) && memnote=" (shared memfd)"
     say "memory:  ${MEM} MiB$memnote"
     say "disk:    $IMG (${SIZE} GiB)"
+    [[ -n "$SHARE_DIR" ]] && say "share:   $SHARE_DIR (virtio-fs '$XFER_TAG')"
     say "iso:     $ISO"
     [[ -n "$VIRTIO" ]] && say "virtio:  $VIRTIO"
 
@@ -370,6 +400,40 @@ domain_create() {
             "makes the virtio disk visible." \
             "See the guest prerequisites in README.md for what to install after."
     fi
+}
+
+# domain_time VM -- report both clocks and put the guest's on the host's. The
+# sync itself is guest_time_sync in modules/guest, which every automatic caller
+# uses too; this only adds the before/after a person asking by hand wants to see.
+domain_time() {
+    local VM="${1:-}"
+    case "$VM" in
+        "")           domain_usage 1 ;;
+        -h|--help)    domain_usage 0 ;;
+        -*)           die "virutil domain time: unknown option: $VM" ;;
+    esac
+    (( $# <= 1 )) || die "virutil domain time: unexpected argument: $2"
+
+    domain_exists "$VM" || die "no such domain: $VM (see: virutil domain list)"
+    [[ "$("${VIRSH[@]}" domstate "$VM" 2>/dev/null)" == running ]] \
+        || die "$VM is not running; its clock is set from the host's RTC when" \
+               "it boots, so there is nothing to sync while it is off."
+
+    local before
+    before="$(guest_time "$VM")"
+    [[ "$before" =~ ^[0-9]+$ ]] \
+        && say "guest:  $(date -d "@$before" '+%F %T %z')" \
+               "host:   $(date '+%F %T %z')"
+
+    # VIRUTIL_TIME_SYNC turns off the syncs virutil does on its own. Asking for
+    # one by name is not one of those, so it does not gate this.
+    local VIRUTIL_TIME_SYNC=1
+    guest_time_sync "$VM"
+
+    local after
+    after="$(guest_time "$VM")"
+    [[ "$after" =~ ^[0-9]+$ ]] && say "guest:  $(date -d "@$after" '+%F %T %z') (now)"
+    return 0
 }
 
 domain_console() {
@@ -454,6 +518,18 @@ domain_start() {
                    "smaller than the current size)"
         say "disk:   $img (${SIZE} GiB)" \
             "        the guest still has to extend its partition (diskmgmt.msc)"
+    fi
+
+    # A domain defined with a virtio-fs share will not start without the
+    # directory it exports -- and that directory is empty by design, so nothing
+    # stops it being cleaned up, moved with VIRUTILS_DIR, or lost with a /tmp
+    # root. Recreating it beats a start that fails on a missing path.
+    local share; share="$(virtiofs_configured_dir --inactive "$VM")"
+    if [[ -n "$share" && ! -d "$share" ]]; then
+        mkdir -p "$share" || die "could not create the virtio-fs share directory" \
+                                 "$share, which $VM is defined to export"
+        paths_qemu_warn "$share"
+        say "share:  $share (recreated)"
     fi
 
     local state; state="$("${VIRSH[@]}" domstate "$VM" 2>/dev/null || true)"

@@ -38,6 +38,7 @@ step and no dependencies beyond the utilities it calls.
    - [delete](#delete)
    - [start](#start)
    - [list, shutdown, addr](#list-shutdown-addr)
+   - [time](#time)
    - [port](#port)
 - [virutil usb](#virutil-usb)
    - [usb media](#usb-media)
@@ -92,7 +93,7 @@ in one go. The layout, and what fills each subdirectory:
 | `~/.virutils/conf/` | sync configs (`sync.conf`, `NAME.conf`) |
 | `~/.virutils/images/` | domain disks (`domain create`), snapshot overlays and memory files (`snapshot`, `pull`), and the volume transport's staging image (`VM-xfer.qcow2`) |
 | `~/.virutils/staging/` | sync's incremental staging trees (`@staging` names) |
-| `~/.virutils/share/` | the virtiofs share directory (`virutil-<VM>`) |
+| `~/.virutils/share/` | the virtiofs share directory (`virutil-<VM>`), created with the domain and exported to it |
 | `~/.virutils/ports/` | `domain port` forward state and relay logs |
 | `~/.virutils/mnt/` | host mount points for guest filesystems (`<VM>`, `<VM>-xfer`) |
 
@@ -151,7 +152,7 @@ The seven modules fall into four groups, which is also the order
 
 | Module | Purpose | Usage |
 | --- | --- | --- |
-| `domain` | The domain lifecycle: create one from an install ISO with a KVM-tuned profile, delete one along with its disks, and the everyday operations in between. | `virutil domain {create\|delete\|list\|start\|shutdown\|addr\|port} [VM] [ISO] [OPTIONS]` |
+| `domain` | The domain lifecycle: create one from an install ISO with a KVM-tuned profile, delete one along with its disks, and the everyday operations in between. | `virutil domain {create\|delete\|list\|start\|shutdown\|addr\|time\|port} [VM] [ISO] [OPTIONS]` |
 | `snapshot` | External snapshots (disk and memory) for libvirt domains. | `virutil snapshot {create\|list\|revert\|delete} VM [SNAP]` |
 
 ### transfer
@@ -201,7 +202,7 @@ your back is not a fallback. So `virtiofs` being the default makes its
 | Who writes `C:` | the host, through `ntfs-3g` | the guest, `robocopy` | the guest, `robocopy` |
 | Host side | `qemu-nbd` on the guest's own qcow2 | `qemu-nbd` on a scratch qcow2 | `virtiofsd` |
 | Guest side | nothing | the agent (`viostor` is already there) | the agent, WinFsp, viofs |
-| Domain change | none | a disk that comes and goes | shared-memfd RAM, a **cold** restart to add |
+| Domain change | none | a disk that comes and goes | shared-memfd RAM and a share device, both **cold** to add |
 | Copies of the data | 1 | 2 | 1 |
 | Fixed cost per run | a full shutdown and boot | seconds | none |
 
@@ -223,21 +224,55 @@ the guest cannot dirty the filesystem the host has to mount next.
 is copied twice. It is the default. It needs WinFsp and the viofs driver in the
 guest, `virtiofsd` on the host, and guest RAM on a shared memfd — which
 `virutil domain create` sets up by default, but which an older domain can only
-gain through a full stop and start. The share is left attached between runs.
+gain through a full stop and start.
+
+The share device itself is part of a domain from `virutil domain create`
+onwards: it comes up with the guest, holds one drive letter for the life of the
+domain, and is unaffected by a snapshot revert. A domain defined without one
+still works — the device is hotplugged for the run and unplugged after it — but
+then the guest re-enumerates it every time and takes whichever drive letter
+happens to be free, and a run killed before its cleanup leaves the device
+behind. That is the difference between the two: a transfer that means the same
+thing twice, and one that mostly does.
+
+A domain that predates this — or one created with `VIRUTIL_SHARED_MEMORY=0` —
+keeps working on the hotplug path. To give it the persistent share instead, with
+the domain shut off:
+
+```sh
+mkdir -p ~/.virutils/share/virutil-VM
+
+# The memory backing goes first: libvirt refuses a virtio-fs device outright
+# on a domain without it ("'virtiofs' requires shared memory").
+virt-xml --connect qemu:///system VM --edit --define \
+  --memorybacking access.mode=shared,source.type=memfd
+
+virt-xml --connect qemu:///system VM --add-device --define --filesystem \
+  type=mount,accessmode=passthrough,driver.type=virtiofs,driver.queue=1024,\
+binary.path=/usr/lib/virtiofsd,source.dir=$HOME/.virutils/share/virutil-VM,\
+target.dir=virutil-xfer
+```
+
+Both take effect at the next full start, not at a reboot from inside the guest.
+`virutil` finds the share by its target tag, `virutil-xfer`, and takes the
+source directory from the domain's own XML, so the directory above only has to
+match what you put in the device.
 
 ### Everything a transport needs, at create time
 
-A domain from `virutil domain create` carries the *capacity* for every
-transport, not the devices: the guest-agent channel and the shared-memfd memory
-backing are in the profile, because neither can be added to a running domain —
-the channel needs a cold plug and `memoryBacking` a full stop and start.
+A domain from `virutil domain create` carries what the default transport needs
+in its definition: the guest-agent channel, the shared-memfd memory backing —
+neither of which can be added to a running domain, the channel needing a cold
+plug and `memoryBacking` a full stop and start — and the virtio-fs share
+device, pointed at `~/.virutils/share/virutil-VM`, which is created with the
+domain. That last one *could* be hotplugged, and is when a domain lacks it; it
+is defined here so the guest sees the same share, at the same drive letter,
+from boot and across a snapshot revert.
 
-Everything else is hotplugged per run, so a domain that never moves a file
-carries nothing for one. The virtio-fs share device is attached live on first
-use (`~/.virutils/share/virutil-VM`, created then); the `volume` transport's staging disk
-must be, since a permanently attached one would be a second writer on an image
-the host has to mount. Neither needs domain preparation — `q35` comes with
-fourteen `pcie-root-port`s and a Windows guest uses six.
+The `volume` transport's staging disk stays hotplug-only, since a permanently
+attached one would be a second writer on an image the host has to mount.
+Neither device needs domain preparation — `q35` comes with fourteen
+`pcie-root-port`s and a Windows guest uses six.
 
 What remains outside the XML entirely is guest-side software: `qemu-ga` (the
 virtio-win MSI), and WinFsp plus the viofs driver for `virtiofs`.
@@ -771,6 +806,7 @@ virutil domain list
 virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]
 virutil domain shutdown VM
 virutil domain addr     VM
+virutil domain time     VM
 ```
 
 ### create
@@ -832,14 +868,13 @@ What the profile actually sets, and why:
    Windows guest does not need, and a clock policy that replays missed ticks
    rather than dropping them.
 - **Guest RAM backed by a shared memfd**
-   (`<memoryBacking><access mode='shared'/><source type='memfd'/>`). Nothing in
-   the default profile uses it, but a vhost-user device — **virtio-fs** above all
-   — cannot attach to a guest whose memory the host cannot map, and
-   `memoryBacking` is a *cold* setting: adding it to an existing domain costs a
-   full shutdown and start. Carrying it is free (the memfd is sized, not
-   preallocated, so an idle guest uses no more host memory than before), so every
-   new domain gets it and stays one hotplug away from a live host↔guest share
-   instead of one power cycle away. `VIRUTIL_SHARED_MEMORY=0` opts out.
+   (`<memoryBacking><access mode='shared'/><source type='memfd'/>`), because a
+   vhost-user device — **virtio-fs** above all — cannot attach to a guest whose
+   memory the host cannot map, and `memoryBacking` is a *cold* setting: adding
+   it to an existing domain costs a full shutdown and start. Carrying it is free
+   (the memfd is sized, not preallocated, so an idle guest uses no more host
+   memory than before). `VIRUTIL_SHARED_MEMORY=0` opts out, and takes the share
+   below with it.
 - **The qemu-guest-agent channel** (`org.qemu.guest_agent.0`). `virt-manager`
    does not add it and nothing inside the guest can, yet the `volume` and
    `virtiofs` transports need it — it is what runs the copy in Windows — and the
@@ -847,11 +882,18 @@ What the profile actually sets, and why:
    with apps forced closed rather than an ACPI event it may sit on until
    `@shutdown_timeout`. It costs one virtio-serial port, so it is not optional
    and there is no flag to leave it out.
-- **No virtio-fs share device.** Only the memfd backing above, which is what
-   actually has to be cold. The device hotplugs, so provisioning one here would
-   put a drive letter in every guest whether or not it ever moves a file, and
-   pin the domain to a share directory it will not start without. The default
-   transport attaches it live on first use instead.
+- **The virtio-fs share device**, tagged `virutil-xfer` and pointed at
+   `$VIRUTILS_DIR/share/virutil-VM`, which is created with the domain. This is
+   what makes a file transfer repeatable: the device is enumerated once at boot,
+   keeps one drive letter for the life of the domain, and survives a snapshot
+   revert, where a per-run hotplug would be re-enumerated each time, take
+   whichever letter was free, and be left plugged in by any run that died before
+   its cleanup. The cost is one PCIe port, an idle `virtiofsd` per running
+   domain, and a directory that is empty except during a transfer — virutil
+   clears it at both ends of every run, so nothing it carried stays readable in
+   the guest afterwards. Skipped, with a warning, when
+   `virtiofsd` is not installed on the host; a domain without it falls back to
+   hotplugging per run.
 - **`--network network=default,model=virtio`**, overridable with
    `$VIRUTIL_NETWORK`. On a host where libvirt's default NAT network is not
    available — WSL2 often, where the `nf_nat` modules may be missing — SLIRP
@@ -884,7 +926,9 @@ profile once, or prefix a single `create` with them.
 | `VIRUTIL_VIRTIO` | `virtio-win*.iso` beside the install ISO | Default for `-v`: driver ISO to attach as a second cdrom, or `none`. |
 | `VIRUTIL_NETWORK` | `network=default,model=virtio` | Passed to `virt-install --network`. |
 | `VIRUTIL_FIRMWARE` | `uefi` | `bios` selects SeaBIOS instead. Windows 11 will not install without UEFI. |
-| `VIRUTIL_SHARED_MEMORY` | `1` | `0` leaves guest RAM on private anonymous memory, which makes virtio-fs impossible without a later cold restart. |
+| `VIRUTIL_SHARED_MEMORY` | `1` | `0` leaves guest RAM on private anonymous memory, which makes virtio-fs impossible without a later cold restart, and drops the share device from the domain along with it. |
+| `VIRUTIL_TIME_SYNC` | `1` | `0` stops virutil syncing the guest clock on its own — after a snapshot revert, and before a transfer. See [time](#time). |
+| `VIRUTIL_TIME_SYNC_WAIT` | `60` | Seconds to wait for the guest agent after a snapshot revert before giving up on the clock. |
 
 ```
 VIRUTIL_FIRMWARE=bios VIRUTIL_VIRTIO=none \
@@ -1016,6 +1060,57 @@ guest-agent path that `sync` and `push` use, see `modules/guest`.
 
 Note that `addr` is `virsh domifaddr`; the shorter name is deliberate, since the
 `dom` prefix is redundant under a module already called `domain`.
+
+### time
+
+```
+virutil domain time VM
+```
+
+Set the guest's clock from the host's, through the guest agent, and print both
+sides:
+
+```
+guest:  2026-08-14 09:12:44 +0700
+host:   2026-08-14 22:41:03 +0700
+clock: win11 was 48499s behind -> synced to the host
+guest:  2026-08-14 22:41:03 +0700 (now)
+```
+
+**This mostly happens on its own.** A guest's clock stops whenever the guest
+does, and a reverted snapshot restores memory whose clock stopped when the
+snapshot was taken — so a guest reverted to a week-old checkpoint wakes up a
+week behind and stays there. Windows will not fix it promptly on its own: the
+time provider it would use is a Hyper-V device KVM does not present, which
+leaves `w32tm`, whose own resync schedule is measured in hours and needs a
+reachable time server it may not have.
+
+That skew is not cosmetic here, because timestamps are what every transfer
+compares. `rsync` and `robocopy` both skip a file whose destination is not older
+than the source, so a guest running *ahead* of the host turns `sync` and `push`
+into silent no-ops, and one running *behind* does the same to `pull`. So virutil
+syncs the clock at the two points the skew appears:
+
+- after `virutil snapshot revert`, waiting up to `VIRUTIL_TIME_SYNC_WAIT`
+   seconds (default 60) for the agent to come back up with the guest;
+- before every `sync`, `pull` and `push` over the `volume` or `virtiofs`
+   transports, where the agent is already known to be answering, so it costs one
+   round trip and never waits.
+
+A guest already within two seconds of the host is left alone and nothing is
+printed. The `disk` transport is not included: it writes the guest's filesystem
+from the host with the guest shut down, and a guest reads the host's RTC when it
+boots. `VIRUTIL_TIME_SYNC=0` turns off all of the automatic ones;
+`virutil domain time` ignores it, since asking by name is not automatic.
+
+Under the hood this is `virsh domtime --now`, not `--sync`: `--sync` re-reads
+the emulated RTC, whose offset a Windows guest interprets as local time, so it
+can only ever hand back the answer the guest already had.
+
+A guest with no `qemu-ga` cannot be synced at all; the sync says so once and the
+transfer or revert carries on. Nothing here touches the *host* clock — under
+WSL2 that one drifts across a Windows sleep on its own, and
+`sudo hwclock -s` on the WSL side is the fix for that, not virutil.
 
 ### port
 

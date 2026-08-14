@@ -32,6 +32,98 @@ ci_glob() {
 # the EEXIST on a literal '.' as fatal ("mkdir ..././ failed: File exists").
 root_rel() { local s="$1"; [[ "$s" == "." ]] && s=""; printf '%s' "$s"; }
 
+# --- the guest clock --------------------------------------------------------
+#
+# A guest's clock stops whenever the guest is not running, and a reverted
+# snapshot restores memory whose clock stopped when the snapshot was taken: the
+# guest wakes up however long ago that was. Nothing inside fixes it promptly.
+# Windows would use the hypervisor's own time provider, but that is a Hyper-V
+# device KVM does not present, so all that is left is w32tm, which resyncs
+# against a time server on a schedule of its own -- an hour or more after the
+# damage is done, and never at all on a guest with no route to one.
+#
+# The damage is not cosmetic here: timestamps are what every copy in this tool
+# compares. rsync and robocopy both skip a file whose destination looks no older
+# than the source, so a guest running ahead of the host turns a transfer into a
+# silent no-op, and one running behind makes the next transfer back out stale.
+# So the clock is set at the two points drift appears -- after a revert, and
+# before a transfer -- rather than left for the guest to notice.
+
+TIME_SYNC_WAIT="${VIRUTIL_TIME_SYNC_WAIT:-60}"  # agent wait after a revert
+TIME_SKEW_MAX=2                                 # seconds; below this, in step
+
+# guest_agent_wait VM [SECS] -- true once the agent answers. guest-ping, not the
+# channel state: the channel reads 'connected' with nothing listening behind it.
+guest_agent_wait() {
+    local vm="$1" secs="${2:-0}" i
+    for (( i = 0; ; i++ )); do
+        "${VIRSH[@]}" qemu-agent-command "$vm" '{"execute":"guest-ping"}' \
+            >/dev/null 2>&1 && return 0
+        (( i >= secs )) && return 1
+        sleep 1
+    done
+}
+
+# guest_time VM -- the guest's clock, in seconds since the epoch, or nothing.
+guest_time() {
+    "${VIRSH[@]}" domtime "$1" 2>/dev/null \
+        | awk -F'[: \t]+' '/[Tt]ime:/ { print $2; exit }'
+}
+
+# guest_time_sync VM [WAIT] -- put the guest's clock on the host's, through the
+# agent. Advisory: a guest that cannot be reached is reported and the caller
+# carries on, since every caller has real work that is worth doing anyway.
+# VIRUTIL_TIME_SYNC=0 turns it off.
+guest_time_sync() {
+    local vm="$1" wait="${2:-0}" before now skew
+
+    [[ "${VIRUTIL_TIME_SYNC:-1}" == 0 ]] && return 0
+
+    # A domain with no agent channel has no agent to wait for -- waiting the
+    # full timeout on every revert of such a guest would be a minute of nothing.
+    if ! "${VIRSH[@]}" dumpxml "$vm" 2>/dev/null | grep -q org.qemu.guest_agent; then
+        warn "clock not synced: $vm has no qemu-guest-agent channel, so nothing" \
+             "can set its clock from here. A domain from 'virutil domain create'" \
+             "has one; an older one needs it cold-plugged."
+        return 0
+    fi
+
+    if ! guest_agent_wait "$vm" "$wait"; then
+        local waited=""
+        (( wait )) && waited=" after ${wait}s"
+        warn "clock not synced: the qemu guest agent in $vm is not answering$waited." \
+             "Install the guest-agent MSI from the virtio-win ISO (see the guest" \
+             "prerequisites in README.md), or set VIRUTIL_TIME_SYNC=0 to stop trying."
+        return 0
+    fi
+
+    before="$(guest_time "$vm")"
+    now="$(date +%s)"
+
+    # An agent that answers guest-ping may still not implement guest-get-time;
+    # an unknown skew is a reason to set the clock, not to skip it.
+    if [[ "$before" =~ ^[0-9]+$ ]]; then
+        skew=$(( before - now ))
+        (( skew < 0 )) && skew=$(( -skew ))
+        (( skew <= TIME_SKEW_MAX )) && return 0
+    fi
+
+    # --now, not --sync: --sync re-reads the emulated RTC, whose offset a
+    # Windows guest reads as local time, so it only ever restores the same
+    # answer the guest already had. --now hands the agent the host's clock.
+    if "${VIRSH[@]}" domtime "$vm" --now >/dev/null 2>&1; then
+        if [[ -n "${skew:-}" ]]; then
+            say "clock: $vm was ${skew}s $( (( before > now )) && echo ahead || echo behind ) -> synced to the host"
+        else
+            say "clock: $vm synced to the host"
+        fi
+    else
+        warn "could not set the clock in $vm (virsh domtime --now failed);" \
+             "file timestamps there may not compare against the host's"
+    fi
+    return 0
+}
+
 # Verified from observed state, not exit codes. Both probes are world-readable,
 # so verification cannot itself fail on sudo auth.
 nbd_attached() {
