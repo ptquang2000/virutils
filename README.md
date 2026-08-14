@@ -28,6 +28,7 @@ step and no dependencies beyond the utilities it calls.
       - [Map rules](#map-rules)
       - [Excludes](#excludes)
       - [Cleanup rules](#cleanup-rules)
+      - [Run rules](#run-rules)
    - [Example](#example)
    - [Notes](#notes)
 - [virutil pull](#virutil-pull)
@@ -426,6 +427,7 @@ unknown setting or an unrecognised directive is reported with its line number.
 | `globs\|subdir` | Map: copy `<staging>/globs` into `<@dest>/subdir` in the guest. |
 | `!pat pat ...` | `rsync --exclude` patterns, applied to both the fetch and the map. |
 | `-path` | Empty this guest directory after copying. The directory itself is kept. |
+| `>pre CMD` / `>post CMD` | Run `CMD` inside the guest, before or after the files land. |
 
 Map rules are the only unsigilled form. A line starting with punctuation that is
 not one of the sigils above is treated as a mistyped directive, not as a glob,
@@ -498,6 +500,37 @@ Two safety rules apply, so a mistyped pattern cannot empty a top-level
 directory: the expansion must stay inside the mount point, and it must be at
 least two levels deep.
 
+#### Run rules
+
+```
+>pre  Stop-Service -Name ExampleSvc -Force
+>post Start-Service -Name ExampleSvc
+>post & 'C:\Program Files (x86)\Example\Product\setup.exe' /S
+```
+
+Each line is a PowerShell command run **inside the guest**, through the same
+guest-agent path as [`virutil exec ps`](#virutil-exec) — as `SYSTEM`, with the
+guest's output printed here. The phase keyword comes first and is required:
+
+| Phase | When it runs |
+| --- | --- |
+| `pre` | After the fetch and the staging copy, immediately before the files reach the guest's `C:`. This is where a service is stopped or a running binary is killed, so the delivery does not hit a locked file. |
+| `post` | After the delivery *and* after the cleanup rules — so an installer or a service start sees the final state. |
+
+Rules run in the order they appear in the config, and the first one that exits
+non-zero aborts the run: a rule exists to make the copy land correctly, so
+carrying on past one that did not happen would report success on a
+half-installed guest.
+
+The phase is spelled out rather than defaulted because a command is free text —
+`>Stop-Service ...` could not be told apart from a missing keyword. `#` still
+starts a comment on these lines, so a command cannot contain one.
+
+Run rules need the guest **running**, with the guest agent answering, so they
+work only under the `virtiofs` transport. A config with run rules under
+`-t disk` is rejected before the fetch starts, since that transport shuts the
+guest down to write to its image.
+
 ### Example
 
 `~/.virutils/conf/sync.conf`:
@@ -521,6 +554,10 @@ helper.exe|helpers
 
 # cleanup: start the guest with no stale logs
 -ProgramData/Example/logs
+
+# run: free the locked binary first, put the service back afterwards
+>pre  Stop-Service -Name ExampleSvc -Force
+>post Start-Service -Name ExampleSvc
 ```
 
 Then:
