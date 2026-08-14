@@ -1,4 +1,10 @@
 # snapshot -- external snapshots (disk + memory) for libvirt domains
+#
+# External snapshots are two things at once: a libvirt metadata record, and the
+# overlay and memory files on disk that the record names. Deleting the record
+# does not delete the files, and libvirt will not delete an external snapshot
+# that is both current and has children. Both facts leak disk space if the
+# commands here pretend otherwise, so delete accounts for the files explicitly.
 
 DIR="${VIRUTIL_IMAGE_DIR:-$VIRUTILS_IMAGE_DIR}"
 
@@ -7,8 +13,134 @@ snapshot_usage() {
         "usage: virutil snapshot create VM [SNAP]  (default name snap-<timestamp>)" \
         "       virutil snapshot list   VM" \
         "       virutil snapshot revert VM SNAP" \
-        "       virutil snapshot delete VM SNAP" >&2
+        "       virutil snapshot delete VM SNAP" \
+        "" \
+        "delete takes SNAP's descendants with it, drops the libvirt records" \
+        "without committing disk data, and unlinks the overlay and memory files" \
+        "that no surviving record or live domain still reads." >&2
     exit "${1:-1}"
+}
+
+# snapshot_exists VM SNAP
+snapshot_exists() {
+    "${VIRSH_Q[@]}" snapshot-info --domain "$1" --snapshotname "$2" >/dev/null 2>&1
+}
+
+# snapshot_children VM SNAP -- direct children, one per line. Asked one snapshot
+# at a time: `snapshot-list --parent` prints a creation time with spaces in it,
+# so its Parent column cannot be read positionally.
+snapshot_children() {
+    local vm="$1" parent="$2" snap
+    while read -r snap; do
+        [[ -n "$snap" ]] || continue
+        [[ "$("${VIRSH_Q[@]}" snapshot-parent --domain "$vm" \
+              --snapshotname "$snap" 2>/dev/null)" == "$parent" ]] \
+            && printf '%s\n' "$snap"
+    done < <("${VIRSH_Q[@]}" snapshot-list --domain "$vm" --name 2>/dev/null)
+    return 0
+}
+
+# snapshot_descendants VM SNAP -- SNAP's whole subtree, deepest first, so an
+# unlink order that libvirt accepts falls straight out of the list.
+snapshot_descendants() {
+    local vm="$1" snap="$2" child
+    while read -r child; do
+        [[ -n "$child" ]] || continue
+        snapshot_descendants "$vm" "$child"
+        printf '%s\n' "$child"
+    done < <(snapshot_children "$vm" "$snap")
+}
+
+# snapshot_files VM SNAP -- the external files SNAP's record names: its memory
+# image, plus the overlay each disk was switched onto. Read from the record
+# while it still exists; once the metadata is gone the names are unrecoverable.
+#
+# Scoped to <memory> and the <disks> element on purpose. A snapshot record also
+# embeds the whole guest config in an inner <domain>, whose <source> elements
+# name the *backing* images -- the domain's base disk among them. Collecting
+# those would turn a snapshot delete into a delete of the domain's disk, so the
+# <disks> bound is load-bearing, not tidiness.
+#
+# A record written by a create that libvirt had to rename around can carry more
+# than one entry for the same disk, so every source is collected, not the first.
+# Each line is "mem<TAB>PATH" or "disk<TAB>PATH": a memory image is never part of
+# a disk backing chain, so the two kinds are safe to unlink under different
+# conditions and the caller has to be able to tell them apart.
+snapshot_files() {
+    "${VIRSH[@]}" snapshot-dumpxml --domain "$1" --snapshotname "$2" 2>/dev/null \
+        | awk '
+            /<disks>/    { indisks = 1; next }
+            /<\/disks>/  { indisks = 0; next }
+            /<domain[ \t>]/ { exit }   # the inner guest config: nothing past here
+            !indisks && !/<memory[ \t]/ { next }
+            match($0, /file='"'"'[^'"'"']*'"'"'/) {
+                s = substr($0, RSTART + 6, RLENGTH - 7)
+                if (s != "") printf "%s\t%s\n", (indisks ? "disk" : "mem"), s
+            }'
+}
+
+# snapshot_paths VM SNAP -- snapshot_files without the kind tag.
+snapshot_paths() {
+    snapshot_files "$1" "$2" | cut -f2-
+}
+
+# snapshot_live_files VM -- every file the domain's disk chain reads, so a delete
+# can refuse to unlink out from under the guest. Returns non-zero if the chain
+# could not be resolved in full; a caller that unlinks on a partial answer would
+# delete a live backing file, so the status is not optional.
+#
+# The domain XML is the source here, not qemu-img: libvirt nests the whole chain
+# under each disk as <backingStore>, and virsh answers over the libvirt socket,
+# which the libvirt group can read. qemu-img has to open the overlay itself,
+# which is 0600 and owned by the qemu user, so it needs root and fails without a
+# password -- silently, and in the direction that unlinks too much.
+snapshot_live_files() {
+    local vm="$1" xml disk out rc=0
+
+    xml="$("${VIRSH[@]}" dumpxml "$vm" 2>/dev/null)" || return 1
+    [[ -n "$xml" ]] || return 1
+
+    # Bounded to <disk device='disk'> so a cdrom's iso never enters the set, and
+    # picking up the nested <backingStore> sources along with the top image.
+    printf '%s\n' "$xml" | awk '
+        /<disk /   { indisk = ($0 ~ /device=.disk./); next }
+        /<\/disk>/ { indisk = 0; next }
+        indisk && match($0, /file='"'"'[^'"'"']*'"'"'/) {
+            print substr($0, RSTART + 6, RLENGTH - 7) }'
+
+    # A shut-off domain's XML may name the top image alone -- libvirt fills
+    # <backingStore> in when it probes the chain, and a domain that has never run
+    # under this definition has nothing recorded. Where it is missing the chain
+    # has to come from qemu-img, which may not be readable; the union of the two
+    # is what makes the answer complete, and rc=1 says when it is not.
+    if [[ "$("${VIRSH[@]}" domstate "$vm" 2>/dev/null)" != running ]]; then
+        while read -r disk; do
+            [[ -n "$disk" ]] || continue
+            if out="$(qemu-img info --backing-chain -- "$disk" 2>/dev/null)"; then
+                printf '%s\n' "$out" | awk '/^image: /{ sub(/^image: /, ""); print }'
+            else
+                rc=1
+            fi
+        done < <(domain_disks "$vm")
+    fi
+    return "$rc"
+}
+
+# snapshot_kept_files VM EXCLUDE... -- the files still named by the records that
+# survive this delete. An overlay shared with another snapshot stays.
+snapshot_kept_files() {
+    local vm="$1"; shift
+    local -a skip=("$@")
+    local snap s keep
+    while read -r snap; do
+        [[ -n "$snap" ]] || continue
+        keep=1
+        for s in ${skip[@]+"${skip[@]}"}; do
+            [[ "$snap" == "$s" ]] && { keep=0; break; }
+        done
+        (( keep )) || continue
+        snapshot_paths "$vm" "$snap"
+    done < <("${VIRSH_Q[@]}" snapshot-list --domain "$vm" --name 2>/dev/null)
 }
 
 snapshot_main() {
@@ -19,25 +151,51 @@ snapshot_main() {
     VM="${2:-}"
     [ -n "$VM" ] || snapshot_usage
 
+    # The commands that unlink root-owned files escalate only that step, exactly
+    # as the domain module does.
+    [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] \
+        && die "do not run virutil under sudo -- run it as yourself." \
+               "It escalates only the commands that actually need root."
+    if [[ $EUID -eq 0 ]]; then SUDO=(); else SUDO=(sudo); fi
+
     case "$CMD" in
     create)
         SNAP="${3:-snap-$(date +%Y%m%d-%H%M%S)}"
 
+        # A name libvirt already holds is not an overwrite: libvirt keeps the
+        # old record, renames the overlay it cannot create to
+        # <file>.<timestamp>, and the record ends up naming two overlays for
+        # one disk. That state cannot be reverted to and cannot be deleted
+        # without --metadata, so refuse it here instead.
+        ! snapshot_exists "$VM" "$SNAP" \
+            || die "snapshot '$SNAP' already exists on $VM" \
+                   "Pick another name, or: virutil snapshot delete $VM $SNAP"
+
         # Disk targets vary by bus, so ask the domain. cdroms are read-only.
-        local -a DISKSPECS=()
-        local target
+        local -a DISKSPECS=() CLOBBER=()
+        local target file
         mkdir -p "$DIR"
         paths_qemu_warn "$DIR"
         while read -r target; do
             [ -n "$target" ] || continue
-            DISKSPECS+=(--diskspec
-                        "$target,snapshot=external,file=$DIR/$VM.$SNAP.$target.qcow2")
+            file="$DIR/$VM.$SNAP.$target.qcow2"
+            [[ -e "$file" ]] && CLOBBER+=("$file")
+            DISKSPECS+=(--diskspec "$target,snapshot=external,file=$file")
         done < <("${VIRSH[@]}" domblklist "$VM" --details \
                  | awk '$2=="disk" {print $3}')
         [ "${#DISKSPECS[@]}" -gt 0 ] || {
             echo "no disks found for domain '$VM'" >&2
             exit 1
         }
+        [[ -e "$DIR/$VM.$SNAP.mem" ]] && CLOBBER+=("$DIR/$VM.$SNAP.mem")
+
+        # Left over from an earlier delete that could not unlink them. libvirt
+        # would rename around these the same way it renames around a duplicate
+        # name, so stop while the fix is still a plain rm.
+        (( ${#CLOBBER[@]} )) && die \
+            "these files are in the way of snapshot '$SNAP':" \
+            "$(printf '  %s\n' "${CLOBBER[@]}")" \
+            "No record names them. Remove them, then create again."
 
         "${VIRSH[@]}" snapshot-create-as \
             --domain "$VM" \
@@ -58,8 +216,78 @@ snapshot_main() {
     delete)
         SNAP="${3:?usage: virutil snapshot delete VM_NAME SNAP_NAME}"
 
-        "${VIRSH[@]}" snapshot-delete --domain "$VM" --snapshotname "$SNAP"
-        echo "deleted: $SNAP"
+        snapshot_exists "$VM" "$SNAP" || die "no such snapshot on $VM: $SNAP"
+
+        # Deepest first, and spelled out here rather than handed to virsh's
+        # --children: libvirt only ever accepts a leaf, and every record removed
+        # has to be walked anyway to collect the files it names.
+        local -a TARGETS=()
+        local s
+        while read -r s; do
+            [[ -n "$s" ]] || continue
+            TARGETS+=("$s")
+        done < <(snapshot_descendants "$VM" "$SNAP")
+        TARGETS+=("$SNAP")
+
+        (( ${#TARGETS[@]} > 1 )) \
+            && say "taking ${#TARGETS[@]} records: ${TARGETS[*]}"
+
+        # Collected before anything is deleted -- the record is the only place
+        # these names exist.
+        local -A OWNED=()
+        local f kind
+        for s in "${TARGETS[@]}"; do
+            while IFS=$'\t' read -r kind f; do
+                [[ -n "$f" ]] || continue
+                OWNED["$f"]="$kind"
+            done < <(snapshot_files "$VM" "$s")
+        done
+
+        # --metadata unconditionally. Without it libvirt tries to commit the
+        # overlay into its backing file, which it refuses outright for a snapshot
+        # that is both current and has children -- the one case a delete most
+        # needs to work. Dropping the record discards that overlay's data rather
+        # than merging it, which is the trade a revert point is for: the state
+        # worth keeping is the one already committed under it.
+        for s in "${TARGETS[@]}"; do
+            "${VIRSH[@]}" snapshot-delete --domain "$VM" \
+                --snapshotname "$s" --metadata \
+                || die "could not delete the record for '$s'"
+            say "deleted: $s"
+        done
+
+        # Only files nothing else still reads. The domain's chain is read now,
+        # after the delete, and an overlay a surviving record shares stays.
+        local LIVE CHAINOK=1
+        LIVE="$(snapshot_live_files "$VM")" || CHAINOK=0
+
+        local -A INUSE=()
+        while read -r f; do
+            [[ -n "$f" ]] || continue
+            INUSE["$f"]=1
+        done < <(printf '%s\n' "$LIVE"; snapshot_kept_files "$VM" "${TARGETS[@]}")
+
+        local rc=0
+        for f in "${!OWNED[@]}"; do
+            [[ -e "$f" ]] || continue
+            if [[ -n "${INUSE[$f]:-}" ]]; then
+                warn "kept $f -- still in use"
+                continue
+            fi
+            # An unresolved chain makes that set incomplete, and a disk image
+            # missing from it may still be something the guest reads through.
+            # Keep every disk image in that case: leaving a file behind costs
+            # space, unlinking a live backing file costs the guest.
+            if (( ! CHAINOK )) && [[ "${OWNED[$f]}" == disk ]]; then
+                warn "kept $f -- could not confirm it is out of the disk chain"
+                rc=1
+                continue
+            fi
+            domain_rm "$f" || rc=1
+        done
+        (( rc )) && warn "some files were left behind; re-run once the domain is" \
+                         "running, or remove them by hand"
+        return "$rc"
         ;;
     *)
         snapshot_usage
