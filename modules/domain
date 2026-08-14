@@ -50,7 +50,7 @@ domain_usage() {
         "" \
         "delete takes no options. It never asks, and it removes everything the" \
         "domain has: disks and their backing chain, snapshot overlays and memory" \
-        "files, the volume and usb images, the virtio-fs share, mount points," \
+        "files, the usb drive image, the virtio-fs share, mount points," \
         "and any open port forwards. Files another domain uses are kept." \
         "" \
         "  -h, --help        this message" \
@@ -302,7 +302,7 @@ domain_create() {
         else
             warn "virtiofsd was not found, so $VM gets no virtio-fs share." \
                  "Transfers still work -- the share hotplugs per run once" \
-                 "virtiofsd is installed, or use --transport volume."
+                 "virtiofsd is installed, or use --transport disk."
         fi
     fi
 
@@ -784,9 +784,10 @@ domain_rm() {
 #
 #   forwards      domain_port_file      relay pid plus state and log file
 #   share dir     virtiofs_host_dir     the virtio-fs export directory
-#   mount points  virutils_mnt          bare, -xfer (volume), -usb (usb media)
-#   images        $DOMAIN_IMAGE_DIR     snapshot overlays and memory files,
-#                                       the volume scratch disk, the usb drive
+#   mount points  virutils_mnt          bare, -usb (usb media), -xfer (left by
+#                                       the removed volume transport)
+#   images        $DOMAIN_IMAGE_DIR     snapshot overlays and memory files, the
+#                                       usb drive, and the same -xfer leftover
 #
 # sync's staging trees are named by @staging in a config, not after the domain,
 # so nothing here can find them -- they are shared between domains by design.

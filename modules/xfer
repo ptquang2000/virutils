@@ -6,23 +6,19 @@
 # MNT always stands for the root of the guest's C:. For the disk transport it
 # *is* C:, so xfer_deliver is a no-op.
 
-XFER=""            # the resolved backend: disk, volume or virtiofs
+XFER=""            # the resolved backend: disk or virtiofs
 XFER_MODE=""       # write or read
 XFER_ARMED=0       # whether the EXIT trap has anything to undo
 
 XFER_DEFAULT=virtiofs
 
-# Both halves find the staging volume and the share by name, so these are part
-# of the protocol. 11 characters: the exFAT label limit.
-XFER_LABEL="VIRUTILXFER"
+# Both halves find the share by this tag, so it is part of the protocol.
 XFER_TAG="virutil-xfer"
 
 xfer_transport_help() {
     printf '%s\n' \
         "  -t, --transport T       how to move the files (default: $XFER_DEFAULT):" \
         "                            virtiofs  a live virtio-fs share" \
-        "                            volume    a staging qcow2 hotplugged into" \
-        "                                      the running guest" \
         "                            disk      the guest's own disk over" \
         "                                      qemu-nbd (a write shuts it down)"
 }
@@ -55,12 +51,12 @@ xfer_select() {
     local want="${2:-$XFER_DEFAULT}" dom="$DOMAIN"
 
     case "$want" in
-        disk|volume|virtiofs) ;;
-        *) die "unknown transport: $want (disk, volume or virtiofs)" ;;
+        disk|virtiofs) ;;
+        *) die "unknown transport: $want (disk or virtiofs)" ;;
     esac
 
     case "$want" in
-        volume|virtiofs)
+        virtiofs)
             xfer_running "$dom" \
                 || die "--transport $want needs $dom running; it is" \
                        "'$("${VIRSH[@]}" domstate "$dom" 2>/dev/null)'." \
@@ -94,7 +90,6 @@ xfer_open() {
     XFER_MODE=write
     case "$XFER" in
         disk)     guest_open ;;          # arms its own trap; see modules/guest
-        volume)   volume_open write ;;
         virtiofs) virtiofs_open write ;;
     esac
 }
@@ -102,7 +97,6 @@ xfer_open() {
 xfer_open_read() {
     XFER_MODE=read
     case "$XFER" in
-        volume)   volume_open read ;;
         virtiofs) virtiofs_open read ;;
         *)        die "internal: xfer_open_read is not for the $XFER transport" ;;
     esac
@@ -111,14 +105,12 @@ xfer_open_read() {
 xfer_deliver() {
     case "$XFER" in
         disk)     ;;                     # MNT is C: -- already delivered
-        volume)   volume_deliver ;;
         virtiofs) virtiofs_deliver ;;
     esac
 }
 
 xfer_collect() {
     case "$XFER" in
-        volume)   volume_collect "$@" ;;
         virtiofs) virtiofs_collect "$@" ;;
         *)        die "internal: xfer_collect is not for the $XFER transport" ;;
     esac
@@ -126,7 +118,6 @@ xfer_collect() {
 
 xfer_close() {
     case "$XFER" in
-        volume)   volume_close ;;
         virtiofs) virtiofs_close ;;
     esac
 }
@@ -176,7 +167,7 @@ nbd_has_table() {
 # after the caller has already globbed for them, which reads as "no partition
 # found" on a perfectly good image.
 #
-# The wait is gated on a partition table actually being there: volume_create
+# The wait is gated on a partition table actually being there: usb_media_create
 # probes a freshly made, still-unpartitioned image, and that must not stall for
 # the whole timeout.
 NBD_SETTLE_TRIES=50          # x 0.2s
@@ -227,50 +218,6 @@ xfer_ps() {
     exec_ps_text "$1"
 }
 
-# The letter Windows gave a volume, by label, or nothing. Polled: a hotplugged
-# disk takes a moment to be enumerated and assigned one. Also brings the disk
-# online (Windows' SAN policy) and assigns a letter if it came up without one.
-#
-# Both of those are scoped to the staging disk. Windows keeps an online state
-# and a letter assignment in the registry, so doing either to a disk a file copy
-# was not asked to touch is a permanent change to the guest.
-xfer_drive_letter() {
-    local tries="${1:-30}"
-    xfer_ps '
-$deadline = (Get-Date).AddSeconds('"$tries"')
-do {
-  $v = Get-Volume -FileSystemLabel "'"$XFER_LABEL"'" -ErrorAction SilentlyContinue |
-       Select-Object -First 1
-  if ($v -and $v.DriveLetter) { Write-Output $v.DriveLetter; exit 0 }
-
-  # By serial, then by the labelled volume -- never the RAW fallback, which
-  # names any unformatted disk and so is not an identity.
-  $disk = Get-Disk -ErrorAction SilentlyContinue |
-          Where-Object { $_.SerialNumber -like "*'"$XFER_LABEL"'*" } | Select-Object -First 1
-  if (-not $disk -and $v) {
-    # Matched on the volume path: the volume has no letter to look it up by yet.
-    $disk = Get-Partition -ErrorAction SilentlyContinue |
-            Where-Object { $_.AccessPaths -contains $v.Path } |
-            Get-Disk -ErrorAction SilentlyContinue | Select-Object -First 1
-  }
-
-  if ($disk) {
-    if ($disk.IsOffline) {
-      try { Set-Disk -Number $disk.Number -IsOffline $false -ErrorAction Stop } catch {}
-    }
-    if ($v -and -not $v.DriveLetter) {
-      try {
-        Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue |
-          Where-Object { -not $_.DriveLetter -and $_.Type -ne "Reserved" } |
-          Add-PartitionAccessPath -AssignDriveLetter -ErrorAction Stop
-      } catch {}
-    }
-  }
-  Start-Sleep -Milliseconds 500
-} while ((Get-Date) -lt $deadline)
-exit 1' 2>/dev/null | tr -d '[:space:]'
-}
-
 # Doubling is how a single quote is escaped in a powershell literal.
 xfer_ps_quote() { printf '%s' "${1//\'/\'\'}"; }
 
@@ -300,26 +247,6 @@ foreach ($p in @('
 }
 exit 0'
     xfer_ps "$script" || warn "some cleanup rules failed inside $DOMAIN"
-}
-
-# A powershell fragment leaving the staging disk in $disk, or $null. Three
-# probes, because none holds alone: virtio-blk does not always surface libvirt's
-# <serial>, a fresh image has no label, and 'the raw one' only holds while
-# nothing else is unformatted.
-xfer_ps_find_disk() {
-    printf '%s' '
-$disk = Get-Disk | Where-Object { $_.SerialNumber -like "*'"$XFER_LABEL"'*" } | Select-Object -First 1
-if (-not $disk) {
-  $v = Get-Volume -FileSystemLabel "'"$XFER_LABEL"'" -ErrorAction SilentlyContinue | Select-Object -First 1
-  if ($v -and $v.DriveLetter) {
-    $disk = Get-Partition -DriveLetter $v.DriveLetter -ErrorAction SilentlyContinue |
-            Get-Disk -ErrorAction SilentlyContinue | Select-Object -First 1
-  }
-}
-if (-not $disk) {
-  $disk = Get-Disk | Where-Object { $_.PartitionStyle -eq "RAW" } | Select-Object -First 1
-}
-'
 }
 
 # xfer_robocopy SRC DST [EXTRA...] -- a whole-tree copy inside the guest.

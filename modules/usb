@@ -10,22 +10,23 @@
 #
 # `usb media` is the virtual counterpart: no physical device, just a qcow2 the
 # host fills over qemu-nbd and hands to the guest as a usb-storage device, which
-# Windows lists under removable media. It follows the volume transport's strict
-# turn: the image is never mounted here while it is attached there.
+# Windows lists under removable media. The host and the guest take strict turns:
+# the image is never mounted here while it is attached there.
 
 USBIPD="/mnt/c/Program Files/usbipd-win/usbipd.exe"
 USBIPD_WIN='C:\Program Files\usbipd-win\usbipd.exe'
 DISTRO=archlinux
 
 # Removable media state, module scope for the EXIT trap.
+USB_DIR="$VIRUTILS_IMAGE_DIR" # where the drive image is kept
 USB_MEDIA_SIZE=4              # GiB, sparse -- an upper bound, not an allocation
 USB_MEDIA_FS=""               # ''=auto (exfat>ntfs>guest); else exfat|ntfs|fat32|guest
+USB_FS=""                     # what it is formatted as, once decided
 USB_IMG=""                    # the drive image
 USB_TARGET=""                 # the sdX the usb-storage device attaches as
 USB_ATTACHED=0                # attached to the guest
 USB_ABORTED=0                 # a failed run undoes the guest attach too
-# Serial and filesystem label both. 10 chars, under exFAT's 11-char limit, and
-# distinct from XFER_LABEL so a staging volume can never be mistaken for it.
+# Serial and filesystem label both. 10 chars, under exFAT's 11-char limit.
 USB_MEDIA_LABEL="VIRUTILUSB"
 
 usb_usage() {
@@ -239,7 +240,7 @@ detach_scope() {
 
 # --- removable media --------------------------------------------------------
 
-usb_media_image() { printf '%s/%s-usb.qcow2' "$VOLUME_DIR" "$1"; }
+usb_media_image() { printf '%s/%s-usb.qcow2' "$USB_DIR" "$1"; }
 
 usb_media_mnt() { virutils_mnt "$1-usb"; }
 
@@ -283,16 +284,37 @@ usb_media_fs_ok() {
     esac
 }
 
+# exFAT first: in-kernel on the host, where NTFS is FUSE, and Windows reads
+# both. With no mkfs at all, the guest formats it.
+usb_media_pick_fs() {
+    if command -v mkfs.exfat >/dev/null; then USB_FS=exfat
+    elif command -v mkfs.ntfs >/dev/null || command -v mkntfs >/dev/null; then USB_FS=ntfs
+    else USB_FS=guest
+    fi
+}
+
+# One GPT partition spanning the disk: Windows shows a disk with no partition
+# table as 'not initialized'.
+usb_media_partition() {
+    "${SUDO[@]}" sfdisk --quiet "$NBD" <<'EOF'
+label: gpt
+type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
+EOF
+    "${SUDO[@]}" partx -u "$NBD" 2>/dev/null || true
+    # The mkfs below opens ${NBD}p1 directly, so the node has to be there.
+    nbd_settle
+}
+
 # usb_media_create -- make the drive image and format it by whichever half of
-# the machine can, exactly as the volume transport does for its staging image:
-# one GPT partition spanning the disk, exFAT when the host can, NTFS otherwise,
+# the machine can: one GPT partition spanning the disk, exFAT when the host can,
+# NTFS otherwise,
 # and Windows itself when neither exists. --fs narrows the choice to the named
 # type, which still needs its host mkfs. Idempotent; ends with $NBD detached.
 usb_media_create() {
     local created=0
     if [[ ! -e "$USB_IMG" ]]; then
-        mkdir -p "$VOLUME_DIR"
-        paths_qemu_warn "$VOLUME_DIR"
+        mkdir -p "$USB_DIR"
+        paths_qemu_warn "$USB_DIR"
         say "usb media: creating $USB_IMG (${USB_MEDIA_SIZE} GiB, sparse)"
         local -a imgsudo=()
         [[ -w "$(dirname -- "$USB_IMG")" ]] || imgsudo=("${SUDO[@]}")
@@ -310,21 +332,21 @@ usb_media_create() {
         return 0
     fi
 
-    volume_pick_fs
+    usb_media_pick_fs
     if [[ -n "$USB_MEDIA_FS" && "$USB_MEDIA_FS" != guest ]]; then
         local mk; mk="$(usb_media_fs_ok "$USB_MEDIA_FS")"
         [[ -n "$mk" ]] || die "--fs $USB_MEDIA_FS needs its mkfs on the host (or" \
                                "--fs guest, to let Windows format the drive)"
-        VOLUME_FS="$USB_MEDIA_FS"
+        USB_FS="$USB_MEDIA_FS"
     elif [[ "$USB_MEDIA_FS" == guest ]]; then
-        VOLUME_FS=guest
+        USB_FS=guest
     fi
 
     (( created )) || warn "usb media $USB_IMG has no readable filesystem;" \
                           "reformatting it (nothing on it is worth keeping)"
-    volume_partition
+    usb_media_partition
 
-    case "$VOLUME_FS" in
+    case "$USB_FS" in
     exfat)
         say "usb media: formatting exFAT"
         "${SUDO[@]}" mkfs.exfat -n "$USB_MEDIA_LABEL" "${NBD}p1" >/dev/null \
@@ -489,10 +511,10 @@ usb_detach_device() {
 }
 
 # Flush the guest's cache and take the drive offline, so the filesystem is
-# closed before the device disappears underneath it. Mirrors the volume
-# transport's release, matching the drive by its own serial and label so a
-# staging volume can never be offlined instead. The drive letter goes back
-# first: Windows remembers an assignment long after the disk behind it has gone.
+# closed before the device disappears underneath it. The drive is matched by its
+# own serial and label, never "the removable one", so another disk can never be
+# offlined instead. The drive letter goes back first: Windows remembers an
+# assignment long after the disk behind it has gone.
 usb_release_in_guest() {
     xfer_ps '
 try { Get-Volume -FileSystemLabel "'"$USB_MEDIA_LABEL"'" -ErrorAction SilentlyContinue |

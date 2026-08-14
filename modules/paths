@@ -5,7 +5,7 @@
 #   $VIRUTILS_DIR          the root, one directory for all of it
 #   $VIRUTILS_CONF_DIR     sync configs (looked up here first)
 #   $VIRUTILS_IMAGE_DIR    domain disks, snapshot overlays and memory files,
-#                          and the volume transport's staging image
+#                          and the `usb media` drive image
 #   $VIRUTILS_STAGING_ROOT sync's incremental staging trees
 #   $VIRUTILS_SHARE_ROOT   the virtiofs share directories
 #   $VIRUTILS_PORT_DIR     domain port forward state and logs

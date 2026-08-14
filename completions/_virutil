@@ -144,7 +144,6 @@ _virutil_pull() {
 _virutil_transports() {
   _values 'transport' \
     'virtiofs[a live virtio-fs share (default)]' \
-    'volume[a staging qcow2 hotplugged into the running guest]' \
     'disk[the guest'\''s own disk over qemu-nbd; a write shuts it down]'
 }
 

@@ -19,7 +19,7 @@ transfer
   pull       copy a file or directory out of a running guest
   push       copy a file or directory from the host into a guest
 
-  All three take -t/--transport disk|volume|virtiofs (default: virtiofs).
+  All three take -t/--transport disk|virtiofs (default: virtiofs).
 
 guest
   exec       run commands inside a Windows guest via the QEMU guest agent

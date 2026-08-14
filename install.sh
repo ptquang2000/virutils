@@ -63,7 +63,7 @@ REQUIRED=(
     "sync pull push  |qemu-nbd rsync sudo partx blkid blockdev lsblk mount"
     "domain          |virt-install virt-xml qemu-img"
     "exec            |jq python3"
-    "volume transport|jq sfdisk qemu-img"
+    "usb media       |jq sfdisk qemu-img"
     "usb             |jq usbipd.exe powershell.exe"
 )
 OPTIONAL=(
@@ -72,7 +72,7 @@ OPTIONAL=(
     "domain: fixing ISO permissions under a 0700 home|setfacl"
     "domain port: the relay that carries a guest port to the host|socat"
     "sync pull: NTFS volumes on the guest disk|mount.ntfs-3g"
-    "volume transport: host-side formatting of the staging image (the guest formats it otherwise)|mkfs.exfat"
+    "usb media: host-side formatting of the drive image (the guest formats it otherwise)|mkfs.exfat"
 )
 
 check_deps() {
@@ -115,7 +115,7 @@ check_deps() {
         done
         if [[ -z "$vfsd" ]]; then
             warn "virtiofsd not found -- virtiofs is the default transport for" \
-                 "sync, pull and push. Install it, or pass --transport volume."
+                 "sync, pull and push. Install it, or pass --transport disk."
             missing_any=1
         fi
     fi

@@ -91,11 +91,11 @@ in one go. The layout, and what fills each subdirectory:
 | Path | Filled by |
 | --- | --- |
 | `~/.virutils/conf/` | sync configs (`sync.conf`, `NAME.conf`) |
-| `~/.virutils/images/` | domain disks (`domain create`), snapshot overlays and memory files (`snapshot`, `pull`), and the volume transport's staging image (`VM-xfer.qcow2`) |
+| `~/.virutils/images/` | domain disks (`domain create`), snapshot overlays and memory files (`snapshot`, `pull`), and the `usb media` drive image (`VM-usb.qcow2`) |
 | `~/.virutils/staging/` | sync's incremental staging trees (`@staging` names) |
 | `~/.virutils/share/` | the virtiofs share directory (`virutil-<VM>`), created with the domain and exported to it |
 | `~/.virutils/ports/` | `domain port` forward state and relay logs |
-| `~/.virutils/mnt/` | host mount points for guest filesystems (`<VM>`, `<VM>-xfer`) |
+| `~/.virutils/mnt/` | host mount points for guest filesystems (`<VM>`, `<VM>-usb`) |
 
 Installation links are the exception and follow the [installation
 above](#installation): `virutil` in `~/.local/bin` and `_virutil` in the zsh
@@ -120,7 +120,7 @@ configs in `~/.config/virutils/` keep working — see [virutil sync](#virutil-sy
 
 Everything here is owned by you, and most of it never leaves the host. The one
 exception is anything qemu has to read or write: the domain disks, the snapshot
-overlays and memory files, and the volume staging image are all opened by the
+overlays and memory files, and the usb drive image are all opened by the
 `qemu` process (usually running as `libvirt-qemu`), not just by you.
 
 libvirt relabels the *files* it opens, but never the directories above them, so
@@ -188,7 +188,7 @@ document covers `virutil sync`, then `virutil pull`, then `virutil push`, then
 ## Transports
 
 `sync`, `pull` and `push` describe *what* to move. A transport decides *how*,
-and the three differ in what they need from the guest rather than in what they
+and the two differ in what they need from the guest rather than in what they
 achieve. `-t`/`--transport` picks one; **`virtiofs` is the default**.
 
 There is no fallback. A transport that cannot work is an error naming the fix,
@@ -196,29 +196,20 @@ never a silent downgrade — turning "copy a file" into "reboot Windows" behind
 your back is not a fallback. So `virtiofs` being the default makes its
 [guest prerequisites](#guest-prerequisites) a prerequisite of the tool.
 
-| | `disk` | `volume` | `virtiofs` |
-| --- | --- | --- | --- |
-| Guest must be | shut down to write, running to read | running | running |
-| Who writes `C:` | the host, through `ntfs-3g` | the guest, `robocopy` | the guest, `robocopy` |
-| Host side | `qemu-nbd` on the guest's own qcow2 | `qemu-nbd` on a scratch qcow2 | `virtiofsd` |
-| Guest side | nothing | the agent (`viostor` is already there) | the agent, WinFsp, viofs |
-| Domain change | none | a disk that comes and goes | shared-memfd RAM and a share device, both **cold** to add |
-| Copies of the data | 1 | 2 | 1 |
-| Fixed cost per run | a full shutdown and boot | seconds | none |
+| | `disk` | `virtiofs` |
+| --- | --- | --- |
+| Guest must be | shut down to write, running to read | running |
+| Who writes `C:` | the host, through `ntfs-3g` | the guest, `robocopy` |
+| Host side | `qemu-nbd` on the guest's own qcow2 | `virtiofsd` |
+| Guest side | nothing | the agent, WinFsp, viofs |
+| Domain change | none | shared-memfd RAM and a share device, both **cold** to add |
+| Fixed cost per run | a full shutdown and boot | none |
 
-**`disk`** is the original, and the only one that needs nothing at all from
+**`disk`** is the original, and the one that needs nothing at all from
 inside the guest — which is what makes it the one to ask for when there is no
 agent, no drivers, or the guest will not boot. For a write it shuts the guest down,
 mounts its NTFS over `qemu-nbd`, copies, and restores the power state it found.
 For a read it leaves the guest running and reads a frozen snapshot instead.
-
-**`volume`** keeps the guest running and installs nothing. A scratch qcow2 is
-filled by the host over `qemu-nbd`, released, hotplugged into the guest, and
-`robocopy`'d onto `C:` from inside. The host and the guest take strict turns:
-two writers on one image is the one unrecoverable mistake available here, so
-every handover is verified from `/proc/mounts` and the domain's own device list
-rather than from exit codes. A write hands the volume over **read-only**, so
-the guest cannot dirty the filesystem the host has to mount next.
 
 **`virtiofs`** exports a host directory the running guest sees live, so nothing
 is copied twice. It is the default. It needs WinFsp and the viofs driver in the
@@ -269,28 +260,13 @@ domain. That last one *could* be hotplugged, and is when a domain lacks it; it
 is defined here so the guest sees the same share, at the same drive letter,
 from boot and across a snapshot revert.
 
-The `volume` transport's staging disk stays hotplug-only, since a permanently
-attached one would be a second writer on an image the host has to mount.
-Neither device needs domain preparation — `q35` comes with fourteen
-`pcie-root-port`s and a Windows guest uses six.
+The `usb media` drive stays hotplug-only, since a permanently attached one would
+be a second writer on an image the host has to mount. Neither device needs
+domain preparation — `q35` comes with fourteen `pcie-root-port`s and a Windows
+guest uses six.
 
 What remains outside the XML entirely is guest-side software: `qemu-ga` (the
 virtio-win MSI), and WinFsp plus the viofs driver for `virtiofs`.
-
-### The staging volume
-
-`volume` keeps one scratch image per domain at
-`~/.virutils/images/VM-xfer.qcow2`, 16 GiB and sparse, created and
-formatted on first use and kept afterwards. It is formatted exFAT when the host
-has `mkfs.exfat` — an in-kernel driver on both sides, where NTFS on the host is
-FUSE — NTFS when it has `mkfs.ntfs`, and by **Windows itself** when it has
-neither: the blank image is handed to the guest once, `Initialize-Disk` and
-`Format-Volume` run inside it, and it comes back ready. Delete the image to
-rebuild it.
-
-The volume is found from inside the guest by its label, `VIRUTILXFER`, and its
-drive letter is asked for on every run rather than assumed, because Windows
-assigns the highest free one and that moves.
 
 
 ## Guest prerequisites
@@ -308,7 +284,7 @@ otherwise download it once:
 | What | Where it comes from | Needed by |
 | --- | --- | --- |
 | **virtio drivers** (`viostor`, `NetKVM`) | `virtio-win` ISO, or `virtio-win-guest-tools.exe` on it | booting at all — the installer cannot see a virtio disk without `viostor` |
-| **QEMU guest agent** (`qemu-ga`) | `virtio-win-guest-tools.exe`, or `guest-agent\qemu-ga-x86_64.msi` on the ISO | `virutil exec`, and the `volume` and `virtiofs` transports |
+| **QEMU guest agent** (`qemu-ga`) | `virtio-win-guest-tools.exe`, or `guest-agent\qemu-ga-x86_64.msi` on the ISO | `virutil exec` and the `virtiofs` transport |
 | **SPICE guest agent** (`spice-vdagent`) | [spice-guest-tools](https://www.spice-space.org/download/windows/spice-guest-tools/spice-guest-tools-latest.exe) | the `spice` display and `spicevmc` channel of every `virutil domain create` domain — clipboard sharing and display auto-resize |
 | **WinFsp** | <https://winfsp.dev> — install this **first** | `virtiofs` |
 | **viofs driver + `VirtioFsSvc`** | `viofs\<os>\amd64\` on the `virtio-win` ISO | `virtiofs` |
@@ -365,7 +341,7 @@ Two settings in Windows also matter, both for the `disk` transport only:
 ### Synopsis
 
 ```
-virutil sync VM [-c NAME|PATH] [-t disk|volume|virtiofs]
+virutil sync VM [-c NAME|PATH] [-t disk|virtiofs]
 virutil sync -h
 ```
 
@@ -408,7 +384,7 @@ need no privilege of their own.
 | Option | Description |
 | --- | --- |
 | `-c`, `--config NAME\|PATH` | Config to use. A value containing `/` is a path, taken as given. Anything else names a config, looked up in `~/.virutils/conf/` first and then `~/.config/virutils/`, with `.conf` appended when absent — so `-c win11` reads `~/.virutils/conf/win11.conf` if it exists, else `~/.config/virutils/win11.conf`. Defaults to `sync.conf`, resolved the same way. |
-| `-t`, `--transport T` | How to move the files: `virtiofs` (default), `volume` or `disk`. See [Transports](#transports). Overrides `@transport` in the config. |
+| `-t`, `--transport T` | How to move the files: `virtiofs` (default) or `disk`. See [Transports](#transports). Overrides `@transport` in the config. |
 | `-h`, `--help` | Print usage and exit. |
 
 The domain is an argument rather than a config setting, so one config —
@@ -646,7 +622,7 @@ guest's `C:` drive onto the host, over any of the three
 ### Synopsis
 
 ```
-virutil pull VM SRC DST [-t disk|volume|virtiofs]
+virutil pull VM SRC DST [-t disk|virtiofs]
 virutil pull -h
 ```
 
@@ -679,9 +655,9 @@ the host.
 
 ### Transports
 
-Under `volume` and `virtiofs` (the default) the guest does the reading: the
-path is resolved *in Windows* and `robocopy`'d into the staging volume or the
-share, which the host then reads. That is file-level consistency, and it needs
+Under `virtiofs` (the default) the guest does the reading: the path is
+resolved *in Windows* and `robocopy`'d into the share, which the host then
+reads. That is file-level consistency, and it needs
 the agent.
 
 Under `--transport disk` nothing runs inside the guest at all — no agent, no
@@ -741,7 +717,7 @@ NTFS, copy, and restore the power state you started with.
 ### Synopsis
 
 ```
-virutil push VM SRC DST [-t disk|volume|virtiofs]
+virutil push VM SRC DST [-t disk|virtiofs]
 virutil push -h
 ```
 
@@ -786,10 +762,8 @@ under `sudo`; a running guest is shut down through the guest agent (ACPI as a
 fallback, never a forced power-off) and restarted only once the disk is provably
 free; a domain with a managed-save image, and paused or suspended domains, are
 refused; Fast Startup must be off. That machinery lives in the shared
-`modules/guest`. Under `volume` and `virtiofs` none of it applies — the guest is
-never stopped — and the rule that replaces it is the handover check in
-`modules/volume`: the staging image is never mounted here and attached there at
-the same time. There are no
+`modules/guest`. Under `virtiofs` none of it applies — the guest is never
+stopped, and nothing but the share directory is touched on the host. There are no
 excludes — `push` copies exactly what you name, which is the point of having it
 at all.
 
@@ -876,8 +850,8 @@ What the profile actually sets, and why:
    memory than before). `VIRUTIL_SHARED_MEMORY=0` opts out, and takes the share
    below with it.
 - **The qemu-guest-agent channel** (`org.qemu.guest_agent.0`). `virt-manager`
-   does not add it and nothing inside the guest can, yet the `volume` and
-   `virtiofs` transports need it — it is what runs the copy in Windows — and the
+   does not add it and nothing inside the guest can, yet the `virtiofs`
+   transport needs it — it is what runs the copy in Windows — and the
    `disk` transport wants it, since with the agent a shutdown is Windows' own
    with apps forced closed rather than an ACPI event it may sit on until
    `@shutdown_timeout`. It costs one virtio-serial port, so it is not optional
@@ -955,10 +929,9 @@ under `~/.virutils/`, each found by the same name the module that wrote it uses:
 | Artifact | Path |
 | --- | --- |
 | Snapshot overlays and memory files | `images/VM.SNAP.*.qcow2`, `images/VM.SNAP.mem` |
-| `volume` transport scratch disk | `images/VM-xfer.qcow2` |
 | `usb media` drive image | `images/VM-usb.qcow2` |
 | `virtiofs` share directory | `share/virutil-VM/` |
-| Host mount points | `mnt/VM`, `mnt/VM-xfer`, `mnt/VM-usb` |
+| Host mount points | `mnt/VM`, `mnt/VM-usb` |
 | Open port forwards | the `socat` relay, plus `ports/tcp-PORT` and its `.log` |
 
 A still-mounted mount point is unmounted lazily first, and only ever `rmdir`'d —
@@ -1093,8 +1066,7 @@ syncs the clock at the two points the skew appears:
 
 - after `virutil snapshot revert`, waiting up to `VIRUTIL_TIME_SYNC_WAIT`
    seconds (default 60) for the agent to come back up with the guest;
-- before every `sync`, `pull` and `push` over the `volume` or `virtiofs`
-   transports, where the agent is already known to be answering, so it costs one
+- before every `sync`, `pull` and `push` over the `virtiofs` transport, where the agent is already known to be answering, so it costs one
    round trip and never waits.
 
 A guest already within two seconds of the host is left alone and nothing is
@@ -1206,13 +1178,14 @@ afterwards. `--eject` flushes and detaches the drive in the guest, keeping the
 image; `--detach` unmounts and releases it on the host, refusing while the
 guest still has it.
 
-The drive follows the volume transport's strict turn: it is never mounted on
-the host while it is attached in the guest, and the handover refuses if either
-probe still holds the image. The image lives at
-`$VOLUME_DIR/$DOMAIN-usb.qcow2`.
+The host and the guest take strict turns with the drive: it is never mounted
+on the host while it is attached in the guest, and the handover refuses if
+either probe still holds the image. The image lives at
+`~/.virutils/images/VM-usb.qcow2`, 4 GiB and sparse, created and formatted on
+first use and kept afterwards. Delete it to rebuild it.
 
-Formatting is the same policy as the [staging volume](#the-staging-volume):
-one GPT partition spanning the disk, exFAT when the host can, NTFS otherwise,
+Formatting is one GPT partition spanning the disk, exFAT when the host can
+(an in-kernel driver on both sides, where NTFS on the host is FUSE), NTFS otherwise,
 and Windows itself when neither exists — the last attaches the blank drive
 once and runs `Initialize-Disk`/`Format-Volume` inside the guest, which always
 formats NTFS. `-f`/`--fs` overrides the policy with one of `exfat`, `ntfs`,
@@ -1238,9 +1211,7 @@ Host, per [transport](#transports):
 
 - `virtiofs` (**the default**) — `virtiofsd`, found at `/usr/lib/virtiofsd`,
    `/usr/libexec/virtiofsd` or on `PATH`
-- `volume` — `sfdisk`, `qemu-img` and `jq`, plus `mkfs.exfat` (or `mkfs.ntfs`)
-   if you would rather the host formatted the staging image than the guest
-- `disk` — everything above; nothing further
+- `disk` — nothing further
 
 Host, for `virutil domain`:
 
@@ -1260,8 +1231,8 @@ these comes from and how to install it:
 
 - WinFsp and the virtio-win viofs driver, for `virtiofs` (the default) — and
    therefore for `sync`, `pull` and `push` as they are normally used
-- The QEMU guest agent, for `virutil exec` and for the `volume` and `virtiofs`
-   transports, which run the guest-side copy through it. Strongly recommended
+- The QEMU guest agent, for `virutil exec` and for the `virtiofs` transport,
+   which runs the guest-side copy through it. Strongly recommended
    for `disk` too, where without it the shutdown falls back to ACPI and Windows
    may sit on it until `@shutdown_timeout` expires
 - The SPICE guest tools, for the `spice` display and `spicevmc` channel every

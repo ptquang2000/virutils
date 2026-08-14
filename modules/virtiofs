@@ -43,7 +43,8 @@ virtiofs_binary() {
     die "virtiofsd not found in any of:" \
         "$(printf '  %s\n' "${VIRTIOFS_BINARY[@]}")" \
         "Install it (package 'virtiofsd' on Arch, 'virtiofsd'/'qemu-virtiofsd'" \
-        "elsewhere), or use --transport volume, which needs nothing new."
+        "elsewhere), or use --transport disk, which needs nothing new" \
+        "-- though a write shuts the guest down."
 }
 
 # Guest RAM the host can map: virtiofsd maps the guest's memory directly, and
@@ -137,7 +138,8 @@ virtiofs_setup() {
             "  virt-xml --connect qemu:///system $DOMAIN --edit --define \\" \
             "     --memorybacking access.mode=shared,source.type=memfd" \
             "  virutil domain shutdown $DOMAIN && virutil domain start $DOMAIN" \
-            "Or use --transport volume, which needs no restart at all."
+            "Or use --transport disk, which needs nothing defined at all" \
+            "-- though a write shuts the guest down."
     fi
 
     xml="$(virtiofs_fs_xml "$binary" "$dir")"
@@ -159,7 +161,7 @@ virtiofs_start_service() {
             "  1. WinFsp                 https://winfsp.dev" \
             "  2. the viofs driver from the virtio-win ISO (viofs\\<os>\\amd64)" \
             "See the guest prerequisites in README.md. Then run this again --" \
-            "or use --transport volume, which needs neither."
+            "or use --transport disk, which needs neither."
     }
     case "$out" in
         *RUNNING*) ;;
