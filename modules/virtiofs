@@ -44,7 +44,7 @@ virtiofs_binary() {
         "$(printf '  %s\n' "${VIRTIOFS_BINARY[@]}")" \
         "Install it (package 'virtiofsd' on Arch, 'virtiofsd'/'qemu-virtiofsd'" \
         "elsewhere), or use --transport disk, which needs nothing new" \
-        "-- though a write shuts the guest down."
+        "-- though it needs the guest shut off."
 }
 
 # Guest RAM the host can map: virtiofsd maps the guest's memory directly, and
@@ -139,7 +139,7 @@ virtiofs_setup() {
             "     --memorybacking access.mode=shared,source.type=memfd" \
             "  virutil domain shutdown $DOMAIN && virutil domain start $DOMAIN" \
             "Or use --transport disk, which needs nothing defined at all" \
-            "-- though a write shuts the guest down."
+            "-- though it needs the guest shut off."
     fi
 
     xml="$(virtiofs_fs_xml "$binary" "$dir")"

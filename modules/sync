@@ -149,7 +149,10 @@ sync_main() {
                      nbd)              NBD="$val" ;;
                      mnt)              MNT="$val" ;;
                      transport)        SYNC_TRANSPORT="$val" ;;
-                     shutdown_timeout) SHUTDOWN_TIMEOUT="$val" ;;
+                     shutdown_timeout) die "$CONF:$lineno: @shutdown_timeout is no longer a setting" \
+                                           "-- -t disk needs the guest already shut off, so nothing" \
+                                           "here waits for a shutdown. Shut it down yourself:" \
+                                           "  virutil domain shutdown VM" ;;
                      *) die "$CONF:$lineno: unknown setting '$key'" ;;
                  esac ;;
             !*)  local -a pats
@@ -205,11 +208,11 @@ sync_main() {
     xfer_select write "${TRANSPORT:-$SYNC_TRANSPORT}"
 
     # Run rules go through the guest agent, so they need the guest up -- which
-    # the disk transport is precisely not: it shuts Windows down to write to the
-    # image. Said here, before the fetch, rather than after the copy.
+    # the disk transport is precisely not: it writes to the image of a guest
+    # that is shut off. Said here, before the fetch, rather than after the copy.
     if (( ${#RUN_PRE[@]} + ${#RUN_POST[@]} )) && [[ "$XFER" == disk ]]; then
         die "$CONF has run rules, which the disk transport cannot run:" \
-            "it shuts $DOMAIN down to write to its image, and a command needs" \
+            "it writes to the image of a shut-off $DOMAIN, and a command needs" \
             "the guest agent answering. Use --transport virtiofs, or drop the" \
             "'>' rules."
     fi

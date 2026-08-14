@@ -12,8 +12,8 @@ push_usage() {
         "$(xfer_transport_help)" \
         "  -h, --help              this message" \
         "" \
-        "A directory source is copied recursively. Only the disk transport" \
-        "shuts the guest down; see README.md." >&2
+        "A directory source is copied recursively. The disk transport needs" \
+        "the guest shut off; see README.md." >&2
     exit "${1:-1}"
 }
 

@@ -144,7 +144,7 @@ _virutil_pull() {
 _virutil_transports() {
   _values 'transport' \
     'virtiofs[a live virtio-fs share (default)]' \
-    'disk[the guest'\''s own disk over qemu-nbd; a write shuts it down]'
+    'disk[the guest'\''s own disk over qemu-nbd; needs it shut off]'
 }
 
 # Sizes are free-form numbers, so the best a completion can do is offer sensible

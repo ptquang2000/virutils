@@ -199,18 +199,20 @@ your back is not a fallback. So `virtiofs` being the default makes its
 
 | | `disk` | `virtiofs` |
 | --- | --- | --- |
-| Guest must be | shut down to write, running to read | running |
+| Guest must be | already shut off to write, running to read | running |
 | Who writes `C:` | the host, through `ntfs-3g` | the guest, `robocopy` |
 | Host side | `qemu-nbd` on the guest's own qcow2 | `virtiofsd` |
 | Guest side | nothing | the agent, WinFsp, viofs |
 | Domain change | none | shared-memfd RAM and a share device, both **cold** to add |
-| Fixed cost per run | a full shutdown and boot | none |
+| Fixed cost per run | you shut the guest down and boot it again | none |
 
 **`disk`** is the original, and the one that needs nothing at all from
 inside the guest — which is what makes it the one to ask for when there is no
-agent, no drivers, or the guest will not boot. For a write it shuts the guest down,
-mounts its NTFS over `qemu-nbd`, copies, and restores the power state it found.
-For a read it leaves the guest running and reads a frozen snapshot instead.
+agent, no drivers, or the guest will not boot. For a write it needs the guest
+**already shut off**: it mounts the guest's NTFS over `qemu-nbd` and copies.
+It never shuts the guest down for you and never starts it again afterwards —
+a guest that is not shut off is an error, not a reboot. For a read it leaves
+the guest running and reads a frozen snapshot instead.
 
 **`virtiofs`** exports a host directory the running guest sees live, so nothing
 is copied twice. It is the default. It needs WinFsp and the viofs driver in the
@@ -361,17 +363,17 @@ directory under `~/.virutils/staging/`, applying the exclude patterns. The stagi
 normally arranged to mirror what will land in the guest, so the map rules stay
 trivial.
 
-**Push** shuts the guest down if it is running, attaches its disk image with
+**Push** attaches the disk image of the (already shut off) guest with
 `qemu-nbd`, picks the largest NTFS partition on it, mounts that, copies the
 staged files to their destinations, empties any directories listed for cleanup,
-then unmounts, detaches, and restores the guest's original power state.
+then unmounts and detaches. Starting the guest again is left to you.
 
 Run it as yourself, **not** under `sudo`. It refuses to start when invoked under
 `sudo`, because `$HOME` — and therefore config discovery — resolves to root's
 home on any host whose sudoers sets `always_set_home`. Only the commands that
 genuinely need root are escalated individually (`modprobe`, `qemu-nbd`, `partx`,
 `blkid`, `blockdev`, `mkdir`, `mount`, `umount`), and you are prompted once
-before the guest is shut down. Every `virsh` call runs unprivileged, which
+before anything is attached. Every `virsh` call runs unprivileged, which
 requires membership of the `libvirt` group. The guest filesystem is mounted with
 `uid=`/`gid=` set to the invoking user, so both copy phases and the cleanup pass
 need no privilege of their own.
@@ -443,7 +445,6 @@ and is rejected.
 | `@nbd` | no | `/dev/nbd0` | NBD device used to attach the disk image. |
 | `@mnt` | no | `~/.virutils/mnt/<VM>` | Host mount point for the guest filesystem. |
 | `@transport` | no | `virtiofs` | Default transport for this config. `-t` on the command line wins. |
-| `@shutdown_timeout` | no | `180` | Seconds to wait for the guest to shut down before aborting the run. The guest is never forced off. |
 
 #### Fetch rules
 
@@ -528,8 +529,8 @@ starts a comment on these lines, so a command cannot contain one.
 
 Run rules need the guest **running**, with the guest agent answering, so they
 work only under the `virtiofs` transport. A config with run rules under
-`-t disk` is rejected before the fetch starts, since that transport shuts the
-guest down to write to its image.
+`-t disk` is rejected before the fetch starts, since that transport writes to
+the image of a guest that is shut off.
 
 ### Example
 
@@ -539,7 +540,6 @@ guest down to write to its image.
 @repo=/mnt/c/Users/me/work/myproject
 @staging=vmsync/myproject
 @dest=Program Files (x86)/Example/Product
-@shutdown_timeout=180
 
 # fetch: build tree -> staging
 <bin/Release|.
@@ -579,13 +579,38 @@ Or, keeping several profiles side by side, and pointing them at any guest:
 leaves the NTFS volume dirty on shutdown and `ntfs-3g` refuses to mount it
 read-write.
 
-**Install `qemu-guest-agent` in the guest.** The shutdown uses it when it
-answers, and ACPI only as a fallback. ACPI is a power-button event Windows is
-free to deliberate over — a modal dialog or "an app is preventing shutdown" and
-the wait runs to `@shutdown_timeout`. The agent calls Windows' own shutdown with
-applications forced closed, which usually takes seconds, and it is still a real
-shutdown: Windows closes the NTFS volume, so the disk is left clean. See
-[Guest prerequisites](#guest-prerequisites), then confirm the host can see it:
+**Under `-t disk` the guest must already be shut off**, and stopping and
+starting it is yours to do. A guest in any other state — running, paused,
+pmsuspended — is a hard error before the fetch starts, not something the run
+resolves by shutting Windows down. Writing to the qcow2 of a guest that has it
+open would put two writers on one image, and shutting a guest down is not a
+decision this tool can make for you: it may be mid-install, mid-update or
+holding unsaved work. So the sequence is spelled out:
+
+```
+virutil domain shutdown win11     # wait for it to reach 'shut off'
+virutil sync win11 -t disk
+virutil domain start win11
+```
+
+The run leaves the guest shut off when it finishes, on success and on failure.
+
+**Nothing is ever forced off.** There is no `virsh destroy` anywhere in this
+path. Cutting power to a live Windows leaves the NTFS volume dirty — the same
+state Fast Startup causes above — so the disk would be unmountable read-write
+on the next run, and an interrupted write can leave the guest unbootable. If
+you decide to force it, do that by hand and expect to boot Windows once to let
+it check the volume.
+
+**Install `qemu-guest-agent` in the guest.** Nothing in the `disk` transport
+needs it now that the shutdown is yours, but `virutil exec` and the `virtiofs`
+transport both require it outright — and it is what lets you shut the guest
+down with `virsh --connect qemu:///system shutdown VM --mode agent`, which
+calls Windows' own shutdown with applications forced closed rather than an
+ACPI power-button event Windows is free to deliberate over. Either way it is a
+real shutdown, so Windows closes the NTFS volume and the disk is left clean.
+See [Guest prerequisites](#guest-prerequisites), then confirm the host can see
+it:
 
 ```
 virutil exec ping DOMAIN      # confirms qemu-ga is answering
@@ -593,14 +618,6 @@ virutil exec ping DOMAIN      # confirms qemu-ga is answering
 
 The agent channel is part of every domain `virutil domain create` makes, so
 nothing is needed on the host side.
-
-**The guest is never forced off.** If it has not shut down within
-`@shutdown_timeout`, the run aborts with the guest left running rather than
-falling back to `virsh destroy`. Cutting power to a live Windows leaves the NTFS
-volume dirty — the same state Fast Startup causes above — so the disk would be
-unmountable read-write on the next run, and an interrupted write can leave the
-guest unbootable. If you decide to force it, do that by hand and expect to boot
-Windows once to let it check the volume.
 
 **Case matters in map destinations.** The guest's NTFS is case-insensitive, but
 the `ntfs-3g` mount is not. `@dest` and map destinations are used verbatim, so
@@ -616,16 +633,17 @@ first:
 virsh managedsave-remove DOMAIN
 ```
 
-**Paused and suspended domains are refused** for the same reason. Shut the
-domain down or destroy it first.
+**Paused and suspended domains are refused** for the same reason — as is a
+running one. Shut the domain down yourself first.
 
-**The guest is restarted only once the disk is provably free.** After unmounting
+**Teardown is verified before you are told the disk is free.** After unmounting
 and detaching, `virutil sync` re-reads `/proc/mounts` and
 `/sys/block/<nbd>/{pid,size}` to confirm — observed state rather than exit codes,
 and both readable without privilege, so the check cannot fail merely because
-`sudo` could not authenticate. If teardown cannot be verified, the domain is left
-**shut off on purpose** and the recovery commands are printed. Starting it with
-the image still attached to NBD would put two writers on one qcow2.
+`sudo` could not authenticate. If teardown cannot be verified, the run exits
+non-zero telling you **not to start the domain yet**, and prints the recovery
+commands. Starting it with the image still attached to NBD would put two
+writers on one qcow2.
 
 **A stale attachment aborts the run before anything is touched.** If the NBD
 device is already attached, or the mount point already mounted, `virutil sync` exits
@@ -634,8 +652,8 @@ rather than risk detaching or unmounting something that is not its own.
 **There is no `sudo` keep-alive.** The copy phases run unprivileged, so nothing
 refreshes the `sudo` timestamp while they run. On a copy longer than
 `timestamp_timeout` (15 minutes by default) you are asked for your password
-again at teardown. If nobody answers, teardown fails and the guest is left off,
-per the rule above.
+again at teardown. If nobody answers, teardown fails and the recovery commands
+are printed, per the rule above.
 
 **The staging directory is always under `~/.virutils/staging/`.** Whatever
 `@staging` says is treated as a name relative to that root, including an
@@ -748,8 +766,9 @@ a config file you edited by hand, a build artifact you want in the guest right
 now, a one-off test file.
 
 The guest keeps running under the default transport. `--transport disk` is the
-offline path: shut the guest down, attach its qcow2 with `qemu-nbd`, mount the
-NTFS, copy, and restore the power state you started with.
+offline path: with the guest **already shut off**, attach its qcow2 with
+`qemu-nbd`, mount the NTFS, copy, and leave it shut off for you to start again.
+A guest that is not shut off is an error — `push` will not shut it down.
 
 ### Synopsis
 
@@ -888,11 +907,11 @@ What the profile actually sets, and why:
    below with it.
 - **The qemu-guest-agent channel** (`org.qemu.guest_agent.0`). `virt-manager`
    does not add it and nothing inside the guest can, yet the `virtiofs`
-   transport needs it — it is what runs the copy in Windows — and the
-   `disk` transport wants it, since with the agent a shutdown is Windows' own
-   with apps forced closed rather than an ACPI event it may sit on until
-   `@shutdown_timeout`. It costs one virtio-serial port, so it is not optional
-   and there is no flag to leave it out.
+   transport needs it — it is what runs the copy in Windows — and it is also
+   what makes `virsh shutdown --mode agent` Windows' own shutdown with apps
+   forced closed, rather than an ACPI event the guest may sit on. It costs one
+   virtio-serial port, so it is not optional and there is no flag to leave it
+   out.
 - **The virtio-fs share device**, tagged `virutil-xfer` and pointed at
    `$VIRUTILS_DIR/share/virutil-VM`, which is created with the domain. This is
    what makes a file transfer repeatable: the device is enumerated once at boot,
@@ -1269,9 +1288,9 @@ these comes from and how to install it:
 - WinFsp and the virtio-win viofs driver, for `virtiofs` (the default) — and
    therefore for `sync`, `pull` and `push` as they are normally used
 - The QEMU guest agent, for `virutil exec` and for the `virtiofs` transport,
-   which runs the guest-side copy through it. Strongly recommended
-   for `disk` too, where without it the shutdown falls back to ACPI and Windows
-   may sit on it until `@shutdown_timeout` expires
+   which runs the guest-side copy through it. Still worth having for `disk`,
+   where it is what lets you shut the guest down with `--mode agent` instead of
+   waiting on ACPI
 - The SPICE guest tools, for the `spice` display and `spicevmc` channel every
    `virutil domain create` guest has — without the vdagent there is no
    clipboard sharing and the display does not auto-resize

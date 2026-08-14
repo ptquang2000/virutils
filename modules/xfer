@@ -20,7 +20,7 @@ xfer_transport_help() {
         "  -t, --transport T       how to move the files (default: $XFER_DEFAULT):" \
         "                            virtiofs  a live virtio-fs share" \
         "                            disk      the guest's own disk over" \
-        "                                      qemu-nbd (a write shuts it down)"
+        "                                      qemu-nbd (needs it shut off)"
 }
 
 # Escalate only what needs root: under sudo $HOME is root's, so config
@@ -56,6 +56,18 @@ xfer_select() {
     esac
 
     case "$want" in
+        disk)
+            # Here rather than in guest_open: the guest's state decides whether
+            # this run can happen at all, so it is checked before the fetch or
+            # any other work that would be thrown away.
+            [[ "$("${VIRSH[@]}" domstate "$dom" 2>/dev/null)" == "shut off" ]] \
+                || die "--transport $want needs $dom shut off; it is" \
+                       "'$("${VIRSH[@]}" domstate "$dom" 2>/dev/null)'." \
+                       "It writes straight to the disk image, which a running" \
+                       "guest also has open. Shut it down with" \
+                       "'virutil domain shutdown $dom' and start it again" \
+                       "yourself afterwards, or use --transport virtiofs."
+            ;;
         virtiofs)
             xfer_running "$dom" \
                 || die "--transport $want needs $dom running; it is" \
