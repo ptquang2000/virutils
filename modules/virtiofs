@@ -4,19 +4,16 @@
 #
 #   host dir <--(virtiofsd, vhost-user)--> guest drive letter --(robocopy)--> C:\
 #
-# The share stays attached between runs: setting it up is the expensive part and
-# an idle share costs nothing.
+# The first transfer attaches the share, live and to the definition at once, and
+# every transfer after it finds the share already there. Setting it up is the
+# expensive part, an idle share costs nothing, and a device that comes back with
+# the guest keeps the same drive letter across runs and snapshot reverts.
 
 VIRTIOFS_DIR=""                # the host side of the share
 VIRTIOFS_CACHE=auto            # auto is coherent enough for a host that writes
 VIRTIOFS_QUEUE=1024
 VIRTIOFS_LETTER=""
 VIRTIOFS_SENTINEL=".virutil-xfer"   # how the guest recognises the share; see below
-
-# Read by the EXIT trap, so module scope: set -u must not trip on them.
-VIRTIOFS_OURS=0
-VIRTIOFS_PERSISTENT=0    # the share is part of the domain, not this run's doing
-VIRTIOFS_SVC_PRIOR=""
 
 # The path goes into the XML explicitly: libvirt only finds virtiofsd where it
 # was built to look, and distros disagree (Arch /usr/lib, Fedora /usr/libexec).
@@ -75,18 +72,77 @@ virtiofs_fs_xml() {
 EOF
 }
 
-# libvirt matches a filesystem device by its target alone.
-virtiofs_match_xml() {
-    cat <<EOF
-<filesystem type='mount' accessmode='passthrough'>
-  <source dir='$1'/>
-  <target dir='$XFER_TAG'/>
-</filesystem>
-EOF
-}
-
 virtiofs_attached() {
     "${VIRSH[@]}" dumpxml "$@" 2>/dev/null | grep -q "<target dir='$XFER_TAG'/>"
+}
+
+# virtiofs_device_xml [--inactive] VM -- our whole <filesystem> element, exactly
+# as that XML has it, or nothing when the share is not there. Taken verbatim
+# rather than rebuilt: a device attached by hand, or by an older virutil, may
+# differ in queue size or cache mode, and putting back something other than what
+# was unplugged is not putting it back.
+virtiofs_device_xml() {
+    local want="<target dir='$XFER_TAG'/>"
+    "${VIRSH[@]}" dumpxml "$@" 2>/dev/null | awk -v want="$want" '
+        /<filesystem/    { buf = $0; inside = 1; next }
+        !inside          { next }
+                         { buf = buf "\n" $0 }
+        /<\/filesystem>/ { inside = 0; if (index(buf, want)) { print buf; exit } }'
+}
+
+# virtiofs_unplug VM -- take the share off the running guest and print the
+# element that was removed, so the caller can put it back. Prints nothing, and
+# succeeds, when there is no share attached.
+#
+# The wait is the point: detach-device only asks, and a PCI unplug completes
+# when the guest acknowledges the eject. Returning before that would hand the
+# caller a domain that still has the device in every way that matters.
+VIRTIOFS_UNPLUG_TRIES=40        # x 0.5s
+virtiofs_unplug() {
+    local vm="$1" xml i
+    # A shut-off domain has nothing plugged in, and its dumpxml is the
+    # definition -- which keeps the share and is not what this touches.
+    xfer_running "$vm" || return 0
+    xml="$(virtiofs_device_xml "$vm")"
+    [[ -n "$xml" ]] || return 0
+
+    printf '%s\n' "$xml" \
+        | "${VIRSH[@]}" detach-device "$vm" --live /dev/stdin >/dev/null \
+        || die "could not unplug the virtio-fs share from $vm"
+
+    for (( i = 0; i < VIRTIOFS_UNPLUG_TRIES; i++ )); do
+        virtiofs_attached "$vm" || { printf '%s' "$xml"; return 0; }
+        sleep 0.5
+    done
+    die "$vm has not released the virtio-fs share $(( VIRTIOFS_UNPLUG_TRIES / 2 ))s" \
+        "after being asked to. A PCI unplug needs the guest to acknowledge it," \
+        "so this is the guest not answering -- check that it is not suspended," \
+        "and that VirtioFsSvc is not wedged (services.msc)."
+}
+
+# virtiofs_replug VM XML -- put back what virtiofs_unplug took off.
+#
+# The alias and address go: libvirt rejects an incoming alias that is its own
+# rather than a user 'ua-' one, and the slot the device had is better left to
+# libvirt to choose again than asserted from a definition taken before an unplug.
+virtiofs_replug() {
+    local vm="$1"
+    printf '%s\n' "$2" | grep -v '<\(alias\|address\) ' \
+        | "${VIRSH[@]}" attach-device "$vm" --live /dev/stdin >/dev/null \
+        || warn "could not plug the virtio-fs share back into $vm." \
+                "The domain still has it in its definition, so the next" \
+                "transfer attaches it again -- or start the domain afresh."
+}
+
+# Where the share should point when nothing has decided yet: the running
+# domain's own XML first (a device attached live by a run that never persisted
+# it), then the definition, then the default directory.
+virtiofs_resolve_dir() {
+    local dir
+    dir="$(virtiofs_configured_dir --inactive "$DOMAIN")"
+    [[ -n "$dir" ]] || dir="$(virtiofs_configured_dir "$DOMAIN")"
+    [[ -n "$dir" ]] || dir="$(virtiofs_host_dir)"
+    printf '%s' "$dir"
 }
 
 # virtiofs_configured_dir [--inactive] VM -- the source directory of the share
@@ -103,52 +159,66 @@ virtiofs_configured_dir() {
         $0 ~ ("<target dir='"'"'" tag "'"'"'/>") { if (dir != "") print dir; exit }'
 }
 
-# virtiofs_setup -- make sure the share is live. Idempotent.
+# virtiofs_setup DIR -- make sure the share is attached, to the running guest
+# and to the definition both. Idempotent, and the attach happens once in a
+# domain's life rather than once per transfer.
 #
-# Two shapes, and which one this is decides the teardown as much as the setup:
+# --config as well as --live is the whole point: a device plugged in for the
+# duration of one command is re-enumerated by the guest every run, lands on
+# whichever drive letter is free at the time, and is left stranded when a run
+# dies before its trap. Persisted, it comes back with the guest, keeps the same
+# letter, and survives a snapshot revert -- which is what makes a transfer mean
+# the same thing twice. The share is a plumbing detail of the domain either
+# way, and an idle one costs an idle virtiofsd.
 #
-#   persisted  the domain was defined with the device (virutil domain create).
-#              It comes up with the guest, holds one drive letter for the life
-#              of the domain, and survives a snapshot revert. Nothing here
-#              unplugs it -- it is the domain's, not this run's.
-#   hotplugged no device in the definition, so one is attached --live for the
-#              run and detached by the EXIT trap. A drive letter that outlived
-#              the command would be a permanent change to a guest that only
-#              asked for a file copy.
+# It is not defined at domain create, because at that point neither virtiofsd on
+# the host nor WinFsp in the guest need exist yet; here they have just been
+# checked.
 virtiofs_setup() {
-    local dir="$1" binary xml
+    local dir="$1" binary xml live=0 persisted=0
 
-    mkdir -p "$dir"
+    virtiofs_attached "$DOMAIN"            && live=1
+    virtiofs_attached --inactive "$DOMAIN" && persisted=1
 
-    if virtiofs_attached "$DOMAIN"; then
-        # Already live: the persisted device, or residue from a run that died
-        # before its trap. The tag is virutil's own either way, so adopt it --
-        # and take the residue with us at close rather than leave it stranded.
-        (( VIRTIOFS_PERSISTENT )) || VIRTIOFS_OURS=1
-        return 0
+    if [[ ! -d "$dir" ]]; then
+        mkdir -p "$dir" || die "could not create the share directory $dir"
+        # A defined domain will not start without the directory it exports, so
+        # qemu has to be able to reach it before this goes into the definition.
+        (( persisted )) || paths_qemu_warn "$dir"
     fi
+
+    (( live && persisted )) && return 0
 
     binary="$(virtiofs_binary)" || exit 1
+    xml="$(virtiofs_fs_xml "$binary" "$dir")"
 
-    if ! virtiofs_shared_mem "$DOMAIN"; then
-        die "$DOMAIN is running without shared memory backing, so a virtio-fs" \
-            "device cannot attach to it: virtiofsd has to map the guest's RAM." \
-            "This is a cold setting -- a reboot from inside the guest will not" \
-            "pick it up. Fix it once:" \
-            "  virt-xml --connect qemu:///system $DOMAIN --edit --define \\" \
-            "     --memorybacking access.mode=shared,source.type=memfd" \
-            "  virutil domain shutdown $DOMAIN && virutil domain start $DOMAIN" \
-            "Or use --transport disk, which needs nothing defined at all" \
-            "-- though it needs the guest shut off."
+    if (( ! live )); then
+        if ! virtiofs_shared_mem "$DOMAIN"; then
+            die "$DOMAIN is running without shared memory backing, so a virtio-fs" \
+                "device cannot attach to it: virtiofsd has to map the guest's RAM." \
+                "This is a cold setting -- a reboot from inside the guest will not" \
+                "pick it up. Fix it once:" \
+                "  virt-xml --connect qemu:///system $DOMAIN --edit --define \\" \
+                "     --memorybacking access.mode=shared,source.type=memfd" \
+                "  virutil domain shutdown $DOMAIN && virutil domain start $DOMAIN" \
+                "Or use --transport disk, which needs nothing defined at all" \
+                "-- though it needs the guest shut off."
+        fi
+        printf '%s\n' "$xml" | "${VIRSH[@]}" attach-device "$DOMAIN" --live /dev/stdin \
+            || die "could not attach the virtio-fs share to $DOMAIN"
     fi
 
-    xml="$(virtiofs_fs_xml "$binary" "$dir")"
-    printf '%s\n' "$xml" | "${VIRSH[@]}" attach-device "$DOMAIN" --live /dev/stdin \
-        || die "could not attach the virtio-fs share to $DOMAIN"
-
-    # A domain defined with the share but running from before it was: the
-    # definition already says the device belongs here, so it stays plugged in.
-    (( VIRTIOFS_PERSISTENT )) || VIRTIOFS_OURS=1
+    # Separate calls: one --live --config attach cannot express "already
+    # plugged in, just remember it", which is exactly the case for a device a
+    # previous virutil hotplugged and never persisted.
+    if (( ! persisted )); then
+        printf '%s\n' "$xml" \
+            | "${VIRSH[@]}" attach-device "$DOMAIN" --config /dev/stdin >/dev/null \
+            || warn "the share is attached to the running $DOMAIN, but could not" \
+                    "be added to its definition -- the next transfer will attach" \
+                    "it again rather than find it already there"
+        say "share:  attached to $DOMAIN, and defined so it comes back with it"
+    fi
 }
 
 # VirtioFsSvc is the virtio-win viofs service; it maps each tag to a drive
@@ -165,9 +235,10 @@ virtiofs_start_service() {
     }
     case "$out" in
         *RUNNING*) ;;
-        *)  # Read before it is changed, so the trap can put it back.
-            VIRTIOFS_SVC_PRIOR="$(xfer_ps \
-                '(Get-Service VirtioFsSvc).StartType' 2>/dev/null | tr -d '[:space:]')"
+        *)  # Left on automatic afterwards, and not stopped again: the share is
+            # part of the domain now, so it is there at every boot and the
+            # service that maps it belongs on the same footing. Automatic is
+            # also the viofs installer's own default.
             VM="$DOMAIN"; DETACH=0
             gexec sc.exe '["config","VirtioFsSvc","start=","auto"]' >/dev/null 2>&1 || true
             gexec sc.exe '["start","VirtioFsSvc"]' >/dev/null \
@@ -175,27 +246,6 @@ virtiofs_start_service() {
                        "guest (services.msc) and that WinFsp is installed"
             ;;
     esac
-}
-
-# Automatic is the viofs installer's own default, so restoring it would be a
-# guest round trip that changes nothing.
-virtiofs_restore_service() {
-    # A share the domain is defined with is there at every boot, so the service
-    # that maps it belongs on automatic: putting it back the way it was would
-    # only make the next run start it again.
-    (( VIRTIOFS_PERSISTENT )) && return 0
-
-    case "$VIRTIOFS_SVC_PRIOR" in
-        ""|Automatic) return 0 ;;
-        Manual|Disabled|Boot|System) ;;
-        *) return 0 ;;
-    esac
-    local start=demand
-    [[ "$VIRTIOFS_SVC_PRIOR" == Disabled ]] && start=disabled
-    VM="$DOMAIN"; DETACH=0
-    gexec sc.exe "[\"config\",\"VirtioFsSvc\",\"start=\",\"$start\"]" >/dev/null 2>&1 \
-        || warn "could not restore VirtioFsSvc to $VIRTIOFS_SVC_PRIOR in $DOMAIN"
-    gexec sc.exe '["stop","VirtioFsSvc"]' >/dev/null 2>&1 || true
 }
 
 # Which letter the tag landed on -- the client takes the highest free one, so it
@@ -226,15 +276,10 @@ virtiofs_open() {
     xfer_privilege
     command -v rsync >/dev/null || die "rsync not installed"
 
-    # The domain's own definition wins on where the share points: a persisted
-    # device is what the guest already has mounted, and it may name a directory
-    # from before VIRUTILS_SHARE_ROOT moved.
-    VIRTIOFS_DIR="$(virtiofs_configured_dir --inactive "$DOMAIN")"
-    if [[ -n "$VIRTIOFS_DIR" ]]; then
-        VIRTIOFS_PERSISTENT=1
-    else
-        VIRTIOFS_DIR="$(virtiofs_host_dir)"
-    fi
+    # The domain's own XML wins on where the share points: once attached, that
+    # is what the guest has mounted, and it may name a directory from before
+    # VIRUTILS_SHARE_ROOT moved.
+    VIRTIOFS_DIR="$(virtiofs_resolve_dir)"
 
     virtiofs_setup "$VIRTIOFS_DIR"
     virtiofs_start_service
@@ -306,29 +351,19 @@ if ($copied -eq 0) { throw "nothing matched in the guest" }'
     xfer_ps "$script" || die "collecting from $DOMAIN failed"
 }
 
-# Teardown, from the EXIT trap: nothing transferred stays readable at a drive
-# letter once the command has returned. Unplug first, so the guest has lost the
-# mapping before the directory empties underneath it.
+# Teardown, from the EXIT trap: nothing transferred stays readable at the drive
+# letter once the command has returned.
 #
-# A persisted share is not unplugged -- the drive letter is the domain's, and
-# the point of defining it was that it does not come and go. Emptying it still
-# applies: what the share holds is one run's payload either way.
+# The device itself is not unplugged. It was attached once, and to the domain's
+# definition as much as to the running guest, so the drive letter is the
+# domain's rather than this run's -- taking it away is what the persisted share
+# exists to avoid. Emptying it is the whole teardown: what the share holds is
+# one run's payload, and an empty share is inert.
 virtiofs_close() {
     (( XFER_ARMED )) || return 0
 
-    if (( VIRTIOFS_OURS )) && virtiofs_attached "$DOMAIN"; then
-        virtiofs_match_xml "$VIRTIOFS_DIR" \
-            | "${VIRSH[@]}" detach-device "$DOMAIN" --live /dev/stdin >/dev/null 2>&1 \
-            || warn "could not detach the virtio-fs share from $DOMAIN;" \
-                    "$VIRTIOFS_LETTER: is still mapped there. Remove it with:" \
-                    "  ${VIRSH[*]} detach-device $DOMAIN --live <the <filesystem> element>"
-    fi
-
-    # Runs even when the detach failed: a share with nothing in it is inert.
     if [[ -n "$VIRTIOFS_DIR" && -d "$VIRTIOFS_DIR" ]]; then
         find "$VIRTIOFS_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null \
             || warn "could not empty the share directory $VIRTIOFS_DIR"
     fi
-
-    virtiofs_restore_service
 }

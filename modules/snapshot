@@ -8,6 +8,11 @@
 
 DIR="${VIRUTIL_IMAGE_DIR:-$VIRUTILS_IMAGE_DIR}"
 
+# What snapshot_devices_off took away, for snapshot_devices_on to put back.
+# Read by the EXIT trap, so module scope: set -u must not trip on them.
+SNAPSHOT_FS_XML=""
+SNAPSHOT_MEDIA=()
+
 snapshot_usage() {
     printf '%s\n' \
         "usage: virutil snapshot create VM [SNAP]  (default name snap-<timestamp>)" \
@@ -143,6 +148,67 @@ snapshot_kept_files() {
     done < <("${VIRSH_Q[@]}" snapshot-list --domain "$vm" --name 2>/dev/null)
 }
 
+# snapshot_devices_off VM -- strip the running domain down to what libvirt can
+# actually put in an external snapshot. Two things come off:
+#
+#   the virtio-fs share   An external snapshot writes the guest's memory through
+#                         the same machinery as a migration, and a vhost-user
+#                         device carries a migration blocker in qemu. With the
+#                         share attached the snapshot does not degrade, it fails
+#                         outright.
+#   removable media       A revert does not reuse the overlay a create made: it
+#                         builds a fresh one per disk, named <source>.<epoch>
+#                         *beside the source*. For an ISO that means an overlay
+#                         in the ISO's own directory, and where that directory
+#                         is a 9p /mnt/c share -- the normal place to keep an
+#                         ISO under WSL -- libvirt cannot label what it just
+#                         created and the revert dies half-done, leaving the
+#                         guest paused on a base image with no overlay over it.
+#                         An empty drive has no source, so it is skipped by
+#                         both halves. The tray is the whole fix.
+#
+# The create is the only chance to prevent that second one: the revert reads the
+# disks from the record, so a record written with the drives full is a revert
+# that will fail every time it is tried.
+snapshot_devices_off() {
+    local vm="$1" tgt src
+
+    xfer_running "$vm" || return 0
+
+    SNAPSHOT_FS_XML="$(virtiofs_unplug "$vm")" || exit 1
+    [[ -n "$SNAPSHOT_FS_XML" ]] && say "share:  unplugged from $vm for the snapshot"
+
+    while IFS=$'\t' read -r tgt src; do
+        [[ -n "$tgt" && -n "$src" ]] || continue
+        domain_media_eject "$vm" "$tgt" \
+            || die "could not eject $tgt ($src) from $vm, and a snapshot taken" \
+                   "with it loaded cannot be reverted to. Eject it in the guest" \
+                   "and try again, or detach the drive for good:" \
+                   "  virsh --connect qemu:///system change-media $vm $tgt --eject --force"
+        SNAPSHOT_MEDIA+=("$tgt"$'\t'"$src")
+        say "media:  ejected $tgt ($src)"
+    done < <(domain_media "$vm")
+}
+
+# snapshot_devices_on VM -- put back what snapshot_devices_off took. Idempotent,
+# because it is both the EXIT trap and the ordinary path out of a create.
+snapshot_devices_on() {
+    local vm="$1" entry tgt src
+
+    for entry in ${SNAPSHOT_MEDIA[@]+"${SNAPSHOT_MEDIA[@]}"}; do
+        IFS=$'\t' read -r tgt src <<<"$entry"
+        domain_media_insert "$vm" "$tgt" "$src" \
+            || warn "could not put $src back in $tgt on $vm; the drive is empty." \
+                    "The definition still names it, so a fresh start restores it."
+    done
+    SNAPSHOT_MEDIA=()
+
+    if [[ -n "$SNAPSHOT_FS_XML" ]]; then
+        virtiofs_replug "$vm" "$SNAPSHOT_FS_XML"
+        SNAPSHOT_FS_XML=""
+    fi
+}
+
 snapshot_main() {
     local CMD VM SNAP
     CMD="${1:-}"
@@ -197,12 +263,26 @@ snapshot_main() {
             "$(printf '  %s\n' "${CLOBBER[@]}")" \
             "No record names them. Remove them, then create again."
 
+        # From here on the guest is short a device and a disc, so the trap goes
+        # up first: they go back however this ends, including the die below and
+        # a ^C mid-snapshot. Live only, both of them -- the definition still
+        # names the share and the ISOs, so nothing here is a lasting change to
+        # the domain.
+        trap 'snapshot_devices_on "$VM"' EXIT
+        snapshot_devices_off "$VM"
+
+        local rc=0
         "${VIRSH[@]}" snapshot-create-as \
             --domain "$VM" \
             --name "$SNAP" \
             --memspec "$DIR/$VM.$SNAP.mem,snapshot=external" \
             "${DISKSPECS[@]}" \
-            --atomic
+            --atomic || rc=$?
+
+        trap - EXIT
+        snapshot_devices_on "$VM"
+
+        (( rc )) && die "could not create snapshot '$SNAP' on $VM"
         echo "created: $SNAP"
         ;;
     list)
@@ -210,6 +290,16 @@ snapshot_main() {
         ;;
     revert)
         SNAP="${3:?usage: virutil snapshot revert VM_NAME SNAP_NAME}"
+        # Nothing is stripped here, and nothing is put back. A revert restores
+        # the configuration stored in the record, and that was written with the
+        # share unplugged and the drives empty -- so that is the domain that
+        # comes back, definition included.
+        #
+        # Neither is a loss. The next transfer finds no share and attaches one
+        # exactly as the first ever transfer did, and the ISOs a domain still
+        # has loaded after Windows is installed are the install media, which
+        # nothing reads again -- and which are the reason a revert fails when
+        # they are left in.
         "${VIRSH[@]}" snapshot-revert --domain "$VM" --snapshotname "$SNAP" --running
         echo "reverted: $SNAP"
 

@@ -63,8 +63,8 @@ domain_usage() {
         "  VIRUTIL_NETWORK        network=default,model=virtio" \
         "  VIRUTIL_FIRMWARE       uefi         or 'bios'" \
         "  VIRUTIL_SHARED_MEMORY  1            or '0'; the virtio-fs share needs" \
-        "                                      it, and turning it off drops the" \
-        "                                      share from the domain too" >&2
+        "                                      it, and it cannot be added later" \
+        "                                      without a stop and start" >&2
     exit "${1:-1}"
 }
 
@@ -111,6 +111,42 @@ domain_disks() {
     "${VIRSH[@]}" domblklist "$1" --details 2>/dev/null \
         | awk '$1 == "file" && $2 == "disk" {
                    sub(/^[[:space:]]*([^[:space:]]+[[:space:]]+){3}/, ""); print }'
+}
+
+# domain_media NAME -- "TARGET<TAB>SOURCE" for every removable drive in the
+# running domain that has media in it. An empty drive prints nothing: there is
+# no file, so there is nothing for a caller to take out or put back.
+#
+# Read from the XML rather than domblklist, which cannot be split on whitespace
+# when a path has spaces in it -- and an ISO under /mnt/c usually does. libvirt
+# writes <source> before <target> within a device, so the pair completes at the
+# target line.
+domain_media() {
+    "${VIRSH[@]}" dumpxml "$1" 2>/dev/null | awk '
+        /<disk / { removable = ($0 ~ /device=.(cdrom|floppy)./); src = ""; next }
+        !removable { next }
+        match($0, /file='"'"'[^'"'"']*'"'"'/) {
+            src = substr($0, RSTART + 6, RLENGTH - 7); next }
+        match($0, /<target dev='"'"'[^'"'"']*'"'"'/) {
+            if (src != "")
+                printf "%s\t%s\n", substr($0, RSTART + 13, RLENGTH - 14), src }
+        /<\/disk>/ { removable = 0 }'
+}
+
+# domain_media_eject NAME TARGET -- open the tray, live only, so the domain's
+# definition keeps naming the ISO.
+#
+# --force because Windows locks the tray of a disc it has mounted, and without
+# it the eject is a request the guest is free to refuse -- silently, from the
+# host's point of view. What that costs is a guest reading the disc at that
+# instant seeing it go away, against a caller that is putting it straight back.
+domain_media_eject() {
+    "${VIRSH[@]}" change-media "$1" "$2" --eject --live --force >/dev/null
+}
+
+# domain_media_insert NAME TARGET SOURCE -- put the media back.
+domain_media_insert() {
+    "${VIRSH[@]}" change-media "$1" "$2" --insert "$3" --live >/dev/null
 }
 
 # domain_top_image NAME -- the top of the backing chain of the first disk.
@@ -281,29 +317,14 @@ domain_create() {
     # memoryBacking is a cold setting: without a shared memfd here, virtio-fs
     # later costs a full stop and start, not a reboot.
     #
-    # The share device goes in with it. Hotplugging one per transfer works, but
-    # every run then re-enumerates the device in the guest, takes whichever
-    # drive letter happens to be free, and leaves the device behind when a run
-    # dies before its trap. Defined here it is part of the domain: present from
-    # boot, the same letter every time, and unaffected by a snapshot revert --
-    # which is what makes a transfer mean the same thing twice.
-    local SHARE_DIR="" SHARE_BIN=""
+    # The share device itself is not defined here. It needs virtiofsd on the
+    # host and WinFsp plus the viofs driver in the guest, none of which a domain
+    # being installed from an ISO has yet -- so it would sit in the definition
+    # unusable, and pin the host directory it exports for the life of the
+    # domain. The first transfer attaches it instead, once and persistently
+    # (see modules/virtiofs), which leaves this the only cold part.
     if (( SHAREMEM )); then
         ARGS+=(--memorybacking access.mode=shared,source.type=memfd)
-
-        if SHARE_BIN="$(virtiofs_binary 2>/dev/null)" && [[ -n "$SHARE_BIN" ]]; then
-            SHARE_DIR="$(virtiofs_host_dir "$VM")"
-            mkdir -p "$SHARE_DIR"
-            paths_qemu_warn "$SHARE_DIR"
-            # No binary.cache.mode: virtiofsd's own default is 'auto', and
-            # libvirt's <cache> enum has no spelling for it -- saying nothing is
-            # how you ask for it.
-            ARGS+=(--filesystem "type=mount,accessmode=passthrough,driver.type=virtiofs,driver.queue=$VIRTIOFS_QUEUE,binary.path=$SHARE_BIN,source.dir=$SHARE_DIR,target.dir=$XFER_TAG")
-        else
-            warn "virtiofsd was not found, so $VM gets no virtio-fs share." \
-                 "Transfers still work -- the share hotplugs per run once" \
-                 "virtiofsd is installed, or use --transport disk."
-        fi
     fi
 
     if (( BIOS )); then
@@ -369,7 +390,6 @@ domain_create() {
     (( SHAREMEM )) && memnote=" (shared memfd)"
     say "memory:  ${MEM} MiB$memnote"
     say "disk:    $IMG (${SIZE} GiB)"
-    [[ -n "$SHARE_DIR" ]] && say "share:   $SHARE_DIR (virtio-fs '$XFER_TAG')"
     say "iso:     $ISO"
     [[ -n "$VIRTIO" ]] && say "virtio:  $VIRTIO"
 
