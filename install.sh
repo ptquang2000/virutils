@@ -63,7 +63,6 @@ REQUIRED=(
     "sync pull push  |qemu-nbd rsync sudo partx blkid blockdev lsblk mount"
     "domain          |virt-install virt-xml qemu-img"
     "exec            |jq python3"
-    "usb media       |jq sfdisk qemu-img"
     "usb             |jq usbipd.exe powershell.exe"
 )
 OPTIONAL=(
@@ -71,12 +70,11 @@ OPTIONAL=(
     "domain: detecting --osinfo from an install ISO|osinfo-detect"
     "domain: fixing ISO permissions under a 0700 home|setfacl"
     "domain port: the relay that carries a guest port to the host|socat"
-    "sync pull: NTFS volumes on the guest disk|mount.ntfs-3g"
-    "usb media: host-side formatting of the drive image (the guest formats it otherwise)|mkfs.exfat"
+    "sync pull push: NTFS volumes on the guest disk|mount.ntfs-3g"
 )
 
 check_deps() {
-    local missing_any=0 entry mod cmds cmd miss vfsd p
+    local missing_any=0 entry mod cmds cmd miss
 
     log "Checking dependencies"
     for entry in "${REQUIRED[@]}"; do
@@ -104,20 +102,6 @@ check_deps() {
     if [[ ! -e /sys/module/nbd ]] && ! modinfo nbd >/dev/null 2>&1; then
         warn "the nbd kernel module is unavailable -- sync, pull and push need it"
         missing_any=1
-    fi
-    # virtiofsd is not on PATH on every distro (Arch installs it in /usr/lib),
-    # so it is looked for where the transport itself looks. One path at a time:
-    # `ls a b c` exits nonzero when *any* is missing.
-    if ! have virtiofsd; then
-        vfsd=""
-        for p in /usr/lib/virtiofsd /usr/libexec/virtiofsd /usr/lib/qemu/virtiofsd; do
-            [[ -x "$p" ]] && { vfsd="$p"; break; }
-        done
-        if [[ -z "$vfsd" ]]; then
-            warn "virtiofsd not found -- virtiofs is the default transport for" \
-                 "sync, pull and push. Install it, or pass --transport disk."
-            missing_any=1
-        fi
     fi
     [[ -e /dev/kvm ]] || warn "no /dev/kvm -- virutil domain cannot start a guest (nested virtualisation, under WSL2)"
     if have id && ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx libvirt; then

@@ -2,18 +2,17 @@
 
 push_usage() {
     printf '%s\n' \
-        "usage: virutil push VM SRC DST [-t T]" \
+        "usage: virutil push VM SRC DST" \
         "" \
-        "  VM   libvirt domain whose disk is written" \
+        "  VM   libvirt domain whose disk is written; it has to be shut off" \
         "  SRC  host file or directory to copy" \
         "  DST  guest path, relative to C:\\; a trailing slash means a" \
         "       directory, exactly as with rsync. Backslashes and a C:\\" \
         "       prefix are tolerated; '..' is refused." \
-        "$(xfer_transport_help)" \
         "  -h, --help              this message" \
         "" \
-        "A directory source is copied recursively. The disk transport needs" \
-        "the guest shut off; see README.md." >&2
+        "A directory source is copied recursively. The copy writes to the" \
+        "guest's disk image, so the guest has to be shut off; see README.md." >&2
     exit "${1:-1}"
 }
 
@@ -40,11 +39,10 @@ push_norm_dst() {
 }
 
 push_main() {
-    local VM="" SRC="" DST="" TRANSPORT=""
+    local VM="" SRC="" DST=""
 
     while (( $# )); do
         case "$1" in
-            -t|--transport) TRANSPORT="${2:?$1 needs a value}"; shift 2 ;;
             -h|--help)      push_usage 0 ;;
             -*)             warn "unrecognised argument: $1"; push_usage ;;
             *)
@@ -64,12 +62,12 @@ push_main() {
     DOMAIN="$VM"
     domain_exists "$DOMAIN" || die "no such domain: $DOMAIN (see: virutil domain list)"
 
-    xfer_select write "$TRANSPORT"
-    xfer_open
+    xfer_check write
+    # guest_open arms the EXIT trap that unmounts and detaches again.
+    guest_open
 
     push_copy "$SRC" "$DST"
 
-    xfer_deliver
     echo "copied -> $DOMAIN"
 }
 

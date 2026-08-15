@@ -5,18 +5,17 @@ DISK=""; SNAP=""; OVERLAY=""
 
 pull_usage() {
     printf '%s\n' \
-        "usage: virutil pull VM SRC DST [-t T]" \
+        "usage: virutil pull VM SRC DST" \
         "" \
-        "  VM   libvirt domain to read from" \
+        "  VM   libvirt domain to read from; it has to be running" \
         "  SRC  guest path, relative to C:\\. Wildcards are allowed and match" \
         "       case-insensitively. Backslashes and a C:\\ prefix are tolerated;" \
         "       '..' is refused." \
         "  DST  host directory to copy into (created if needed)" \
-        "$(xfer_transport_help)" \
         "  -h, --help              this message" \
         "" \
-        "A directory source is copied recursively. The guest keeps running under" \
-        "every transport; see README.md." >&2
+        "A directory source is copied recursively. The guest keeps running" \
+        "throughout: the read is taken off a disk-only snapshot. See README.md." >&2
     exit "${1:-1}"
 }
 
@@ -89,7 +88,7 @@ pull_norm_src() {
 
 # Take a disk-only live snapshot so the guest's writes go to an overlay, attach
 # the frozen base read-only, and mount it at MNT. The guest is never touched,
-# which is what makes this the transport that needs no agent.
+# which is what makes this need no agent inside it.
 #
 # The checkpoint is at the QCOW2 level, not the filesystem level: the guest's
 # page cache is absent and the NTFS journal may be mid-transaction. Fine for
@@ -110,8 +109,8 @@ pull_open_disk() {
     local state="$("${VIRSH[@]}" domstate "$DOMAIN")"
     echo "domain: $DOMAIN ($state)"
     [[ "$state" == running ]] \
-        || die "$DOMAIN is '$state'; the disk transport reads the live disk via" \
-               "a snapshot. Start it, or copy the other way with virutil push."
+        || die "$DOMAIN is '$state'; the read goes through a snapshot of the" \
+               "live disk. Start it, or copy the other way with virutil push."
 
     DISK="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
            | awk '$2=="disk" {print $3; exit}')"
@@ -155,7 +154,7 @@ pull_open_disk() {
 }
 
 pull_main() {
-    local VM="" SRC="" DST="" TRANSPORT=""
+    local VM="" SRC="" DST=""
 
     [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] \
         && die "do not run virutil pull under sudo -- run it as yourself." \
@@ -164,7 +163,6 @@ pull_main() {
 
     while (( $# )); do
         case "$1" in
-            -t|--transport) TRANSPORT="${2:?$1 needs a value}"; shift 2 ;;
             -h|--help)      pull_usage 0 ;;
             -*)             warn "unrecognised argument: $1"; pull_usage ;;
             *)
@@ -185,16 +183,11 @@ pull_main() {
     SRC="$(pull_norm_src "$SRC")" || exit 1
     [[ -n "$SRC" ]] || die "source may not be the root of C:"
 
-    xfer_select read "$TRANSPORT"
+    xfer_check read
 
     mkdir -p "$DST" || die "could not create destination: $DST"
 
-    if [[ "$XFER" == disk ]]; then
-        pull_open_disk
-    else
-        xfer_open_read
-        xfer_collect "$SRC"
-    fi
+    pull_open_disk
 
     pull_copy "$SRC" "$DST"
 

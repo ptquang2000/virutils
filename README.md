@@ -15,9 +15,8 @@ step and no dependencies beyond the utilities it calls.
    - [transfer](#transfer)
    - [guest](#guest)
    - [hardware](#hardware)
-- [Transports](#transports)
-   - [Everything a transport needs, at create time](#everything-a-transport-needs-at-create-time)
-   - [Snapshots strip the domain first](#snapshots-strip-the-domain-first)
+- [How files move](#how-files-move)
+   - [Snapshots eject loaded media first](#snapshots-eject-loaded-media-first)
 - [Guest prerequisites](#guest-prerequisites)
 - [virutil sync](#virutil-sync)
    - [Synopsis](#synopsis)
@@ -30,7 +29,6 @@ step and no dependencies beyond the utilities it calls.
       - [Map rules](#map-rules)
       - [Excludes](#excludes)
       - [Cleanup rules](#cleanup-rules)
-      - [Run rules](#run-rules)
    - [Example](#example)
    - [Notes](#notes)
 - [virutil pull](#virutil-pull)
@@ -44,7 +42,6 @@ step and no dependencies beyond the utilities it calls.
    - [time](#time)
    - [port](#port)
 - [virutil usb](#virutil-usb)
-   - [usb media](#usb-media)
 - [Requirements](#requirements)
 - [See also](#see-also)
 
@@ -94,11 +91,10 @@ in one go. The layout, and what fills each subdirectory:
 | Path | Filled by |
 | --- | --- |
 | `~/.virutils/conf/` | sync configs (`sync.conf`, `NAME.conf`) |
-| `~/.virutils/images/` | domain disks (`domain create`), snapshot overlays and memory files (`snapshot`, `pull`), and the `usb media` drive image (`VM-usb.qcow2`) |
+| `~/.virutils/images/` | domain disks (`domain create`), snapshot overlays and memory files (`snapshot`, `pull`) |
 | `~/.virutils/staging/` | sync's incremental staging trees (`@staging` names) |
-| `~/.virutils/share/` | the virtiofs share directory (`virutil-<VM>`), created by the first transfer and exported to the domain from then on |
 | `~/.virutils/ports/` | `domain port` forward state and relay logs |
-| `~/.virutils/mnt/` | host mount points for guest filesystems (`<VM>`, `<VM>-usb`) |
+| `~/.virutils/mnt/` | host mount points for guest filesystems (`<VM>`) |
 
 Installation links are the exception and follow the [installation
 above](#installation): `virutil` in `~/.local/bin` and `_virutil` in the zsh
@@ -107,23 +103,23 @@ above](#installation): `virutil` in `~/.local/bin` and `_virutil` in the zsh
 ### Relocating the root
 
 Set `VIRUTILS_DIR` to move everything at once — configs, images, staging,
-shares, port state and mount points:
+port state and mount points:
 
 ```sh
 export VIRUTILS_DIR=/mnt/big/virutils
 ```
 
 Each piece can also be moved on its own (`VIRUTILS_CONF_DIR`,
-`VIRUTILS_IMAGE_DIR`, `VIRUTILS_STAGING_ROOT`, `VIRUTILS_SHARE_ROOT`,
-`VIRUTILS_PORT_DIR`, `VIRUTILS_MNT_ROOT`), each defaulting under the root. The
+`VIRUTILS_IMAGE_DIR`, `VIRUTILS_STAGING_ROOT`, `VIRUTILS_PORT_DIR`,
+`VIRUTILS_MNT_ROOT`), each defaulting under the root. The
 legacy `VIRUTIL_IMAGE_DIR` is still honoured for image placement. Existing
 configs in `~/.config/virutils/` keep working — see [virutil sync](#virutil-sync).
 
 ### A note on who owns the files
 
 Everything here is owned by you, and most of it never leaves the host. The one
-exception is anything qemu has to read or write: the domain disks, the snapshot
-overlays and memory files, and the usb drive image are all opened by the
+exception is anything qemu has to read or write: the domain disks and the
+snapshot overlays and memory files are all opened by the
 `qemu` process (usually running as `libvirt-qemu`), not just by you.
 
 libvirt relabels the *files* it opens, but never the directories above them, so
@@ -148,8 +144,9 @@ the warning simply never fires.
 ## Modules
 
 The seven modules fall into four groups, which is also the order
-`virutil help` prints them in. The three transfer modules additionally share a
-[transport](#transports) layer, which decides *how* the bytes move.
+`virutil help` prints them in. The three transfer modules additionally share the
+host-side machinery in `modules/xfer` and `modules/guest`, which is
+[how the bytes move](#how-files-move).
 
 ### domains
 
@@ -162,9 +159,9 @@ The seven modules fall into four groups, which is also the order
 
 | Module | Purpose | Usage |
 | --- | --- | --- |
-| `sync` | Fetch a project's build output from a Windows host and push it into a guest's `C:` drive. | `virutil sync VM [-c NAME\|PATH] [-t T]` |
-| `pull` | Copy a file or directory out of a **running** guest. | `virutil pull VM SRC DST [-t T]` |
-| `push` | Copy a file or directory from the host into a guest's `C:` drive. | `virutil push VM SRC DST [-t T]` |
+| `sync` | Fetch a project's build output from a Windows host and push it into a **shut-off** guest's `C:` drive. | `virutil sync VM [-c NAME\|PATH]` |
+| `pull` | Copy a file or directory out of a **running** guest. | `virutil pull VM SRC DST` |
+| `push` | Copy a file or directory from the host into a **shut-off** guest's `C:` drive. | `virutil push VM SRC DST` |
 
 ### guest
 
@@ -176,10 +173,10 @@ The seven modules fall into four groups, which is also the order
 
 | Module | Purpose | Usage |
 | --- | --- | --- |
-| `usb` | USB passthrough end to end from a Windows host under WSL: `usbipd` bind, import over `vhci_hcd`, then attach to the domain. `usb media` is the virtual counterpart: a qcow2 handed to the guest as a removable drive. | `virutil usb {list\|show\|attach\|detach\|unbind} [VM] [BUSID]`; `virutil usb media VM [-s GiB] [SRC...]` |
+| `usb` | USB passthrough end to end from a Windows host under WSL: `usbipd` bind, import over `vhci_hcd`, then attach to the domain. | `virutil usb {list\|show\|attach\|detach\|unbind} [VM] [BUSID]` |
 
-All three take `-t`/`--transport`, and all three write the same C:-shaped tree
-whichever one is chosen — see [Transports](#transports).
+All three go through the guest's own disk image, so all three write the same
+C:-shaped tree — see [How files move](#how-files-move).
 
 `virutil` alone, or `virutil help`, prints the module list. `modules/parser`
 handles the top-level dispatch plus the helpers every module shares; each
@@ -188,120 +185,76 @@ file; the rest take everything on the command line. The remainder of this
 document covers `virutil sync`, then `virutil pull`, then `virutil push`, then
 `virutil domain`.
 
-## Transports
+## How files move
 
-`sync`, `pull` and `push` describe *what* to move. A transport decides *how*,
-and the two differ in what they need from the guest rather than in what they
-achieve. `-t`/`--transport` picks one; **`virtiofs` is the default**.
+`sync`, `pull` and `push` differ in *what* they move; they all move it the same
+way. The host attaches the guest's own qcow2 with `qemu-nbd`, mounts its largest
+NTFS partition with `ntfs-3g`, and reads or writes that directly. Nothing runs
+inside the guest, so a transfer needs no guest agent, no drivers and no guest
+networking — and the mount *is* `C:`, so there is no second copy step afterwards.
 
-There is no fallback. A transport that cannot work is an error naming the fix,
-never a silent downgrade — turning "copy a file" into "reboot Windows" behind
-your back is not a fallback. So `virtiofs` being the default makes its
-[guest prerequisites](#guest-prerequisites) a prerequisite of the tool.
+The one thing that follows from this is the state the guest has to be in, and
+the two directions need opposite ones:
 
-| | `disk` | `virtiofs` |
+| | write (`sync`, `push`) | read (`pull`) |
 | --- | --- | --- |
-| Guest must be | already shut off to write, running to read | running |
-| Who writes `C:` | the host, through `ntfs-3g` | the guest, `robocopy` |
-| Host side | `qemu-nbd` on the guest's own qcow2 | `virtiofsd` |
-| Guest side | nothing | the agent, WinFsp, viofs |
-| Domain change | none | shared-memfd RAM (**cold**) plus a share device, attached once and kept |
-| Fixed cost per run | you shut the guest down and boot it again | none |
+| Guest must be | **shut off** | **running** |
+| What is mounted | the disk image itself, read-write | a frozen snapshot of it, read-only |
+| Guest side | nothing | nothing |
+| Fixed cost per run | you shut the guest down and start it again | none |
 
-**`disk`** is the original, and the one that needs nothing at all from
-inside the guest — which is what makes it the one to ask for when there is no
-agent, no drivers, or the guest will not boot. For a write it needs the guest
-**already shut off**: it mounts the guest's NTFS over `qemu-nbd` and copies.
-It never shuts the guest down for you and never starts it again afterwards —
-a guest that is not shut off is an error, not a reboot. For a read it leaves
-the guest running and reads a frozen snapshot instead.
+**Writing** needs the guest **already shut off**. A running guest holds the same
+qcow2 open, and two writers on one image is the one mistake nothing here can
+undo. virutil never shuts a guest down for you and never starts it again
+afterwards: a guest in any other state is an error naming the fix, not a reboot.
+It may be mid-install, mid-update or holding unsaved work, and that is not a
+decision this tool can make for you.
 
-**`virtiofs`** exports a host directory the running guest sees live, so nothing
-is copied twice. It is the default. It needs WinFsp and the viofs driver in the
-guest, `virtiofsd` on the host, and guest RAM on a shared memfd — which
-`virutil domain create` sets up by default, but which an older domain can only
-gain through a full stop and start.
+```sh
+virutil domain shutdown win11     # wait for it to reach 'shut off'
+virutil push win11 ./f.txt 'C:\'
+virutil domain start win11
+```
 
-The share device is attached **once**, by the first transfer that needs it, and
-attached to the domain's definition as much as to the running guest. Every
-transfer after that finds it already there. So it comes up with the guest, holds
-one drive letter for the life of the domain, and is unaffected by a snapshot
-revert — which is what makes a transfer mean the same thing twice, rather than
-re-enumerating a fresh device onto whichever letter is free that run.
+**Reading** leaves the guest running throughout. A disk-only external snapshot
+redirects the guest's writes to an overlay, freezing the base image at a
+checkpoint; the base is attached read-only, mounted, copied out, and the overlay
+is folded back in with `virsh blockcommit` before the run ends — on success and
+on failure. See [virutil pull](#virutil-pull).
 
-The one place it comes off again is `virutil snapshot create`. An external
-snapshot writes the guest's memory through the same machinery as a migration,
-and a vhost-user device — virtio-fs among them — carries a migration blocker in
-qemu, so the snapshot fails outright rather than degrading. `snapshot create`
-unplugs the share, waits for the guest to acknowledge the eject, takes the
-snapshot and plugs it back — along with [ejecting any loaded
-media](#snapshots-strip-the-domain-first), for a different reason. A revert then
-comes back to a guest without the share, since that is the state the record was
-taken in; the next transfer attaches one again, exactly as the first ever
-transfer did.
+There is nothing to pick and nothing to configure. Earlier versions carried a
+second, live transport over virtio-fs, selected with `-t`/`--transport` or
+`@transport`. It is gone, and with it the share device, the shared-memfd memory
+backing it needed, and sync's `>pre`/`>post` run rules — those ran through the
+guest agent, which needs a running guest, which is precisely what a write is
+not. A config still carrying `@transport` or a `>` rule is rejected with its
+line number rather than quietly ignored, and `-t` is no longer accepted on the
+command line.
 
-It is not defined by `virutil domain create`, because at that point nothing it
-needs exists yet: no `virtiofsd` has been looked for, and a guest still being
-installed from an ISO has neither WinFsp nor the viofs driver. A device that
-cannot work would sit in the definition anyway, pinning the host directory it
-exports for the life of the domain. The first transfer is where all of that has
-just been checked.
-
-What `virutil domain create` *does* set up is the shared-memfd memory backing,
-because that one is cold: it cannot be added to a running domain at all, and a
-reboot from inside the guest will not pick it up. A domain created with
-`VIRUTIL_SHARED_MEMORY=0`, or one predating this, needs it added with the domain
+A domain created by an older virutil may still have a `virtio-fs` share in its
+definition. Nothing here uses it, and libvirt will refuse to start the domain if
+the directory it exports has since been removed; strip it once, with the domain
 shut off:
 
 ```sh
-# libvirt refuses a virtio-fs device outright on a domain without it
-# ("'virtiofs' requires shared memory").
-virt-xml --connect qemu:///system VM --edit --define \
-  --memorybacking access.mode=shared,source.type=memfd
+virsh --connect qemu:///system dumpxml VM     # find the <filesystem> element
+virt-xml --connect qemu:///system VM --remove-device --filesystem all --define
 ```
 
-That takes effect at the next full start, not at a reboot from inside the guest.
-Then the next `sync`, `pull` or `push` attaches the share itself.
+`virutil domain delete` sweeps the leftover share directory either way.
 
-`virutil` finds the share by its target tag, `virutil-xfer`, and takes the source
-directory from the domain's own XML — so a share attached by hand, or one
-pointing somewhere `virutil` would not have picked, is used as it is rather than
-duplicated.
+### Snapshots eject loaded media first
 
-### Everything a transport needs, at create time
-
-A domain from `virutil domain create` carries the parts of the default transport
-that *cannot* be added later: the guest-agent channel and the shared-memfd
-memory backing, neither of which a running domain can take — the channel needs a
-cold plug, `memoryBacking` a full stop and start.
-
-The virtio-fs share device is deliberately not among them. It hotplugs cleanly,
-so nothing is lost by waiting, and by waiting it is only ever added once its
-host and guest halves are known to be installed. The first transfer attaches it
-and persists it, and it behaves from then on exactly as if it had been defined
-here — same share, same drive letter, from every boot.
-
-The `usb media` drive stays hotplug-only *and* per-run, since a permanently
-attached one would be a second writer on an image the host has to mount. No
-device here needs domain preparation — `q35` comes with fourteen
-`pcie-root-port`s and a Windows guest uses six.
-
-What remains outside the XML entirely is guest-side software: `qemu-ga` (the
-virtio-win MSI), and WinFsp plus the viofs driver for `virtiofs`.
-
-### Snapshots strip the domain first
-
-`virutil snapshot create` takes two things off the running guest before it asks
-libvirt for anything, and puts both back afterwards. Neither touches the
-domain's definition, and both are there because an external snapshot cannot
-carry them:
+`virutil snapshot create` takes one thing off the running guest before it asks
+libvirt for anything, and puts it back afterwards. It does not touch the
+domain's definition, and it is there because an external snapshot cannot carry
+it:
 
 | Removed | Why |
 | --- | --- |
-| the virtio-fs share | The memory image is written through the same machinery as a migration, and a vhost-user device carries a migration blocker in qemu. The snapshot does not degrade — it fails. |
 | any loaded cdrom or floppy | A **revert** does not reuse the overlay the create made. It builds a fresh one per disk, named `<source>.<epoch>`, **in the source's own directory** — so a loaded ISO means an overlay written next to the ISO. |
 
-That second one is why an ISO kept under `/mnt/c` breaks a revert. The path is a
+That is why an ISO kept under `/mnt/c` breaks a revert. The path is a
 9p mount, libvirt cannot label a file it has just created there, and the revert
 fails *half-done*: memory restored, disk switched back to the base image, no new
 overlay over it, guest left paused. Unpause it and the guest writes straight
@@ -315,34 +268,32 @@ Windows locks the tray of a disc it has mounted.
 
 The consequence to know about: a revert restores the configuration in the
 record, which was written mid-eject, so the guest comes back with empty drives
-and no share, and libvirt drops both from the definition on its way past. The
-share the next transfer attaches again on its own. The ISOs it does not — they
-are install media, and a domain that is past Windows Setup has no further use
-for them.
+and libvirt drops them from the definition on its way past. That is no loss —
+they are install media, and a domain past Windows Setup has no further use for
+them.
 
 
 ## Guest prerequisites
 
-Four pieces of software go **inside** the Windows guest. Three of them come off
-the `virtio-win` ISO; WinFsp and the SPICE guest tools are downloaded
-separately. `virutil domain create` attaches that ISO as a second cdrom
-automatically, so on a fresh install it is already in the guest's drive list;
-otherwise download it once:
+Three pieces of software go **inside** the Windows guest. Two of them come off
+the `virtio-win` ISO; the SPICE guest tools are downloaded separately.
+`virutil domain create` attaches that ISO as a second cdrom automatically, so on
+a fresh install it is already in the guest's drive list; otherwise download it
+once:
 
 - `virtio-win.iso` — <https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso>
-- WinFsp — <https://winfsp.dev>
 - SPICE guest tools — <https://www.spice-space.org/download/windows/spice-guest-tools/spice-guest-tools-latest.exe>
+
+None of it is needed to move files: `sync`, `pull` and `push` work on the disk
+image from the host and never talk to the guest. What the agent buys you is
+`virutil exec`, `virutil domain time`, `virutil domain port` on a statically
+addressed guest, and `virsh shutdown --mode agent`.
 
 | What | Where it comes from | Needed by |
 | --- | --- | --- |
 | **virtio drivers** (`viostor`, `NetKVM`) | `virtio-win` ISO, or `virtio-win-guest-tools.exe` on it | booting at all — the installer cannot see a virtio disk without `viostor` |
-| **QEMU guest agent** (`qemu-ga`) | `virtio-win-guest-tools.exe`, or `guest-agent\qemu-ga-x86_64.msi` on the ISO | `virutil exec` and the `virtiofs` transport |
+| **QEMU guest agent** (`qemu-ga`) | `virtio-win-guest-tools.exe`, or `guest-agent\qemu-ga-x86_64.msi` on the ISO | `virutil exec`, `virutil domain time`, and `virsh shutdown --mode agent` |
 | **SPICE guest agent** (`spice-vdagent`) | [spice-guest-tools](https://www.spice-space.org/download/windows/spice-guest-tools/spice-guest-tools-latest.exe) | the `spice` display and `spicevmc` channel of every `virutil domain create` domain — clipboard sharing and display auto-resize |
-| **WinFsp** | <https://winfsp.dev> — install this **first** | `virtiofs` |
-| **viofs driver + `VirtioFsSvc`** | `viofs\<os>\amd64\` on the `virtio-win` ISO | `virtiofs` |
-
-The order matters for the last two: the viofs driver is a WinFsp file-system
-driver and will not install usefully without WinFsp already there.
 
 **During Windows Setup**, when no disk is listed, use *Load driver* → the
 `virtio-win` CD → `amd64\<os>` to load `viostor`.
@@ -357,35 +308,21 @@ E:\virtio-win-guest-tools.exe /install /quiet
 That single installer covers the drivers and `qemu-ga`. Then install the SPICE
 guest tools (`spice-guest-tools-latest.exe`) from an elevated prompt — without
 the `spice-vdagent` there is no clipboard sharing and the display does not
-auto-resize. Then, for `virtiofs`:
-
-1. Install WinFsp (`winfsp-<version>.msi`), keeping the default components.
-2. Install the viofs driver: right-click `E:\viofs\<os>\amd64\viofs.inf` →
-   *Install*, or run `pnputil /add-driver E:\viofs\<os>\amd64\viofs.inf /install`.
-3. Confirm the service exists — `virutil` starts it itself, but it has to be
-   there to start:
-
-```
-sc query VirtioFsSvc
-```
+auto-resize.
 
 The guest-agent channel itself is part of every domain `virutil domain create`
-makes, so nothing has to be added on the host side. Confirm the whole path from
-the host:
+makes, so nothing has to be added on the host side. Confirm it from the host:
 
 ```
 virutil exec ping VM        # the agent answers
-virutil push VM ./f.txt C:\   # the default transport works end to end
 ```
 
-`virutil` reports exactly which of these is missing when a transport cannot
-start, so there is no need to check them pre-emptively.
-
-Two settings in Windows also matter, both for the `disk` transport only:
+Two settings in Windows matter for every transfer, and these are not optional:
 
 - **Fast Startup must be off** (`powercfg /h off`). With it on, Windows leaves
    the NTFS volume dirty on shutdown and `ntfs-3g` refuses to mount it
-   read-write.
+   read-write — which makes `sync` and `push` fail on a guest that is properly
+   shut off.
 - **A single disk** whose system volume is the largest NTFS partition on it.
 
 ## virutil sync
@@ -393,7 +330,7 @@ Two settings in Windows also matter, both for the `disk` transport only:
 ### Synopsis
 
 ```
-virutil sync VM [-c NAME|PATH] [-t disk|virtiofs]
+virutil sync VM [-c NAME|PATH]
 virutil sync -h
 ```
 
@@ -401,7 +338,8 @@ virutil sync -h
 
 `virutil sync` copies a build tree into a **powered-off** Windows guest by
 mounting its disk on the host, so nothing has to run inside the guest — no
-network, no shares, no guest agent. It works in two halves:
+network, no shares, no guest agent. See [How files move](#how-files-move). It
+works in two halves:
 
 ```
 Windows build tree --(fetch)--> staging dir --(map)--> guest NTFS
@@ -436,7 +374,6 @@ need no privilege of their own.
 | Option | Description |
 | --- | --- |
 | `-c`, `--config NAME\|PATH` | Config to use. A value containing `/` is a path, taken as given. Anything else names a config, looked up in `~/.virutils/conf/` first and then `~/.config/virutils/`, with `.conf` appended when absent — so `-c win11` reads `~/.virutils/conf/win11.conf` if it exists, else `~/.config/virutils/win11.conf`. Defaults to `sync.conf`, resolved the same way. |
-| `-t`, `--transport T` | How to move the files: `virtiofs` (default) or `disk`. See [Transports](#transports). Overrides `@transport` in the config. |
 | `-h`, `--help` | Print usage and exit. |
 
 The domain is an argument rather than a config setting, so one config —
@@ -478,7 +415,6 @@ unknown setting or an unrecognised directive is reported with its line number.
 | `globs\|subdir` | Map: copy `<staging>/globs` into `<@dest>/subdir` in the guest. |
 | `!pat pat ...` | `rsync --exclude` patterns, applied to both the fetch and the map. |
 | `-path` | Empty this guest directory after copying. The directory itself is kept. |
-| `>pre CMD` / `>post CMD` | Run `CMD` inside the guest, before or after the files land. |
 
 Map rules are the only unsigilled form. A line starting with punctuation that is
 not one of the sigils above is treated as a mistyped directive, not as a glob,
@@ -493,7 +429,6 @@ and is rejected.
 | `@dest` | no | *(empty)* | Install directory in the guest, relative to `C:\`. Every map destination hangs off it, so the install path is spelled once. Empty means the root of `C:`. |
 | `@nbd` | no | `/dev/nbd0` | NBD device used to attach the disk image. |
 | `@mnt` | no | `~/.virutils/mnt/<VM>` | Host mount point for the guest filesystem. |
-| `@transport` | no | `virtiofs` | Default transport for this config. `-t` on the command line wins. |
 
 #### Fetch rules
 
@@ -550,37 +485,6 @@ Two safety rules apply, so a mistyped pattern cannot empty a top-level
 directory: the expansion must stay inside the mount point, and it must be at
 least two levels deep.
 
-#### Run rules
-
-```
->pre  Stop-Service -Name ExampleSvc -Force
->post Start-Service -Name ExampleSvc
->post & 'C:\Program Files (x86)\Example\Product\setup.exe' /S
-```
-
-Each line is a PowerShell command run **inside the guest**, through the same
-guest-agent path as [`virutil exec ps`](#virutil-exec) — as `SYSTEM`, with the
-guest's output printed here. The phase keyword comes first and is required:
-
-| Phase | When it runs |
-| --- | --- |
-| `pre` | After the fetch and the staging copy, immediately before the files reach the guest's `C:`. This is where a service is stopped or a running binary is killed, so the delivery does not hit a locked file. |
-| `post` | After the delivery *and* after the cleanup rules — so an installer or a service start sees the final state. |
-
-Rules run in the order they appear in the config, and the first one that exits
-non-zero aborts the run: a rule exists to make the copy land correctly, so
-carrying on past one that did not happen would report success on a
-half-installed guest.
-
-The phase is spelled out rather than defaulted because a command is free text —
-`>Stop-Service ...` could not be told apart from a missing keyword. `#` still
-starts a comment on these lines, so a command cannot contain one.
-
-Run rules need the guest **running**, with the guest agent answering, so they
-work only under the `virtiofs` transport. A config with run rules under
-`-t disk` is rejected before the fetch starts, since that transport writes to
-the image of a guest that is shut off.
-
 ### Example
 
 `~/.virutils/conf/sync.conf`:
@@ -603,10 +507,6 @@ helper.exe|helpers
 
 # cleanup: start the guest with no stale logs
 -ProgramData/Example/logs
-
-# run: free the locked binary first, put the service back afterwards
->pre  Stop-Service -Name ExampleSvc -Force
->post Start-Service -Name ExampleSvc
 ```
 
 Then:
@@ -628,7 +528,7 @@ Or, keeping several profiles side by side, and pointing them at any guest:
 leaves the NTFS volume dirty on shutdown and `ntfs-3g` refuses to mount it
 read-write.
 
-**Under `-t disk` the guest must already be shut off**, and stopping and
+**The guest must already be shut off**, and stopping and
 starting it is yours to do. A guest in any other state — running, paused,
 pmsuspended — is a hard error before the fetch starts, not something the run
 resolves by shutting Windows down. Writing to the qcow2 of a guest that has it
@@ -638,7 +538,7 @@ holding unsaved work. So the sequence is spelled out:
 
 ```
 virutil domain shutdown win11     # wait for it to reach 'shut off'
-virutil sync win11 -t disk
+virutil sync win11
 virutil domain start win11
 ```
 
@@ -651,9 +551,9 @@ on the next run, and an interrupted write can leave the guest unbootable. If
 you decide to force it, do that by hand and expect to boot Windows once to let
 it check the volume.
 
-**Install `qemu-guest-agent` in the guest.** Nothing in the `disk` transport
-needs it now that the shutdown is yours, but `virutil exec` and the `virtiofs`
-transport both require it outright — and it is what lets you shut the guest
+**Install `qemu-guest-agent` in the guest.** Nothing in a transfer needs it —
+the copy is made from the host with the guest shut off — but `virutil exec`
+requires it outright, and it is what lets you shut the guest
 down with `virsh --connect qemu:///system shutdown VM --mode agent`, which
 calls Windows' own shutdown with applications forced closed rather than an
 ACPI power-button event Windows is free to deliberate over. Either way it is a
@@ -720,13 +620,13 @@ location.
 ## virutil pull
 
 `pull` is `push` reversed: copy one file or directory out of a **running**
-guest's `C:` drive onto the host, over any of the three
-[transports](#transports). It never powers the guest off.
+guest's `C:` drive onto the host. It never powers the guest off, and nothing
+runs inside the guest — see [How files move](#how-files-move).
 
 ### Synopsis
 
 ```
-virutil pull VM SRC DST [-t disk|virtiofs]
+virutil pull VM SRC DST
 virutil pull -h
 ```
 
@@ -757,15 +657,10 @@ virutil pull win11 'Users/me/Desktop/note.txt' ~/
 Quote the source in the shell: the wildcards are for the guest to match, not
 the host.
 
-### Transports
+### How the read is taken
 
-Under `virtiofs` (the default) the guest does the reading: the path is
-resolved *in Windows* and `robocopy`'d into the share, which the host then
-reads. That is file-level consistency, and it needs
-the agent.
-
-Under `--transport disk` nothing runs inside the guest at all — no agent, no
-power-state change — and the host reads a frozen snapshot instead:
+Nothing runs inside the guest at all — no agent, no power-state change. The host
+reads a frozen snapshot instead:
 
 ```
 guest NTFS --(snapshot freezes base)--> base qcow2 --(ro mount)--> host DST
@@ -780,12 +675,9 @@ it would have been. The guest never stops writing through it.
 
 ### Notes
 
-**The guest must be running**, under every transport. `pull` dies on any other
-state. There is no managed-save or paused-state special case: those states are
-simply not `running`, and are refused.
-
-**The notes below apply to `--transport disk` only.** The live transports take
-no snapshot, so none of it is relevant to them.
+**The guest must be running.** `pull` dies on any other state. There is no
+managed-save or paused-state special case: those states are simply not
+`running`, and are refused.
 
 **The checkpoint is at the QCOW2 level, not the filesystem level.** The base
 image freezes whatever Windows has already flushed to disk. A file whose data
@@ -809,20 +701,19 @@ single-disk assumption `sync` documents.
 ## virutil push
 
 `push` is `sync`'s second half on demand: copy one file or directory from the
-host into a guest's `C:` drive with no config file, over any of the three
-[transports](#transports). It exists for the cases that do not deserve a config:
-a config file you edited by hand, a build artifact you want in the guest right
-now, a one-off test file.
+host into a guest's `C:` drive with no config file. It exists for the cases that
+do not deserve a config: a config file you edited by hand, a build artifact you
+want in the guest right now, a one-off test file.
 
-The guest keeps running under the default transport. `--transport disk` is the
-offline path: with the guest **already shut off**, attach its qcow2 with
-`qemu-nbd`, mount the NTFS, copy, and leave it shut off for you to start again.
-A guest that is not shut off is an error — `push` will not shut it down.
+With the guest **already shut off**, it attaches its qcow2 with `qemu-nbd`,
+mounts the NTFS, copies, and leaves it shut off for you to start again. A guest
+that is not shut off is an error — `push` will not shut it down. See
+[How files move](#how-files-move).
 
 ### Synopsis
 
 ```
-virutil push VM SRC DST [-t disk|virtiofs]
+virutil push VM SRC DST
 virutil push -h
 ```
 
@@ -861,16 +752,13 @@ ending in `/` or `\` always means a directory, even one that does not exist yet.
 
 ### Notes
 
-`push` shares every safety rule `sync` documents, wholesale, and the rules that
-matter depend on the transport. Under `disk`: it must be run as yourself, not
-under `sudo`; a running guest is shut down through the guest agent (ACPI as a
-fallback, never a forced power-off) and restarted only once the disk is provably
-free; a domain with a managed-save image, and paused or suspended domains, are
-refused; Fast Startup must be off. That machinery lives in the shared
-`modules/guest`. Under `virtiofs` none of it applies — the guest is never
-stopped, and nothing but the share directory is touched on the host. There are no
-excludes — `push` copies exactly what you name, which is the point of having it
-at all.
+`push` shares every safety rule `sync` documents, wholesale: it must be run as
+yourself, not under `sudo`; the guest must already be shut off, and a running,
+paused or suspended one is refused rather than shut down; a domain with a
+managed-save image is refused; teardown is verified from observed state before
+you are told the disk is free; Fast Startup must be off. That machinery lives in
+the shared `modules/guest`. There are no excludes — `push` copies exactly what
+you name, which is the point of having it at all.
 
 ## virutil domain
 
@@ -946,34 +834,13 @@ What the profile actually sets, and why:
 - **No balloon, no HPET, `rtc_tickpolicy=catchup`.** Two emulated devices a
    Windows guest does not need, and a clock policy that replays missed ticks
    rather than dropping them.
-- **Guest RAM backed by a shared memfd**
-   (`<memoryBacking><access mode='shared'/><source type='memfd'/>`), because a
-   vhost-user device — **virtio-fs** above all — cannot attach to a guest whose
-   memory the host cannot map, and `memoryBacking` is a *cold* setting: adding
-   it to an existing domain costs a full shutdown and start. Carrying it is free
-   (the memfd is sized, not preallocated, so an idle guest uses no more host
-   memory than before). `VIRUTIL_SHARED_MEMORY=0` opts out, and with it goes any
-   later chance of a virtio-fs share short of a stop and start.
 - **The qemu-guest-agent channel** (`org.qemu.guest_agent.0`). `virt-manager`
-   does not add it and nothing inside the guest can, yet the `virtiofs`
-   transport needs it — it is what runs the copy in Windows — and it is also
-   what makes `virsh shutdown --mode agent` Windows' own shutdown with apps
-   forced closed, rather than an ACPI event the guest may sit on. It costs one
-   virtio-serial port, so it is not optional and there is no flag to leave it
-   out.
-- **No virtio-fs share device, yet.** It is not part of `domain create` — a
-   guest still being installed has neither WinFsp nor the viofs driver, and the
-   host may have no `virtiofsd`, so defining one here would put a device in the
-   definition that cannot work and pin a host directory to it besides. The first
-   `sync`, `pull` or `push` attaches it instead, tagged `virutil-xfer`, pointed
-   at `$VIRUTILS_DIR/share/virutil-VM`, and persisted to the definition in the
-   same breath — so it is attached once in a domain's life, not once per
-   transfer. From then on it behaves as a defined device does: enumerated at
-   boot, one drive letter for the life of the domain, unaffected by a snapshot
-   revert. The cost is one PCIe port, an idle `virtiofsd` per running domain, and
-   a directory that is empty except during a transfer — virutil clears it at both
-   ends of every run, so nothing it carried stays readable in the guest
-   afterwards.
+   does not add it and nothing inside the guest can, yet it is what
+   `virutil exec` talks to, what sets the guest clock, and what makes
+   `virsh shutdown --mode agent` Windows' own shutdown with apps forced closed
+   rather than an ACPI event the guest may sit on. It needs a cold plug, so it
+   cannot be added to a running domain later. It costs one virtio-serial port,
+   so it is not optional and there is no flag to leave it out.
 - **`--network network=default,model=virtio`**, overridable with
    `$VIRUTIL_NETWORK`. On a host where libvirt's default NAT network is not
    available — WSL2 often, where the `nf_nat` modules may be missing — SLIRP
@@ -999,15 +866,14 @@ profile once, or prefix a single `create` with them.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `VIRUTILS_DIR` | `~/.virutils` | Root of everything virutil leaves on the host. Moves configs, images, staging, shares, port state and mount points at once. See [Artifacts and state](#artifacts-and-state). |
+| `VIRUTILS_DIR` | `~/.virutils` | Root of everything virutil leaves on the host. Moves configs, images, staging, port state and mount points at once. See [Artifacts and state](#artifacts-and-state). |
 | `VIRUTILS_IMAGE_DIR` | `$VIRUTILS_DIR/images` | The images directory. |
 | `VIRUTIL_IMAGE_DIR` | `$VIRUTILS_IMAGE_DIR` | Legacy name, still honoured: where a domain's disk image goes, and where `snapshot` writes overlays. |
 | `VIRUTIL_OSINFO` | `win11` | Fallback libosinfo id when the ISO is not recognised. |
 | `VIRUTIL_VIRTIO` | `virtio-win*.iso` beside the install ISO | Default for `-v`: driver ISO to attach as a second cdrom, or `none`. |
 | `VIRUTIL_NETWORK` | `network=default,model=virtio` | Passed to `virt-install --network`. |
 | `VIRUTIL_FIRMWARE` | `uefi` | `bios` selects SeaBIOS instead. Windows 11 will not install without UEFI. |
-| `VIRUTIL_SHARED_MEMORY` | `1` | `0` leaves guest RAM on private anonymous memory, which makes virtio-fs impossible without a later cold restart — no share can be attached to the domain until it is put back. |
-| `VIRUTIL_TIME_SYNC` | `1` | `0` stops virutil syncing the guest clock on its own — after a snapshot revert, and before a transfer. See [time](#time). |
+| `VIRUTIL_TIME_SYNC` | `1` | `0` stops virutil syncing the guest clock on its own after a snapshot revert. See [time](#time). |
 | `VIRUTIL_TIME_SYNC_WAIT` | `60` | Seconds to wait for the guest agent after a snapshot revert before giving up on the clock. |
 
 ```
@@ -1035,9 +901,8 @@ under `~/.virutils/`, each found by the same name the module that wrote it uses:
 | Artifact | Path |
 | --- | --- |
 | Snapshot overlays and memory files | `images/VM.SNAP.*.qcow2`, `images/VM.SNAP.mem` |
-| `usb media` drive image | `images/VM-usb.qcow2` |
-| `virtiofs` share directory | `share/virutil-VM/` |
-| Host mount points | `mnt/VM`, `mnt/VM-usb` |
+| Host mount points | `mnt/VM`, and `mnt/VM-usb` and `mnt/VM-xfer` if an older virutil left them |
+| Leftovers of removed commands | `images/VM-usb.qcow2`, `images/VM-xfer.qcow2`, `share/virutil-VM/` |
 | Open port forwards | the `socat` relay, plus `ports/tcp-PORT` and its `.log` |
 
 A still-mounted mount point is unmounted lazily first, and only ever `rmdir`'d —
@@ -1164,21 +1029,18 @@ time provider it would use is a Hyper-V device KVM does not present, which
 leaves `w32tm`, whose own resync schedule is measured in hours and needs a
 reachable time server it may not have.
 
-That skew is not cosmetic here, because timestamps are what every transfer
-compares. `rsync` and `robocopy` both skip a file whose destination is not older
-than the source, so a guest running *ahead* of the host turns `sync` and `push`
-into silent no-ops, and one running *behind* does the same to `pull`. So virutil
-syncs the clock at the two points the skew appears:
+That skew is not cosmetic. `rsync` skips a file whose destination is not older
+than the source, so a guest whose clock ran ahead while it was up leaves
+timestamps on `C:` that a later transfer reads as newer than the host's. So
+virutil syncs the clock at the point the skew appears:
 
 - after `virutil snapshot revert`, waiting up to `VIRUTIL_TIME_SYNC_WAIT`
-   seconds (default 60) for the agent to come back up with the guest;
-- before every `sync`, `pull` and `push` over the `virtiofs` transport, where the agent is already known to be answering, so it costs one
-   round trip and never waits.
+   seconds (default 60) for the agent to come back up with the guest.
 
 A guest already within two seconds of the host is left alone and nothing is
-printed. The `disk` transport is not included: it writes the guest's filesystem
-from the host with the guest shut down, and a guest reads the host's RTC when it
-boots. `VIRUTIL_TIME_SYNC=0` turns off all of the automatic ones;
+printed. Transfers do not sync the clock themselves: they are made from the host
+against a shut-off or snapshotted disk, and a guest reads the host's RTC when it
+boots. `VIRUTIL_TIME_SYNC=0` turns off the automatic sync;
 `virutil domain time` ignores it, since asking by name is not automatic.
 
 Under the hood this is `virsh domtime --now`, not `--sync`: `--sync` re-reads
@@ -1235,10 +1097,9 @@ own firewall allows the port — no host-side plumbing works around either.
 
 ## virutil usb
 
-Two families under one command. The passthrough half manages physical devices
-shared from Windows: `usbipd` binds a device on Windows, imports it into WSL
-over `vhci_hcd`, and attaches it to the domain as a USB host controller device;
-`detach` and `unbind` hand it back.
+Physical USB devices shared from the Windows host: `usbipd` binds a device on
+Windows, imports it into WSL over `vhci_hcd`, and attaches it to the domain as a
+USB host controller device; `detach` and `unbind` hand it back.
 
 ```
 virutil usb list
@@ -1256,50 +1117,6 @@ Administrator on Windows, and a bind is persistent — expect one UAC prompt per
 physical device ever. A `detach` stops short of unbinding: the device stays
 usable in Windows.
 
-### usb media
-
-`usb media` is the virtual counterpart: no physical device, just a sparse qcow2
-the host fills over qemu-nbd and hands to the guest as a `usb-storage` device,
-which Windows lists under **removable media**.
-
-```
-virutil usb media VM [-s GiB] [-f TYPE] [SRC...]
-virutil usb media VM --mount
-virutil usb media VM --eject
-virutil usb media VM --detach
-```
-
-| Argument | Meaning |
-| --- | --- |
-| `SRC...` | Host files and directories to copy into the drive before it is attached; each keeps its basename at the drive's root. |
-| `-s`, `--size` | Drive size in GiB, honored only when the image is first created (default 4). Ignored once it exists. |
-| `-f`, `--fs` | Filesystem when the image is first created: `exfat`, `ntfs`, `fat32`, or `guest` (let Windows format it). Defaults to exfat when the host can, else ntfs, else guest. Ignored once it exists. |
-
-Run with no options: the drive is created once per VM and kept, filled from
-`SRC` (empty if none), and attached to the **running** VM as removable media.
-Idempotent: if the drive is already attached, nothing happens. `--mount` is the
-host half for hand-filling — it works with the domain shut off, mounts the
-image at `~/.virutils/mnt/VM-usb`, and prints the command that hands it over
-afterwards. `--eject` flushes and detaches the drive in the guest, keeping the
-image; `--detach` unmounts and releases it on the host, refusing while the
-guest still has it.
-
-The host and the guest take strict turns with the drive: it is never mounted
-on the host while it is attached in the guest, and the handover refuses if
-either probe still holds the image. The image lives at
-`~/.virutils/images/VM-usb.qcow2`, 4 GiB and sparse, created and formatted on
-first use and kept afterwards. Delete it to rebuild it.
-
-Formatting is one GPT partition spanning the disk, exFAT when the host can
-(an in-kernel driver on both sides, where NTFS on the host is FUSE), NTFS otherwise,
-and Windows itself when neither exists — the last attaches the blank drive
-once and runs `Initialize-Disk`/`Format-Volume` inside the guest, which always
-formats NTFS. `-f`/`--fs` overrides the policy with one of `exfat`, `ntfs`,
-`fat32` or `guest`, and the choice sticks to the image once made. The guest
-must be running with the [QEMU guest agent](#guest-prerequisites) answering
-for both the in-guest fallback and `--eject`, since the agent is what flushes
-the drive before it is detached.
-
 ## Requirements
 
 Host:
@@ -1312,12 +1129,6 @@ Host:
    `mount`)
 - `sudo`, for the privileged commands listed under
    [Description](#description)
-
-Host, per [transport](#transports):
-
-- `virtiofs` (**the default**) — `virtiofsd`, found at `/usr/lib/virtiofsd`,
-   `/usr/libexec/virtiofsd` or on `PATH`
-- `disk` — nothing further
 
 Host, for `virutil domain`:
 
@@ -1335,17 +1146,14 @@ Host, for `virutil domain`:
 Guest — see [Guest prerequisites](#guest-prerequisites) for where each of
 these comes from and how to install it:
 
-- WinFsp and the virtio-win viofs driver, for `virtiofs` (the default) — and
-   therefore for `sync`, `pull` and `push` as they are normally used
-- The QEMU guest agent, for `virutil exec` and for the `virtiofs` transport,
-   which runs the guest-side copy through it. Still worth having for `disk`,
-   where it is what lets you shut the guest down with `--mode agent` instead of
-   waiting on ACPI
+- The QEMU guest agent, for `virutil exec`, `virutil domain time`, and shutting
+   the guest down with `--mode agent` instead of waiting on ACPI. No transfer
+   needs it
 - The SPICE guest tools, for the `spice` display and `spicevmc` channel every
    `virutil domain create` guest has — without the vdagent there is no
    clipboard sharing and the display does not auto-resize
-- For the `disk` transport only: Windows with Fast Startup disabled, and a
-   single disk whose system volume is the largest NTFS partition on it
+- For every transfer: Windows with Fast Startup disabled, and a single disk
+   whose system volume is the largest NTFS partition on it
 
 The `org.qemu.guest_agent.0` channel itself is part of every domain
 `virutil domain create` makes; nothing has to be added on the host side.

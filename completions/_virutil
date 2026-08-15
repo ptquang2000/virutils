@@ -103,12 +103,10 @@ _virutil_sync() {
   local state line
   _arguments \
     '(-c --config)'{-c,--config}'[config NAME or PATH]:config:->config' \
-    '(-t --transport)'{-t,--transport}'[how to move the files]:transport:->transport' \
     '(-h --help)'{-h,--help}'[print usage and exit]' \
     '2:domain:->domain'   # 1 is the module word itself; _arguments skips words[1]
   case $state in
     domain) _virutil_domains ;;
-    transport) _virutil_transports ;;
     config)
       if [[ $PREFIX == */* ]]; then
         _files
@@ -129,36 +127,17 @@ _virutil_sync() {
 # pull and push take the same shape: VM SRC DST. Only the side each path lives
 # on differs, so only the middle argument completes differently.
 _virutil_pull() {
-  case $words[CURRENT-1] in
-    -t|--transport) _virutil_transports; return ;;
-  esac
   case $CURRENT in
     3) _virutil_domains ;;
     4) ;;                             # the guest-side source: nothing to complete
     5) _files -/ ;;
-    *) _values 'option' \
-         '(-t --transport)'{-t,--transport}'[how to move the files]' ;;
   esac
-}
-
-_virutil_transports() {
-  _values 'transport' \
-    'virtiofs[a live virtio-fs share (default)]' \
-    'disk[the guest'\''s own disk over qemu-nbd; needs it shut off]'
 }
 
 # Sizes are free-form numbers, so the best a completion can do is offer sensible
 # round values and let anything else be typed over them.
 _virutil_size() {
   _values -w 'GiB' 32 64 128 256 512
-}
-
-_virutil_fs() {
-  _values -w 'filesystem' \
-    'exfat:Windows-native removable media format (needs exfatprogs)' \
-    'ntfs:NTFS (needs ntfs-3g)' \
-    'fat32:universal, 4 GiB file limit (needs dosfstools)' \
-    'guest:let Windows format the drive'
 }
 
 _virutil_memory() {
@@ -172,15 +151,10 @@ _virutil_vcpus() {
 }
 
 _virutil_push() {
-  case $words[CURRENT-1] in
-    -t|--transport) _virutil_transports; return ;;
-  esac
   case $CURRENT in
     3) _virutil_domains ;;
     4) _files ;;
     5) ;;                             # the guest-side destination: nothing to complete
-    *) _values 'option' \
-         '(-t --transport)'{-t,--transport}'[how to move the files]' ;;
   esac
 }
 
@@ -191,7 +165,6 @@ _virutil_usb() {
     'attach:share on Windows, import into WSL, attach to the VM'
     'detach:return a device to the Windows host'
     'unbind:stop sharing a device on Windows'
-    'media:create a virtual removable USB drive'
   )
   case $CURRENT in
     3) _describe -t command 'command' cmds ;;
@@ -203,23 +176,6 @@ _virutil_usb() {
           ;;
         unbind)
           _virutil_usb_busids
-          ;;
-        media)
-          case $words[CURRENT-1] in
-            -s|--size) _virutil_size; return ;;
-            -f|--fs)   _virutil_fs; return ;;
-          esac
-          case $CURRENT in
-            4) _virutil_domains ;;
-            5) _files ;;
-            *) _values 'option' \
-                 '(-s --size)'{-s,--size}'[drive size in GiB when first created]' \
-                 '(-f --fs)'{-f,--fs}'[filesystem when first created: exfat, ntfs, fat32 or guest]' \
-                 '(--mount)'--mount'[mount the drive image on the host to fill it]' \
-                 '(--eject)'--eject'[flush and detach the drive in the guest]' \
-                 '(--detach)'--detach'[unmount and release the drive image on the host]'
-               ;;
-          esac
           ;;
       esac
       ;;

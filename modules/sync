@@ -26,21 +26,19 @@ SYNC_STAGING_ROOT="${VIRUTILS_STAGING_ROOT:-$VIRUTILS_ROOT/staging}"
 
 REPO=""; STAGING=""; DEST=""
 FETCH=(); MAPPINGS=(); EXCLUDES=(); CLEANUP=()
-RUN_PRE=(); RUN_POST=()
-SYNC_TRANSPORT=""   # @transport in the config; --transport on the command line wins
 
 sync_usage() {
     printf '%s\n' \
-        "usage: virutil sync VM [-c NAME|PATH] [-t T]" \
+        "usage: virutil sync VM [-c NAME|PATH]" \
         "" \
-        "  VM                      libvirt domain whose disk is written" \
+        "  VM                      libvirt domain whose disk is written;" \
+        "                          it has to be shut off" \
         "  -c, --config NAME|PATH  config to use. A value containing '/' is a" \
         "                          path, taken as given; anything else names a" \
         "                          config looked up in $CONF_DIR first, then" \
         "                          $SYNC_LEGACY_CONF_DIR" \
         "                          ('.conf' is appended when absent)." \
         "                          default: $SYNC_DEFAULT_CONF" \
-        "$(xfer_transport_help)" \
         "  -h, --help              this message" \
         "" \
         "The config is the whole interface; see README.md for its format." >&2
@@ -77,32 +75,14 @@ empty_guest_dirs() {
     done
 }
 
-# sync_run WHEN CMD... -- run each command inside the guest, in config order,
-# through the guest agent. Fatal on the first failure: a run rule exists to make
-# the copy land correctly ("stop the service", "run the installer"), so carrying
-# on past one that did not happen would deliver a half-installed guest and
-# report success.
-sync_run() {
-    local when="$1"; shift
-    local cmd
-    for cmd in "$@"; do
-        echo "run ($when): $cmd"
-        xfer_ps "$cmd" \
-            || die "$when run rule failed in $DOMAIN: $cmd" \
-                   "Its output is above. Nothing after it was run."
-    done
-}
-
 sync_main() {
-    local CONF_ARG CONF lineno line VM TRANSPORT
+    local CONF_ARG CONF lineno line VM
 
-    CONF_ARG=""; VM=""; TRANSPORT=""
+    CONF_ARG=""; VM=""
     while (( $# )); do
         case "$1" in
             -c|--config)    (( $# >= 2 )) || { warn "$1 needs a value"; sync_usage; }
                             CONF_ARG="$2"; shift 2 ;;
-            -t|--transport) (( $# >= 2 )) || { warn "$1 needs a value"; sync_usage; }
-                            TRANSPORT="$2"; shift 2 ;;
             -h|--help)      sync_usage 0 ;;
             -*)             warn "unrecognised argument: $1"; sync_usage ;;
             *)              [[ -z "$VM" ]] || { warn "unexpected argument: $1"; sync_usage; }
@@ -128,8 +108,6 @@ sync_main() {
     local key val
     REPO=""; STAGING=""; DEST=""
     FETCH=(); MAPPINGS=(); EXCLUDES=(); CLEANUP=()
-    RUN_PRE=(); RUN_POST=()
-    SYNC_TRANSPORT=""
     lineno=0
     while IFS= read -r line || [[ -n "$line" ]]; do
         (( ++lineno ))
@@ -148,7 +126,9 @@ sync_main() {
                                            "-- pass the domain as an argument: virutil sync $val" ;;
                      nbd)              NBD="$val" ;;
                      mnt)              MNT="$val" ;;
-                     transport)        SYNC_TRANSPORT="$val" ;;
+                     transport)        die "$CONF:$lineno: @transport is no longer a setting" \
+                                           "-- the guest's own disk is the only transport there is." \
+                                           "Drop the line." ;;
                      shutdown_timeout) die "$CONF:$lineno: @shutdown_timeout is no longer a setting" \
                                            "-- -t disk needs the guest already shut off, so nothing" \
                                            "here waits for a shutdown. Shut it down yourself:" \
@@ -159,24 +139,13 @@ sync_main() {
                  read -r -a pats <<< "${line#!}"
                  for p in "${pats[@]}"; do EXCLUDES+=(--exclude="$p"); done ;;
             -*)  CLEANUP+=("${line#-}") ;;
-            \>*) # The phase is spelled out rather than defaulted: a command is
-                 # free text, so there is no way to tell a missing keyword from
-                 # a command that happens to start with one.
-                 local when cmd
-                 cmd="${line#>}"
-                 cmd="${cmd#"${cmd%%[![:space:]]*}"}"
-                 when="${cmd%%[[:space:]]*}"
-                 cmd="${cmd#"$when"}"
-                 cmd="${cmd#"${cmd%%[![:space:]]*}"}"
-                 [[ -n "$cmd" ]] \
-                     || die "$CONF:$lineno: run rule has no command: $line"
-                 case "$when" in
-                     pre)  RUN_PRE+=("$cmd") ;;
-                     post) RUN_POST+=("$cmd") ;;
-                     *) die "$CONF:$lineno: run rule needs 'pre' or 'post': $line" \
-                            "  >pre  COMMAND   before the files reach the guest" \
-                            "  >post COMMAND   after they have" ;;
-                 esac ;;
+            \>*) # A run rule needed the guest agent, which needs the guest up --
+                 # and the copy writes to the disk of a guest that is shut off.
+                 die "$CONF:$lineno: run rules are no longer supported: $line" \
+                     "They ran through the guest agent, which needs $DOMAIN" \
+                     "running, and the copy writes to its disk image while it is" \
+                     "shut off. Run the command yourself once the guest is up:" \
+                     "  virutil exec ps $DOMAIN '<command>'" ;;
             \<*) [[ "$line" == *"|"* ]] \
                      || die "$CONF:$lineno: fetch rule needs '|': $line"
                  FETCH+=("${line#<}") ;;
@@ -198,24 +167,14 @@ sync_main() {
 
     echo "config: $CONF"
     echo "  ${#FETCH[@]} fetch, ${#MAPPINGS[@]} map, ${#EXCLUDES[@]} exclude," \
-         "${#CLEANUP[@]} cleanup, $(( ${#RUN_PRE[@]} + ${#RUN_POST[@]} )) run"
+         "${#CLEANUP[@]} cleanup"
     echo "  staging: $STAGING"
     echo "  domain: $DOMAIN"
 
-    # Before the fetch: a transport that cannot work is worth saying so before
+    # Before the fetch: a guest in the wrong state is worth saying so before
     # spending minutes pulling a build tree off the Windows host.
     domain_exists "$DOMAIN" || die "no such domain: $DOMAIN (see: virutil domain list)"
-    xfer_select write "${TRANSPORT:-$SYNC_TRANSPORT}"
-
-    # Run rules go through the guest agent, so they need the guest up -- which
-    # the disk transport is precisely not: it writes to the image of a guest
-    # that is shut off. Said here, before the fetch, rather than after the copy.
-    if (( ${#RUN_PRE[@]} + ${#RUN_POST[@]} )) && [[ "$XFER" == disk ]]; then
-        die "$CONF has run rules, which the disk transport cannot run:" \
-            "it writes to the image of a shut-off $DOMAIN, and a command needs" \
-            "the guest agent answering. Use --transport virtiofs, or drop the" \
-            "'>' rules."
-    fi
+    xfer_check write
 
     # --- fetch: Windows build tree -> staging -------------------------------
     (( ${#FETCH[@]} )) || die "no fetch rules in $CONF"
@@ -240,9 +199,9 @@ sync_main() {
     [[ -d "$STAGING" ]] || die "staging dir not found: $STAGING"
     (( ${#MAPPINGS[@]} )) || die "no map rules in $CONF"
 
-    # MNT stands for the root of C: whichever transport is used, which is why
-    # the copy phase below is written once.
-    xfer_open
+    # MNT is the guest's C:, mounted from its disk image; guest_open arms the
+    # EXIT trap that unmounts and detaches it again (see modules/guest).
+    guest_open
 
     shopt -s nullglob
 
@@ -269,25 +228,7 @@ sync_main() {
 
     shopt -u nullglob
 
-    # Here, not earlier: MNT holds what is about to be delivered, so the guest's
-    # own C: is still untouched. A rule that frees a locked file ("stop the
-    # service") has to run at this point and no sooner -- the fetch above can
-    # take minutes.
-    if (( ${#RUN_PRE[@]} )); then sync_run pre "${RUN_PRE[@]}"; fi
-
-    # A no-op for the disk transport, where MNT is already C:.
-    xfer_deliver
-
-    # Cleanup rules delete *in the guest*, so they run after delivery.
-    if (( ${#CLEANUP[@]} )); then
-        if [[ "$XFER" == disk ]]; then empty_guest_dirs
-        else xfer_empty_guest_dirs "${CLEANUP[@]}"
-        fi
-    fi
-
-    # Last, so a rule that starts the service or runs an installer sees the
-    # delivered files and the emptied directories.
-    if (( ${#RUN_POST[@]} )); then sync_run post "${RUN_POST[@]}"; fi
+    if (( ${#CLEANUP[@]} )); then empty_guest_dirs; fi
 
     # The unmount, detach and restart happen in the EXIT trap.
     echo "copy complete -> $DOMAIN"

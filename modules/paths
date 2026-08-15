@@ -4,10 +4,8 @@
 #
 #   $VIRUTILS_DIR          the root, one directory for all of it
 #   $VIRUTILS_CONF_DIR     sync configs (looked up here first)
-#   $VIRUTILS_IMAGE_DIR    domain disks, snapshot overlays and memory files,
-#                          and the `usb media` drive image
+#   $VIRUTILS_IMAGE_DIR    domain disks, snapshot overlays and memory files
 #   $VIRUTILS_STAGING_ROOT sync's incremental staging trees
-#   $VIRUTILS_SHARE_ROOT   the virtiofs share directories
 #   $VIRUTILS_PORT_DIR     domain port forward state and logs
 #   $VIRUTILS_MNT_ROOT     host mount points for guest filesystems
 
@@ -20,7 +18,6 @@ VIRUTILS_ROOT="${VIRUTILS_DIR:-$HOME/.virutils}"
 VIRUTILS_CONF_DIR="${VIRUTILS_CONF_DIR:-$VIRUTILS_ROOT/conf}"
 VIRUTILS_IMAGE_DIR="${VIRUTILS_IMAGE_DIR:-$VIRUTILS_ROOT/images}"
 VIRUTILS_STAGING_ROOT="${VIRUTILS_STAGING_ROOT:-$VIRUTILS_ROOT/staging}"
-VIRUTILS_SHARE_ROOT="${VIRUTILS_SHARE_ROOT:-$VIRUTILS_ROOT/share}"
 VIRUTILS_PORT_DIR="${VIRUTILS_PORT_DIR:-$VIRUTILS_ROOT/ports}"
 VIRUTILS_MNT_ROOT="${VIRUTILS_MNT_ROOT:-$VIRUTILS_ROOT/mnt}"
 

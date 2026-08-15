@@ -9,8 +9,7 @@
 DIR="${VIRUTIL_IMAGE_DIR:-$VIRUTILS_IMAGE_DIR}"
 
 # What snapshot_devices_off took away, for snapshot_devices_on to put back.
-# Read by the EXIT trap, so module scope: set -u must not trip on them.
-SNAPSHOT_FS_XML=""
+# Read by the EXIT trap, so module scope: set -u must not trip on it.
 SNAPSHOT_MEDIA=()
 
 snapshot_usage() {
@@ -149,13 +148,8 @@ snapshot_kept_files() {
 }
 
 # snapshot_devices_off VM -- strip the running domain down to what libvirt can
-# actually put in an external snapshot. Two things come off:
+# actually put in an external snapshot. One thing comes off:
 #
-#   the virtio-fs share   An external snapshot writes the guest's memory through
-#                         the same machinery as a migration, and a vhost-user
-#                         device carries a migration blocker in qemu. With the
-#                         share attached the snapshot does not degrade, it fails
-#                         outright.
 #   removable media       A revert does not reuse the overlay a create made: it
 #                         builds a fresh one per disk, named <source>.<epoch>
 #                         *beside the source*. For an ISO that means an overlay
@@ -174,9 +168,6 @@ snapshot_devices_off() {
     local vm="$1" tgt src
 
     xfer_running "$vm" || return 0
-
-    SNAPSHOT_FS_XML="$(virtiofs_unplug "$vm")" || exit 1
-    [[ -n "$SNAPSHOT_FS_XML" ]] && say "share:  unplugged from $vm for the snapshot"
 
     while IFS=$'\t' read -r tgt src; do
         [[ -n "$tgt" && -n "$src" ]] || continue
@@ -202,11 +193,6 @@ snapshot_devices_on() {
                     "The definition still names it, so a fresh start restores it."
     done
     SNAPSHOT_MEDIA=()
-
-    if [[ -n "$SNAPSHOT_FS_XML" ]]; then
-        virtiofs_replug "$vm" "$SNAPSHOT_FS_XML"
-        SNAPSHOT_FS_XML=""
-    fi
 }
 
 snapshot_main() {

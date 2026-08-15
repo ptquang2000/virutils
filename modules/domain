@@ -50,8 +50,8 @@ domain_usage() {
         "" \
         "delete takes no options. It never asks, and it removes everything the" \
         "domain has: disks and their backing chain, snapshot overlays and memory" \
-        "files, the usb drive image, the virtio-fs share, mount points," \
-        "and any open port forwards. Files another domain uses are kept." \
+        "files, mount points, and any open port forwards. Files another domain" \
+        "uses are kept." \
         "" \
         "  -h, --help        this message" \
         "" \
@@ -61,10 +61,7 @@ domain_usage() {
         "  VIRUTIL_OSINFO         win11        fallback when the ISO is not recognised" \
         "  VIRUTIL_VIRTIO         (auto)       virtio-win ISO path, or 'none'" \
         "  VIRUTIL_NETWORK        network=default,model=virtio" \
-        "  VIRUTIL_FIRMWARE       uefi         or 'bios'" \
-        "  VIRUTIL_SHARED_MEMORY  1            or '0'; the virtio-fs share needs" \
-        "                                      it, and it cannot be added later" \
-        "                                      without a stop and start" >&2
+        "  VIRUTIL_FIRMWARE       uefi         or 'bios'" >&2
     exit "${1:-1}"
 }
 
@@ -240,12 +237,11 @@ domain_default_vcpus() {
 
 domain_create() {
     local VM="" ISO="" SIZE=64 MEM="" VCPUS="" IMG="" OSINFO=""
-    local VIRTIO NETWORK BIOS=0 SHAREMEM=1 candidate
+    local VIRTIO NETWORK BIOS=0 candidate
 
     VIRTIO="${VIRUTIL_VIRTIO:-}"
     NETWORK="${VIRUTIL_NETWORK:-network=default,model=virtio}"
     [[ "${VIRUTIL_FIRMWARE:-uefi}" == bios ]] && BIOS=1
-    [[ "${VIRUTIL_SHARED_MEMORY:-1}" == 0 ]] && SHAREMEM=0
 
     while (( $# )); do
         case "$1" in
@@ -314,19 +310,6 @@ domain_create() {
         --noautoconsole
     )
 
-    # memoryBacking is a cold setting: without a shared memfd here, virtio-fs
-    # later costs a full stop and start, not a reboot.
-    #
-    # The share device itself is not defined here. It needs virtiofsd on the
-    # host and WinFsp plus the viofs driver in the guest, none of which a domain
-    # being installed from an ISO has yet -- so it would sit in the definition
-    # unusable, and pin the host directory it exports for the life of the
-    # domain. The first transfer attaches it instead, once and persistently
-    # (see modules/virtiofs), which leaves this the only cold part.
-    if (( SHAREMEM )); then
-        ARGS+=(--memorybacking access.mode=shared,source.type=memfd)
-    fi
-
     if (( BIOS )); then
         ARGS+=(--boot cdrom,hd)
     else
@@ -386,9 +369,7 @@ domain_create() {
 
     say "domain:  $VM ($OSINFO)"
     say "cpu:     $VCPUS vcpus (1 socket x $cores cores x $threads threads)"
-    local memnote=""
-    (( SHAREMEM )) && memnote=" (shared memfd)"
-    say "memory:  ${MEM} MiB$memnote"
+    say "memory:  ${MEM} MiB"
     say "disk:    $IMG (${SIZE} GiB)"
     say "iso:     $ISO"
     [[ -n "$VIRTIO" ]] && say "virtio:  $VIRTIO"
@@ -538,18 +519,6 @@ domain_start() {
                    "smaller than the current size)"
         say "disk:   $img (${SIZE} GiB)" \
             "        the guest still has to extend its partition (diskmgmt.msc)"
-    fi
-
-    # A domain defined with a virtio-fs share will not start without the
-    # directory it exports -- and that directory is empty by design, so nothing
-    # stops it being cleaned up, moved with VIRUTILS_DIR, or lost with a /tmp
-    # root. Recreating it beats a start that fails on a missing path.
-    local share; share="$(virtiofs_configured_dir --inactive "$VM")"
-    if [[ -n "$share" && ! -d "$share" ]]; then
-        mkdir -p "$share" || die "could not create the virtio-fs share directory" \
-                                 "$share, which $VM is defined to export"
-        paths_qemu_warn "$share"
-        say "share:  $share (recreated)"
     fi
 
     local state; state="$("${VIRSH[@]}" domstate "$VM" 2>/dev/null || true)"
@@ -803,11 +772,14 @@ domain_rm() {
 # path is derived exactly as the module that writes it does; keep them in step:
 #
 #   forwards      domain_port_file      relay pid plus state and log file
-#   share dir     virtiofs_host_dir     the virtio-fs export directory
-#   mount points  virutils_mnt          bare, -usb (usb media), -xfer (left by
-#                                       the removed volume transport)
-#   images        $DOMAIN_IMAGE_DIR     snapshot overlays and memory files, the
-#                                       usb drive, and the same -xfer leftover
+#   mount points  virutils_mnt          bare, plus -usb and -xfer, left by the
+#                                       removed usb media and volume commands
+#   images        $DOMAIN_IMAGE_DIR     snapshot overlays and memory files, plus
+#                                       the -usb and -xfer leftovers
+#   share dir     share/virutil-VM      left by the removed virtio-fs transport
+#
+# The leftovers are still swept: a domain created by an older virutil has them,
+# and a delete that walks past them is a delete that leaves disk behind.
 #
 # sync's staging trees are named by @staging in a config, not after the domain,
 # so nothing here can find them -- they are shared between domains by design.
@@ -842,7 +814,7 @@ domain_purge() {
         fi
     done
 
-    p="${VIRUTILS_SHARE_ROOT:-$VIRUTILS_ROOT/share}/virutil-$vm"
+    p="$VIRUTILS_ROOT/share/virutil-$vm"
     if [[ -d "$p" ]]; then
         if rm -rf -- "$p" 2>/dev/null || "${SUDO[@]}" rm -rf -- "$p"; then
             say "removed $p"

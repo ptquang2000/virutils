@@ -1,27 +1,11 @@
-# xfer -- the transport layer behind sync, pull and push
+# xfer -- the transport behind sync, pull and push: the guest's own qcow2 over
+# qemu-nbd, mounted on the host. There is one, so nothing here chooses.
 #
-# Write direction:  xfer_open -> caller writes into $MNT -> xfer_deliver -> xfer_close
-# Read direction:   xfer_open_read -> xfer_collect PAT... -> caller reads $MNT -> xfer_close
+# Write direction:  xfer_check write -> guest_open      -> caller writes into $MNT
+# Read direction:   xfer_check read  -> pull_open_disk  -> caller reads  from $MNT
 #
-# MNT always stands for the root of the guest's C:. For the disk transport it
-# *is* C:, so xfer_deliver is a no-op.
-
-XFER=""            # the resolved backend: disk or virtiofs
-XFER_MODE=""       # write or read
-XFER_ARMED=0       # whether the EXIT trap has anything to undo
-
-XFER_DEFAULT=virtiofs
-
-# Both halves find the share by this tag, so it is part of the protocol.
-XFER_TAG="virutil-xfer"
-
-xfer_transport_help() {
-    printf '%s\n' \
-        "  -t, --transport T       how to move the files (default: $XFER_DEFAULT):" \
-        "                            virtiofs  a live virtio-fs share" \
-        "                            disk      the guest's own disk over" \
-        "                                      qemu-nbd (needs it shut off)"
-}
+# MNT is the root of the guest's C: -- literally, since the mount *is* C:, so a
+# copy into it needs no delivery step afterwards.
 
 # Escalate only what needs root: under sudo $HOME is root's, so config
 # discovery would read /root.
@@ -36,101 +20,39 @@ xfer_running() {
     [[ "$("${VIRSH[@]}" domstate "$1" 2>/dev/null)" == running ]]
 }
 
-# guest-ping, not the channel's XML state: the channel reads 'connected' with
-# nothing listening on the other side.
-xfer_agent_ok() {
-    "${VIRSH[@]}" qemu-agent-command "$1" '{"execute":"guest-ping"}' \
-        >/dev/null 2>&1
-}
-
-# xfer_select MODE REQUEST -- validate the transport before anything is touched.
-# No fallback: a transport that cannot work is an error naming the fix, never a
-# silent downgrade that turns "copy a file" into "reboot Windows".
-xfer_select() {
-    XFER_MODE="$1"
-    local want="${2:-$XFER_DEFAULT}" dom="$DOMAIN"
-
-    case "$want" in
-        disk|virtiofs) ;;
-        *) die "unknown transport: $want (disk or virtiofs)" ;;
-    esac
-
-    case "$want" in
-        disk)
-            # Here rather than in guest_open: the guest's state decides whether
-            # this run can happen at all, so it is checked before the fetch or
-            # any other work that would be thrown away.
-            [[ "$("${VIRSH[@]}" domstate "$dom" 2>/dev/null)" == "shut off" ]] \
-                || die "--transport $want needs $dom shut off; it is" \
-                       "'$("${VIRSH[@]}" domstate "$dom" 2>/dev/null)'." \
-                       "It writes straight to the disk image, which a running" \
-                       "guest also has open. Shut it down with" \
-                       "'virutil domain shutdown $dom' and start it again" \
-                       "yourself afterwards, or use --transport virtiofs."
-            ;;
-        virtiofs)
-            xfer_running "$dom" \
-                || die "--transport $want needs $dom running; it is" \
-                       "'$("${VIRSH[@]}" domstate "$dom" 2>/dev/null)'." \
-                       "Start it, or use --transport disk."
-            xfer_agent_ok "$dom" \
-                || die "--transport $want needs the qemu guest agent in $dom," \
-                       "which is what runs the copy inside it. Install the" \
-                       "guest-agent MSI from the virtio-win ISO (see the guest" \
-                       "prerequisites in README.md), or use --transport disk."
-            command -v jq >/dev/null \
-                || die "jq not installed; --transport $want talks to the guest agent"
-
-            # Before a byte moves: both directions compare timestamps to decide
-            # what to skip, so a guest whose clock is off silently copies the
-            # wrong set of files. The agent is known to answer by here, so this
-            # costs one round trip and never waits.
-            guest_time_sync "$dom"
-            ;;
-    esac
-
-    XFER="$want"
-    echo "transport: $XFER"
-}
-
-# --- dispatch ---------------------------------------------------------------
+# xfer_check MODE -- the guest has to be in the right state for the direction
+# about to be taken, and the two directions want opposite ones:
 #
-# One EXIT trap for the whole run, armed by whichever open() succeeded. Backend
-# state lives at module scope: the trap fires after the main has returned.
+#   write  the mount writes straight to the disk image, which a running guest
+#          also has open -- so the guest must be shut off
+#   read   the read runs off a live disk-only snapshot, taken while the guest
+#          keeps running -- so the guest must be running
+#
+# Checked here, up front, rather than inside the open: the guest's state decides
+# whether the run can happen at all, so it is settled before the fetch or any
+# other work that would be thrown away.
+xfer_check() {
+    local mode="$1" dom="$DOMAIN" state
+    state="$("${VIRSH[@]}" domstate "$dom" 2>/dev/null)"
 
-xfer_open() {
-    XFER_MODE=write
-    case "$XFER" in
-        disk)     guest_open ;;          # arms its own trap; see modules/guest
-        virtiofs) virtiofs_open write ;;
-    esac
-}
-
-xfer_open_read() {
-    XFER_MODE=read
-    case "$XFER" in
-        virtiofs) virtiofs_open read ;;
-        *)        die "internal: xfer_open_read is not for the $XFER transport" ;;
-    esac
-}
-
-xfer_deliver() {
-    case "$XFER" in
-        disk)     ;;                     # MNT is C: -- already delivered
-        virtiofs) virtiofs_deliver ;;
-    esac
-}
-
-xfer_collect() {
-    case "$XFER" in
-        virtiofs) virtiofs_collect "$@" ;;
-        *)        die "internal: xfer_collect is not for the $XFER transport" ;;
-    esac
-}
-
-xfer_close() {
-    case "$XFER" in
-        virtiofs) virtiofs_close ;;
+    case "$mode" in
+        write)
+            [[ "$state" == "shut off" ]] \
+                || die "$dom has to be shut off for this; it is '$state'." \
+                       "The copy writes straight to the disk image, which a" \
+                       "running guest also has open. Shut it down with" \
+                       "'virutil domain shutdown $dom' and start it again" \
+                       "yourself afterwards."
+            ;;
+        read)
+            [[ "$state" == running ]] \
+                || die "$dom has to be running for this; it is '$state'." \
+                       "The copy reads the live disk through a disk-only" \
+                       "snapshot, so there is nothing to read from a guest" \
+                       "that is not up. Start it with" \
+                       "'virutil domain start $dom'."
+            ;;
+        *) die "internal: xfer_check wants write or read, got '$mode'" ;;
     esac
 }
 
@@ -179,9 +101,8 @@ nbd_has_table() {
 # after the caller has already globbed for them, which reads as "no partition
 # found" on a perfectly good image.
 #
-# The wait is gated on a partition table actually being there: usb_media_create
-# probes a freshly made, still-unpartitioned image, and that must not stall for
-# the whole timeout.
+# The wait is gated on a partition table actually being there: an image with no
+# table has nothing to wait for, and must not stall for the whole timeout.
 NBD_SETTLE_TRIES=50          # x 0.2s
 nbd_settle() {
     local i
@@ -218,59 +139,4 @@ nbd_find_part() {
 nbd_part_size() {
     local bytes; bytes="$("${SUDO[@]}" blockdev --getsize64 "$1" 2>/dev/null || echo 0)"
     printf '%s' "$(( bytes / 1024 / 1024 / 1024 ))"
-}
-
-# --- guest-side primitives --------------------------------------------------
-
-# xfer_ps SCRIPT -- run SCRIPT in the guest via modules/exec. Bash scoping is
-# dynamic, so VM set here reaches gexec().
-xfer_ps() {
-    VM="$DOMAIN"
-    DETACH=0
-    exec_ps_text "$1"
-}
-
-# Doubling is how a single quote is escaped in a powershell literal.
-xfer_ps_quote() { printf '%s' "${1//\'/\'\'}"; }
-
-# xfer_empty_guest_dirs PATTERN... -- sync's cleanup rules, run inside the guest
-# (the live transports hold what we are *sending*, not the guest's C:).
-# Two levels down minimum, so a mistyped pattern cannot empty C:\.
-xfer_empty_guest_dirs() {
-    local pat script rel sep=""
-    script='$ErrorActionPreference = "Stop"
-foreach ($p in @('
-    for pat in "$@"; do
-        rel="${pat#/}"; rel="${rel%/}"
-        [[ "$rel" == */* ]] \
-            || { warn "refusing unsafe cleanup pattern (too shallow): $pat"; continue; }
-        [[ "$rel" == *..* ]] \
-            && { warn "refusing unsafe cleanup pattern: $pat"; continue; }
-        script+="$sep'$(xfer_ps_quote "${rel//\//\\}")'"; sep=","
-    done
-    script+=')) {
-  foreach ($d in @(Get-Item -Path (Join-Path "C:\" $p) -ErrorAction SilentlyContinue)) {
-    if (-not $d.PSIsContainer) { continue }
-    $n = @(Get-ChildItem -LiteralPath $d.FullName -Force -Recurse -ErrorAction SilentlyContinue).Count
-    Get-ChildItem -LiteralPath $d.FullName -Force -ErrorAction SilentlyContinue |
-      Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Output "   emptied $($d.FullName) ($n entries)"
-  }
-}
-exit 0'
-    xfer_ps "$script" || warn "some cleanup rules failed inside $DOMAIN"
-}
-
-# xfer_robocopy SRC DST [EXTRA...] -- a whole-tree copy inside the guest.
-# robocopy's exit code is a bit field, not a status: under 8 is success.
-xfer_robocopy() {
-    local src="$1" dst="$2"; shift 2
-    local extra="" a
-    for a in "$@"; do extra+=" '$a'"; done
-    xfer_ps '
-$out = robocopy "'"$src"'" "'"$dst"'" /E /NJH /NJS /NP /NDL /R:1 /W:1 /XD "System Volume Information" "`$RECYCLE.BIN"'"$extra"'
-$rc = $LASTEXITCODE
-$out | Where-Object { $_ -match "\S" } | Select-Object -Last 12
-if ($rc -ge 8) { throw "robocopy failed with code $rc" }
-exit 0'
 }
