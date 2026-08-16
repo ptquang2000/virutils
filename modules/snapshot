@@ -1,4 +1,5 @@
-# snapshot -- external snapshots (disk + memory) for libvirt domains
+# snapshot -- external snapshots for libvirt domains: disk + memory for a
+# running domain, disk-only for one that is shut off.
 #
 # External snapshots are two things at once: a libvirt metadata record, and the
 # overlay and memory files on disk that the record names. Deleting the record
@@ -21,7 +22,11 @@ snapshot_usage() {
         "" \
         "delete takes SNAP's descendants with it, drops the libvirt records" \
         "without committing disk data, and unlinks the overlay and memory files" \
-        "that no surviving record or live domain still reads." >&2
+        "that no surviving record or live domain still reads." \
+        "" \
+        "A running domain gets a memory snapshot too; a shut-off one cannot," \
+        "so its snapshot is disk-only -- the guest boots fresh from the" \
+        "disk state on a revert." >&2
     exit "${1:-1}"
 }
 
@@ -257,11 +262,24 @@ snapshot_main() {
         trap 'snapshot_devices_on "$VM"' EXIT
         snapshot_devices_off "$VM"
 
+        # A shut-off domain has no memory to save, and libvirt refuses the
+        # memspec for one outright. The memory is left out, on the same rule
+        # the media handling above follows: everything only a live guest makes
+        # possible is what turns a snapshot into a memory snapshot, so a
+        # non-running domain takes a disk-only one. Revert still works -- with
+        # no memory to restore the guest just boots fresh from the disk state.
+        local -a MEMSPEC=()
+        if xfer_running "$VM"; then
+            MEMSPEC=(--memspec "$DIR/$VM.$SNAP.mem,snapshot=external")
+        else
+            say "shut off: disk-only snapshot (no memory image)"
+        fi
+
         local rc=0
         "${VIRSH[@]}" snapshot-create-as \
             --domain "$VM" \
             --name "$SNAP" \
-            --memspec "$DIR/$VM.$SNAP.mem,snapshot=external" \
+            "${MEMSPEC[@]}" \
             "${DISKSPECS[@]}" \
             --atomic || rc=$?
 

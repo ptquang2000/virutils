@@ -17,6 +17,7 @@ step and no dependencies beyond the utilities it calls.
    - [hardware](#hardware)
 - [How files move](#how-files-move)
    - [Snapshots eject loaded media first](#snapshots-eject-loaded-media-first)
+   - [A shut-off domain gets a disk-only snapshot](#a-shut-off-domain-gets-a-disk-only-snapshot)
 - [Guest prerequisites](#guest-prerequisites)
 - [virutil sync](#virutil-sync)
    - [Synopsis](#synopsis)
@@ -271,6 +272,18 @@ record, which was written mid-eject, so the guest comes back with empty drives
 and libvirt drops them from the definition on its way past. That is no loss —
 they are install media, and a domain past Windows Setup has no further use for
 them.
+
+### A shut-off domain gets a disk-only snapshot
+
+The eject-and-put-back dance is for a *running* guest, and so is the memory half
+of the snapshot: libvirt refuses a `--memspec` for a domain that is not running,
+so `virutil snapshot create` on a shut-off domain skips it and takes a
+disk-only external snapshot instead. Everything else is the same — the overlay
+files, the records, and `revert`/`list`/`delete` all work. The one difference
+is on the way back: with no saved memory to restore, a revert boots the guest
+fresh from the disk state rather than resuming it mid-run. A domain created
+without the media dance (shut off, or paused) has its drives left alone, so the
+revert needs nothing ejected to begin with.
 
 
 ## Guest prerequisites

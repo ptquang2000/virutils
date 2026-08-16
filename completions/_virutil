@@ -197,7 +197,7 @@ _virutil_usb_busids() {
 
 _virutil_snapshot() {
   local -a cmds=(
-    'create:create an external snapshot (default name snap-<timestamp>)'
+    'create:create an external snapshot (default name snap-<timestamp>; disk-only when shut off)'
     'list:list snapshots as a tree'
     'revert:revert to a snapshot and leave the VM running'
     'delete:delete a snapshot and its children'
