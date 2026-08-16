@@ -160,9 +160,9 @@ host-side machinery in `modules/xfer` and `modules/guest`, which is
 
 | Module | Purpose | Usage |
 | --- | --- | --- |
-| `sync` | Fetch a project's build output from a Windows host and push it into a **shut-off** guest's `C:` drive. | `virutil sync VM [-c NAME\|PATH]` |
+| `sync` | Fetch a project's build output from a Windows host and push it into a guest's `C:` drive. | `virutil sync VM [-c NAME\|PATH]` |
 | `pull` | Copy a file or directory out of a **running** guest. | `virutil pull VM SRC DST` |
-| `push` | Copy a file or directory from the host into a **shut-off** guest's `C:` drive. | `virutil push VM SRC DST` |
+| `push` | Copy a file or directory from the host into a guest's `C:` drive. | `virutil push VM SRC DST` |
 
 ### guest
 
@@ -199,22 +199,28 @@ the two directions need opposite ones:
 
 | | write (`sync`, `push`) | read (`pull`) |
 | --- | --- | --- |
-| Guest must be | **shut off** | **running** |
+| Guest must be | running or **shut off** | **running** |
 | What is mounted | the disk image itself, read-write | a frozen snapshot of it, read-only |
 | Guest side | nothing | nothing |
-| Fixed cost per run | you shut the guest down and start it again | none |
+| Fixed cost per run | a shutdown and boot, only when it was running | none |
 
-**Writing** needs the guest **already shut off**. A running guest holds the same
-qcow2 open, and two writers on one image is the one mistake nothing here can
-undo. virutil never shuts a guest down for you and never starts it again
-afterwards: a guest in any other state is an error naming the fix, not a reboot.
-It may be mid-install, mid-update or holding unsaved work, and that is not a
-decision this tool can make for you.
+**Writing** shuts a running guest down, and only then touches its disk. The guest
+holds the same qcow2 open, and two writers on one image is the one mistake
+nothing here can undo — so a guest that is on is first asked to shut down
+(`virsh shutdown`, via the guest agent when it answers, ACPI otherwise), waited
+for to reach `shut off`, and started again when the run is over, on success and
+on failure. A guest that is already off is used as-is. What is refused outright
+is paused and `pmsuspended`: that RAM no longer matches the disk being edited,
+so it cannot be brought down and back around a write. One thing is never done —
+forced off. There is no `virsh destroy` anywhere in this path; cutting power
+leaves the NTFS volume dirty, so the disk would be unmountable read-write on the
+next run, and an interrupted write can leave the guest unbootable.
+
+So a running guest needs nothing from you beyond the run itself:
 
 ```sh
-virutil domain shutdown win11     # wait for it to reach 'shut off'
+virutil sync win11        # running -> shut down -> copy -> started again
 virutil push win11 ./f.txt 'C:\'
-virutil domain start win11
 ```
 
 **Reading** leaves the guest running throughout. A disk-only external snapshot
@@ -227,8 +233,8 @@ There is nothing to pick and nothing to configure. Earlier versions carried a
 second, live transport over virtio-fs, selected with `-t`/`--transport` or
 `@transport`. It is gone, and with it the share device, the shared-memfd memory
 backing it needed, and sync's `>pre`/`>post` run rules — those ran through the
-guest agent, which needs a running guest, which is precisely what a write is
-not. A config still carrying `@transport` or a `>` rule is rejected with its
+guest agent against a guest that had to stay up, which a disk write cannot
+promise. A config still carrying `@transport` or a `>` rule is rejected with its
 line number rather than quietly ignored, and `-t` is no longer accepted on the
 command line.
 
@@ -349,10 +355,10 @@ virutil sync -h
 
 ### Description
 
-`virutil sync` copies a build tree into a **powered-off** Windows guest by
-mounting its disk on the host, so nothing has to run inside the guest — no
-network, no shares, no guest agent. See [How files move](#how-files-move). It
-works in two halves:
+`virutil sync` copies a build tree into a Windows guest by mounting its disk on
+the host, so nothing has to run inside the guest — no network, no shares, no
+guest agent. A guest that is running is shut down first and started again when
+the run is over; see [How files move](#how-files-move). It works in two halves:
 
 ```
 Windows build tree --(fetch)--> staging dir --(map)--> guest NTFS
@@ -363,10 +369,12 @@ directory under `~/.virutils/staging/`, applying the exclude patterns. The stagi
 normally arranged to mirror what will land in the guest, so the map rules stay
 trivial.
 
-**Push** attaches the disk image of the (already shut off) guest with
-`qemu-nbd`, picks the largest NTFS partition on it, mounts that, copies the
-staged files to their destinations, empties any directories listed for cleanup,
-then unmounts and detaches. Starting the guest again is left to you.
+**Push** shuts the guest down if it is running (waiting up to `@shutdown_timeout`
+for it to reach `shut off`), attaches its disk image with `qemu-nbd`, picks the
+largest NTFS partition on it, mounts that, copies the staged files to their
+destinations, empties any directories listed for cleanup, then unmounts and
+detaches. A guest that was running is started again — on success and on failure;
+one that was already off stays off.
 
 Run it as yourself, **not** under `sudo`. It refuses to start when invoked under
 `sudo`, because `$HOME` — and therefore config discovery — resolves to root's
@@ -382,7 +390,7 @@ need no privilege of their own.
 
 | Argument | Description |
 | --- | --- |
-| `VM` | libvirt domain whose disk is written. Required. |
+| `VM` | libvirt domain whose disk is written. A running one is shut down first and started again afterwards. Required. |
 
 | Option | Description |
 | --- | --- |
@@ -442,6 +450,7 @@ and is rejected.
 | `@dest` | no | *(empty)* | Install directory in the guest, relative to `C:\`. Every map destination hangs off it, so the install path is spelled once. Empty means the root of `C:`. |
 | `@nbd` | no | `/dev/nbd0` | NBD device used to attach the disk image. |
 | `@mnt` | no | `~/.virutils/mnt/<VM>` | Host mount point for the guest filesystem. |
+| `@shutdown_timeout` | no | `180` | Seconds to wait for a running guest to shut down before aborting the run. The guest is never forced off. |
 
 #### Fetch rules
 
@@ -541,21 +550,18 @@ Or, keeping several profiles side by side, and pointing them at any guest:
 leaves the NTFS volume dirty on shutdown and `ntfs-3g` refuses to mount it
 read-write.
 
-**The guest must already be shut off**, and stopping and
-starting it is yours to do. A guest in any other state — running, paused,
-pmsuspended — is a hard error before the fetch starts, not something the run
-resolves by shutting Windows down. Writing to the qcow2 of a guest that has it
-open would put two writers on one image, and shutting a guest down is not a
-decision this tool can make for you: it may be mid-install, mid-update or
-holding unsaved work. So the sequence is spelled out:
+**A running guest is shut down and started again for you.** virutil asks it to
+shut down (`virsh shutdown` — via the guest agent when it answers, ACPI
+otherwise), waits up to `@shutdown_timeout` seconds for it to reach `shut off`,
+does the copy, and starts it again — on success and on failure. A guest that was
+already off stays off. What is refused is paused and `pmsuspended`: that RAM no
+longer matches the disk, so it cannot be brought down and back around a write.
+Shut those down by hand first.
 
-```
-virutil domain shutdown win11     # wait for it to reach 'shut off'
-virutil sync win11
-virutil domain start win11
-```
-
-The run leaves the guest shut off when it finishes, on success and on failure.
+**`@shutdown_timeout` bounds the wait.** Default 180 seconds. A graceful shutdown
+of a healthy Windows guest usually takes seconds, but a modal dialog or "an app
+is preventing shutdown" can hold it open indefinitely. If the timeout is hit,
+nothing is written, the guest is left running, and the run fails naming the fix.
 
 **Nothing is ever forced off.** There is no `virsh destroy` anywhere in this
 path. Cutting power to a live Windows leaves the NTFS volume dirty — the same
@@ -565,14 +571,16 @@ you decide to force it, do that by hand and expect to boot Windows once to let
 it check the volume.
 
 **Install `qemu-guest-agent` in the guest.** Nothing in a transfer needs it —
-the copy is made from the host with the guest shut off — but `virutil exec`
-requires it outright, and it is what lets you shut the guest
-down with `virsh --connect qemu:///system shutdown VM --mode agent`, which
-calls Windows' own shutdown with applications forced closed rather than an
-ACPI power-button event Windows is free to deliberate over. Either way it is a
-real shutdown, so Windows closes the NTFS volume and the disk is left clean.
-See [Guest prerequisites](#guest-prerequisites), then confirm the host can see
-it:
+the copy is made from the host with the guest shut off — but it is what makes
+the automatic shutdown fast. `virutil exec` requires it outright, and it is what
+lets you shut the guest down with
+`virsh --connect qemu:///system shutdown VM --mode agent`, which calls Windows'
+own shutdown with applications forced closed rather than an ACPI power-button
+event Windows is free to deliberate over. Either way it is a real shutdown, so
+Windows closes the NTFS volume and the disk is left clean. Without it, the
+automatic shutdown falls back to ACPI, which can run the wait to the full
+`@shutdown_timeout`. See [Guest prerequisites](#guest-prerequisites), then
+confirm the host can see it:
 
 ```
 virutil exec ping DOMAIN      # confirms qemu-ga is answering
@@ -718,9 +726,10 @@ host into a guest's `C:` drive with no config file. It exists for the cases that
 do not deserve a config: a config file you edited by hand, a build artifact you
 want in the guest right now, a one-off test file.
 
-With the guest **already shut off**, it attaches its qcow2 with `qemu-nbd`,
-mounts the NTFS, copies, and leaves it shut off for you to start again. A guest
-that is not shut off is an error — `push` will not shut it down. See
+A running guest is shut down and started again around the copy, exactly as
+`sync` does it: asked to shut down (guest agent preferred, ACPI otherwise),
+waited for up to `@shutdown_timeout`, then restarted on success and on failure.
+A guest that is already off is used as-is. See
 [How files move](#how-files-move).
 
 ### Synopsis
@@ -766,12 +775,12 @@ ending in `/` or `\` always means a directory, even one that does not exist yet.
 ### Notes
 
 `push` shares every safety rule `sync` documents, wholesale: it must be run as
-yourself, not under `sudo`; the guest must already be shut off, and a running,
-paused or suspended one is refused rather than shut down; a domain with a
-managed-save image is refused; teardown is verified from observed state before
-you are told the disk is free; Fast Startup must be off. That machinery lives in
-the shared `modules/guest`. There are no excludes — `push` copies exactly what
-you name, which is the point of having it at all.
+yourself, not under `sudo`; a running guest is shut down and started again
+around the copy, while a paused or suspended one is refused rather than shut
+down; a domain with a managed-save image is refused; teardown is verified from
+observed state before you are told the disk is free; Fast Startup must be off.
+That machinery lives in the shared `modules/guest`. There are no excludes —
+`push` copies exactly what you name, which is the point of having it at all.
 
 ## virutil domain
 

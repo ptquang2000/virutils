@@ -19,8 +19,8 @@ transfer
   pull       copy a file or directory out of a running guest
   push       copy a file or directory from the host into a guest
 
-  All three go through the guest's own disk image: sync and push need the
-  domain shut off, pull needs it running.
+  All three go through the guest's own disk image: sync and push shut a running
+  guest down (and start it again after), pull leaves it running.
 
 guest
   exec       run commands inside a Windows guest via the QEMU guest agent

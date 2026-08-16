@@ -31,8 +31,9 @@ sync_usage() {
     printf '%s\n' \
         "usage: virutil sync VM [-c NAME|PATH]" \
         "" \
-        "  VM                      libvirt domain whose disk is written;" \
-        "                          it has to be shut off" \
+        "  VM                      libvirt domain whose disk is written; a" \
+        "                          running one is shut down first and started" \
+        "                          again afterwards" \
         "  -c, --config NAME|PATH  config to use. A value containing '/' is a" \
         "                          path, taken as given; anything else names a" \
         "                          config looked up in $CONF_DIR first, then" \
@@ -129,10 +130,10 @@ sync_main() {
                      transport)        die "$CONF:$lineno: @transport is no longer a setting" \
                                            "-- the guest's own disk is the only transport there is." \
                                            "Drop the line." ;;
-                     shutdown_timeout) die "$CONF:$lineno: @shutdown_timeout is no longer a setting" \
-                                           "-- -t disk needs the guest already shut off, so nothing" \
-                                           "here waits for a shutdown. Shut it down yourself:" \
-                                           "  virutil domain shutdown VM" ;;
+                     shutdown_timeout) [[ "$val" =~ ^[0-9]+$ ]] \
+                                           || die "$CONF:$lineno: @shutdown_timeout wants a whole" \
+                                                  "number of seconds, got '$val'"
+                                       SHUTDOWN_TIMEOUT="$val" ;;
                      *) die "$CONF:$lineno: unknown setting '$key'" ;;
                  esac ;;
             !*)  local -a pats
@@ -230,6 +231,7 @@ sync_main() {
 
     if (( ${#CLEANUP[@]} )); then empty_guest_dirs; fi
 
-    # The unmount, detach and restart happen in the EXIT trap.
+    # The unmount and detach happen in the EXIT trap, which also starts the
+    # guest again if it was running when this started.
     echo "copy complete -> $DOMAIN"
 }

@@ -4,7 +4,8 @@ push_usage() {
     printf '%s\n' \
         "usage: virutil push VM SRC DST" \
         "" \
-        "  VM   libvirt domain whose disk is written; it has to be shut off" \
+        "  VM   libvirt domain whose disk is written; a running one is shut" \
+        "       down first and started again afterwards" \
         "  SRC  host file or directory to copy" \
         "  DST  guest path, relative to C:\\; a trailing slash means a" \
         "       directory, exactly as with rsync. Backslashes and a C:\\" \
@@ -12,7 +13,8 @@ push_usage() {
         "  -h, --help              this message" \
         "" \
         "A directory source is copied recursively. The copy writes to the" \
-        "guest's disk image, so the guest has to be shut off; see README.md." >&2
+        "guest's disk image, so the guest is shut down around it; see" \
+        "README.md." >&2
     exit "${1:-1}"
 }
 

@@ -1,9 +1,8 @@
 # guest -- the offline attach lifecycle, plus the helpers every module shares.
 #
-# guest_open() requires the domain to be shut off already, attaches its qcow2
-# with qemu-nbd, mounts the largest NTFS partition at MNT and arms
-# guest_finish() as the EXIT trap. Shutting the guest down, and starting it
-# again afterwards, is the caller's decision to make, not this module's.
+# guest_open() shuts a running guest down, attaches its qcow2 with qemu-nbd,
+# mounts the largest NTFS partition at MNT and arms guest_finish() as the EXIT
+# trap, which unmounts, detaches and starts the guest again if it was running.
 #
 # State lives at module scope: the trap runs after a main has returned and
 # set -u must not trip on it.
@@ -16,6 +15,8 @@ VIRSH_Q=("${VIRSH[@]}" --quiet)
 SUDO=()
 
 DOMAIN=""; NBD="/dev/nbd0"; MNT=""
+SHUTDOWN_TIMEOUT=180                 # seconds to wait for a graceful shutdown
+ORIG_STATE=""                        # the domain's state before guest_open
 IMG=""
 
 # Rewrite every letter as [Aa] so a path matches case-insensitively. nocaseglob
@@ -143,23 +144,23 @@ mnt_writable() {
                      END { exit !found }' /proc/mounts
 }
 
-# guest_require_off -- the domain must already be shut off. Attaching a live
-# guest's image would put two writers on one qcow2, so anything else is an
-# error naming the fix. Shutting it down is not ours to do: the guest may be
-# mid-install or holding unsaved work, and only the person at the keyboard
-# knows whether losing that is acceptable.
-guest_require_off() {
-    local state; state="$("${VIRSH[@]}" domstate "$DOMAIN" 2>/dev/null || true)"
-    [[ -n "$state" ]] || die "could not read the state of $DOMAIN"
-    echo "domain: $DOMAIN ($state)"
+# guest_state_check -- the disk transport can work on a guest that is shut off
+# and on one that is running (it is shut down by guest_open and started again
+# by the EXIT trap). What it cannot touch is paused or pmsuspended RAM, which
+# would no longer match the disk being edited. Sets ORIG_STATE.
+guest_state_check() {
+    ORIG_STATE="$("${VIRSH[@]}" domstate "$DOMAIN" 2>/dev/null || true)"
+    [[ -n "$ORIG_STATE" ]] || die "could not read the state of $DOMAIN"
+    echo "domain: $DOMAIN ($ORIG_STATE)"
 
-    [[ "$state" == "shut off" ]] && return 0
-
-    # paused / pmsuspended too: their RAM would no longer match the disk.
-    die "$DOMAIN is '$state'; the disk transport needs it shut off." \
-        "Nothing was touched. Shut it down first, then run this again:" \
-        "  virutil domain shutdown $DOMAIN" \
-        "and start it again yourself when you are done."
+    case "$ORIG_STATE" in
+        running|"shut off") ;;
+        *)  # paused / pmsuspended: their RAM would no longer match the disk.
+            die "$DOMAIN is '$ORIG_STATE'; its RAM no longer matches the disk," \
+                "so it cannot be shut down and started again around a write." \
+                "Shut it down by hand (or destroy it) and run this again."
+            ;;
+    esac
 }
 
 guest_finish() {
@@ -174,8 +175,8 @@ guest_finish() {
     sync
 
     # Verified from observed state, not the exit codes above: two writers on one
-    # qcow2 is the failure this module must never cause, and the guest is the
-    # caller's to start again once the image is free.
+    # qcow2 is the failure this module must never cause, and a guest started
+    # while the image is still attached would be exactly that.
     if mnt_mounted || nbd_attached; then
         warn "" \
              "teardown could not be verified -- do not start $DOMAIN yet." \
@@ -186,11 +187,27 @@ guest_finish() {
              "  virsh --connect qemu:///system start $DOMAIN"
         exit 1
     fi
+
+    # The restart is gated on observed state, not intent: only start what is
+    # actually off. A run that aborted on a guest that would not shut down
+    # reaches here with the domain still running, and must not start it again.
+    if [[ "$ORIG_STATE" == running ]]; then
+        local now
+        now="$("${VIRSH[@]}" domstate "$DOMAIN" 2>/dev/null || true)"
+        if [[ "$now" == "shut off" ]]; then
+            echo "restoring $DOMAIN to running"
+            "${VIRSH[@]}" start "$DOMAIN" >/dev/null \
+                || warn "failed to restart $DOMAIN -- start it manually"
+        elif [[ -z "$now" ]]; then
+            warn "could not read the state of $DOMAIN -- it was running when" \
+                 "this started; check it and start it manually if needed"
+        fi
+    fi
 }
 
-# guest_open -- requires DOMAIN (and optionally NBD, MNT) from the caller, and
-# requires DOMAIN to be shut off; sets IMG and mounts the guest filesystem at
-# MNT.
+# guest_open -- requires DOMAIN (and optionally NBD, MNT, SHUTDOWN_TIMEOUT) from
+# the caller; sets ORIG_STATE and IMG, shuts a running guest down, and mounts
+# the guest filesystem at MNT.
 guest_open() {
 
     xfer_privilege
@@ -200,7 +217,7 @@ guest_open() {
 
     # The state of the guest decides whether this can happen at all, so it is
     # settled before the password prompt.
-    guest_require_off
+    guest_state_check
 
     # Authenticate up front rather than partway through the attach.
     if (( ${#SUDO[@]} )); then
@@ -221,6 +238,49 @@ guest_open() {
                "would corrupt the filesystem. Run: virsh managedsave-remove $DOMAIN"
 
     trap guest_finish EXIT
+
+    if [[ "$ORIG_STATE" == running ]]; then
+        # Prefer the agent: ACPI is a power-button event Windows is free to
+        # deliberate over -- a modal dialog or "an app is preventing shutdown"
+        # and the wait runs to the full timeout. The agent calls Windows' own
+        # shutdown with applications forced closed, which usually takes seconds,
+        # and it is still a real shutdown: Windows closes the NTFS volume, so
+        # the disk is left clean.
+        local mode=acpi
+        if "${VIRSH[@]}" qemu-agent-command "$DOMAIN" \
+               '{"execute":"guest-ping"}' >/dev/null 2>&1; then
+            mode=agent
+        else
+            warn "   qemu-guest-agent is not answering; falling back to ACPI." \
+                 "Installing it in the guest makes this shutdown much faster" \
+                 "-- see the README note on guest shutdown."
+        fi
+
+        echo "   shutting down (--mode $mode, up to ${SHUTDOWN_TIMEOUT}s)..."
+        "${VIRSH[@]}" shutdown --mode "$mode" "$DOMAIN" >/dev/null
+        local state="$ORIG_STATE"
+        for (( i = 0; i < SHUTDOWN_TIMEOUT; i++ )); do
+            state="$("${VIRSH[@]}" domstate "$DOMAIN" 2>/dev/null || true)"
+            [[ "$state" == "shut off" ]] && break
+            # A silent wait of up to @shutdown_timeout looks like a hang.
+            (( i > 0 && i % 15 == 0 )) \
+                && echo "   still '$state' after ${i}s of ${SHUTDOWN_TIMEOUT}s" \
+                        "-- check the guest console for a dialog blocking shutdown"
+            sleep 1
+        done
+
+        # No destroy fallback: cutting power leaves the NTFS volume dirty, which
+        # ntfs-3g then refuses to mount read-write. The guest stays running; the
+        # EXIT trap sees it still running and does not start it again.
+        [[ "$state" == "shut off" ]] \
+            || die "$DOMAIN did not shut down within ${SHUTDOWN_TIMEOUT}s (still '$state')." \
+                   "Nothing was written and the guest is left running." \
+                   "Check its console for a dialog blocking shutdown, or raise" \
+                   "@shutdown_timeout. If you must force it, run" \
+                   "'virsh --connect qemu:///system destroy $DOMAIN' yourself and" \
+                   "expect to boot Windows once to clear the dirty NTFS volume."
+        echo "   shut off"
+    fi
 
     # Top of the backing chain: writing to the base would corrupt the guest.
     IMG="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \

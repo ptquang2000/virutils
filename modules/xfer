@@ -23,8 +23,10 @@ xfer_running() {
 # xfer_check MODE -- the guest has to be in the right state for the direction
 # about to be taken, and the two directions want opposite ones:
 #
-#   write  the mount writes straight to the disk image, which a running guest
-#          also has open -- so the guest must be shut off
+#   write  the mount writes straight to the disk image. A guest that is running
+#          is fine: guest_open shuts it down and the EXIT trap starts it again.
+#          What is not fine is paused or pmsuspended, whose RAM would no longer
+#          match the disk being edited.
 #   read   the read runs off a live disk-only snapshot, taken while the guest
 #          keeps running -- so the guest must be running
 #
@@ -37,12 +39,17 @@ xfer_check() {
 
     case "$mode" in
         write)
-            [[ "$state" == "shut off" ]] \
-                || die "$dom has to be shut off for this; it is '$state'." \
-                       "The copy writes straight to the disk image, which a" \
-                       "running guest also has open. Shut it down with" \
-                       "'virutil domain shutdown $dom' and start it again" \
-                       "yourself afterwards."
+            case "$state" in
+                running|"shut off") ;;
+                *)  # paused / pmsuspended: RAM that would not match the disk.
+                    die "$dom is '$state'; the copy writes straight to the" \
+                        "disk image. Running and shut off are both fine (a" \
+                        "running guest is shut down first and restarted" \
+                        "afterwards), but this state cannot be shut down and" \
+                        "brought back around a write. Shut it down by hand and" \
+                        "run again."
+                    ;;
+            esac
             ;;
         read)
             [[ "$state" == running ]] \
