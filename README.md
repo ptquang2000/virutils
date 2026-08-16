@@ -49,7 +49,7 @@ step and no dependencies beyond the utilities it calls.
 ## Installation
 
 ```sh
-git clone https://github.com/ptquang2000/virutils.git
+git clone https://github.com/yourname/virutils.git
 cd virutils
 ./install.sh
 ```
@@ -79,7 +79,7 @@ For the completion to be picked up, its directory has to be on `fpath` before
 fpath+=( "${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions" )
 ```
 
-Installed as part of [the dotfiles](https://github.com/ptquang2000/.dotfiles),
+Installed as part of [the dotfiles](https://github.com/yourname/.dotfiles),
 none of this is needed: `setup.sh` links `virutils/vir*` into `~/.local/bin`
 itself and `.zshrc` puts `virutils/completions` on `fpath` directly.
 
@@ -447,7 +447,7 @@ and is rejected.
 
 ```
 <bin/Release|.
-<GearsApp/www/brand-default/translationsUI|brand-default/translationsUI
+<MyApp/www/brand-default/translationsUI|brand-default/translationsUI
 ```
 
 The part before `|` is a directory relative to `@repo`; the part after is a
@@ -463,7 +463,7 @@ simply be absent in some checkouts.
 ```
 *|
 qt-deployment-lib/*|
-wabpoes.exe|ondemands/bs
+app.exe|bin
 ```
 
 The part before `|` is a space-separated list of globs, expanded relative to the
@@ -485,8 +485,8 @@ directive as often as convenient; the lists are concatenated.
 #### Cleanup rules
 
 ```
--ProgramData/OPSWAT/Gears/logs
--Users/*/AppData/Local/OPSWAT/Gears/logs
+-ProgramData/MyApp/logs
+-Users/*/AppData/Local/MyApp/logs
 ```
 
 Each path is emptied in the guest after the copy, leaving the directory itself in
