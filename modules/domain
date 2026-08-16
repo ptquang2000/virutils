@@ -149,7 +149,7 @@ domain_media_insert() {
 # domain_top_image NAME -- the top of the backing chain of the first disk.
 domain_top_image() {
     "${VIRSH[@]}" domblklist "$1" --details 2>/dev/null \
-        | awk '$2 == "disk" {print $4; exit}'
+        | awk '$2 == "disk" && !found {print $4; found=1}'
 }
 
 # domain_chain FILE -- FILE plus every backing file under it.
@@ -207,7 +207,7 @@ domain_detect_osinfo() {
                  <<<"$out")"
     else
         out="$(osinfo-detect -t media -- "$1" 2>/dev/null || true)"
-        short="$(sed -n "s/.*for OS '.*(\([^)]*\))'.*/\1/p" <<<"$out" | head -1)"
+        short="$(sed -n "1s/.*for OS '.*(\([^)]*\))'.*/\1/p" <<<"$out")"
     fi
     printf '%s' "${short:-${VIRUTIL_OSINFO:-win11}}"
 }
@@ -541,9 +541,9 @@ domain_ip() {
     for src in lease agent arp; do
         ip="$("${VIRSH[@]}" domifaddr "$1" --source "$src" 2>/dev/null |
             awk '{ for (i = 1; i <= NF; i++)
-                       if ($i ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}\/[0-9]+$/) {
+                       if ($i ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}\/[0-9]+$/ && !found) {
                            split($i, a, "/")
-                           if (a[1] !~ /^127\./) { print a[1]; exit }
+                           if (a[1] !~ /^127\./) { print a[1]; found=1 }
                        } }')"
         [[ -n "$ip" ]] && { printf '%s' "$ip"; return 0; }
     done

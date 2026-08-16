@@ -80,7 +80,8 @@ snapshot_files() {
         | awk '
             /<disks>/    { indisks = 1; next }
             /<\/disks>/  { indisks = 0; next }
-            /<domain[ \t>]/ { exit }   # the inner guest config: nothing past here
+            /<domain[ \t>]/ { done = 1 }
+            done { next }        # the inner guest config: nothing past here
             !indisks && !/<memory[ \t]/ { next }
             match($0, /file='"'"'[^'"'"']*'"'"'/) {
                 s = substr($0, RSTART + 6, RLENGTH - 7)

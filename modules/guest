@@ -69,7 +69,7 @@ guest_agent_wait() {
 # guest_time VM -- the guest's clock, in seconds since the epoch, or nothing.
 guest_time() {
     "${VIRSH[@]}" domtime "$1" 2>/dev/null \
-        | awk -F'[: \t]+' '/[Tt]ime:/ { print $2; exit }'
+        | awk -F'[: \t]+' '/[Tt]ime:/ && !found { print $2; found=1 }'
 }
 
 # guest_time_sync VM [WAIT] -- put the guest's clock on the host's, through the
@@ -83,7 +83,8 @@ guest_time_sync() {
 
     # A domain with no agent channel has no agent to wait for -- waiting the
     # full timeout on every revert of such a guest would be a minute of nothing.
-    if ! "${VIRSH[@]}" dumpxml "$vm" 2>/dev/null | grep -q org.qemu.guest_agent; then
+    if ! "${VIRSH[@]}" dumpxml "$vm" 2>/dev/null \
+         | awk '/org.qemu.guest_agent/ {found=1} END {exit !found}'; then
         warn "clock not synced: $vm has no qemu-guest-agent channel, so nothing" \
              "can set its clock from here. A domain from 'virutil domain create'" \
              "has one; an older one needs it cold-plugged."
@@ -233,7 +234,8 @@ guest_open() {
 
     # A managed-save image means the guest resumes from stale RAM, whose cached
     # NTFS metadata would not match the disk we are about to edit.
-    "${VIRSH[@]}" dominfo "$DOMAIN" | grep -qi '^Managed save: *yes' \
+    "${VIRSH[@]}" dominfo "$DOMAIN" \
+        | awk '/^[Mm]anaged [Ss]ave: *[Yy]es/ {found=1} END {exit !found}' \
         && die "$DOMAIN has a managed-save image; resuming it after editing the disk" \
                "would corrupt the filesystem. Run: virsh managedsave-remove $DOMAIN"
 
@@ -284,7 +286,7 @@ guest_open() {
 
     # Top of the backing chain: writing to the base would corrupt the guest.
     IMG="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
-           | awk '$2=="disk" {print $4; exit}')"
+           | awk '$2=="disk" && !found {print $4; found=1}')"
     [[ -f "$IMG" ]] || die "could not resolve disk image for $DOMAIN"
     echo "image: $IMG"
 

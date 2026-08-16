@@ -189,7 +189,8 @@ hostdevs() { "${VIRSH[@]}" dumpxml "$@" | sed -n '/<hostdev/,/<\/hostdev>/p'; }
 has_hostdev() {
     hostdevs "$@" |
         sed -n "s/.*<\(vendor\|product\) id='0x\([0-9a-f]*\)'.*/\2/p" |
-        paste -d: - - | grep -qx "$ID"
+        paste -d: - - |
+        awk -v id="$ID" '$0 == id {found=1} END {exit !found}'
 }
 
 # A device can sit in the live domain, the persistent config, or both. Only

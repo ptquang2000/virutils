@@ -58,7 +58,8 @@ pull_finish() {
         exit 1
     fi
 
-    if "${VIRSH[@]}" snapshot-list --name 2>/dev/null | grep -qx "$SNAP"; then
+    if "${VIRSH[@]}" snapshot-list --name 2>/dev/null \
+        | awk -v s="$SNAP" '$0 == s {found=1} END {exit !found}'; then
         "${VIRSH[@]}" snapshot-delete "$DOMAIN" "$SNAP" --metadata >/dev/null 2>&1 \
             || { warn "snapshot metadata delete failed; leaving $OVERLAY in place"; return 1; }
     fi
@@ -113,9 +114,9 @@ pull_open_disk() {
                "live disk. Start it, or copy the other way with virutil push."
 
     DISK="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
-           | awk '$2=="disk" {print $3; exit}')"
+           | awk '$2=="disk" && !found {print $3; found=1}')"
     IMG="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
-          | awk '$2=="disk" {print $4; exit}')"
+          | awk '$2=="disk" && !found {print $4; found=1}')"
     [[ -n "$DISK" ]] || die "no disk device found for $DOMAIN"
     [[ -f "$IMG" ]] || die "could not resolve disk image for $DOMAIN"
 
