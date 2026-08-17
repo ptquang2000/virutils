@@ -192,7 +192,7 @@ sync_main() {
             || { warn "   warning: no such source dir, skipped: $rel"; continue; }
 
         echo "   $rel -> ${sub:-.}"
-        "${RSYNC[@]}" --chmod=F755,D755 "${EXCLUDES[@]}" \
+        "${RSYNC[@]}" --whole-file --chmod=F755,D755 "${EXCLUDES[@]}" \
               "$REPO/$rel/" "$STAGING${sub:+/$sub}/"
     done
 
@@ -224,7 +224,7 @@ sync_main() {
         (( ${#files[@]} )) || { warn "skipping '$dst_rel': nothing matched"; continue; }
 
         echo "-> C:\\${dst_rel//\//\\} (${#files[@]} item(s))"
-        "${RSYNC[@]}" "${EXCLUDES[@]}" "${files[@]}" "$MNT/$dst_rel/"
+        "${RSYNC[@]}" --whole-file "${EXCLUDES[@]}" "${files[@]}" "$MNT/$dst_rel/"
     done
 
     shopt -u nullglob
