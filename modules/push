@@ -7,6 +7,9 @@
 #   --live   HTTP over the guest's own NIC, driven by the guest agent. The
 #            guest keeps running and sees no new device; it needs an agent, a
 #            route back to this host and curl.exe.
+#   --smb    the same, over SMB with robocopy in place of curl. The guest reads
+#            a live tree rather than one tar, so a re-push moves only what
+#            changed; it costs a rootful smbd on the host's port 445.
 
 push_usage() {
     printf '%s\n' \
@@ -27,6 +30,11 @@ push_usage() {
         "                          down and no drive letter appears. Needs the" \
         "                          guest agent, a route from the guest back to" \
         "                          this host, and curl.exe in the guest." \
+        "      --smb               like --live, but the guest fetches with" \
+        "                          robocopy over SMB, copying only the files" \
+        "                          that differ from what it already has. Needs" \
+        "                          the guest agent, a route back to this host," \
+        "                          and root on the host to bind port 445." \
         "  -h, --help              this message" \
         "" \
         "A directory source is copied recursively. Without --live the copy" \
@@ -58,12 +66,13 @@ push_norm_dst() {
 }
 
 push_main() {
-    local VM="" SRC="" DST="" LIVE=0
+    local VM="" SRC="" DST="" LIVE=0 SMB=0
 
     while (( $# )); do
         case "$1" in
             -h|--help)      push_usage 0 ;;
             --live)         LIVE=1; shift ;;
+            --smb)          SMB=1; shift ;;
             -*)             warn "unrecognised argument: $1"; push_usage ;;
             *)
                 if   [[ -z "$VM"  ]]; then VM="$1"
@@ -75,6 +84,8 @@ push_main() {
         esac
     done
     [[ -n "$VM" && -n "$SRC" && -n "$DST" ]] || push_usage
+    (( LIVE && SMB )) && die "--live and --smb are two forms of the same" \
+        "transport; pick one."
 
     [[ -e "$SRC" ]] || die "source not found: $SRC"
     [[ -r "$SRC" ]] || die "source not readable: $SRC"
@@ -82,7 +93,10 @@ push_main() {
     DOMAIN="$VM"
     domain_exists "$DOMAIN" || die "no such domain: $DOMAIN (see: virutil domain list)"
 
-    if (( LIVE )); then
+    if (( SMB )); then
+        xfer_check live
+        push_smb "$SRC" "$DST"
+    elif (( LIVE )); then
         xfer_check live
         # Reports for itself: it knows what landed and how long it took, which
         # is more than "copied" says.
@@ -332,5 +346,163 @@ push_live_die() {
         *)
             die "the guest failed to fetch the payload (exit $rc); its own" \
                 "error is above." ;;
+    esac
+}
+
+# --- the live path, over SMB ------------------------------------------------
+
+# push_smb SRC DST -- the SMB twin of push_live. The host exports the payload as
+# a read-only share and the running guest pulls it with robocopy, which copies
+# only the files that differ from what it already holds -- so a second push of a
+# build that changed one file moves one file, where --live would resend the
+# whole tar. A file source is served from a one-entry staging directory (robocopy
+# and Copy-Item both want a directory to point at, not a bare file over UNC); a
+# directory source is served in place, no pack and no copy.
+PUSH_RC_ROBO=93             # robocopy returned a failure code (>= 8)
+
+push_smb() {
+    local SRC="$1" DST="$2" VM="$DOMAIN"
+    local DST_IS_DIR export_dir base ip host rc=0 reported t0 elapsed win_dst
+
+    if [[ "$DST" == */ || "$DST" == *'\' ]]; then DST_IS_DIR=1; else DST_IS_DIR=0; fi
+    DST="$(push_norm_dst "$DST")" || exit 1
+    # A directory source always lands *in* a directory, as with rsync.
+    [[ -d "$SRC" ]] && DST_IS_DIR=1
+
+    ip="$(domain_ip "$DOMAIN")" \
+        || die "could not work out $DOMAIN's address, so there is nothing to" \
+               "serve the payload to. Check 'virutil domain addr $DOMAIN'."
+    host="$(xfer_host_addr "$ip")"
+    [[ -n "$host" ]] \
+        || die "no route from this host to $DOMAIN at $ip, so the guest has" \
+               "no address to fetch from. A guest on an isolated network" \
+               "cannot use --smb; drop it to write to the disk image instead."
+
+    # What gets exported. A directory is served where it lies; a file is
+    # hardlinked (or, across filesystems, copied) into a scratch directory of
+    # its own, so the share carries that one file and none of its siblings.
+    if [[ -d "$SRC" ]]; then
+        export_dir="$SRC"
+    else
+        mkdir -p "$VIRUTILS_TMP_DIR" \
+            || die "could not create $VIRUTILS_TMP_DIR for the transfer payload"
+        XFER_SMB_STAGE="$(mktemp -d "$VIRUTILS_TMP_DIR/smb.XXXXXX")" \
+            || die "could not create a staging directory for the transfer"
+        base="$(basename -- "$SRC")"
+        ln "$SRC" "$XFER_SMB_STAGE/$base" 2>/dev/null \
+            || cp -- "$SRC" "$XFER_SMB_STAGE/$base" \
+            || die "could not stage $SRC for transfer"
+        export_dir="$XFER_SMB_STAGE"
+    fi
+
+    xfer_smb_serve "$export_dir" "$host"
+
+    win_dst="${DST//\//\\}"
+    (( DST_IS_DIR )) && win_dst="${win_dst:+$win_dst\\}"
+    echo "push --smb: $SRC -> C:\\$win_dst"
+
+    t0="$(now_ms)"
+    reported="$(push_smb_fetch "$SRC" "$DST" "$DST_IS_DIR")" || rc=$?
+    elapsed=$(( $(now_ms) - t0 ))
+    (( rc == 0 )) || push_smb_die "$rc" "$host"
+
+    xfer_smb_stop
+    push_smb_report "$SRC" "$reported" "$elapsed"
+}
+
+# push_smb_fetch SRC DST DST_IS_DIR -- the guest side, one powershell run.
+# robocopy for a directory (its whole reason for being: it skips unchanged
+# files); Copy-Item for a single file, which robocopy cannot rename onto a new
+# name. Both time themselves with a stopwatch so the reported duration is the
+# copy alone, without the agent round trip and powershell start-up that the
+# host's own wall clock would fold in. robocopy's exit code is a bitmap, not an
+# error level: 0 means nothing needed copying, bit 0 means files were copied,
+# and only >= 8 is a real failure -- so the usual 'non-zero is bad' is wrong
+# here and would call every successful copy an error.
+push_smb_fetch() {
+    local SRC="$1" DST="$2" is_dir="$3" script dst_win base unc
+
+    if [[ -d "$SRC" ]]; then
+        base="$(basename -- "$SRC")"
+        # Trailing slash means "contents into DST"; no slash means "DST/<name>",
+        # matching rsync and the tar layout the --live path builds.
+        if [[ "$SRC" == */ ]]; then
+            dst_win="C:\\${DST//\//\\}"
+        else
+            dst_win="C:\\${DST:+${DST//\//\\}\\}$base"
+        fi
+        script=$(printf '%s\n' \
+            '$ErrorActionPreference = "Stop"' \
+            "\$src = $(push_ps_quote "$XFER_SMB_UNC")" \
+            "\$dst = $(push_ps_quote "$dst_win")" \
+            'try { New-Item -ItemType Directory -Force -Path $dst | Out-Null }' \
+            "catch { [Console]::Error.WriteLine(\$_.Exception.Message); exit $PUSH_RC_MKDIR }" \
+            '$sw = [Diagnostics.Stopwatch]::StartNew()' \
+            '& robocopy $src $dst /E /R:1 /W:1 /NP /NFL /NDL /NJH /NJS | Out-Null' \
+            '$rc = $LASTEXITCODE' \
+            '$sw.Stop()' \
+            "if (\$rc -ge 8) { [Console]::Error.WriteLine(\"robocopy exit \$rc\"); exit $PUSH_RC_ROBO }" \
+            '$copied = [int][bool]($rc -band 1)' \
+            '$total  = (Get-ChildItem -LiteralPath $dst -Recurse -File).Count' \
+            '"$copied $total $([int]$sw.Elapsed.TotalMilliseconds)"')
+    else
+        base="$(basename -- "$SRC")"
+        unc="$XFER_SMB_UNC\\$base"
+        if (( is_dir )); then
+            dst_win="C:\\${DST:+${DST//\//\\}\\}$base"
+        else
+            dst_win="C:\\${DST//\//\\}"
+        fi
+        script=$(printf '%s\n' \
+            '$ErrorActionPreference = "Stop"' \
+            "\$src = $(push_ps_quote "$unc")" \
+            "\$dst = $(push_ps_quote "$dst_win")" \
+            '$dir = Split-Path -Parent $dst' \
+            'try { if ($dir) { New-Item -ItemType Directory -Force -Path $dir | Out-Null } }' \
+            "catch { [Console]::Error.WriteLine(\$_.Exception.Message); exit $PUSH_RC_MKDIR }" \
+            '$sw = [Diagnostics.Stopwatch]::StartNew()' \
+            'Copy-Item -LiteralPath $src -Destination $dst -Force' \
+            '$sw.Stop()' \
+            '"$((Get-Item -LiteralPath $dst).Length) $([int]$sw.Elapsed.TotalMilliseconds)"')
+    fi
+
+    exec_ps_text "$script"
+}
+
+# push_smb_report SRC REPORTED MS -- what landed, and how fast. REPORTED is the
+# guest's own line: "copied total ms" from a directory robocopy, or "bytes ms"
+# from a file copy. The rate is computed from the guest's stopwatch, not MS,
+# for the reason push_live_report gives -- MS holds the round trip too.
+push_smb_report() {
+    local SRC="$1" reported="$2" ms="$3" rate what
+    if [[ -d "$SRC" ]]; then
+        local copied total gms
+        read -r copied total gms <<<"$reported"
+        what="$total file"; (( total == 1 )) || what+="s"
+        if (( copied )); then what+=" present (some copied)"; else what+=" present (all up to date)"; fi
+        echo "$DOMAIN: $what in $(fmt_duration "${gms:-$ms}")"
+    else
+        local bytes gms
+        read -r bytes gms <<<"$reported"
+        rate="$(fmt_rate "$bytes" "${gms:-0}")"
+        echo "$DOMAIN: done ($(fmt_bytes "${bytes:-0}")) in $(fmt_duration "${gms:-$ms}")${rate:+ ($rate on the wire)}"
+    fi
+}
+
+# push_smb_die RC HOST -- name what went wrong; the guest has already printed
+# its own line above.
+push_smb_die() {
+    local rc="$1" host="$2"
+    case "$rc" in
+        "$PUSH_RC_ROBO")
+            die "robocopy could not complete the copy in the guest (its exit" \
+                "code is above). Anything it did copy is left where it landed." ;;
+        "$PUSH_RC_MKDIR")
+            die "the guest could not create the destination directory; its" \
+                "own message is above." ;;
+        *)
+            die "the guest failed to fetch the payload (exit $rc); its own" \
+                "error is above. If it could not reach $host, check the" \
+                "guest's outbound firewall or drop --smb for the disk image." ;;
     esac
 }

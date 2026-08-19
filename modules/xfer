@@ -1,4 +1,4 @@
-# xfer -- the transports behind sync, pull and push. There are two, and they
+# xfer -- the transports behind sync, pull and push. There are three, and they
 # differ in what they cost the guest rather than in what they can carry.
 #
 # Offline, the guest's own qcow2 over qemu-nbd, mounted on the host:
@@ -12,6 +12,12 @@
 #   xfer_check live -> xfer_http_serve -> guest fetches with curl.exe
 #   Nothing is mounted on either side, no device appears in the guest and the
 #   guest keeps running. See the section at the foot of this file.
+#
+# Live, SMB over the guest's own NIC (write direction only):
+#   xfer_check live -> xfer_smb_serve -> guest fetches with robocopy
+#   Like the HTTP path, but the guest reads a live tree instead of one tar, so
+#   a re-push moves only what changed. Costs a rootful smbd on port 445. See
+#   the second section at the foot of this file.
 
 # Escalate only what needs root: under sudo $HOME is root's, so config
 # discovery would read /root.
@@ -358,4 +364,149 @@ xfer_http_wait() {
     (( rc == 0 )) && XFER_HTTP_MS="$(sed -n '2p' "$XFER_HTTP_DIR/port" 2>/dev/null || echo 0)"
     XFER_HTTP_MS="${XFER_HTTP_MS:-0}"
     return "$rc"
+}
+
+# --- the live path, over SMB -------------------------------------------------
+#
+# The twin of the HTTP path above, and it exists for one thing HTTP cannot do:
+# the guest fetches with robocopy, which compares the tree it already has
+# against the one being served and copies only what differs. HTTP carries a
+# directory as one tar that is unpacked whole every time; SMB carries it as a
+# live tree, so a second push of a build that changed one file moves one file.
+#
+#   xfer_smb_serve DIR ADDR -> guest robocopies from \\ADDR\<share>
+#
+# What it costs that HTTP does not: the share is SMB, which for a Windows client
+# means port 445, which no ephemeral-port trick can move -- so this binds the
+# one privileged port, needs root to do it, and refuses to run if something (on
+# WSL, the Windows host's own file sharing) already holds 445. Nothing is
+# mounted in the guest all the same: robocopy against a UNC path is a redirector
+# read, no drive letter and no share of the guest's own.
+
+XFER_SMB_PID=""              # the smbd; killed by xfer_smb_stop
+XFER_SMB_RUN=""              # short-path runtime dir for smbd's sockets
+XFER_SMB_STAGE=""            # scratch under VIRUTILS_TMP_DIR, only the file case
+XFER_SMB_CONF=""             # the throwaway smb.conf, also our kill key
+XFER_SMB_SHARE=""            # the random share name the guest is told
+XFER_SMB_UNC=""              # \\ADDR\<share>, the guest's source path
+
+# 445 cannot be moved for a Windows client, so a listener already on it is a
+# hard stop rather than something to work around. On WSL that listener is
+# usually the Windows host's own file sharing.
+xfer_smb_free() {
+    # An if, not `... && die`: on the free path the grep returns non-zero, and a
+    # bare function ending on that would trip set -e and abort the whole run --
+    # silently, and only ever when the port was actually available.
+    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq '[:.]445$'; then
+        die "something already holds TCP 445 on this host, and SMB cannot" \
+            "be served on any other port to a Windows guest. On WSL this is" \
+            "usually the Windows host's own file sharing; stop it, or use" \
+            "--live (HTTP) instead, which needs no privileged port."
+    fi
+}
+
+# smbd keeps its lock, message and pid state in a set of directories and opens
+# an AF_UNIX socket under them -- whose path is capped near 108 bytes. The
+# scratch tree virutil uses elsewhere is far too long for that (it is what made
+# a first attempt fail with "File name too long"), so the runtime dirs go under
+# a short /tmp path of their own, separate from any payload.
+xfer_smb_run_dir() {
+    [[ -n "$XFER_SMB_RUN" ]] && return 0
+    XFER_SMB_RUN="$(mktemp -d /tmp/vsmb.XXXXXX)" \
+        || die "could not create a runtime directory for smbd"
+    trap xfer_smb_stop EXIT
+}
+
+# xfer_smb_serve DIR ADDR -- export DIR read-only on ADDR:445, once, under a
+# random share name, and set XFER_SMB_UNC. Anonymous and guest-only: the guest
+# reaches it with no credential, and the share carries nothing but this payload.
+# The bind address is ADDR alone, the one that reaches the guest, for the same
+# reason the HTTP server binds narrowly -- not the wildcard, which would offer
+# the share to every network this host is on.
+xfer_smb_serve() {
+    local dir="$1" addr="$2" i
+
+    command -v smbd >/dev/null 2>&1 \
+        || die "--smb serves the payload over SMB and needs smbd (the Samba" \
+               "server) on the host; it is not installed. Use --live for the" \
+               "HTTP transport instead, which needs only python3."
+
+    xfer_privilege
+    xfer_smb_free
+    xfer_smb_run_dir
+    XFER_SMB_SHARE="$(xfer_http_token)"
+    XFER_SMB_CONF="$XFER_SMB_RUN/smb.conf"
+
+    # guest account is the invoking user so smbd reads the payload as its owner
+    # rather than as nobody; under sudo that is still the real user, since
+    # xfer_privilege refuses to run as root-via-sudo in the first place.
+    cat > "$XFER_SMB_CONF" <<CONF
+[global]
+    workgroup = WORKGROUP
+    server min protocol = SMB2
+    map to guest = Bad User
+    guest account = ${SUDO_USER:-$USER}
+    security = user
+    private dir = $XFER_SMB_RUN
+    lock directory = $XFER_SMB_RUN
+    state directory = $XFER_SMB_RUN
+    cache directory = $XFER_SMB_RUN
+    pid directory = $XFER_SMB_RUN
+    ncalrpc dir = $XFER_SMB_RUN
+    log file = $XFER_SMB_RUN/log
+    bind interfaces only = yes
+    interfaces = lo $addr
+    disable netbios = yes
+[$XFER_SMB_SHARE]
+    path = $dir
+    read only = yes
+    guest ok = yes
+    guest only = yes
+CONF
+
+    # smbd runs detached, so sudo cannot prompt once it is in the background:
+    # prime the credential up front, synchronously, where the prompt has a
+    # terminal to reach.
+    if (( ${#SUDO[@]} )); then
+        "${SUDO[@]}" -v || die "could not obtain the root privilege --smb needs to bind port 445"
+    fi
+    "${SUDO[@]}" smbd -s "$XFER_SMB_CONF" -F --no-process-group \
+        >"$XFER_SMB_RUN/out" 2>&1 &
+    XFER_SMB_PID=$!
+
+    # The bind is done when 445 answers; poll for it, and stop early if smbd has
+    # already died -- its output holds the reason.
+    for (( i = 0; i < 50; i++ )); do
+        ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq '[:.]445$' && break
+        kill -0 "$XFER_SMB_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq '[:.]445$' || {
+        warn "$(cat "$XFER_SMB_RUN/out" 2>/dev/null)"
+        die "smbd did not come up on $addr:445"
+    }
+
+    XFER_SMB_UNC="\\\\$addr\\$XFER_SMB_SHARE"
+}
+
+# Retire the server and clear its scratch, however the run ends. smbd is root
+# and leaves helper children (notifyd, cleanupd); killing by the unique conf
+# path catches the lot, where killing one pid would not. The EXIT trap is armed
+# in xfer_smb_run_dir.
+xfer_smb_stop() {
+    # Escalate only if smbd was actually launched (XFER_SMB_PID set). Before
+    # that the runtime dir is the user's own mktemp and the kill has nothing to
+    # aim at, so a failure that never got as far as binding does not need -- and
+    # should not noisily attempt -- a root pkill and rm it cannot run anyway.
+    if [[ -n "$XFER_SMB_PID" ]]; then
+        [[ -n "$XFER_SMB_CONF" ]] \
+            && { "${SUDO[@]}" pkill -f "smbd -s $XFER_SMB_CONF" 2>/dev/null || true; }
+        [[ -n "$XFER_SMB_RUN" && -d "$XFER_SMB_RUN" ]] \
+            && { "${SUDO[@]}" rm -rf "$XFER_SMB_RUN" || true; }
+    else
+        [[ -n "$XFER_SMB_RUN" && -d "$XFER_SMB_RUN" ]] && rm -rf "$XFER_SMB_RUN"
+    fi
+    XFER_SMB_PID=""
+    [[ -n "$XFER_SMB_STAGE" && -d "$XFER_SMB_STAGE" ]] && rm -rf "$XFER_SMB_STAGE"
+    XFER_SMB_RUN=""; XFER_SMB_STAGE=""; XFER_SMB_CONF=""
 }
