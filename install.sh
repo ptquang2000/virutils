@@ -60,7 +60,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # "module|command command ..." -- one line per group in `virutil help`.
 REQUIRED=(
     "core            |virsh awk"
-    "sync pull push  |qemu-nbd rsync sudo partx blkid blockdev lsblk mount"
+    "sync pull push  |qemu-nbd rsync sudo partx blkid blockdev lsblk mount smbd ss"
     "domain          |virt-install virt-xml qemu-img"
     "exec            |jq python3"
     "usb             |jq usbipd.exe powershell.exe"

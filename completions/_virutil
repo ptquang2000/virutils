@@ -103,6 +103,7 @@ _virutil_sync() {
   local state line
   _arguments \
     '(-c --config)'{-c,--config}'[config NAME or PATH]:config:->config' \
+    '--disk[write the disk image instead, with the guest shut down]' \
     '(-h --help)'{-h,--help}'[print usage and exit]' \
     '2:domain:->domain'   # 1 is the module word itself; _arguments skips words[1]
   case $state in
@@ -150,15 +151,15 @@ _virutil_vcpus() {
   _values -w 'vcpus' $n
 }
 
-# --live may sit anywhere before the operands, so the positions are counted past
-# it rather than fixed: with the flag typed, VM is one word further along.
+# --disk may sit anywhere before the operands, so the positions are counted past
+# the flag rather than fixed: with it typed, VM is one word further along.
 _virutil_push() {
   local -i shift_by=0 i
   for (( i = 2; i < CURRENT; i++ )); do
-    [[ ${words[i]} == --live ]] && shift_by=1
+    [[ ${words[i]} == --disk ]] && shift_by=1
   done
   if [[ $words[CURRENT] == -* ]]; then
-    _values 'option' '--live[copy into the running guest over its own network]' \
+    _values 'option' '--disk[write the disk image instead, with the guest shut down]' \
                      '--help[usage]'
     return
   fi

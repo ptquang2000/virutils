@@ -19,10 +19,12 @@ transfer
   pull       copy a file or directory out of a running guest
   push       copy a file or directory from the host into a guest
 
-  All three go through the guest's own disk image: sync and push shut a running
-  guest down (and start it again after), pull leaves it running. 'push --live'
-  is the exception -- it copies into a running guest over its own network,
-  touching neither the disk image nor the guest's uptime.
+  sync and push deliver into a running guest over its own network, touching
+  neither the disk image nor the guest's uptime, and move only what changed -- so
+  a re-run after rebuilding one file moves one file. Both take --disk to write
+  the guest's disk image instead, which shuts a running guest down (and starts it
+  again after) but needs nothing of the guest. pull only ever reads the disk
+  image, and leaves the guest running while it does.
 
 guest
   exec       run commands inside a Windows guest via the QEMU guest agent

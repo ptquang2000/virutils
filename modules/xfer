@@ -1,23 +1,23 @@
-# xfer -- the transports behind sync, pull and push. There are three, and they
+# xfer -- the transports behind sync, pull and push. There are two, and they
 # differ in what they cost the guest rather than in what they can carry.
 #
-# Offline, the guest's own qcow2 over qemu-nbd, mounted on the host:
+# Live, SMB over the guest's own NIC (write direction only). The default for
+# sync and push, and the reason is incrementality:
+#   xfer_check smb -> xfer_smb_serve -> guest fetches with robocopy
+#   The host serves the payload as a live tree on the address the guest already
+#   reaches it at, and robocopy copies only what differs from what the guest
+#   already has -- so a re-push of a build that changed one file moves one file.
+#   Nothing is mounted on either side, no device appears in the guest, and the
+#   guest keeps running. Costs a rootful smbd on port 445. See the section at
+#   the foot of this file.
+#
+# Offline, the guest's own qcow2 over qemu-nbd, mounted on the host. Behind
+# --disk for a write, and the only transport there has ever been for a read:
 #   Write direction:  xfer_check write -> guest_open      -> caller writes into $MNT
 #   Read direction:   xfer_check read  -> pull_open_disk  -> caller reads  from $MNT
 #   MNT is the root of the guest's C: -- literally, since the mount *is* C:, so
 #   a copy into it needs no delivery step afterwards. A running guest is shut
 #   down around a write, which is the whole cost of this transport.
-#
-# Live, HTTP over the guest's own NIC (write direction only):
-#   xfer_check live -> xfer_http_serve -> guest fetches with curl.exe
-#   Nothing is mounted on either side, no device appears in the guest and the
-#   guest keeps running. See the section at the foot of this file.
-#
-# Live, SMB over the guest's own NIC (write direction only):
-#   xfer_check live -> xfer_smb_serve -> guest fetches with robocopy
-#   Like the HTTP path, but the guest reads a live tree instead of one tar, so
-#   a re-push moves only what changed. Costs a rootful smbd on port 445. See
-#   the second section at the foot of this file.
 
 # Escalate only what needs root: under sudo $HOME is root's, so config
 # discovery would read /root.
@@ -54,7 +54,7 @@ xfer_check() {
             case "$state" in
                 running|"shut off") ;;
                 *)  # paused / pmsuspended: RAM that would not match the disk.
-                    die "$dom is '$state'; the copy writes straight to the" \
+                    die "$dom is '$state'; --disk writes straight to the" \
                         "disk image. Running and shut off are both fine (a" \
                         "running guest is shut down first and restarted" \
                         "afterwards), but this state cannot be shut down and" \
@@ -71,22 +71,24 @@ xfer_check() {
                        "that is not up. Start it with" \
                        "'virutil domain start $dom'."
             ;;
-        live)
+        smb)
             # Nothing is written to the disk image, so the only requirement is
             # that the guest is up with an agent to drive it.
             [[ "$state" == running ]] \
-                || die "$dom has to be running for --live; it is '$state'." \
-                       "The copy hands the file to the guest over its own" \
-                       "network, so there has to be a guest to hand it to." \
-                       "Start it with 'virutil domain start $dom', or drop" \
-                       "--live to write to the disk image instead."
+                || die "$dom has to be running to be delivered to; it is" \
+                       "'$state'. The copy hands the files to the guest over" \
+                       "its own network, so there has to be a guest to hand" \
+                       "them to. Start it with 'virutil domain start $dom', or" \
+                       "pass --disk to write to the disk image instead, which" \
+                       "works on a guest that is shut off."
             guest_agent_wait "$dom" 5 \
                 || die "$dom is running but its QEMU guest agent is not" \
-                       "answering. --live needs the agent to start the" \
-                       "download inside the guest. Check that qemu-ga is" \
-                       "running in the guest, or drop --live."
+                       "answering, and the agent is what starts the fetch" \
+                       "inside the guest. Check that qemu-ga is running in the" \
+                       "guest, or pass --disk to write to the disk image" \
+                       "instead, which needs no agent."
             ;;
-        *) die "internal: xfer_check wants write, read or live, got '$mode'" ;;
+        *) die "internal: xfer_check wants write, read or smb, got '$mode'" ;;
     esac
 }
 
@@ -175,34 +177,6 @@ nbd_part_size() {
     printf '%s' "$(( bytes / 1024 / 1024 / 1024 ))"
 }
 
-# --- live transport: HTTP over the guest's own NIC ---------------------------
-#
-# The transport above writes to the disk image, which is why it has to take the
-# guest down first. This one never touches the image: the host serves the
-# payload on the address the guest already reaches it at, and the guest pulls it
-# with curl.exe, driven through the guest agent. Nothing is mounted on either
-# side, no drive letter appears, and the guest keeps running.
-#
-# It is also the only fast one. The agent's own channel would carry these bytes
-# too, but a guest-exec payload is base64 inside JSON inside a single argv
-# entry, which Linux caps at 128KB -- about 98KB of file per call, a call per
-# second. The NIC does the same work three orders of magnitude faster, so the
-# agent is used only to say "fetch this".
-#
-# The bind address is the load-bearing part. This host is on the guest's network
-# and usually on a real one as well; a listener on the wildcard address would
-# publish the payload to the real one for the length of the transfer. So the
-# server binds to the single address that reaches the guest, on an ephemeral
-# port, behind a random path, and stops after serving the payload once.
-
-XFER_HTTP_PID=""              # the server; killed by xfer_http_stop
-XFER_HTTP_URL=""              # what the guest is told to fetch
-XFER_HTTP_DIR=""              # scratch for the server script and any payload
-XFER_HTTP_BYTES=0             # size of what is being served
-
-# Long enough for a big payload over a slow link, short enough that a guest
-# which never connects does not leave a listener behind for the day.
-XFER_HTTP_TIMEOUT="${VIRUTIL_HTTP_TIMEOUT:-1800}"
 
 # xfer_host_addr GUEST_IP -- the address the guest reaches this host at, which
 # is the source address the kernel would use to reach the guest. Asking the
@@ -213,29 +187,41 @@ xfer_host_addr() {
         awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }'
 }
 
-xfer_http_stop() {
-    if [[ -n "$XFER_HTTP_PID" ]]; then
-        kill "$XFER_HTTP_PID" 2>/dev/null || true
-        wait "$XFER_HTTP_PID" 2>/dev/null || true
-        XFER_HTTP_PID=""
-    fi
-    [[ -n "$XFER_HTTP_DIR" && -d "$XFER_HTTP_DIR" ]] && rm -rf "$XFER_HTTP_DIR"
-    XFER_HTTP_DIR=""
-}
-
-# xfer_http_dir -- scratch directory, removed by the EXIT trap however we leave.
+# --- the live path, over SMB -------------------------------------------------
 #
-# Under $VIRUTILS_TMP_DIR rather than /tmp, for the same reason sync's staging
-# tree is: a directory payload is tarred here first, /tmp is tmpfs on a good
-# many hosts (including WSL, where it is half of RAM), and a build tree is
-# exactly the sort of thing this carries. Disk, not memory.
-xfer_http_dir() {
-    [[ -n "$XFER_HTTP_DIR" ]] && return 0
-    mkdir -p "$VIRUTILS_TMP_DIR" \
-        || die "could not create $VIRUTILS_TMP_DIR for the transfer payload"
-    XFER_HTTP_DIR="$(mktemp -d "$VIRUTILS_TMP_DIR/live.XXXXXX")" \
-        || die "could not create a scratch directory for the transfer"
-    trap xfer_http_stop EXIT
+# How sync and push deliver unless --disk says otherwise. The host serves the
+# payload as a live tree and the guest fetches it with robocopy, which compares
+# the tree it already has against the one being served and copies only what
+# differs -- so a second push of a build where one file changed moves one file,
+# and leaves the rest untouched down to their timestamps.
+#
+#   xfer_smb_serve DIR ADDR -> guest robocopies from \\ADDR\<share>
+#
+# The agent's own channel could carry these bytes instead, and does not: a
+# guest-exec payload is base64 inside JSON inside a single argv entry, which
+# Linux caps at 128KB -- about 98KB of file per call, a call per second. The NIC
+# does the same work three orders of magnitude faster, so the agent is used only
+# to say "fetch this".
+#
+# Two things this costs. The share is SMB, which for a Windows client means port
+# 445, which no ephemeral-port trick can move -- so this binds the one
+# privileged port, needs root to do it, and refuses to run if something (on WSL,
+# the Windows host's own file sharing) already holds 445. And the bind address
+# is load-bearing: this host is on the guest's network and usually on a real one
+# as well, so the share goes to the single address that reaches the guest and
+# never the wildcard, which would offer it to every network this host is on.
+# Nothing is mounted in the guest all the same: robocopy against a UNC path is a
+# redirector read, no drive letter and no share of the guest's own.
+
+# The share name the guest is told and nothing else can guess. Not a secret in
+# any strong sense -- it is one private network and one transfer long -- but it
+# keeps the payload from being reachable by anything else on that network that
+# goes looking for shares.
+xfer_share_token() {
+    local t
+    t="$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')"
+    [[ ${#t} -ge 16 ]] || die "internal: could not generate a transfer token"
+    printf '%s' "${t:0:24}"
 }
 
 # xfer_room_for BYTES DIR -- refuse a payload that will not fit, before spending
@@ -251,138 +237,6 @@ xfer_room_for() {
                "somewhere with room, or push fewer files."
 }
 
-# A path component the guest is told and nothing else can guess. Not a secret in
-# any strong sense -- it is one private network and one transfer long -- but it
-# keeps the payload from being enumerable by anything else on that network.
-xfer_http_token() {
-    local t
-    t="$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')"
-    [[ ${#t} -ge 16 ]] || die "internal: could not generate a transfer token"
-    printf '%s' "${t:0:24}"
-}
-
-# xfer_http_serve FILE ADDR -- serve FILE on ADDR, once, and set XFER_HTTP_URL.
-#
-# The port is chosen by the kernel and reported back rather than picked here: a
-# fixed port is one concurrent transfer away from failing, and scanning for a
-# free one races anything else on the host.
-xfer_http_serve() {
-    local file="$1" addr="$2" py port token i
-
-    command -v python3 >/dev/null 2>&1 \
-        || die "--live serves the payload over HTTP and needs python3 on the" \
-               "host; it is not installed. Drop --live to write to the disk" \
-               "image instead."
-
-    xfer_http_dir
-    py="$XFER_HTTP_DIR/serve.py"
-    token="$(xfer_http_token)"
-    XFER_HTTP_BYTES="$(stat -c %s "$file")"
-
-    cat > "$py" <<'PYEOF'
-import http.server, os, shutil, socket, sys, time
-
-path, addr, token, timeout = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
-size = os.path.getsize(path)
-
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def do_GET(self):
-        if self.path != "/" + token:
-            self.send_error(404)
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(size))
-        self.end_headers()
-        start = time.monotonic()
-        with open(path, "rb") as fh:
-            shutil.copyfileobj(fh, self.wfile)
-        # Only a transfer that ran to the end retires the server: a client that
-        # dropped halfway is about to retry, and has to find it still there.
-        self.server.elapsed_ms = int((time.monotonic() - start) * 1000)
-        self.server.served = True
-
-    def log_message(self, *args):
-        pass
-
-
-server = http.server.HTTPServer((addr, 0), Handler)
-server.served = False
-server.elapsed_ms = 0
-server.timeout = 1.0
-print(server.server_address[1], flush=True)
-
-deadline = time.monotonic() + timeout
-while not server.served and time.monotonic() < deadline:
-    server.handle_request()
-
-# Second line: how long the payload itself took to go out. The caller's own
-# wall clock also contains an agent round trip and a powershell starting up,
-# which for a small payload is nearly all of it -- so the rate it would compute
-# from that would describe the overhead rather than the transfer.
-print(server.elapsed_ms, flush=True)
-sys.exit(0 if server.served else 1)
-PYEOF
-
-    # Created here, not by the redirection: the child does that after the fork,
-    # and the poll below would otherwise read a file that does not exist yet.
-    : > "$XFER_HTTP_DIR/port"
-    : > "$XFER_HTTP_DIR/err"
-    python3 "$py" "$file" "$addr" "$token" "$XFER_HTTP_TIMEOUT" \
-        >"$XFER_HTTP_DIR/port" 2>"$XFER_HTTP_DIR/err" &
-    XFER_HTTP_PID=$!
-
-    # The port is the server's first line of output; it exists once the socket
-    # is bound, so waiting for it is also what proves the bind succeeded.
-    for (( i = 0; i < 50; i++ )); do
-        port="$(< "$XFER_HTTP_DIR/port")"
-        [[ -n "$port" ]] && break
-        kill -0 "$XFER_HTTP_PID" 2>/dev/null || break
-        sleep 0.1
-    done
-    if [[ -z "${port:-}" ]]; then
-        warn "$(< "$XFER_HTTP_DIR/err")"
-        die "could not serve the payload on $addr"
-    fi
-
-    XFER_HTTP_URL="http://$addr:$port/$token"
-}
-
-# xfer_http_wait -- the server's own verdict on the transfer, for the case where
-# the guest reported success. Non-zero means it never served the payload
-# through, whatever the guest thought. On success XFER_HTTP_MS is how long the
-# payload spent on the wire.
-XFER_HTTP_MS=0
-xfer_http_wait() {
-    local rc=0
-    [[ -n "$XFER_HTTP_PID" ]] || return 0
-    wait "$XFER_HTTP_PID" || rc=$?
-    XFER_HTTP_PID=""
-    (( rc == 0 )) && XFER_HTTP_MS="$(sed -n '2p' "$XFER_HTTP_DIR/port" 2>/dev/null || echo 0)"
-    XFER_HTTP_MS="${XFER_HTTP_MS:-0}"
-    return "$rc"
-}
-
-# --- the live path, over SMB -------------------------------------------------
-#
-# The twin of the HTTP path above, and it exists for one thing HTTP cannot do:
-# the guest fetches with robocopy, which compares the tree it already has
-# against the one being served and copies only what differs. HTTP carries a
-# directory as one tar that is unpacked whole every time; SMB carries it as a
-# live tree, so a second push of a build that changed one file moves one file.
-#
-#   xfer_smb_serve DIR ADDR -> guest robocopies from \\ADDR\<share>
-#
-# What it costs that HTTP does not: the share is SMB, which for a Windows client
-# means port 445, which no ephemeral-port trick can move -- so this binds the
-# one privileged port, needs root to do it, and refuses to run if something (on
-# WSL, the Windows host's own file sharing) already holds 445. Nothing is
-# mounted in the guest all the same: robocopy against a UNC path is a redirector
-# read, no drive letter and no share of the guest's own.
-
 XFER_SMB_PID=""              # the smbd; killed by xfer_smb_stop
 XFER_SMB_RUN=""              # short-path runtime dir for smbd's sockets
 XFER_SMB_STAGE=""            # scratch under VIRUTILS_TMP_DIR, only the file case
@@ -397,11 +251,12 @@ xfer_smb_free() {
     # An if, not `... && die`: on the free path the grep returns non-zero, and a
     # bare function ending on that would trip set -e and abort the whole run --
     # silently, and only ever when the port was actually available.
-    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq '[:.]445$'; then
+    if xfer_smb_bound; then
         die "something already holds TCP 445 on this host, and SMB cannot" \
             "be served on any other port to a Windows guest. On WSL this is" \
-            "usually the Windows host's own file sharing; stop it, or use" \
-            "--live (HTTP) instead, which needs no privileged port."
+            "usually the Windows host's own file sharing; stop it, or pass" \
+            "--disk instead, which writes the disk image and needs no" \
+            "privileged port."
     fi
 }
 
@@ -415,6 +270,137 @@ xfer_smb_run_dir() {
     XFER_SMB_RUN="$(mktemp -d /tmp/vsmb.XXXXXX)" \
         || die "could not create a runtime directory for smbd"
     trap xfer_smb_stop EXIT
+    # An EXIT trap alone does not cover a run killed at the sudo password
+    # prompt: the shell dies from the signal and never reaches its exit. That
+    # leaves the runtime directory and its conf on disk, which is where the one
+    # stray /tmp/vsmb.* on this host came from. These handlers do no cleanup of
+    # their own -- they only turn the signal into an exit, which is what runs
+    # the trap above.
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+
+# Is anything listening on 445 yet? A function because it is asked three times --
+# before the launch, around the launch, and after a failure to launch -- and the
+# three must agree on what "taken" means.
+xfer_smb_bound() {
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq '[:.]445$'
+}
+
+# How long to wait for the bind, in 0.1s steps. smbd binds in about two tenths
+# of a second on a warm host; the rest of the budget is for a cold one building
+# its tdb databases in a runtime directory that did not exist a moment ago.
+XFER_SMB_TRIES=150
+
+# Is the launch still actually running? Not kill -0: a process that has exited
+# but has not been reaped still answers that, so a launcher which died on the
+# spot would be called alive for the whole wait and then reported as "started
+# but never bound" -- with its exit code, the one thing that says what happened,
+# never read. An empty state means gone; Z means gone and unreaped.
+xfer_smb_alive() {
+    local st
+    st="$(ps -o stat= -p "$XFER_SMB_PID" 2>/dev/null | tr -d '[:space:]')" || true
+    [[ -n "$st" && "$st" != Z* ]]
+}
+
+# xfer_smb_nobind ADDR -- smbd was launched and 445 never answered. Everything
+# smbd has to say about why is in one of two places and neither is this shell's
+# stdout, so both are printed before the run ends: sudo's own complaint and
+# smbd's pre-logging errors land in out, and everything after it opens its log
+# file lands in there. The runtime directory is removed by the EXIT trap
+# immediately after this, which is exactly why the log is quoted here rather
+# than pointed at.
+# xfer_smb_diag -- what the failing launch looked like from outside, written
+# into the runtime directory so the copy below preserves it. This answers the one
+# question the launcher's own output cannot: whether sudo ever exec'd smbd at
+# all. An isolated harness that reproduces this launch exactly -- same short
+# runtime dir, same generated conf, same primed-then-backgrounded sudo -- binds
+# every time, so a failure here is something about the surrounding run, and
+# narrowing it needs the process tree rather than more of smbd's silence.
+xfer_smb_diag() {
+    local f="$XFER_SMB_RUN/diag"
+    {
+        echo "== launcher $XFER_SMB_PID"
+        ps -o pid,ppid,pgid,sess,tpgid,stat,wchan:25,args -p "$XFER_SMB_PID" 2>&1
+        # The split: no smbd process while the launcher lives means sudo never
+        # got as far as exec, and nothing smbd could have logged would say so.
+        echo "== any smbd on this host"
+        pgrep -af smbd 2>&1 || echo "NO smbd PROCESS AT ALL -- sudo never exec'd it"
+        echo "== launcher's descendants"
+        ps -eo pid,ppid,pgid,sess,stat,wchan:25,args --forest 2>&1 |
+            grep -E 'smbd|sudo' 2>&1 || true
+        echo "== what the launcher is parked on"
+        cat /proc/"$XFER_SMB_PID"/wchan 2>&1; echo
+        echo "== listeners"
+        ss -ltnp 2>&1
+        echo "== is the credential still valid?"
+        if [[ -n "${SUDO[*]:-}" ]]; then
+            "${SUDO[@]}" -n true 2>&1 && echo "sudo -n OK" || echo "sudo -n REFUSED"
+        fi
+    } > "$f" 2>&1 || true
+}
+
+xfer_smb_nobind() {
+    local addr="$1" out log keep rc=0
+    # || true on both: a file that was never created makes the *assignment*
+    # fail, which under set -e takes the whole run down here -- silently, and
+    # only ever on the path whose entire job is to explain a failure.
+    out="$(cat "$XFER_SMB_RUN/out" 2>/dev/null)" || true
+    log="$(tail -n 20 "$XFER_SMB_RUN/log" 2>/dev/null)" || true
+    [[ -n "$out" ]] && warn "$out"
+    [[ -n "$log" ]] && warn "$log"
+
+    # Kept rather than summarised. The EXIT trap removes the runtime directory
+    # moments from now, and when the launch says nothing at all -- which is the
+    # hard case -- what it left in there is the only evidence there is.
+    xfer_smb_diag
+    keep="$VIRUTILS_TMP_DIR/smb-failed.$$"
+    mkdir -p "$VIRUTILS_TMP_DIR" 2>/dev/null || true
+    cp -a "$XFER_SMB_RUN" "$keep" 2>/dev/null || true
+    [[ -d "$keep" ]] || keep=""
+
+    # An exit needs no timeout to explain it, and its status is readable only
+    # once the process is waited for.
+    if ! xfer_smb_alive; then
+        wait "$XFER_SMB_PID" 2>/dev/null || rc=$?
+        die "the smbd launch exited with status $rc without binding" \
+            "$addr:445.${out:+ Its own output is above.}" \
+            "${keep:+What it left behind is kept at $keep, where out holds its stdout and stderr.}" \
+            "Status 1 from sudo means the credential went stale between" \
+            "priming it and this launch; anything else is smbd's own." \
+            "Run it by hand to see it live:" \
+            "  sudo smbd -s $XFER_SMB_CONF -F --no-process-group --debug-stdout"
+    fi
+
+    # A listener that appeared between the check at the start and now is a
+    # different failure from smbd refusing to start, and reads nothing like it.
+    if kill -0 "$XFER_SMB_PID" 2>/dev/null; then
+        # A stopped process is its own diagnosis and reads nothing like a slow
+        # one: it means something put the launch in the background while it was
+        # still touching the terminal, and it will never bind on its own.
+        local state=""
+        state="$(ps -o stat= -p "$XFER_SMB_PID" 2>/dev/null | tr -d '[:space:]')" || true
+        if [[ "$state" == T* ]]; then
+            die "the process serving the share is stopped (state $state) and so" \
+                "never bound $addr:445 -- it was suspended for touching the" \
+                "terminal from the background. This is a virutil bug rather" \
+                "than anything about this host; the command that produced it is" \
+                "worth reporting.${keep:+ Its runtime state is kept at $keep.}"
+        fi
+        die "smbd started but has not bound $addr:445 after" \
+            "$(( XFER_SMB_TRIES / 10 ))s; whatever it logged is above. On WSL," \
+            "check whether the Windows host is holding 445 -- the check this" \
+            "run made looks at Linux's own sockets and cannot see Windows'." \
+            "${keep:+Its runtime state is kept at $keep, where diag holds the}" \
+            "${keep:+process tree at the moment it gave up -- read that first.}" \
+            "Or pass --disk, which writes the disk image and needs no" \
+            "privileged port."
+    fi
+    die "smbd exited without binding $addr:445; its own output is above." \
+        "If it says nothing, run it by hand to see why:" \
+        "  sudo smbd -s $XFER_SMB_CONF -F --no-process-group --debug-stdout" \
+        "Or pass --disk, which writes the disk image and needs no" \
+        "privileged port."
 }
 
 # xfer_smb_serve DIR ADDR -- export DIR read-only on ADDR:445, once, under a
@@ -427,14 +413,23 @@ xfer_smb_serve() {
     local dir="$1" addr="$2" i
 
     command -v smbd >/dev/null 2>&1 \
-        || die "--smb serves the payload over SMB and needs smbd (the Samba" \
-               "server) on the host; it is not installed. Use --live for the" \
-               "HTTP transport instead, which needs only python3."
+        || die "delivering into a running guest serves the payload over SMB" \
+               "and needs smbd (the Samba server) on the host; it is not" \
+               "installed. Install it, or pass --disk to write to the disk" \
+               "image instead."
+    # Both the "is 445 taken" check and the "has smbd bound it yet" wait read
+    # ss. Without it each would silently answer no, which reads as a free port
+    # and then as an smbd that never started -- so it is required outright
+    # rather than treated as absent evidence.
+    command -v ss >/dev/null 2>&1 \
+        || die "the delivery needs ss (iproute2) to tell whether port 445 is" \
+               "free and whether smbd has bound it; it is not on PATH." \
+               "Install iproute2, or pass --disk to write to the disk image."
 
     xfer_privilege
     xfer_smb_free
     xfer_smb_run_dir
-    XFER_SMB_SHARE="$(xfer_http_token)"
+    XFER_SMB_SHARE="$(xfer_share_token)"
     XFER_SMB_CONF="$XFER_SMB_RUN/smb.conf"
 
     # guest account is the invoking user so smbd reads the payload as its owner
@@ -468,23 +463,37 @@ CONF
     # prime the credential up front, synchronously, where the prompt has a
     # terminal to reach.
     if (( ${#SUDO[@]} )); then
-        "${SUDO[@]}" -v || die "could not obtain the root privilege --smb needs to bind port 445"
+        "${SUDO[@]}" -v || die "could not obtain the root privilege needed to bind port 445" \
+            "and serve the payload. Pass --disk to write to the disk image" \
+            "instead, which needs no privileged port."
     fi
-    "${SUDO[@]}" smbd -s "$XFER_SMB_CONF" -F --no-process-group \
-        >"$XFER_SMB_RUN/out" 2>&1 &
+    # --debug-stdout so everything smbd has to say lands in one file this shell
+    # owns. Without it, its first messages go to the compiled-in
+    # /var/log/samba/log.smbd -- which under sudo it can actually open, so a
+    # failure to bind would log there, be unreadable without root, and leave the
+    # run reporting "did not come up" with nothing to say about why.
+    # -n and </dev/null, because this one runs in the background: there,
+    # anything that touches the terminal is a hang and not a prompt. A
+    # background process reading the tty is stopped with SIGTTIN, and a stopped
+    # sudo never execs smbd -- which is the "started but never bound, and logged
+    # nothing" failure this produced whenever the run's output was redirected
+    # away from the terminal. The credential was primed above, synchronously,
+    # where a prompt could still reach one; by here there is nothing left to ask,
+    # so -n turns a stale timestamp into an error instead of a wait.
+    local -a launch=("${SUDO[@]}")
+    (( ${#SUDO[@]} )) && launch+=(-n)
+    launch+=(smbd -s "$XFER_SMB_CONF" -F --no-process-group --debug-stdout)
+    "${launch[@]}" >"$XFER_SMB_RUN/out" 2>&1 </dev/null &
     XFER_SMB_PID=$!
 
     # The bind is done when 445 answers; poll for it, and stop early if smbd has
     # already died -- its output holds the reason.
-    for (( i = 0; i < 50; i++ )); do
-        ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq '[:.]445$' && break
-        kill -0 "$XFER_SMB_PID" 2>/dev/null || break
+    for (( i = 0; i < XFER_SMB_TRIES; i++ )); do
+        xfer_smb_bound && break
+        xfer_smb_alive || break
         sleep 0.1
     done
-    ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq '[:.]445$' || {
-        warn "$(cat "$XFER_SMB_RUN/out" 2>/dev/null)"
-        die "smbd did not come up on $addr:445"
-    }
+    if ! xfer_smb_bound; then xfer_smb_nobind "$addr"; fi
 
     XFER_SMB_UNC="\\\\$addr\\$XFER_SMB_SHARE"
 }
