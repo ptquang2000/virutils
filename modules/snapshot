@@ -94,6 +94,54 @@ snapshot_paths() {
     snapshot_files "$1" "$2" | cut -f2-
 }
 
+# snapshot_xml_chain XML DISK -- the backing chain the domain XML already carries
+# for the disk whose top image is DISK, deepest entries included, one per line.
+# Non-zero if the XML names that disk alone: libvirt records a chain in full or
+# not at all, so one source and no <backingStore> means unprobed, not "no
+# backing file" -- and the caller has to tell those apart.
+snapshot_xml_chain() {
+    printf '%s\n' "$1" | awk -v want="$2" '
+        /<disk /   { indisk = ($0 ~ /device=.disk./); n = 0; delete chain; next }
+        /<\/disk>/ {
+            if (indisk && n > 1 && chain[1] == want)
+                for (i = 1; i <= n; i++) { print chain[i]; found = 1 }
+            indisk = 0; next
+        }
+        indisk && match($0, /file='"'"'[^'"'"']*'"'"'/) {
+            chain[++n] = substr($0, RSTART + 6, RLENGTH - 7) }
+        END { exit(found ? 0 : 1) }'
+}
+
+# snapshot_record_targets VM SNAP -- the disk targets SNAP's record actually
+# snapshotted. A disk the record never knew about -- the transfer share, attached
+# long after the snapshot was taken -- must stay out of every set derived from
+# that record, and so must the cdroms, which the record lists as snapshot='no'.
+snapshot_record_targets() {
+    "${VIRSH[@]}" snapshot-dumpxml --domain "$1" --snapshotname "$2" 2>/dev/null \
+        | awk '
+            /<disks>/    { indisks = 1; next }
+            /<\/disks>/  { exit }
+            indisks && /snapshot='"'"'external'"'"'/ &&
+            match($0, /name='"'"'[^'"'"']*'"'"'/) {
+                print substr($0, RSTART + 6, RLENGTH - 7) }'
+}
+
+# snapshot_domain_chain XML TARGETS -- every image the disks in TARGETS (space
+# separated, trailing space) read in XML: top overlay and backing store both.
+snapshot_domain_chain() {
+    printf '%s\n' "$1" | awk -v want="$2" '
+        /<disk /   { indisk = ($0 ~ /device=.disk./); n = 0; keep = 0; delete c; next }
+        /<\/disk>/ {
+            if (keep) for (i = 1; i <= n; i++) print c[i]
+            indisk = 0; next
+        }
+        !indisk { next }
+        match($0, /file='"'"'[^'"'"']*'"'"'/) {
+            c[++n] = substr($0, RSTART + 6, RLENGTH - 7); next }
+        /<target / && match($0, /dev='"'"'[^'"'"']*'"'"'/) {
+            if (index(want, substr($0, RSTART + 5, RLENGTH - 6) " ")) keep = 1 }'
+}
+
 # snapshot_live_files VM -- every file the domain's disk chain reads, so a delete
 # can refuse to unlink out from under the guest. Returns non-zero if the chain
 # could not be resolved in full; a caller that unlinks on a partial answer would
@@ -102,8 +150,7 @@ snapshot_paths() {
 # The domain XML is the source here, not qemu-img: libvirt nests the whole chain
 # under each disk as <backingStore>, and virsh answers over the libvirt socket,
 # which the libvirt group can read. qemu-img has to open the overlay itself,
-# which is 0600 and owned by the qemu user, so it needs root and fails without a
-# password -- silently, and in the direction that unlinks too much.
+# which is 0600 and owned by the qemu user, so it needs root.
 snapshot_live_files() {
     local vm="$1" xml disk out rc=0
 
@@ -120,13 +167,21 @@ snapshot_live_files() {
 
     # A shut-off domain's XML may name the top image alone -- libvirt fills
     # <backingStore> in when it probes the chain, and a domain that has never run
-    # under this definition has nothing recorded. Where it is missing the chain
-    # has to come from qemu-img, which may not be readable; the union of the two
-    # is what makes the answer complete, and rc=1 says when it is not.
+    # under this definition has nothing recorded. Only those disks need qemu-img;
+    # asking it about a disk the XML already chained would be a root prompt for
+    # an answer we have. When it is needed it is tried as ourselves first and
+    # only then under sudo, because the images are 0600 and owned by the qemu
+    # user: without the escalation every delete against a shut-off domain
+    # reports a partial chain and keeps overlays that nothing reads.
     if [[ "$("${VIRSH[@]}" domstate "$vm" 2>/dev/null)" != running ]]; then
         while read -r disk; do
             [[ -n "$disk" ]] || continue
-            if out="$(qemu-img info --backing-chain -- "$disk" 2>/dev/null)"; then
+            snapshot_xml_chain "$xml" "$disk" >/dev/null && continue
+            if out="$(qemu-img info --backing-chain -- "$disk" 2>/dev/null)" \
+               || { say "chain:  reading $disk needs root" && \
+                    out="$("${SUDO[@]}" qemu-img info --backing-chain -- "$disk" \
+                           2>/dev/null)"; }
+            then
                 printf '%s\n' "$out" | awk '/^image: /{ sub(/^image: /, ""); print }'
             else
                 rc=1
@@ -136,8 +191,33 @@ snapshot_live_files() {
     return "$rc"
 }
 
-# snapshot_kept_files VM EXCLUDE... -- the files still named by the records that
-# survive this delete. An overlay shared with another snapshot stays.
+# snapshot_backing_files VM SNAP -- the images SNAP's overlays are stacked on:
+# the disk sources inside the record's inner <domain>, which is the chain as it
+# stood when the snapshot was taken.
+#
+# The exact set snapshot_files refuses to collect, and for the exact opposite
+# reason. Nothing may *unlink* these -- the domain's own base disk is among them.
+# But a record whose backing file is gone is a record that cannot be reverted to,
+# so anything deciding what is safe to remove has to count them as in use.
+#
+# It is not a hypothetical: a revert re-points the reverted record onto a fresh
+# overlay, and the overlay it drops is routinely the backing file of a *child*
+# snapshot's overlay -- named nowhere in that child's <disks>, only here.
+snapshot_backing_files() {
+    "${VIRSH[@]}" snapshot-dumpxml --domain "$1" --snapshotname "$2" 2>/dev/null \
+        | awk '
+            /<domain[ \t>]/ { indomain = 1 }
+            !indomain  { next }
+            /<disk /   { indisk = ($0 ~ /device=.disk./); next }
+            /<\/disk>/ { indisk = 0; next }
+            indisk && match($0, /file='"'"'[^'"'"']*'"'"'/) {
+                print substr($0, RSTART + 6, RLENGTH - 7) }'
+}
+
+# snapshot_kept_files VM EXCLUDE... -- every file the records that survive this
+# operation still need: the overlays they name, and the images those overlays
+# are stacked on. An overlay shared with another snapshot stays, and so does one
+# that only a surviving record's backing chain reads.
 snapshot_kept_files() {
     local vm="$1"; shift
     local -a skip=("$@")
@@ -150,7 +230,112 @@ snapshot_kept_files() {
         done
         (( keep )) || continue
         snapshot_paths "$vm" "$snap"
+        snapshot_backing_files "$vm" "$snap"
     done < <("${VIRSH_Q[@]}" snapshot-list --domain "$vm" --name 2>/dev/null)
+}
+
+# snapshot_clear_clobber VM SNAP FILE... -- make room for a create whose overlay
+# names are already taken on disk.
+#
+# Left over from an earlier delete: libvirt would rename around these the same
+# way it renames around a duplicate snapshot name, and the record would come out
+# naming two overlays for one disk. What to do about them turns entirely on
+# whether anything still reads them, which is a question with an answer -- and
+# the wrong answer is the expensive one. A file the domain reads through is
+# exactly what a delete leaves behind when it keeps an overlay the guest still
+# needs, and telling the user to remove that is telling them to unlink their own
+# disk. So: unreferenced ones go, referenced ones are a name collision the user
+# has to resolve, and an unreadable chain is neither and stops the create.
+snapshot_clear_clobber() {
+    local vm="$1" snap="$2"; shift 2
+    local LIVE CHAINOK=1 f
+    local -A INUSE=()
+    local -a BLOCKED=()
+
+    (( $# )) || return 0
+
+    LIVE="$(snapshot_live_files "$vm")" || CHAINOK=0
+    (( CHAINOK )) || die \
+        "these files are in the way of snapshot '$snap':" \
+        "$(printf '  %s\n' "$@")" \
+        "The domain's disk chain could not be read in full, so whether anything" \
+        "still needs them is unknown. Check them by hand, or pick another name" \
+        "for this snapshot."
+
+    while read -r f; do
+        [[ -n "$f" ]] || continue
+        INUSE["$f"]=1
+    done < <(printf '%s\n' "$LIVE"; snapshot_kept_files "$vm")
+
+    for f in "$@"; do
+        [[ -n "${INUSE[$f]:-}" ]] && BLOCKED+=("$f")
+    done
+
+    (( ${#BLOCKED[@]} )) && die \
+        "snapshot '$snap' would be written over a file that is in use:" \
+        "$(printf '  %s\n' "${BLOCKED[@]}")" \
+        "No record names it, but the domain reads through it or another snapshot" \
+        "does -- it is the overlay a delete kept back. Removing it would take the" \
+        "disk with it. Pick another name for this snapshot; this one cannot be" \
+        "reused while that file is live."
+
+    # Named by nothing and read by nothing: the create is free to have the name
+    # back, and a leftover the user cannot act on is not worth stopping for.
+    for f in "$@"; do
+        domain_rm "$f" || die "could not clear $f out of the way of '$snap'"
+    done
+}
+
+# snapshot_sweep VM SKIP... -- unlink the files named on stdin, one
+# "kind<TAB>PATH" line each as snapshot_files prints them, that nothing still
+# reads: not in the domain's disk chain, and not named by any record other than
+# the SKIP ones. Non-zero if anything had to be kept.
+#
+# Shared by delete and revert because the question is the same either way -- a
+# file the metadata used to name and does not any more -- and only the reason it
+# stopped being named differs. --quiet drops the note about a file kept for being
+# in use: a delete was asked about those files by name and is owed the answer,
+# while a revert offers up a whole chain speculatively and most of it staying is
+# the ordinary outcome, not news.
+snapshot_sweep() {
+    local quiet=0
+    [[ "${1:-}" == --quiet ]] && { quiet=1; shift; }
+    local vm="$1"; shift
+    local LIVE CHAINOK=1 f kind rc=0
+    local -A OWNED=() INUSE=()
+
+    while IFS=$'\t' read -r kind f; do
+        [[ -n "$f" ]] || continue
+        OWNED["$f"]="$kind"
+    done
+    (( ${#OWNED[@]} )) || return 0
+
+    # Read now, not before the caller dropped its records: the set that matters
+    # is what survives, and an overlay a surviving record shares stays.
+    LIVE="$(snapshot_live_files "$vm")" || CHAINOK=0
+    while read -r f; do
+        [[ -n "$f" ]] || continue
+        INUSE["$f"]=1
+    done < <(printf '%s\n' "$LIVE"; snapshot_kept_files "$vm" "$@")
+
+    for f in "${!OWNED[@]}"; do
+        [[ -e "$f" ]] || continue
+        if [[ -n "${INUSE[$f]:-}" ]]; then
+            (( quiet )) || warn "kept $f -- still in use"
+            continue
+        fi
+        # An unresolved chain makes that set incomplete, and a disk image
+        # missing from it may still be something the guest reads through.
+        # Keep every disk image in that case: leaving a file behind costs
+        # space, unlinking a live backing file costs the guest.
+        if (( ! CHAINOK )) && [[ "${OWNED[$f]}" == disk ]]; then
+            warn "kept $f -- could not confirm it is out of the disk chain"
+            rc=1
+            continue
+        fi
+        domain_rm "$f" || rc=1
+    done
+    return "$rc"
 }
 
 # snapshot_devices_off VM -- strip the running domain down to what libvirt can
@@ -247,13 +432,7 @@ snapshot_main() {
         }
         [[ -e "$DIR/$VM.$SNAP.mem" ]] && CLOBBER+=("$DIR/$VM.$SNAP.mem")
 
-        # Left over from an earlier delete that could not unlink them. libvirt
-        # would rename around these the same way it renames around a duplicate
-        # name, so stop while the fix is still a plain rm.
-        (( ${#CLOBBER[@]} )) && die \
-            "these files are in the way of snapshot '$SNAP':" \
-            "$(printf '  %s\n' "${CLOBBER[@]}")" \
-            "No record names them. Remove them, then create again."
+        snapshot_clear_clobber "$VM" "$SNAP" ${CLOBBER[@]+"${CLOBBER[@]}"}
 
         # From here on the guest is short a device and a disc, so the trap goes
         # up first: they go back however this ends, including the die below and
@@ -305,8 +484,59 @@ snapshot_main() {
         # has loaded after Windows is installed are the install media, which
         # nothing reads again -- and which are the reason a revert fails when
         # they are left in.
+
+        # A revert does not reuse the overlay the record names: libvirt builds a
+        # fresh one per disk beside the base and rewrites the record onto it. Two
+        # kinds of file are left with nothing pointing at them afterwards, and
+        # both have to be named now -- a moment later the metadata that named
+        # them is gone and they are unrecoverable:
+        #
+        #   the overlay the record dropped    what the revert replaced
+        #   the chain the domain was reading  overlays of the branch being left,
+        #                                     including ones whose record was
+        #                                     already deleted while the domain
+        #                                     still read through them -- the case
+        #                                     delete can only warn about
+        #
+        # Both are candidates, not conclusions: what survives the sweep's in-use
+        # test is what actually goes. Scoped to the targets the record covers, so
+        # a disk attached since -- the transfer share -- is never a candidate.
+        local -a WAS=()
+        local line kind f tgt targets="" xml
+        while read -r tgt; do
+            [[ -n "$tgt" ]] || continue
+            targets+="$tgt "
+        done < <(snapshot_record_targets "$VM" "$SNAP")
+
+        while IFS=$'\t' read -r kind f; do
+            [[ -n "$f" ]] || continue
+            WAS+=("$kind"$'\t'"$f")
+        done < <(snapshot_files "$VM" "$SNAP")
+
+        if [[ -n "$targets" ]] && xml="$("${VIRSH[@]}" dumpxml "$VM" 2>/dev/null)"; then
+            while read -r f; do
+                [[ -n "$f" ]] || continue
+                WAS+=($'disk\t'"$f")
+            done < <(snapshot_domain_chain "$xml" "$targets")
+        fi
+
         "${VIRSH[@]}" snapshot-revert --domain "$VM" --snapshotname "$SNAP" --running
         echo "reverted: $SNAP"
+
+        # Only what the record stopped naming. Everything it still names is in
+        # use by definition, and feeding those to the sweep would be a warning
+        # about a file doing its job, on every single revert.
+        local -A NOW=()
+        while IFS=$'\t' read -r kind f; do
+            [[ -n "$f" ]] || continue
+            NOW["$f"]=1
+        done < <(snapshot_files "$VM" "$SNAP")
+
+        for line in ${WAS[@]+"${WAS[@]}"}; do
+            f="${line#*$'\t'}"
+            [[ -n "${NOW[$f]:-}" ]] || printf '%s\n' "$line"
+        done | snapshot_sweep --quiet "$VM" \
+            || warn "some files the revert replaced were left behind"
 
         # The restored memory carries the clock the guest had when the snapshot
         # was taken, so it wakes up exactly as far behind as the snapshot is old.
@@ -336,12 +566,12 @@ snapshot_main() {
 
         # Collected before anything is deleted -- the record is the only place
         # these names exist.
-        local -A OWNED=()
+        local -a FILES=()
         local f kind
         for s in "${TARGETS[@]}"; do
             while IFS=$'\t' read -r kind f; do
                 [[ -n "$f" ]] || continue
-                OWNED["$f"]="$kind"
+                FILES+=("$kind"$'\t'"$f")
             done < <(snapshot_files "$VM" "$s")
         done
 
@@ -358,35 +588,9 @@ snapshot_main() {
             say "deleted: $s"
         done
 
-        # Only files nothing else still reads. The domain's chain is read now,
-        # after the delete, and an overlay a surviving record shares stays.
-        local LIVE CHAINOK=1
-        LIVE="$(snapshot_live_files "$VM")" || CHAINOK=0
-
-        local -A INUSE=()
-        while read -r f; do
-            [[ -n "$f" ]] || continue
-            INUSE["$f"]=1
-        done < <(printf '%s\n' "$LIVE"; snapshot_kept_files "$VM" "${TARGETS[@]}")
-
         local rc=0
-        for f in "${!OWNED[@]}"; do
-            [[ -e "$f" ]] || continue
-            if [[ -n "${INUSE[$f]:-}" ]]; then
-                warn "kept $f -- still in use"
-                continue
-            fi
-            # An unresolved chain makes that set incomplete, and a disk image
-            # missing from it may still be something the guest reads through.
-            # Keep every disk image in that case: leaving a file behind costs
-            # space, unlinking a live backing file costs the guest.
-            if (( ! CHAINOK )) && [[ "${OWNED[$f]}" == disk ]]; then
-                warn "kept $f -- could not confirm it is out of the disk chain"
-                rc=1
-                continue
-            fi
-            domain_rm "$f" || rc=1
-        done
+        printf '%s\n' ${FILES[@]+"${FILES[@]}"} \
+            | snapshot_sweep "$VM" "${TARGETS[@]}" || rc=1
         (( rc )) && warn "some files were left behind; re-run once the domain is" \
                          "running, or remove them by hand"
         return "$rc"
