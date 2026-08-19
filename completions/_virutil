@@ -150,8 +150,19 @@ _virutil_vcpus() {
   _values -w 'vcpus' $n
 }
 
+# --live may sit anywhere before the operands, so the positions are counted past
+# it rather than fixed: with the flag typed, VM is one word further along.
 _virutil_push() {
-  case $CURRENT in
+  local -i shift_by=0 i
+  for (( i = 2; i < CURRENT; i++ )); do
+    [[ ${words[i]} == --live ]] && shift_by=1
+  done
+  if [[ $words[CURRENT] == -* ]]; then
+    _values 'option' '--live[copy into the running guest over its own network]' \
+                     '--help[usage]'
+    return
+  fi
+  case $(( CURRENT - shift_by )) in
     3) _virutil_domains ;;
     4) _files ;;
     5) ;;                             # the guest-side destination: nothing to complete

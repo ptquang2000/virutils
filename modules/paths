@@ -8,6 +8,7 @@
 #   $VIRUTILS_STAGING_ROOT sync's incremental staging trees
 #   $VIRUTILS_PORT_DIR     domain port forward state and logs
 #   $VIRUTILS_MNT_ROOT     host mount points for guest filesystems
+#   $VIRUTILS_TMP_DIR      scratch for transfer payloads
 
 # The default is ~/.virutils rather than an XDG directory: the staging tree has
 # to survive reboots, qemu has to reach the images, and config discovery reads
@@ -20,6 +21,7 @@ VIRUTILS_IMAGE_DIR="${VIRUTILS_IMAGE_DIR:-$VIRUTILS_ROOT/images}"
 VIRUTILS_STAGING_ROOT="${VIRUTILS_STAGING_ROOT:-$VIRUTILS_ROOT/staging}"
 VIRUTILS_PORT_DIR="${VIRUTILS_PORT_DIR:-$VIRUTILS_ROOT/ports}"
 VIRUTILS_MNT_ROOT="${VIRUTILS_MNT_ROOT:-$VIRUTILS_ROOT/mnt}"
+VIRUTILS_TMP_DIR="${VIRUTILS_TMP_DIR:-$VIRUTILS_ROOT/tmp}"
 
 virutils_mnt() { printf '%s/%s' "$VIRUTILS_MNT_ROOT" "$1"; }
 

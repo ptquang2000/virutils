@@ -1,11 +1,17 @@
-# xfer -- the transport behind sync, pull and push: the guest's own qcow2 over
-# qemu-nbd, mounted on the host. There is one, so nothing here chooses.
+# xfer -- the transports behind sync, pull and push. There are two, and they
+# differ in what they cost the guest rather than in what they can carry.
 #
-# Write direction:  xfer_check write -> guest_open      -> caller writes into $MNT
-# Read direction:   xfer_check read  -> pull_open_disk  -> caller reads  from $MNT
+# Offline, the guest's own qcow2 over qemu-nbd, mounted on the host:
+#   Write direction:  xfer_check write -> guest_open      -> caller writes into $MNT
+#   Read direction:   xfer_check read  -> pull_open_disk  -> caller reads  from $MNT
+#   MNT is the root of the guest's C: -- literally, since the mount *is* C:, so
+#   a copy into it needs no delivery step afterwards. A running guest is shut
+#   down around a write, which is the whole cost of this transport.
 #
-# MNT is the root of the guest's C: -- literally, since the mount *is* C:, so a
-# copy into it needs no delivery step afterwards.
+# Live, HTTP over the guest's own NIC (write direction only):
+#   xfer_check live -> xfer_http_serve -> guest fetches with curl.exe
+#   Nothing is mounted on either side, no device appears in the guest and the
+#   guest keeps running. See the section at the foot of this file.
 
 # Escalate only what needs root: under sudo $HOME is root's, so config
 # discovery would read /root.
@@ -59,7 +65,22 @@ xfer_check() {
                        "that is not up. Start it with" \
                        "'virutil domain start $dom'."
             ;;
-        *) die "internal: xfer_check wants write or read, got '$mode'" ;;
+        live)
+            # Nothing is written to the disk image, so the only requirement is
+            # that the guest is up with an agent to drive it.
+            [[ "$state" == running ]] \
+                || die "$dom has to be running for --live; it is '$state'." \
+                       "The copy hands the file to the guest over its own" \
+                       "network, so there has to be a guest to hand it to." \
+                       "Start it with 'virutil domain start $dom', or drop" \
+                       "--live to write to the disk image instead."
+            guest_agent_wait "$dom" 5 \
+                || die "$dom is running but its QEMU guest agent is not" \
+                       "answering. --live needs the agent to start the" \
+                       "download inside the guest. Check that qemu-ga is" \
+                       "running in the guest, or drop --live."
+            ;;
+        *) die "internal: xfer_check wants write, read or live, got '$mode'" ;;
     esac
 }
 
@@ -146,4 +167,195 @@ nbd_find_part() {
 nbd_part_size() {
     local bytes; bytes="$("${SUDO[@]}" blockdev --getsize64 "$1" 2>/dev/null || echo 0)"
     printf '%s' "$(( bytes / 1024 / 1024 / 1024 ))"
+}
+
+# --- live transport: HTTP over the guest's own NIC ---------------------------
+#
+# The transport above writes to the disk image, which is why it has to take the
+# guest down first. This one never touches the image: the host serves the
+# payload on the address the guest already reaches it at, and the guest pulls it
+# with curl.exe, driven through the guest agent. Nothing is mounted on either
+# side, no drive letter appears, and the guest keeps running.
+#
+# It is also the only fast one. The agent's own channel would carry these bytes
+# too, but a guest-exec payload is base64 inside JSON inside a single argv
+# entry, which Linux caps at 128KB -- about 98KB of file per call, a call per
+# second. The NIC does the same work three orders of magnitude faster, so the
+# agent is used only to say "fetch this".
+#
+# The bind address is the load-bearing part. This host is on the guest's network
+# and usually on a real one as well; a listener on the wildcard address would
+# publish the payload to the real one for the length of the transfer. So the
+# server binds to the single address that reaches the guest, on an ephemeral
+# port, behind a random path, and stops after serving the payload once.
+
+XFER_HTTP_PID=""              # the server; killed by xfer_http_stop
+XFER_HTTP_URL=""              # what the guest is told to fetch
+XFER_HTTP_DIR=""              # scratch for the server script and any payload
+XFER_HTTP_BYTES=0             # size of what is being served
+
+# Long enough for a big payload over a slow link, short enough that a guest
+# which never connects does not leave a listener behind for the day.
+XFER_HTTP_TIMEOUT="${VIRUTIL_HTTP_TIMEOUT:-1800}"
+
+# xfer_host_addr GUEST_IP -- the address the guest reaches this host at, which
+# is the source address the kernel would use to reach the guest. Asking the
+# routing table settles bridge naming, WSL's networking mode and multi-homing in
+# one question. Empty when there is no route at all.
+xfer_host_addr() {
+    ip -o -4 route get "$1" 2>/dev/null |
+        awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }'
+}
+
+xfer_http_stop() {
+    if [[ -n "$XFER_HTTP_PID" ]]; then
+        kill "$XFER_HTTP_PID" 2>/dev/null || true
+        wait "$XFER_HTTP_PID" 2>/dev/null || true
+        XFER_HTTP_PID=""
+    fi
+    [[ -n "$XFER_HTTP_DIR" && -d "$XFER_HTTP_DIR" ]] && rm -rf "$XFER_HTTP_DIR"
+    XFER_HTTP_DIR=""
+}
+
+# xfer_http_dir -- scratch directory, removed by the EXIT trap however we leave.
+#
+# Under $VIRUTILS_TMP_DIR rather than /tmp, for the same reason sync's staging
+# tree is: a directory payload is tarred here first, /tmp is tmpfs on a good
+# many hosts (including WSL, where it is half of RAM), and a build tree is
+# exactly the sort of thing this carries. Disk, not memory.
+xfer_http_dir() {
+    [[ -n "$XFER_HTTP_DIR" ]] && return 0
+    mkdir -p "$VIRUTILS_TMP_DIR" \
+        || die "could not create $VIRUTILS_TMP_DIR for the transfer payload"
+    XFER_HTTP_DIR="$(mktemp -d "$VIRUTILS_TMP_DIR/live.XXXXXX")" \
+        || die "could not create a scratch directory for the transfer"
+    trap xfer_http_stop EXIT
+}
+
+# xfer_room_for BYTES DIR -- refuse a payload that will not fit, before spending
+# minutes writing most of it. A tar that runs the filesystem out of space fails
+# somewhere less legible than here.
+xfer_room_for() {
+    local need="$1" dir="$2" free
+    free="$(df -B1 --output=avail "$dir" 2>/dev/null | tail -1)" || return 0
+    [[ "$free" =~ ^[0-9]+$ ]] || return 0
+    (( free > need )) \
+        || die "packing this needs about $(fmt_bytes "$need") in $dir and" \
+               "there is $(fmt_bytes "$free") free. Point VIRUTILS_TMP_DIR at" \
+               "somewhere with room, or push fewer files."
+}
+
+# A path component the guest is told and nothing else can guess. Not a secret in
+# any strong sense -- it is one private network and one transfer long -- but it
+# keeps the payload from being enumerable by anything else on that network.
+xfer_http_token() {
+    local t
+    t="$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')"
+    [[ ${#t} -ge 16 ]] || die "internal: could not generate a transfer token"
+    printf '%s' "${t:0:24}"
+}
+
+# xfer_http_serve FILE ADDR -- serve FILE on ADDR, once, and set XFER_HTTP_URL.
+#
+# The port is chosen by the kernel and reported back rather than picked here: a
+# fixed port is one concurrent transfer away from failing, and scanning for a
+# free one races anything else on the host.
+xfer_http_serve() {
+    local file="$1" addr="$2" py port token i
+
+    command -v python3 >/dev/null 2>&1 \
+        || die "--live serves the payload over HTTP and needs python3 on the" \
+               "host; it is not installed. Drop --live to write to the disk" \
+               "image instead."
+
+    xfer_http_dir
+    py="$XFER_HTTP_DIR/serve.py"
+    token="$(xfer_http_token)"
+    XFER_HTTP_BYTES="$(stat -c %s "$file")"
+
+    cat > "$py" <<'PYEOF'
+import http.server, os, shutil, socket, sys, time
+
+path, addr, token, timeout = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
+size = os.path.getsize(path)
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        if self.path != "/" + token:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        start = time.monotonic()
+        with open(path, "rb") as fh:
+            shutil.copyfileobj(fh, self.wfile)
+        # Only a transfer that ran to the end retires the server: a client that
+        # dropped halfway is about to retry, and has to find it still there.
+        self.server.elapsed_ms = int((time.monotonic() - start) * 1000)
+        self.server.served = True
+
+    def log_message(self, *args):
+        pass
+
+
+server = http.server.HTTPServer((addr, 0), Handler)
+server.served = False
+server.elapsed_ms = 0
+server.timeout = 1.0
+print(server.server_address[1], flush=True)
+
+deadline = time.monotonic() + timeout
+while not server.served and time.monotonic() < deadline:
+    server.handle_request()
+
+# Second line: how long the payload itself took to go out. The caller's own
+# wall clock also contains an agent round trip and a powershell starting up,
+# which for a small payload is nearly all of it -- so the rate it would compute
+# from that would describe the overhead rather than the transfer.
+print(server.elapsed_ms, flush=True)
+sys.exit(0 if server.served else 1)
+PYEOF
+
+    # Created here, not by the redirection: the child does that after the fork,
+    # and the poll below would otherwise read a file that does not exist yet.
+    : > "$XFER_HTTP_DIR/port"
+    : > "$XFER_HTTP_DIR/err"
+    python3 "$py" "$file" "$addr" "$token" "$XFER_HTTP_TIMEOUT" \
+        >"$XFER_HTTP_DIR/port" 2>"$XFER_HTTP_DIR/err" &
+    XFER_HTTP_PID=$!
+
+    # The port is the server's first line of output; it exists once the socket
+    # is bound, so waiting for it is also what proves the bind succeeded.
+    for (( i = 0; i < 50; i++ )); do
+        port="$(< "$XFER_HTTP_DIR/port")"
+        [[ -n "$port" ]] && break
+        kill -0 "$XFER_HTTP_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if [[ -z "${port:-}" ]]; then
+        warn "$(< "$XFER_HTTP_DIR/err")"
+        die "could not serve the payload on $addr"
+    fi
+
+    XFER_HTTP_URL="http://$addr:$port/$token"
+}
+
+# xfer_http_wait -- the server's own verdict on the transfer, for the case where
+# the guest reported success. Non-zero means it never served the payload
+# through, whatever the guest thought. On success XFER_HTTP_MS is how long the
+# payload spent on the wire.
+XFER_HTTP_MS=0
+xfer_http_wait() {
+    local rc=0
+    [[ -n "$XFER_HTTP_PID" ]] || return 0
+    wait "$XFER_HTTP_PID" || rc=$?
+    XFER_HTTP_PID=""
+    (( rc == 0 )) && XFER_HTTP_MS="$(sed -n '2p' "$XFER_HTTP_DIR/port" 2>/dev/null || echo 0)"
+    XFER_HTTP_MS="${XFER_HTTP_MS:-0}"
+    return "$rc"
 }

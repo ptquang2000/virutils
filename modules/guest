@@ -34,6 +34,52 @@ ci_glob() {
 # the EEXIST on a literal '.' as fatal ("mkdir ..././ failed: File exists").
 root_rel() { local s="$1"; [[ "$s" == "." ]] && s=""; printf '%s' "$s"; }
 
+# --- numbers a person can read ----------------------------------------------
+#
+# These exist because a log line is read by someone deciding whether a transfer
+# is going well, and "50000000 bytes" does not answer that question as fast as
+# "47.7 MiB" does. Binary units throughout, to match what Windows will report
+# for the same file once it lands.
+
+# fmt_bytes N -- a byte count. Whole bytes below a kibibyte, one decimal above:
+# a second decimal on a file size is noise nobody acts on.
+fmt_bytes() {
+    awk -v b="${1:-0}" 'BEGIN {
+        split("B KiB MiB GiB TiB", u, " ")
+        i = 1
+        while (b >= 1024 && i < 5) { b /= 1024; i++ }
+        printf (i == 1 ? "%d %s" : "%.1f %s"), b, u[i]
+    }'
+}
+
+# fmt_duration MS -- a wall-clock interval. Sub-second runs are the common case
+# here and read better in milliseconds than as "0.0s".
+fmt_duration() {
+    awk -v ms="${1:-0}" 'BEGIN {
+        if      (ms <  1000) printf "%dms", ms
+        else if (ms < 60000) printf "%.1fs", ms / 1000
+        else                 printf "%dm%02ds", int(ms / 60000), int(ms % 60000 / 1000)
+    }'
+}
+
+# fmt_rate BYTES MS -- throughput over that interval. Prints nothing when the
+# interval is too short to divide by, rather than a number invented from a
+# rounding artefact.
+fmt_rate() {
+    local ms="${2:-0}"
+    (( ms > 0 )) || return 0
+    awk -v b="${1:-0}" -v ms="$ms" 'BEGIN {
+        r = b * 1000 / ms
+        split("B KiB MiB GiB", u, " ")
+        i = 1
+        while (r >= 1024 && i < 4) { r /= 1024; i++ }
+        printf "%.1f %s/s", r, u[i]
+    }'
+}
+
+# now_ms -- a monotonic-enough clock for timing one transfer.
+now_ms() { printf '%s' "$(( $(date +%s%N) / 1000000 ))"; }
+
 # --- the guest clock --------------------------------------------------------
 #
 # A guest's clock stops whenever the guest is not running, and a reverted

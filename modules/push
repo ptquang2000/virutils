@@ -1,20 +1,37 @@
-# push -- copy a file or directory from the host into a guest's C: drive
+# push -- copy a file or directory from the host into a guest's C: drive.
+#
+# Two transports, chosen by --live, both in modules/xfer:
+#
+#   default  the guest's disk image, mounted on the host. A running guest is
+#            shut down around the copy and started again afterwards.
+#   --live   HTTP over the guest's own NIC, driven by the guest agent. The
+#            guest keeps running and sees no new device; it needs an agent, a
+#            route back to this host and curl.exe.
 
 push_usage() {
     printf '%s\n' \
-        "usage: virutil push VM SRC DST" \
+        "usage: virutil push [--live] VM SRC DST" \
         "" \
-        "  VM   libvirt domain whose disk is written; a running one is shut" \
-        "       down first and started again afterwards" \
+        "  VM   libvirt domain to copy into; without --live its disk image" \
+        "       is written, so a running one is shut down first and started" \
+        "       again afterwards" \
         "  SRC  host file or directory to copy" \
         "  DST  guest path, relative to C:\\; a trailing slash means a" \
         "       directory, exactly as with rsync. Backslashes and a C:\\" \
         "       prefix are tolerated; '..' is refused." \
+        "" \
+        "      --live              copy into the running guest instead: the" \
+        "                          host serves the payload on the address the" \
+        "                          guest reaches it at, and the guest fetches" \
+        "                          it. Nothing is mounted, nothing is shut" \
+        "                          down and no drive letter appears. Needs the" \
+        "                          guest agent, a route from the guest back to" \
+        "                          this host, and curl.exe in the guest." \
         "  -h, --help              this message" \
         "" \
-        "A directory source is copied recursively. The copy writes to the" \
-        "guest's disk image, so the guest is shut down around it; see" \
-        "README.md." >&2
+        "A directory source is copied recursively. Without --live the copy" \
+        "writes to the guest's disk image, so the guest is shut down around" \
+        "it; see README.md." >&2
     exit "${1:-1}"
 }
 
@@ -41,11 +58,12 @@ push_norm_dst() {
 }
 
 push_main() {
-    local VM="" SRC="" DST=""
+    local VM="" SRC="" DST="" LIVE=0
 
     while (( $# )); do
         case "$1" in
             -h|--help)      push_usage 0 ;;
+            --live)         LIVE=1; shift ;;
             -*)             warn "unrecognised argument: $1"; push_usage ;;
             *)
                 if   [[ -z "$VM"  ]]; then VM="$1"
@@ -64,13 +82,18 @@ push_main() {
     DOMAIN="$VM"
     domain_exists "$DOMAIN" || die "no such domain: $DOMAIN (see: virutil domain list)"
 
-    xfer_check write
-    # guest_open arms the EXIT trap that unmounts and detaches again.
-    guest_open
-
-    push_copy "$SRC" "$DST"
-
-    echo "copied -> $DOMAIN"
+    if (( LIVE )); then
+        xfer_check live
+        # Reports for itself: it knows what landed and how long it took, which
+        # is more than "copied" says.
+        push_live "$SRC" "$DST"
+    else
+        xfer_check write
+        # guest_open arms the EXIT trap that unmounts and detaches again.
+        guest_open
+        push_copy "$SRC" "$DST"
+        echo "copied -> $DOMAIN"
+    fi
 }
 
 # push_copy SRC DST -- resolve DST under MNT and run the copy. A trailing slash
@@ -87,4 +110,227 @@ push_copy() {
     [[ $DST_IS_DIR = 1 ]] && win_dst="${win_dst:+$win_dst\\}"
     echo "push: $SRC -> C:\\$win_dst"
     "${RSYNC[@]}" "$SRC" "$dst_arg"
+}
+
+# --- the live path ----------------------------------------------------------
+
+# A path inside a single-quoted powershell string. Backslashes are literal
+# there, which is the whole reason for preferring it over the double-quoted
+# form; only the quote itself has to be escaped, by doubling.
+push_ps_quote() {
+    local s="$1"
+    printf "'%s'" "${s//\'/\'\'}"
+}
+
+# push_live SRC DST -- serve the payload on the host and have the running guest
+# fetch it. A file goes over the wire as itself; a directory goes as a tar,
+# which Windows has unpacked natively since 1803 and which is the only way to
+# carry a tree in the one request this transport makes.
+push_live() {
+    local SRC="$1" DST="$2" VM="$DOMAIN"
+    local DST_IS_DIR DST_TAR="" win_dst ip host rc=0 reported t0 elapsed
+
+    if [[ "$DST" == */ || "$DST" == *'\' ]]; then DST_IS_DIR=1; else DST_IS_DIR=0; fi
+    DST="$(push_norm_dst "$DST")" || exit 1
+    # A directory source always lands *in* a directory, as with rsync, so the
+    # trailing slash is not the user's to get wrong.
+    [[ -d "$SRC" ]] && { DST_IS_DIR=1; DST_TAR=1; }
+
+    ip="$(domain_ip "$DOMAIN")" \
+        || die "could not work out $DOMAIN's address, so there is nothing to" \
+               "serve the payload to. Check 'virutil domain addr $DOMAIN'."
+    host="$(xfer_host_addr "$ip")"
+    [[ -n "$host" ]] \
+        || die "no route from this host to $DOMAIN at $ip, so the guest has" \
+               "no address to fetch from. A guest on an isolated network" \
+               "cannot use --live; drop it to write to the disk image instead."
+
+    # Not a command substitution: the payload may be a tar in the scratch
+    # directory, and a subshell would take both the directory and its own EXIT
+    # trap -- which removes it -- down with it.
+    push_live_payload "$SRC"
+    xfer_http_serve "$PUSH_PAYLOAD" "$host"
+
+    win_dst="${DST//\//\\}"
+    (( DST_IS_DIR )) && win_dst="${win_dst:+$win_dst\\}"
+    # The size goes in the line printed *before* the transfer, not after it:
+    # it is the number that tells you how long to wait, and after the fact you
+    # already know.
+    # A directory crosses as a tar, so its size is the tar's -- said out loud,
+    # because a one-file directory reading as 10 KiB is otherwise a puzzle.
+    echo "push --live: $SRC -> C:\\$win_dst ($(fmt_bytes "$XFER_HTTP_BYTES")${DST_TAR:+ tar})"
+
+    t0="$(now_ms)"
+    reported="$(push_live_fetch "$SRC" "$DST" "$DST_IS_DIR")" || rc=$?
+    elapsed=$(( $(now_ms) - t0 ))
+    (( rc == 0 )) || push_live_die "$rc" "$host"
+
+    # The guest reporting success and the host never finishing the transfer
+    # cannot both be true; if they are, the guest wrote something short.
+    xfer_http_wait \
+        || die "the guest reported success but the host never finished" \
+               "serving the payload; treat what landed in the guest as" \
+               "incomplete and run again."
+
+    xfer_http_stop
+    push_live_report "$SRC" "$reported" "$elapsed"
+}
+
+# push_live_report SRC REPORTED MS -- what landed, and how fast. REPORTED is
+# what the guest printed: the byte count of the file it wrote, or the word "ok"
+# from an unpack, which has nothing to count that the host does not already know.
+push_live_report() {
+    local SRC="$1" reported="$2" ms="$3" rate="" what
+    # The rate comes from the server's own clock, not this one: the wall clock
+    # here also holds an agent round trip and a powershell starting up, roughly
+    # a second and a half of it, which for anything short is most of the run.
+    # Said "on the wire" because the two numbers on this line will not multiply
+    # out, and that is the honest reason why.
+    rate="$(fmt_rate "$XFER_HTTP_BYTES" "$XFER_HTTP_MS")"
+    [[ -n "$rate" ]] && rate="$rate on the wire"
+
+    if [[ -d "$SRC" ]]; then
+        what="$PUSH_PAYLOAD_FILES file"
+        (( PUSH_PAYLOAD_FILES == 1 )) || what+="s"
+        what+=" unpacked"
+    else
+        # A short write is the failure this transport can produce without
+        # anything erroring, so the size the guest reports is checked rather
+        # than printed back.
+        [[ "$reported" == "$XFER_HTTP_BYTES" ]] \
+            || die "the guest wrote $(fmt_bytes "${reported:-0}") of" \
+                   "$(fmt_bytes "$XFER_HTTP_BYTES"); what landed in the guest" \
+                   "is incomplete. Run again."
+        what="done"
+    fi
+
+    echo "$DOMAIN: $what in $(fmt_duration "$ms")${rate:+ ($rate)}"
+}
+
+# push_live_payload SRC -- set PUSH_PAYLOAD to what actually goes over the wire.
+# A file is served as itself with no copy; a directory is tarred into the
+# scratch directory first. A trailing slash on a directory source means its
+# contents rather than the directory itself, matching rsync.
+PUSH_PAYLOAD=""
+PUSH_PAYLOAD_FILES=0        # entries in the tar, for the line printed at the end
+push_live_payload() {
+    local SRC="$1" tar_path
+    if [[ -f "$SRC" ]]; then
+        PUSH_PAYLOAD="$SRC"
+        return 0
+    fi
+    [[ -d "$SRC" ]] || die "source is neither a file nor a directory: $SRC"
+
+    xfer_http_dir
+    # du, not a guess: the tar is about the size of what goes into it, and the
+    # check is worth more than its cost on the one case that matters.
+    xfer_room_for "$(du -sb --apparent-size "$SRC" | cut -f1)" "$XFER_HTTP_DIR"
+    tar_path="$XFER_HTTP_DIR/payload.tar"
+    if [[ "$SRC" == */ ]]; then
+        tar -cf "$tar_path" -C "$SRC" . \
+            || die "could not pack $SRC for transfer"
+    else
+        tar -cf "$tar_path" -C "$(dirname -- "$SRC")" -- "$(basename -- "$SRC")" \
+            || die "could not pack $SRC for transfer"
+    fi
+    # Counted from the tar rather than from the guest: this is the authority on
+    # what was sent, and asking the guest would count whatever was already in
+    # the destination too.
+    PUSH_PAYLOAD_FILES="$(tar -tf "$tar_path" | grep -vc '/$' || true)"
+    PUSH_PAYLOAD="$tar_path"
+}
+
+# push_live_fetch SRC DST DST_IS_DIR -- the guest side, as one powershell run.
+# curl.exe rather than Invoke-WebRequest: it has shipped in Windows since 1803,
+# it streams to the file instead of buffering the response in memory, and its
+# exit code says what happened.
+#
+# Nothing here uses `throw`. A terminating error in powershell arrives as eight
+# lines of CategoryInfo and FullyQualifiedErrorId wrapped around one useful
+# sentence, and buries curl's own message -- which is the one that says whether
+# the network or the destination was at fault. So each failure writes one line
+# and exits with a code the host can name. curl's codes are passed through as
+# they stand; the codes below 100 that curl does not use are ours.
+PUSH_RC_UNPACK=90           # tar.exe could not unpack the payload
+PUSH_RC_NO_TAR=91           # this guest has no tar.exe
+PUSH_RC_MKDIR=92            # the destination directory could not be created
+
+push_live_fetch() {
+    local SRC="$1" DST="$2" is_dir="$3" script dst_win
+
+    if [[ -d "$SRC" ]]; then
+        dst_win="C:\\${DST//\//\\}"
+        script=$(printf '%s\n' \
+            '$ErrorActionPreference = "Stop"' \
+            'if (-not (Get-Command tar.exe -ErrorAction SilentlyContinue)) {' \
+            '  [Console]::Error.WriteLine("tar.exe is not present in this guest")' \
+            "  exit $PUSH_RC_NO_TAR }" \
+            "\$dst = $(push_ps_quote "$dst_win")" \
+            "\$tmp = Join-Path \$env:TEMP $(push_ps_quote "virutil-push-$$.tar")" \
+            'try { New-Item -ItemType Directory -Force -Path $dst | Out-Null }' \
+            "catch { [Console]::Error.WriteLine(\$_.Exception.Message); exit $PUSH_RC_MKDIR }" \
+            "& curl.exe -fsS --max-time $XFER_HTTP_TIMEOUT -o \$tmp $(push_ps_quote "$XFER_HTTP_URL")" \
+            'if ($LASTEXITCODE -ne 0) {' \
+            '  Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue' \
+            '  exit $LASTEXITCODE }' \
+            '& tar.exe -xf $tmp -C $dst' \
+            '$rc = $LASTEXITCODE' \
+            'Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue' \
+            "if (\$rc -ne 0) { exit $PUSH_RC_UNPACK }" \
+            '"ok"')
+    else
+        # A destination that names a directory takes the source's own basename,
+        # as rsync would; one that names a file is used as it stands.
+        if (( is_dir )); then
+            dst_win="C:\\${DST:+${DST//\//\\}\\}$(basename -- "$SRC")"
+        else
+            dst_win="C:\\${DST//\//\\}"
+        fi
+        script=$(printf '%s\n' \
+            '$ErrorActionPreference = "Stop"' \
+            "\$dst = $(push_ps_quote "$dst_win")" \
+            '$dir = Split-Path -Parent $dst' \
+            'try { if ($dir) { New-Item -ItemType Directory -Force -Path $dir | Out-Null } }' \
+            "catch { [Console]::Error.WriteLine(\$_.Exception.Message); exit $PUSH_RC_MKDIR }" \
+            "& curl.exe -fsS --max-time $XFER_HTTP_TIMEOUT -o \$dst $(push_ps_quote "$XFER_HTTP_URL")" \
+            'if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }' \
+            '"$((Get-Item -LiteralPath $dst).Length)"')
+    fi
+
+    exec_ps_text "$script"
+}
+
+# push_live_die RC HOST -- name what actually went wrong. The guest has already
+# printed its own line; this adds the part it cannot know, which is what to do
+# about it. Guessing "check your firewall" at every failure trains people to
+# ignore the message, so each code that means something specific says so.
+push_live_die() {
+    local rc="$1" host="$2"
+    case "$rc" in
+        7|28)
+            die "the guest could not reach this host at $host (curl exit $rc)." \
+                "The payload was served on that address only. Check that the" \
+                "guest's firewall allows outbound connections to it, or drop" \
+                "--live to write to the disk image instead." ;;
+        23)
+            die "the guest fetched the payload but could not write it to the" \
+                "destination (curl exit 23) -- the path is locked, in use or" \
+                "not writable by SYSTEM. The transfer itself was fine." ;;
+        22)
+            die "the host's own server refused the request (curl exit 22)." \
+                "This is a virutil bug, not a guest problem." ;;
+        "$PUSH_RC_UNPACK")
+            die "the payload reached the guest but tar.exe could not unpack" \
+                "it. Anything already extracted is left where it landed." ;;
+        "$PUSH_RC_NO_TAR")
+            die "this guest has no tar.exe, which a directory push --live" \
+                "needs to unpack the payload (Windows 10 1803 or later has" \
+                "it). Push the files one at a time, or drop --live." ;;
+        "$PUSH_RC_MKDIR")
+            die "the guest could not create the destination directory; its" \
+                "own message is above." ;;
+        *)
+            die "the guest failed to fetch the payload (exit $rc); its own" \
+                "error is above." ;;
+    esac
 }

@@ -34,6 +34,7 @@ step and no dependencies beyond the utilities it calls.
    - [Notes](#notes)
 - [virutil pull](#virutil-pull)
 - [virutil push](#virutil-push)
+   - [Live pushes](#live-pushes)
 - [virutil domain](#virutil-domain)
    - [create](#create)
    - [Environment](#environment)
@@ -162,7 +163,7 @@ host-side machinery in `modules/xfer` and `modules/guest`, which is
 | --- | --- | --- |
 | `sync` | Fetch a project's build output from a Windows host and push it into a guest's `C:` drive. | `virutil sync VM [-c NAME\|PATH]` |
 | `pull` | Copy a file or directory out of a **running** guest. | `virutil pull VM SRC DST` |
-| `push` | Copy a file or directory from the host into a guest's `C:` drive. | `virutil push VM SRC DST` |
+| `push` | Copy a file or directory from the host into a guest's `C:` drive. | `virutil push [--live] VM SRC DST` |
 
 ### guest
 
@@ -188,11 +189,16 @@ document covers `virutil sync`, then `virutil pull`, then `virutil push`, then
 
 ## How files move
 
-`sync`, `pull` and `push` differ in *what* they move; they all move it the same
-way. The host attaches the guest's own qcow2 with `qemu-nbd`, mounts its largest
-NTFS partition with `ntfs-3g`, and reads or writes that directly. Nothing runs
-inside the guest, so a transfer needs no guest agent, no drivers and no guest
+`sync`, `pull` and `push` differ in *what* they move; by default they all move it
+the same way. The host attaches the guest's own qcow2 with `qemu-nbd`, mounts its
+largest NTFS partition with `ntfs-3g`, and reads or writes that directly. Nothing
+runs inside the guest, so a transfer needs no guest agent, no drivers and no guest
 networking — and the mount *is* `C:`, so there is no second copy step afterwards.
+
+The one exception is [`push --live`](#live-pushes), which copies into a running
+guest over the guest's own NIC and never touches the disk image. It buys you the
+shutdown and costs you a guest agent, a route and `curl.exe`; everything below
+describes the default transport.
 
 The one thing that follows from this is the state the guest has to be in, and
 the two directions need opposite ones:
@@ -726,16 +732,17 @@ host into a guest's `C:` drive with no config file. It exists for the cases that
 do not deserve a config: a config file you edited by hand, a build artifact you
 want in the guest right now, a one-off test file.
 
-A running guest is shut down and started again around the copy, exactly as
-`sync` does it: asked to shut down (guest agent preferred, ACPI otherwise),
-waited for up to `@shutdown_timeout`, then restarted on success and on failure.
-A guest that is already off is used as-is. See
-[How files move](#how-files-move).
+By default a running guest is shut down and started again around the copy,
+exactly as `sync` does it: asked to shut down (guest agent preferred, ACPI
+otherwise), waited for up to `@shutdown_timeout`, then restarted on success and
+on failure. A guest that is already off is used as-is. See
+[How files move](#how-files-move). `--live` copies into the guest without
+stopping it; see [Live pushes](#live-pushes).
 
 ### Synopsis
 
 ```
-virutil push VM SRC DST
+virutil push [--live] VM SRC DST
 virutil push -h
 ```
 
@@ -743,9 +750,10 @@ virutil push -h
 
 | Argument | Meaning |
 | --- | --- |
-| `VM` | libvirt domain whose disk is written. |
+| `VM` | libvirt domain to copy into. |
 | `SRC` | Host file or directory to copy. Must exist and be readable. |
 | `DST` | Guest path, relative to the root of `C:`. |
+| `--live` | Copy into the **running** guest over its own network instead of writing to its disk image. |
 
 `DST` may be spelled with backslashes and an optional `C:`/`C:\` prefix; it is
 normalised to a `C:`-relative path. A destination containing `..` is refused,
@@ -772,6 +780,80 @@ created if needed, so `dir` arrives as `C:\where\dir`; only the source's
 trailing slash chooses between the directory itself and its contents. `DST`
 ending in `/` or `\` always means a directory, even one that does not exist yet.
 
+### Live pushes
+
+`--live` copies into a guest that stays running. Nothing is mounted on the host,
+nothing is written to the disk image, and no device appears in the guest — the
+bytes cross the guest's own NIC:
+
+```
+$ virutil push --live win11 ./installer.exe 'C:\Users\dev\Desktop\'
+push --live: ./installer.exe -> C:\Users\dev\Desktop\ (47.7 MiB)
+win11: done in 1.5s (454.1 MiB/s on the wire)
+
+$ virutil push --live win11 ./build/ 'C:\src\build\'
+push --live: ./build/ -> C:\src\build\ (2.9 MiB tar)
+win11: 3 files unpacked in 1.5s (478.5 MiB/s on the wire)
+```
+
+The first line is printed before the transfer starts, because its job is to tell
+you how long to wait; a directory's size is the tar's, and says so. The second is
+what actually landed. Two clocks appear because there are two: the run costs
+about a second and a half of agent round trip and `powershell.exe` starting up
+whatever the payload is, so a rate computed from the wall clock would describe
+that overhead rather than the transfer. The rate quoted is the server's own,
+which is why the two numbers do not multiply out — and why none is quoted at all
+for a payload too small to have spent measurable time on the wire.
+
+The host serves the payload on the single address the guest reaches it at, on an
+ephemeral port, behind a random path, exactly once; the guest is told to fetch it
+with `curl.exe` through the QEMU guest agent. A directory is packed into a tar
+first and unpacked in the guest with `tar.exe`, so a tree still crosses in one
+request. The trailing-slash rules above are unchanged.
+
+The agent's own channel would carry these bytes too, and does not, for one
+reason: a `guest-exec` payload is base64 inside JSON inside a single `argv`
+entry, which Linux caps at 128 KB — about 98 KB of file per call, at roughly a
+call per second. The NIC does the same work about three orders of magnitude
+faster. Measured on `virbr0` against a Windows 11 guest: **50 MB in 1.5 s** end
+to end, most of which is the fixed cost above, against ~100 KB/s through the
+agent, which is all transfer.
+
+What it needs, and what it does when it cannot have it:
+
+| Requirement | If missing |
+| --- | --- |
+| Guest running | Refused, naming the state and pointing at `domain start`. |
+| QEMU guest agent answering | Refused; there is nothing to drive the fetch. |
+| A route from the guest back to this host | Refused; a guest on an isolated network cannot use `--live`. |
+| `curl.exe` in the guest (Windows 10 1803+) | The fetch fails and the run says so. |
+| `tar.exe` in the guest (directory sources only) | Refused before anything is fetched, naming `tar.exe`. |
+| `python3` on the host | Refused; the host-side server is Python's `http.server`. |
+
+A failure is named rather than guessed at. The guest exits with a code the host
+can read — curl's own where curl failed, virutil's where the unpack or the
+destination directory did — so "could not reach this host, check the guest
+firewall" and "fetched it fine but could not write it, the path is locked" are
+different messages rather than the same one. Nothing in the guest script uses
+`throw`, because a terminating error in PowerShell buries curl's own line under
+eight of `CategoryInfo` and `FullyQualifiedErrorId`.
+
+Two things are deliberate about the listener. It is bound to the one address that
+reaches the guest, never the wildcard — this host is usually on a real network as
+well as the guest's, and a wildcard bind would publish the payload to it for the
+length of the transfer. And it stops after serving the payload once, so nothing
+is left listening when the run ends, on success or on failure.
+
+`--live` is not the virtio-fs transport that earlier versions carried and that
+[How files move](#how-files-move) records as removed. There is no share device,
+no shared-memfd backing, no config knob and no `-t`; it is one flag on `push`,
+and `sync` and `pull` do not have it.
+
+Its one real limit is that it is not incremental. The offline transport runs
+`rsync` against a mounted `C:`, which skips what already matches; `--live` sends
+everything you name, every time. For a large tree that changes a little, the
+shutdown is often the cheaper of the two.
+
 ### Notes
 
 `push` shares every safety rule `sync` documents, wholesale: it must be run as
@@ -779,7 +861,9 @@ yourself, not under `sudo`; a running guest is shut down and started again
 around the copy, while a paused or suspended one is refused rather than shut
 down; a domain with a managed-save image is refused; teardown is verified from
 observed state before you are told the disk is free; Fast Startup must be off.
-That machinery lives in the shared `modules/guest`. There are no excludes —
+That machinery lives in the shared `modules/guest`. Under `--live` most of that
+does not apply, because none of it is reached: nothing is mounted, nothing is
+shut down and the disk image is never opened. There are no excludes either way —
 `push` copies exactly what you name, which is the point of having it at all.
 
 ## virutil domain

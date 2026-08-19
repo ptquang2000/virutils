@@ -20,7 +20,9 @@ transfer
   push       copy a file or directory from the host into a guest
 
   All three go through the guest's own disk image: sync and push shut a running
-  guest down (and start it again after), pull leaves it running.
+  guest down (and start it again after), pull leaves it running. 'push --live'
+  is the exception -- it copies into a running guest over its own network,
+  touching neither the disk image nor the guest's uptime.
 
 guest
   exec       run commands inside a Windows guest via the QEMU guest agent
