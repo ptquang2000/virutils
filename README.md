@@ -296,9 +296,10 @@ image it is already running on.
 Two transports have been removed, and neither is coming back:
 
 - **virtio-fs**, selected with `-t`/`--transport` or `@transport`. Gone, and with
-   it the share device, the shared-memfd memory backing it needed, and sync's
-   `>pre`/`>post` run rules — those ran through the guest agent against a guest
-   that had to stay up, which a disk write cannot promise.
+   it the share device and the shared-memfd memory backing it needed. Sync's
+   `>pre`/`>post` run rules outlived it: they run through the guest agent
+   against a guest that stays up, which is what the default SMB delivery does
+   anyway. `--disk` cannot promise that, so it skips them with a note.
 - **HTTP**, selected with `--live`: the host served one payload with `python3`
    and the guest fetched it with `curl.exe`, carrying a directory as a single
    `tar` that was unpacked whole every time. SMB does the same job and compares
@@ -307,9 +308,8 @@ Two transports have been removed, and neither is coming back:
    guest, and `python3` is no longer part of any transfer — `virutil exec` still
    uses it.
 
-A config still carrying `@transport` or a `>` rule is rejected with its line
-number rather than quietly ignored, `-t` is no longer accepted on the command
-line, and `--live` and `--smb` each stop with a message naming what replaced
+A config still carrying `@transport` is rejected with its line number rather
+than quietly ignored, `-t` is no longer accepted on the command line, and `--live` and `--smb` each stop with a message naming what replaced
 them rather than being silently accepted.
 
 A domain created by an older virutil may still have a `virtio-fs` share in its
@@ -456,9 +456,10 @@ same rsync, the same excludes and destinations, into a scratch directory instead
 of into a mount — exports that tree as a read-only SMB share on the address the
 guest reaches this host at, and has the guest `robocopy` it onto `C:`. Only the
 files that differ from what the guest already holds cross the wire; the rest keep
-their timestamps to the millisecond. Any directories listed for cleanup are
-emptied in the guest afterwards, and the share and the tree are torn down however
-the run ends. Nothing is mounted and nothing is shut down.
+their timestamps to the millisecond. Any `>pre` run rules go to the guest just
+before it fetches, any directories listed for cleanup are emptied in the guest
+afterwards, `>post` rules run last, and the share and the tree are torn down
+however the run ends. Nothing is mounted and nothing is shut down.
 
 With **`--disk`** this half is replaced by a write to the disk image: the guest is
 shut down if it is running (waiting up to `@shutdown_timeout` for it to reach
@@ -466,7 +467,8 @@ shut down if it is running (waiting up to `@shutdown_timeout` for it to reach
 it is mounted, the staged files are copied to their destinations, the cleanup
 directories are emptied, and the mount is torn down. A guest that was running is
 started again — on success and on failure; one that was already off stays off.
-Every mapped file is written whether it changed or not. See
+Every mapped file is written whether it changed or not, and any `>pre`/`>post`
+run rules are skipped: they need the guest up. See
 [Writing the disk image instead](#writing-the-disk-image-instead).
 
 Run it as yourself, **not** under `sudo`. It refuses to start when invoked under
@@ -533,7 +535,9 @@ unknown setting or an unrecognised directive is reported with its line number.
 | `<src\|subdir` | Fetch: copy the contents of `<@repo>/src` into `<staging>/subdir`. |
 | `globs\|subdir` | Map: copy `<staging>/globs` into `<@dest>/subdir` in the guest. |
 | `!pat pat ...` | `rsync --exclude` patterns, applied to both the fetch and the map. |
-| `-path` | Empty this guest directory after copying. The directory itself is kept. |
+| `-path` | Delete this guest path after copying — a directory is emptied and kept, a file is removed. |
+| `>pre CMD` | Run `CMD` in the guest's PowerShell before the files reach it. |
+| `>post CMD` | Run `CMD` in the guest's PowerShell after they have. |
 
 Map rules are the only unsigilled form. A line starting with punctuation that is
 not one of the sigils above is treated as a mistyped directive, not as a glob,
@@ -596,14 +600,47 @@ directive as often as convenient; the lists are concatenated.
 -Users/*/AppData/Local/MyApp/logs
 ```
 
-Each path is emptied in the guest after the copy, leaving the directory itself in
-place. Paths are relative to the root of `C:` — not to `@dest` — and are matched
+```
+-Windows/System32/drivers/myapp.sys
+```
+
+Each path is cleaned in the guest after the copy. What happens depends on what
+the pattern resolved to, not on how it is written: a **directory** has its
+contents removed and the directory itself is kept, and a **file** is deleted. A
+stale driver and a log directory are both "state the guest must not keep", and
+spelling them differently would only be a trap.
+
+Paths are relative to the root of `C:` — not to `@dest` — and are matched
 **case-insensitively**, so `Users/*` behaves the way it would in Windows. A path
-that is not present is reported and skipped.
+that is not present is reported and skipped, and one the guest has locked costs
+that entry a warning, not the rest of the cleanup.
 
 Two safety rules apply, so a mistyped pattern cannot empty a top-level
 directory: the expansion must stay inside the mount point, and it must be at
 least two levels deep.
+
+#### Run rules
+
+```
+>pre  Stop-Service -Name myapp
+>post Start-Service -Name myapp
+```
+
+Free-text PowerShell, run in the guest through the guest agent — the same route
+`virutil exec ps` takes — in config order, `>pre` before the guest fetches the
+delivery and `>post` after the cleanup rules have run. The phase keyword is
+required: a command is free text, so a missing one cannot be told from a command
+that happens to start with `pre`.
+
+The first failure stops the run. A run rule is there to make the copy land
+correctly, so carrying on past one that did not happen would deliver a
+half-installed guest and report success.
+
+They need the guest up and answering on the agent, so they run only when it is —
+which the default delivery already requires. Under `--disk` the guest is shut
+down for the copy, so the rules are **skipped** with a note saying so, and the
+delivery goes ahead; a guest that went away mid-run is skipped the same way
+rather than failing the copy that already landed.
 
 ### Example
 
@@ -703,8 +740,8 @@ needs no `/XF` or `/XD`.
 **Cleanup rules run in the guest.** With no mount to unlink through, each
 `-pattern` becomes a `Remove-Item` driven by the agent: the pattern is expanded
 guest-side (so still case-insensitively, and still after the delivery, exactly as
-on the disk path), and every directory it names has its contents removed, never
-itself. The two-levels-down rule is enforced twice — once here on the pattern,
+on the disk path), every directory it names has its contents removed but never
+itself, and every file it names is deleted. The two-levels-down rule is enforced twice — once here on the pattern,
 once in the guest on what the pattern actually resolved to, since a wildcard can
 only be judged after it expands. A file the guest has locked costs that file a
 warning, not the rest of the cleanup.
@@ -770,6 +807,8 @@ What changes:
   is running to be asked.
 * **Cleanup runs on the host**, unlinking through the mount rather than through
   the agent.
+* **Run rules are skipped**, with a note before the fetch: `>pre`/`>post` go
+  through the guest agent, and there is no guest up to answer it.
 * **Fast Startup and a clean NTFS volume start to matter**, since the volume has
   to be mounted read-write; see [Guest prerequisites](#guest-prerequisites).
 

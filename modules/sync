@@ -39,7 +39,7 @@ sync_config_lookup() {
 SYNC_STAGING_ROOT="${VIRUTILS_STAGING_ROOT:-$VIRUTILS_ROOT/staging}"
 
 REPO=""; STAGING=""; DEST=""
-FETCH=(); MAPPINGS=(); EXCLUDES=(); CLEANUP=()
+FETCH=(); MAPPINGS=(); EXCLUDES=(); CLEANUP=(); RUN_PRE=(); RUN_POST=()
 
 sync_usage() {
     printf '%s\n' \
@@ -93,7 +93,7 @@ sync_dst_rel() {
 # not; the rules cannot tell the difference, because $dst_rel is the same
 # C:-relative path either way and the share is served with that same layout.
 sync_map_into() {
-    local root="$1" rule globs rel dst_rel g
+    local root="$1" rule globs rel dst_rel g m
     local -a patterns files matches
 
     shopt -s nullglob
@@ -110,7 +110,13 @@ sync_map_into() {
 
         files=()
         for g in "${patterns[@]}"; do
-            matches=("$STAGING/"$g)
+            # nullglob drops a wildcard pattern that matched nothing, but a
+            # pattern with no wildcard expands to itself whether the file is
+            # there or not -- so existence is checked rather than assumed. Left
+            # in, it reaches rsync as a missing source and fails the whole run
+            # over one file a build did not produce.
+            matches=()
+            for m in "$STAGING/"$g; do [[ -e "$m" ]] && matches+=("$m"); done
             (( ${#matches[@]} )) || { warn "warning: no match for '$g'"; continue; }
             files+=("${matches[@]}")
         done
@@ -125,28 +131,75 @@ sync_map_into() {
 
 # A function so IFS can be scoped to newlines: a glob containing spaces
 # ("Program Files") would otherwise split into separate words.
+#
+# A pattern that names a directory has its contents removed and the directory
+# itself kept; one that names a file deletes that file. Which of the two a rule
+# is doing is decided by what the pattern resolved to, not by how it is written:
+# a driver's .sys and a log directory are both "state the guest must not keep",
+# and spelling them differently would only be a trap.
 empty_guest_dirs() {
     local IFS=$'\n'
     local pat targets real rel n
 
     for pat in "${CLEANUP[@]}"; do
-        targets=("$MNT"/$(ci_glob "$pat"))
+        # Filtered by existence rather than left to nullglob: ci_glob turns every
+        # letter into a bracket expression, and a pattern that matches nothing
+        # would otherwise arrive here as its own literal text -- reported as a
+        # path that is present and then quietly skipped.
+        targets=()
+        for real in "$MNT"/$(ci_glob "$pat"); do
+            [[ -e "$real" ]] && targets+=("$real")
+        done
         (( ${#targets[@]} )) \
             || { echo "   not present, skipped: C:\\${pat//\//\\}"; continue; }
 
         for real in "${targets[@]}"; do
-            [[ -d "$real" ]] || continue
 
-            # Two levels down minimum, so a mistyped pattern cannot empty C:\.
+            # Two levels down minimum, so a mistyped pattern cannot empty C:\ --
+            # applied to a file as much as to a directory, since 'Windows' alone
+            # is as wrong a thing to delete either way.
             rel="${real#"$MNT/"}"
             if [[ "$real" != "$MNT/"* || "$rel" != */* ]]; then
                 warn "refusing unsafe cleanup path: $real"
                 continue
             fi
 
-            n="$(find "$real" -mindepth 1 -delete -print | wc -l)"
-            echo "   emptied $real ($n entries)"
+            if [[ -d "$real" ]]; then
+                n="$(find "$real" -mindepth 1 -delete -print | wc -l)"
+                echo "   emptied $real ($n entries)"
+            else
+                rm -f -- "$real" && echo "   deleted $real" \
+                    || warn "   could not delete $real"
+            fi
         done
+    done
+}
+
+# sync_run WHEN CMD... -- run each command in the guest's powershell, in config
+# order. Fatal on the first failure: a run rule exists to make the copy land
+# correctly ("stop the service", "run the installer"), so carrying on past one
+# that did not happen would deliver a half-installed guest and report success.
+sync_run() {
+    local when="$1"; shift
+    local VM="$DOMAIN"   # what the agent helpers in modules/exec address
+    local cmd state
+
+    # A guest that is not up has no agent to run anything, and nothing running
+    # in it to be worth stopping either -- so the rules are skipped rather than
+    # failed. Read here, not once at startup: the default delivery checks the
+    # guest is running before the fetch, and this is minutes later.
+    state="$("${VIRSH[@]}" domstate "$DOMAIN" 2>/dev/null || true)"
+    if [[ "$state" != running ]]; then
+        warn "   $when run rules skipped: $DOMAIN is ${state:-not readable}," \
+             "not running, so there is no agent to run them"
+        return 0
+    fi
+
+    for cmd in "$@"; do
+        echo "run ($when): $cmd"
+        exec_ps_text "$cmd" \
+            || die "$when run rule failed in $DOMAIN: $cmd" \
+                   "Its output is above. Nothing after it was run."
     done
 }
 
@@ -196,7 +249,7 @@ sync_main() {
     # Parsed up front so a malformed config fails before anything is touched.
     local key val
     REPO=""; STAGING=""; DEST=""
-    FETCH=(); MAPPINGS=(); EXCLUDES=(); CLEANUP=()
+    FETCH=(); MAPPINGS=(); EXCLUDES=(); CLEANUP=(); RUN_PRE=(); RUN_POST=()
     lineno=0
     while IFS= read -r line || [[ -n "$line" ]]; do
         (( ++lineno ))
@@ -229,13 +282,24 @@ sync_main() {
                  read -r -a pats <<< "${line#!}"
                  for p in "${pats[@]}"; do EXCLUDES+=(--exclude="$p"); done ;;
             -*)  CLEANUP+=("${line#-}") ;;
-            \>*) # A run rule needed the guest agent, which needs the guest up --
-                 # and the copy writes to the disk of a guest that is shut off.
-                 die "$CONF:$lineno: run rules are no longer supported: $line" \
-                     "They ran through the guest agent, which needs $DOMAIN" \
-                     "running, and the copy writes to its disk image while it is" \
-                     "shut off. Run the command yourself once the guest is up:" \
-                     "  virutil exec ps $DOMAIN '<command>'" ;;
+            \>*) # The phase is spelled out rather than defaulted: a command is
+                 # free text, so there is no way to tell a missing keyword from
+                 # a command that happens to start with one.
+                 local when cmd
+                 cmd="${line#>}"
+                 cmd="${cmd#"${cmd%%[![:space:]]*}"}"
+                 when="${cmd%%[[:space:]]*}"
+                 cmd="${cmd#"$when"}"
+                 cmd="${cmd#"${cmd%%[![:space:]]*}"}"
+                 [[ -n "$cmd" ]] \
+                     || die "$CONF:$lineno: run rule has no command: $line"
+                 case "$when" in
+                     pre)  RUN_PRE+=("$cmd") ;;
+                     post) RUN_POST+=("$cmd") ;;
+                     *) die "$CONF:$lineno: run rule needs 'pre' or 'post': $line" \
+                            "  >pre  COMMAND   before the files reach the guest" \
+                            "  >post COMMAND   after they have" ;;
+                 esac ;;
             \<*) [[ "$line" == *"|"* ]] \
                      || die "$CONF:$lineno: fetch rule needs '|': $line"
                  FETCH+=("${line#<}") ;;
@@ -257,7 +321,7 @@ sync_main() {
 
     echo "config: $CONF"
     echo "  ${#FETCH[@]} fetch, ${#MAPPINGS[@]} map, ${#EXCLUDES[@]} exclude," \
-         "${#CLEANUP[@]} cleanup"
+         "${#CLEANUP[@]} cleanup, $(( ${#RUN_PRE[@]} + ${#RUN_POST[@]} )) run"
     echo "  staging: $STAGING"
     echo "  domain: $DOMAIN"
     if (( DISK )); then
@@ -271,6 +335,15 @@ sync_main() {
     # deliveries want opposite states -- the default needs the guest up with an
     # agent, --disk needs one it may shut down.
     domain_exists "$DOMAIN" || die "no such domain: $DOMAIN (see: virutil domain list)"
+    # Run rules go through the guest agent, so they only happen on a guest that
+    # is up: said once here rather than per rule, since --disk copies with the
+    # guest shut down and will never reach any of them.
+    if (( ${#RUN_PRE[@]} + ${#RUN_POST[@]} )) && (( DISK )); then
+        warn "   note: --disk copies with the guest shut down, so the" \
+             "$(( ${#RUN_PRE[@]} + ${#RUN_POST[@]} )) run rule(s) in $CONF are skipped." \
+             "Drop --disk to deliver over SMB, which leaves $DOMAIN running and" \
+             "runs them."
+    fi
     if (( DISK )); then xfer_check write; else xfer_check smb; fi
 
     # --- fetch: Windows build tree -> staging -------------------------------
@@ -380,6 +453,11 @@ sync_smb_push() {
     printf 'deliver: %s file(s), %s -> %s C:\\\n' \
         "$files" "$(fmt_bytes "$bytes")" "$DOMAIN"
 
+    # Here, and no sooner: the delivery tree is built and served, so a rule that
+    # frees a locked file ("stop the service") is not holding the guest open
+    # across the fetch above, which can take minutes.
+    if (( ${#RUN_PRE[@]} )); then sync_run pre "${RUN_PRE[@]}"; fi
+
     t0="$(now_ms)"
     reported="$(sync_smb_fetch)" || rc=$?
     elapsed=$(( $(now_ms) - t0 ))
@@ -392,6 +470,10 @@ sync_smb_push() {
     # map destination has always emptied it last, and moving it earlier would
     # quietly change what a config means.
     if (( ${#CLEANUP[@]} )); then sync_smb_cleanup; fi
+
+    # Last, so a rule that starts the service or runs an installer sees the
+    # delivered files and the emptied directories.
+    if (( ${#RUN_POST[@]} )); then sync_run post "${RUN_POST[@]}"; fi
 
     echo "copy complete -> $DOMAIN"
 }
@@ -443,10 +525,11 @@ sync_smb_report() {
 
 # sync_smb_cleanup -- the cleanup rules, run in the guest instead of through the
 # mount. Same semantics as empty_guest_dirs: each pattern is expanded in the
-# guest, and every directory it names has its contents removed, never itself.
-# The two-levels-down rule is enforced twice, once here on the pattern and once
-# in the guest on what the pattern actually resolved to -- a wildcard can only
-# be checked after it has been expanded, and that happens guest-side.
+# guest, every directory it names has its contents removed but not itself, and
+# every file it names is deleted. The two-levels-down rule is enforced twice,
+# once here on the pattern and once in the guest on what the pattern actually
+# resolved to -- a wildcard can only be checked after it has been expanded, and
+# that happens guest-side.
 sync_smb_cleanup() {
     local VM="$DOMAIN"
     local pat win joined="" script out line kind rest n path
@@ -473,13 +556,17 @@ sync_smb_cleanup() {
     script=$(printf '%s\n' \
         '$ErrorActionPreference = "Stop"' \
         "foreach (\$p in @($joined)) {" \
-        '  $hits = @(Get-Item -Path $p -ErrorAction SilentlyContinue |' \
-        '            Where-Object { $_.PSIsContainer })' \
+        '  $hits = @(Get-Item -Path $p -Force -ErrorAction SilentlyContinue)' \
         '  if ($hits.Count -eq 0) { "absent $p"; continue }' \
         '  foreach ($d in $hits) {' \
         '    $full = $d.FullName.TrimEnd("\")' \
         '    $rel  = $full -replace "^[A-Za-z]:\\", ""' \
         '    if (($rel -split "\\").Count -lt 2) { "unsafe $full"; continue }' \
+        '    if (-not $d.PSIsContainer) {' \
+        '      try { Remove-Item -LiteralPath $full -Force; "deleted $full" }' \
+        '      catch { "locked $full" }' \
+        '      continue' \
+        '    }' \
         '    $n = 0' \
         '    foreach ($k in @(Get-ChildItem -LiteralPath $full -Force)) {' \
         '      try { Remove-Item -LiteralPath $k.FullName -Recurse -Force; $n++ }' \
@@ -500,6 +587,7 @@ sync_smb_cleanup() {
             absent)  echo "   not present, skipped: $rest" ;;
             unsafe)  warn "refusing unsafe cleanup path: $rest" ;;
             locked)  warn "   could not remove: $rest" ;;
+            deleted) echo "   deleted $rest" ;;
             emptied) n="${rest%% *}"; path="${rest#* }"
                      echo "   emptied $path ($n entries)" ;;
             *)       echo "   $line" ;;
