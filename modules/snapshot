@@ -9,10 +9,6 @@
 
 DIR="${VIRUTIL_IMAGE_DIR:-$VIRUTILS_IMAGE_DIR}"
 
-# What snapshot_devices_off took away, for snapshot_devices_on to put back.
-# Read by the EXIT trap, so module scope: set -u must not trip on it.
-SNAPSHOT_MEDIA=()
-
 snapshot_usage() {
     printf '%s\n' \
         "usage: virutil snapshot create VM [SNAP]  (default name snap-<timestamp>)" \
@@ -338,54 +334,6 @@ snapshot_sweep() {
     return "$rc"
 }
 
-# snapshot_devices_off VM -- strip the running domain down to what libvirt can
-# actually put in an external snapshot. One thing comes off:
-#
-#   removable media       A revert does not reuse the overlay a create made: it
-#                         builds a fresh one per disk, named <source>.<epoch>
-#                         *beside the source*. For an ISO that means an overlay
-#                         in the ISO's own directory, and where that directory
-#                         is a 9p /mnt/c share -- the normal place to keep an
-#                         ISO under WSL -- libvirt cannot label what it just
-#                         created and the revert dies half-done, leaving the
-#                         guest paused on a base image with no overlay over it.
-#                         An empty drive has no source, so it is skipped by
-#                         both halves. The tray is the whole fix.
-#
-# The create is the only chance to prevent that second one: the revert reads the
-# disks from the record, so a record written with the drives full is a revert
-# that will fail every time it is tried.
-snapshot_devices_off() {
-    local vm="$1" tgt src
-
-    xfer_running "$vm" || return 0
-
-    while IFS=$'\t' read -r tgt src; do
-        [[ -n "$tgt" && -n "$src" ]] || continue
-        domain_media_eject "$vm" "$tgt" \
-            || die "could not eject $tgt ($src) from $vm, and a snapshot taken" \
-                   "with it loaded cannot be reverted to. Eject it in the guest" \
-                   "and try again, or detach the drive for good:" \
-                   "  virsh --connect qemu:///system change-media $vm $tgt --eject --force"
-        SNAPSHOT_MEDIA+=("$tgt"$'\t'"$src")
-        say "media:  ejected $tgt ($src)"
-    done < <(domain_media "$vm")
-}
-
-# snapshot_devices_on VM -- put back what snapshot_devices_off took. Idempotent,
-# because it is both the EXIT trap and the ordinary path out of a create.
-snapshot_devices_on() {
-    local vm="$1" entry tgt src
-
-    for entry in ${SNAPSHOT_MEDIA[@]+"${SNAPSHOT_MEDIA[@]}"}; do
-        IFS=$'\t' read -r tgt src <<<"$entry"
-        domain_media_insert "$vm" "$tgt" "$src" \
-            || warn "could not put $src back in $tgt on $vm; the drive is empty." \
-                    "The definition still names it, so a fresh start restores it."
-    done
-    SNAPSHOT_MEDIA=()
-}
-
 snapshot_main() {
     local CMD VM SNAP
     CMD="${1:-}"
@@ -414,19 +362,39 @@ snapshot_main() {
             || die "snapshot '$SNAP' already exists on $VM" \
                    "Pick another name, or: virutil snapshot delete $VM $SNAP"
 
-        # Disk targets vary by bus, so ask the domain. cdroms are read-only.
+        # Every block device gets a diskspec, not just the disks. A device left
+        # out is not a device left alone: libvirt's default for it is an
+        # external overlay created *beside its own source*. For a cdrom that
+        # means an overlay next to the ISO, and under WSL the ISO lives on a 9p
+        # /mnt/c share where libvirt can neither create nor label one -- so the
+        # create fails outright, and the ones that get through leave a record
+        # whose revert fails on the drive every time it is tried. Naming the
+        # drives snapshot='no' is the fix, and it is the same fix whether the
+        # domain is running or shut off. Ejecting them was not: a shut-off
+        # domain has no tray to open, and a record written with the drives
+        # empty is a revert that takes the media away from the guest.
+        #
+        # Disk targets vary by bus, so ask the domain. The header is skipped off
+        # the dashed rule rather than by line count, since a device row must
+        # never be read as a header row or the reverse.
         local -a DISKSPECS=() CLOBBER=()
-        local target file
+        local dev target file ndisk=0
         mkdir -p "$DIR"
         paths_qemu_warn "$DIR"
-        while read -r target; do
+        while IFS=$'\t' read -r dev target; do
             [ -n "$target" ] || continue
-            file="$DIR/$VM.$SNAP.$target.qcow2"
-            [[ -e "$file" ]] && CLOBBER+=("$file")
-            DISKSPECS+=(--diskspec "$target,snapshot=external,file=$file")
+            if [[ "$dev" == disk ]]; then
+                file="$DIR/$VM.$SNAP.$target.qcow2"
+                [[ -e "$file" ]] && CLOBBER+=("$file")
+                DISKSPECS+=(--diskspec "$target,snapshot=external,file=$file")
+                ndisk=$(( ndisk + 1 ))
+            else
+                DISKSPECS+=(--diskspec "$target,snapshot=no")
+            fi
         done < <("${VIRSH[@]}" domblklist "$VM" --details \
-                 | awk '$2=="disk" {print $3}')
-        [ "${#DISKSPECS[@]}" -gt 0 ] || {
+                 | awk '!seen   { if ($1 ~ /^--+$/) seen = 1; next }
+                        NF >= 3 { printf "%s\t%s\n", $2, $3 }')
+        (( ndisk )) || {
             echo "no disks found for domain '$VM'" >&2
             exit 1
         }
@@ -434,20 +402,10 @@ snapshot_main() {
 
         snapshot_clear_clobber "$VM" "$SNAP" ${CLOBBER[@]+"${CLOBBER[@]}"}
 
-        # From here on the guest is short a device and a disc, so the trap goes
-        # up first: they go back however this ends, including the die below and
-        # a ^C mid-snapshot. Live only, both of them -- the definition still
-        # names the share and the ISOs, so nothing here is a lasting change to
-        # the domain.
-        trap 'snapshot_devices_on "$VM"' EXIT
-        snapshot_devices_off "$VM"
-
         # A shut-off domain has no memory to save, and libvirt refuses the
-        # memspec for one outright. The memory is left out, on the same rule
-        # the media handling above follows: everything only a live guest makes
-        # possible is what turns a snapshot into a memory snapshot, so a
-        # non-running domain takes a disk-only one. Revert still works -- with
-        # no memory to restore the guest just boots fresh from the disk state.
+        # memspec for one outright, so a non-running domain takes a disk-only
+        # snapshot. Revert still works -- with no memory to restore the guest
+        # just boots fresh from the disk state.
         local -a MEMSPEC=()
         if xfer_running "$VM"; then
             MEMSPEC=(--memspec "$DIR/$VM.$SNAP.mem,snapshot=external")
@@ -463,9 +421,6 @@ snapshot_main() {
             "${DISKSPECS[@]}" \
             --atomic || rc=$?
 
-        trap - EXIT
-        snapshot_devices_on "$VM"
-
         (( rc )) && die "could not create snapshot '$SNAP' on $VM"
         echo "created: $SNAP"
         ;;
@@ -474,16 +429,13 @@ snapshot_main() {
         ;;
     revert)
         SNAP="${3:?usage: virutil snapshot revert VM_NAME SNAP_NAME}"
-        # Nothing is stripped here, and nothing is put back. A revert restores
-        # the configuration stored in the record, and that was written with the
-        # share unplugged and the drives empty -- so that is the domain that
-        # comes back, definition included.
-        #
-        # Neither is a loss. The next transfer finds no share and attaches one
-        # exactly as the first ever transfer did, and the ISOs a domain still
-        # has loaded after Windows is installed are the install media, which
-        # nothing reads again -- and which are the reason a revert fails when
-        # they are left in.
+        # A revert restores the configuration stored in the record, devices
+        # included -- so what the domain gets back is what it had when the
+        # snapshot was taken. The create leaves the removable drives loaded and
+        # marks them snapshot='no', so the media comes back with it; a record
+        # written with the drives empty would take them away from the guest
+        # here, and from the guest's own memory image, which was captured with
+        # them present.
 
         # A revert does not reuse the overlay the record names: libvirt builds a
         # fresh one per disk beside the base and rewrites the record onto it. Two

@@ -1,23 +1,27 @@
 # xfer -- the transports behind sync, pull and push. There are two, and they
 # differ in what they cost the guest rather than in what they can carry.
 #
-# Live, SMB over the guest's own NIC (write direction only). The default for
-# sync and push, and the reason is incrementality:
-#   xfer_check smb -> xfer_smb_serve -> guest fetches with robocopy
-#   The host serves the payload as a live tree on the address the guest already
-#   reaches it at, and robocopy copies only what differs from what the guest
-#   already has -- so a re-push of a build that changed one file moves one file.
-#   Nothing is mounted on either side, no device appears in the guest, and the
-#   guest keeps running. Costs a rootful smbd on port 445. See the section at
-#   the foot of this file.
+# Live, SMB over the guest's own NIC. The default for sync, push and pull, and
+# the reason is incrementality:
+#   xfer_check smb -> xfer_smb_serve -> guest copies with robocopy
+#   The host serves a tree on the address the guest already reaches it at, and
+#   robocopy copies only what differs from what the other side already has -- so
+#   a re-push of a build that changed one file moves one file. Direction is the
+#   share's, not the transport's: read-only and the guest fetches from it
+#   (sync, push), writable and the guest copies into it (pull). Nothing is
+#   mounted on either side, no device appears in the guest, and the guest keeps
+#   running. Costs a rootful smbd on port 445. See the section at the foot of
+#   this file.
 #
 # Offline, the guest's own qcow2 over qemu-nbd, mounted on the host. Behind
-# --disk for a write, and the only transport there has ever been for a read:
-#   Write direction:  xfer_check write -> guest_open      -> caller writes into $MNT
-#   Read direction:   xfer_check read  -> pull_open_disk  -> caller reads  from $MNT
+# --disk in both directions:
+#   Write direction:  xfer_check write -> guest_open    -> caller writes into $MNT
+#   Read direction:   xfer_check read  -> guest_open ro -> caller reads  from $MNT
 #   MNT is the root of the guest's C: -- literally, since the mount *is* C:, so
 #   a copy into it needs no delivery step afterwards. A running guest is shut
-#   down around a write, which is the whole cost of this transport.
+#   down around it, which is the whole cost of this transport: nothing about the
+#   disk image is rearranged, so no snapshot, overlay or commit is involved in
+#   either direction.
 
 # Escalate only what needs root: under sudo $HOME is root's, so config
 # discovery would read /root.
@@ -39,8 +43,10 @@ xfer_running() {
 #          is fine: guest_open shuts it down and the EXIT trap starts it again.
 #          What is not fine is paused or pmsuspended, whose RAM would no longer
 #          match the disk being edited.
-#   read   the read runs off a live disk-only snapshot, taken while the guest
-#          keeps running -- so the guest must be running
+#   read   the mount reads the disk image, so the guest must not be writing to
+#          it. Same states as write, and for a near-enough reason: a running
+#          guest is shut down first, and paused or pmsuspended RAM holds writes
+#          the image on disk does not have yet.
 #
 # Checked here, up front, rather than inside the open: the guest's state decides
 # whether the run can happen at all, so it is settled before the fetch or any
@@ -64,29 +70,37 @@ xfer_check() {
             esac
             ;;
         read)
-            [[ "$state" == running ]] \
-                || die "$dom has to be running for this; it is '$state'." \
-                       "The copy reads the live disk through a disk-only" \
-                       "snapshot, so there is nothing to read from a guest" \
-                       "that is not up. Start it with" \
-                       "'virutil domain start $dom'."
+            case "$state" in
+                running|"shut off") ;;
+                *)  # paused / pmsuspended: writes still in RAM, and no clean
+                    # way to get them onto the image before reading it.
+                    die "$dom is '$state'; --disk reads the disk image" \
+                        "directly. Running and shut off are both fine (a" \
+                        "running guest is shut down first and started again" \
+                        "afterwards), but this state cannot be shut down, and" \
+                        "its RAM holds writes the image does not. Shut it down" \
+                        "by hand and run again, or drop --disk to copy over" \
+                        "the guest's own network instead."
+                    ;;
+            esac
             ;;
         smb)
             # Nothing is written to the disk image, so the only requirement is
             # that the guest is up with an agent to drive it.
             [[ "$state" == running ]] \
-                || die "$dom has to be running to be delivered to; it is" \
-                       "'$state'. The copy hands the files to the guest over" \
-                       "its own network, so there has to be a guest to hand" \
-                       "them to. Start it with 'virutil domain start $dom', or" \
-                       "pass --disk to write to the disk image instead, which" \
-                       "works on a guest that is shut off."
+                || die "$dom has to be running for this; it is '$state'." \
+                       "The copy goes over the guest's own network and is" \
+                       "driven from inside it, so there has to be a guest at" \
+                       "the other end. Start it with" \
+                       "'virutil domain start $dom', or pass --disk to use the" \
+                       "disk image instead, which works on a guest that is" \
+                       "shut off."
             guest_agent_wait "$dom" 5 \
                 || die "$dom is running but its QEMU guest agent is not" \
-                       "answering, and the agent is what starts the fetch" \
+                       "answering, and the agent is what starts the copy" \
                        "inside the guest. Check that qemu-ga is running in the" \
-                       "guest, or pass --disk to write to the disk image" \
-                       "instead, which needs no agent."
+                       "guest, or pass --disk to use the disk image instead," \
+                       "which needs no agent."
             ;;
         *) die "internal: xfer_check wants write, read or smb, got '$mode'" ;;
     esac
@@ -403,14 +417,21 @@ xfer_smb_nobind() {
         "privileged port."
 }
 
-# xfer_smb_serve DIR ADDR -- export DIR read-only on ADDR:445, once, under a
-# random share name, and set XFER_SMB_UNC. Anonymous and guest-only: the guest
-# reaches it with no credential, and the share carries nothing but this payload.
-# The bind address is ADDR alone, the one that reaches the guest, for the same
-# reason the HTTP server binds narrowly -- not the wildcard, which would offer
-# the share to every network this host is on.
+# xfer_smb_serve DIR ADDR [rw] -- export DIR on ADDR:445, once, under a random
+# share name, and set XFER_SMB_UNC. Read-only unless the third argument is `rw`,
+# which the read direction needs: there the guest is the one doing the writing,
+# copying out of its C: into a directory of this host's. Anonymous and
+# guest-only either way: the guest reaches it with no credential, and the share
+# carries nothing but this transfer's tree. The bind address is ADDR alone, the
+# one that reaches the guest -- not the wildcard, which would offer the share to
+# every network this host is on, and which a writable share makes a worse idea
+# still.
 xfer_smb_serve() {
-    local dir="$1" addr="$2" i
+    local dir="$1" addr="$2" mode="${3:-ro}" i readonly=yes
+
+    [[ "$mode" == rw || "$mode" == ro ]] \
+        || die "internal: xfer_smb_serve wants ro or rw, got '$mode'"
+    [[ "$mode" == rw ]] && readonly=no
 
     command -v smbd >/dev/null 2>&1 \
         || die "delivering into a running guest serves the payload over SMB" \
@@ -454,9 +475,11 @@ xfer_smb_serve() {
     disable netbios = yes
 [$XFER_SMB_SHARE]
     path = $dir
-    read only = yes
+    read only = $readonly
     guest ok = yes
     guest only = yes
+    create mask = 0644
+    directory mask = 0755
 CONF
 
     # smbd runs detached, so sudo cannot prompt once it is in the background:

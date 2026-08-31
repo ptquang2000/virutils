@@ -17,10 +17,10 @@ step and no dependencies beyond the utilities it calls.
    - [hardware](#hardware)
 - [How files move](#how-files-move)
    - [Delivering](#delivering)
-   - [Writing the disk image](#writing-the-disk-image)
-   - [Reading](#reading)
+   - [Using the disk image](#using-the-disk-image)
+   - [What used to read through a snapshot](#what-used-to-read-through-a-snapshot)
    - [What used to be here](#what-used-to-be-here)
-   - [Snapshots eject loaded media first](#snapshots-eject-loaded-media-first)
+   - [Snapshots name every drive, and snapshot only the disks](#snapshots-name-every-drive-and-snapshot-only-the-disks)
    - [A shut-off domain gets a disk-only snapshot](#a-shut-off-domain-gets-a-disk-only-snapshot)
 - [Guest prerequisites](#guest-prerequisites)
 - [virutil sync](#virutil-sync)
@@ -198,37 +198,42 @@ document covers `virutil sync`, then `virutil pull`, then `virutil push`, then
 ## How files move
 
 `sync`, `pull` and `push` differ in *what* they move. There are two ways it
-moves, and which one you get depends on the direction.
+moves, and every command has both.
 
-**Writing — `sync` and `push` — delivers into a running guest.** The host exports
-the payload as a read-only SMB share on the one address the guest already reaches
-it at, and the guest pulls it with `robocopy`, driven through the QEMU guest
-agent. Nothing is mounted on either side, no drive letter or device appears in
-the guest, and the guest keeps running throughout. The part that matters on a
-second run is `robocopy`: it compares the tree being served against the tree the
-guest already has and copies only the difference, so a re-run after rebuilding
-one file moves one file and leaves the rest untouched down to their timestamps.
+**Over the guest's own network, by default.** The host stands up one throwaway
+SMB share on the address the guest already reaches it at, and the guest's
+`robocopy` does the copying, driven through the QEMU guest agent. Nothing is
+mounted on either side, no drive letter or device appears in the guest, and the
+guest keeps running throughout. Writing (`sync`, `push`) exports the payload
+read-only and the guest fetches from it; reading (`pull`) exports the
+destination directory writable and the guest copies into it. The part that
+matters on a second run is `robocopy`: it compares the two trees and copies only
+the difference, so a re-run after rebuilding one file moves one file and leaves
+the rest untouched down to their timestamps.
 
-**Reading — `pull` — goes through the disk image**, and always has. There is no
-live read: see [Reading](#reading) below.
+All three commands also take **`--disk`**, which uses the disk image instead of
+the network. The host attaches the guest's own qcow2 with `qemu-nbd`, mounts its
+largest NTFS partition with `ntfs-3g`, and reads or writes that directly — and
+the mount *is* `C:`, so there is no second copy step afterwards. It costs the
+guest's uptime and moves every mapped file whether it changed or not, and it
+buys you a transport that needs **nothing of the guest**: no agent, no route
+back to this host, no privileged port, and a guest that is shut off works as
+well as one that is up.
 
-`sync` and `push` also take **`--disk`**, which writes the disk image instead of
-delivering over the network. The host attaches the guest's own qcow2 with
-`qemu-nbd`, mounts its largest NTFS partition with `ntfs-3g`, and writes that
-directly — and the mount *is* `C:`, so there is no second copy step afterwards.
-It costs the guest's uptime and rewrites every mapped file whether it changed or
-not, and it buys you a transport that needs **nothing of the guest**: no agent,
-no route back to this host, no privileged port, and a guest that is shut off
-works as well as one that is up.
+Direction is the share's, not the transport's. `sync` and `push` export the
+payload read-only and the guest fetches from it; `pull` exports the destination
+directory writable and the guest copies into it. Same `smbd`, same random
+one-transfer share name, same single bind address, same `robocopy` on the far
+side skipping whatever the other end already holds.
 
-| | deliver (`sync`, `push`) | `--disk` (`sync`, `push`) | read (`pull`) |
-| --- | --- | --- | --- |
-| Guest must be | **running** | running or **shut off** | **running** |
-| What is mounted | nothing | the disk image itself, read-write | a frozen snapshot of it, read-only |
-| Guest side | `robocopy`, via the agent | nothing | nothing |
-| Host needs | `smbd`, and root for port 445 | `qemu-nbd`, `ntfs-3g`, root to mount | the same, read-only |
-| Fixed cost per run | an agent round trip | a shutdown and boot, only when it was running | a snapshot and a blockcommit |
-| Moves on a re-run | only what changed | everything mapped | — |
+| | over the network (`sync`, `push`, `pull`) | `--disk` (`sync`, `push`, `pull`) |
+| --- | --- | --- |
+| Guest must be | **running**, with its agent answering | running or **shut off** |
+| What is mounted | nothing | the disk image itself — read-write to write, read-only to read |
+| Guest side | `robocopy`, via the agent | nothing |
+| Host needs | `smbd`, and root for port 445 | `qemu-nbd`, `ntfs-3g`, root to mount |
+| Fixed cost per run | an agent round trip | a shutdown and boot, only when it was running |
+| Moves on a re-run | only what changed | everything mapped |
 
 ### Delivering
 
@@ -257,7 +262,7 @@ terminal is required`, rather than hanging. Give `smbd` a `NOPASSWD` rule if you
 need this unattended, or use `--disk`, which needs `sudo` too but is equally
 blocked without a terminal.
 
-### Writing the disk image
+### Using the disk image
 
 `--disk` shuts a running guest down, and only then touches its disk. The guest
 holds the same qcow2 open, and two writers on one image is the one mistake
@@ -265,8 +270,8 @@ nothing here can undo — so a guest that is on is first asked to shut down
 (`virsh shutdown`, via the guest agent when it answers, ACPI otherwise), waited
 for to reach `shut off`, and started again when the run is over, on success and
 on failure. A guest that is already off is used as-is. What is refused outright
-is paused and `pmsuspended`: that RAM no longer matches the disk being edited,
-so it cannot be brought down and back around a write. One thing is never done —
+is paused and `pmsuspended`: that RAM no longer matches the disk, holding writes
+the image does not have and cannot be brought down cleanly to receive. One thing is never done —
 forced off. There is no `virsh destroy` anywhere in this path; cutting power
 leaves the NTFS volume dirty, so the disk would be unmountable read-write on the
 next run, and an interrupted write can leave the guest unbootable.
@@ -276,20 +281,29 @@ So a running guest needs nothing from you beyond the flag:
 ```sh
 virutil sync --disk win11        # running -> shut down -> copy -> started again
 virutil push --disk win11 ./f.txt 'C:\'
+virutil pull --disk win11 'build/out' ./out
 ```
 
-### Reading
+The read direction attaches the image `-r` and mounts it `ro`, so a `pull --disk`
+cannot alter the guest's disk even if the copy goes wrong. That is also why it is
+the one path here that tolerates a managed-save image: it leaves the image
+byte-for-byte as it found it, so a saved guest can be read out of and resumed
+afterwards.
 
-`pull` leaves the guest running throughout. A disk-only external snapshot
-redirects the guest's writes to an overlay, freezing the base image at a
-checkpoint; the base is attached read-only, mounted, copied out, and the overlay
-is folded back in with `virsh blockcommit` before the run ends — on success and
-on failure. See [virutil pull](#virutil-pull).
+### What used to read through a snapshot
 
-There is no live read to choose instead. A read has to see a consistent `C:`, and
-the snapshot is what makes that true of a running guest; nothing the guest could
-be asked to serve back over its own network would be cheaper than freezing the
-image it is already running on.
+`pull` used to leave the guest running by taking a disk-only external snapshot,
+mounting the frozen base read-only, and folding the overlay back in with
+`virsh blockcommit` at the end. It does not any more, and the reason is that the
+commit merges the **whole** backing chain unless it is told otherwise — so on a
+domain carrying `virutil snapshot` records, every pull flattened post-snapshot
+writes into the image those records' disk state was measured against. Their
+memory images stayed where they were, and the next `snapshot revert` restored
+old RAM onto a newer disk, which Windows answers with a bluescreen.
+
+A transfer has no business rewriting the images underneath a snapshot. So the
+live read is now the same SMB transport as the live write, in the other
+direction, and it does not open the disk image at all.
 
 ### What used to be here
 
@@ -324,46 +338,38 @@ virt-xml --connect qemu:///system VM --remove-device --filesystem all --define
 
 `virutil domain delete` sweeps the leftover share directory either way.
 
-### Snapshots eject loaded media first
+### Snapshots name every drive, and snapshot only the disks
 
-`virutil snapshot create` takes one thing off the running guest before it asks
-libvirt for anything, and puts it back afterwards. It does not touch the
-domain's definition, and it is there because an external snapshot cannot carry
-it:
+`virutil snapshot create` passes libvirt a `--diskspec` for *every* block device
+the domain has, not just the ones being snapshotted. The disks get
+`snapshot=external` and an overlay under the image directory; everything else —
+cdroms, floppies, loaded or empty — gets `snapshot=no`.
 
-| Removed | Why |
-| --- | --- |
-| any loaded cdrom or floppy | A **revert** does not reuse the overlay the create made. It builds a fresh one per disk, named `<source>.<epoch>`, **in the source's own directory** — so a loaded ISO means an overlay written next to the ISO. |
+The explicit `no` is the whole point. A device left out of `--diskspec` is not a
+device left alone: libvirt's default for it is an external overlay named
+`<source>.<epoch>`, created **in the source's own directory**. For a loaded ISO
+that means an overlay written next to the ISO, and an ISO kept under `/mnt/c` is
+on a 9p mount where libvirt cannot label a file it has just created. The create
+fails there, and where it gets through, the record carries the drive as a
+snapshotted disk and the *revert* fails on it instead — half-done: memory
+restored, disk switched back to the base image, no new overlay over it, guest
+left paused. Unpause it and the guest writes straight into the image the
+snapshot is defined against.
 
-That is why an ISO kept under `/mnt/c` breaks a revert. The path is a
-9p mount, libvirt cannot label a file it has just created there, and the revert
-fails *half-done*: memory restored, disk switched back to the base image, no new
-overlay over it, guest left paused. Unpause it and the guest writes straight
-into the image the snapshot is defined against.
-
-The create is the only place to prevent it, because a revert reads its disk list
-out of the record — a record written with the drives loaded is a revert that
-fails every time it is tried. Ejecting is enough: an empty drive has no source,
-so there is nothing to snapshot and nothing to label. `--force` is used, since
-Windows locks the tray of a disc it has mounted.
-
-The consequence to know about: a revert restores the configuration in the
-record, which was written mid-eject, so the guest comes back with empty drives
-and libvirt drops them from the definition on its way past. That is no loss —
-they are install media, and a domain past Windows Setup has no further use for
-them.
+Naming the drives is the fix, and it is the same fix whichever state the domain
+is in. Ejecting them was not: a shut-off domain has no tray to open, so a create
+against one snapshotted the ISOs anyway — and a record written with the drives
+empty is a revert that takes the media away from the guest, out of a memory
+image that was captured with it present.
 
 ### A shut-off domain gets a disk-only snapshot
 
-The eject-and-put-back dance is for a *running* guest, and so is the memory half
-of the snapshot: libvirt refuses a `--memspec` for a domain that is not running,
+The memory half of the snapshot is for a *running* guest: libvirt refuses a `--memspec` for a domain that is not running,
 so `virutil snapshot create` on a shut-off domain skips it and takes a
 disk-only external snapshot instead. Everything else is the same — the overlay
 files, the records, and `revert`/`list`/`delete` all work. The one difference
 is on the way back: with no saved memory to restore, a revert boots the guest
-fresh from the disk state rather than resuming it mid-run. A domain created
-without the media dance (shut off, or paused) has its drives left alone, so the
-revert needs nothing ejected to begin with.
+fresh from the disk state rather than resuming it mid-run.
 
 
 ## Guest prerequisites
@@ -918,14 +924,15 @@ location.
 
 ## virutil pull
 
-`pull` is `push` reversed: copy one file or directory out of a **running**
-guest's `C:` drive onto the host. It never powers the guest off, and nothing
-runs inside the guest — see [How files move](#how-files-move).
+`pull` is `push` reversed, transport included: copy one file or directory out of
+a guest's `C:` drive onto the host. By default the guest copies it out itself
+over its own network and keeps running; `--disk` reads the disk image instead —
+see [How files move](#how-files-move).
 
 ### Synopsis
 
 ```
-virutil pull VM SRC DST
+virutil pull [--disk] VM SRC DST
 virutil pull -h
 ```
 
@@ -933,24 +940,29 @@ virutil pull -h
 
 | Argument | Meaning |
 | --- | --- |
-| `VM` | libvirt domain to read from. Must be **running**. |
+| `VM` | libvirt domain to read from. Must be **running**, unless `--disk`. |
 | `SRC` | Guest path, relative to the root of `C:`. Wildcards allowed. |
 | `DST` | Host directory to copy into. Created if it does not exist. |
+| `--disk` | Read the disk image instead of copying over the network. A running guest is shut down for it and started again afterwards. |
 
 `SRC` may be spelled with backslashes and an optional `C:`/`C:\` prefix, and is
 normalised to a `C:`-relative path; one containing `..` is refused. It is
 matched **case-insensitively** — the guest's NTFS is, and the path is what
-Windows would see — so `program files/…` and `Program Files/…` both work.
+Windows would see — so `program files/…` and `Program Files/…` both work. Over
+the network Windows does that matching itself; with `--disk` the host rewrites
+the glob to do it, since an `ntfs-3g` mount is case-sensitive where NTFS is not.
 
 Each match is classified as a file or a directory: a directory is pulled
-**recursively**, a file is copied as-is. The glob decides which a call picks up
-— `foo/bar` (no wildcard) matches the directory itself, `foo/bar/*` its
-contents. A source matching nothing is an error, not a warning.
+**recursively** into a subdirectory of `DST` named after it, a file is copied
+in as-is. The glob decides which a call picks up — `foo/bar` (no wildcard)
+matches the directory itself, `foo/bar/*` its contents. A source matching
+nothing is an error, not a warning.
 
 ```
 virutil pull win11 'ProgramData/Example/logs/*.log' ~/logs
 virutil pull win11 '"Program Files (x86)/Example/Product"' ~/out
 virutil pull win11 'Users/me/Desktop/note.txt' ~/
+virutil pull --disk win11 'Users/me/Desktop/note.txt' ~/
 ```
 
 Quote the source in the shell: the wildcards are for the guest to match, not
@@ -958,44 +970,49 @@ the host.
 
 ### How the read is taken
 
-Nothing runs inside the guest at all — no agent, no power-state change. The host
-reads a frozen snapshot instead:
+The default transport is `push`'s, pointed the other way. The host stands up one
+throwaway SMB share on the address the guest reaches it at — random 24-character
+share name, bound to that single address, anonymous, and **writable** — and the
+guest's own `robocopy` copies into it:
 
 ```
-guest NTFS --(snapshot freezes base)--> base qcow2 --(ro mount)--> host DST
+guest C: --(robocopy, via the agent)--> \\host\<share> --> host DST
 ```
 
-A live external snapshot redirects the guest's writes to an overlay qcow2,
-which freezes the base image at a checkpoint. The base is then attached with
-`qemu-nbd -r`, mounted with `ntfs-3g` **read-only**, rsynced out to the host,
-and the overlay is folded back into the base with `virsh blockcommit` before
-the run ends — on success or failure — so the guest's disk is left exactly as
-it would have been. The guest never stops writing through it.
+Nothing is mounted on the host, no device appears in the guest, no power state
+changes, and the disk image is never opened. `robocopy` compares against what
+`DST` already holds and moves only what differs, so a second pull of a build
+where one file changed moves one file. Writable is the only difference from the
+push direction, and it is why the bind address matters as much as it does: the
+share is offered to the one address that reaches the guest, never the wildcard.
+
+With `--disk` the guest is shut down instead, its disk image attached with
+`qemu-nbd -r`, mounted `ro` with `ntfs-3g`, rsynced out, and the guest started
+again — on success and on failure. Read-only end to end, so the image comes back
+byte-for-byte as it was found.
 
 ### Notes
 
-**The guest must be running.** `pull` dies on any other state. There is no
-managed-save or paused-state special case: those states are simply not
-`running`, and are refused.
+**The guest must be running, unless `--disk`.** The default copy is driven from
+inside the guest, so there has to be a guest to drive. `--disk` takes a running
+or a shut-off one; paused and `pmsuspended` are refused either way.
 
-**The checkpoint is at the QCOW2 level, not the filesystem level.** The base
-image freezes whatever Windows has already flushed to disk. A file whose data
-is on disk reads back complete; anything still sitting in the guest's page
-cache at snapshot time is absent; the NTFS journal may be mid-transaction. This
-is the standard live-backup tradeoff — fine for build output and configs, not
-for auditing a live database.
+**The destination must be writable by you.** `smbd` serves the share under the
+invoking user, and the guest writes into it as that user, so `DST` and the files
+that land in it are yours. This is checked before the server starts.
 
-**The overlay is always folded back.** On success *and* on failure, `pull` runs
-`blockcommit --active --pivot` to merge the guest's writes back into the base,
-then deletes the snapshot and the overlay file. The guest keeps running on the
-overlay throughout, so even a failed run loses nothing — but if teardown cannot
-be verified (see `sync`'s notes on that rule) or `blockcommit` fails, the
-snapshot is left in place deliberately and the exact recovery commands are
-printed.
+**Nothing about the disk image is rearranged.** No snapshot, no overlay, no
+`blockcommit`, in either transport. `pull` used to take a disk-only snapshot and
+commit it back at the end, and that commit — which merges the whole backing
+chain unless told otherwise — flattened post-snapshot writes into the image that
+the domain's `virutil snapshot` records were defined against, leaving a later
+`snapshot revert` restoring old RAM onto a newer disk. That is a bluescreen, and
+the fix was to stop a transfer touching the images underneath a snapshot at all.
 
-**A single disk is assumed.** The first `disk`-type device in
-`virsh domblklist` is the one snapshotted, read, and committed — the same
-single-disk assumption `sync` documents.
+**A single disk is assumed with `--disk`.** The first `disk`-type device in
+`virsh domblklist` is the one mounted — the same single-disk assumption `sync`
+documents. The network transport has no such limit: it copies out of `C:` as
+Windows presents it.
 
 ## virutil push
 

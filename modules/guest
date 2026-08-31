@@ -15,6 +15,11 @@ VIRSH_Q=("${VIRSH[@]}" --quiet)
 SUDO=()
 
 DOMAIN=""; NBD="/dev/nbd0"; MNT=""
+
+# Set by a caller that only reads the image: guest_open then attaches the nbd
+# device and mounts read-only. The default is the write direction, which is what
+# the module was built for.
+GUEST_RO=0
 SHUTDOWN_TIMEOUT=180                 # seconds to wait for a graceful shutdown
 ORIG_STATE=""                        # the domain's state before guest_open
 IMG=""
@@ -193,8 +198,8 @@ mnt_writable() {
 
 # guest_state_check -- the disk transport can work on a guest that is shut off
 # and on one that is running (it is shut down by guest_open and started again
-# by the EXIT trap). What it cannot touch is paused or pmsuspended RAM, which
-# would no longer match the disk being edited. Sets ORIG_STATE.
+# by the EXIT trap). What it cannot touch is paused or pmsuspended RAM, whose
+# contents the disk image does not have. Sets ORIG_STATE.
 guest_state_check() {
     ORIG_STATE="$("${VIRSH[@]}" domstate "$DOMAIN" 2>/dev/null || true)"
     [[ -n "$ORIG_STATE" ]] || die "could not read the state of $DOMAIN"
@@ -204,7 +209,7 @@ guest_state_check() {
         running|"shut off") ;;
         *)  # paused / pmsuspended: their RAM would no longer match the disk.
             die "$DOMAIN is '$ORIG_STATE'; its RAM no longer matches the disk," \
-                "so it cannot be shut down and started again around a write." \
+                "so it cannot be shut down and started again around the copy." \
                 "Shut it down by hand (or destroy it) and run this again."
             ;;
     esac
@@ -279,11 +284,15 @@ guest_open() {
                        "  sudo umount $MNT"
 
     # A managed-save image means the guest resumes from stale RAM, whose cached
-    # NTFS metadata would not match the disk we are about to edit.
-    "${VIRSH[@]}" dominfo "$DOMAIN" \
-        | awk '/^[Mm]anaged [Ss]ave: *[Yy]es/ {found=1} END {exit !found}' \
-        && die "$DOMAIN has a managed-save image; resuming it after editing the disk" \
-               "would corrupt the filesystem. Run: virsh managedsave-remove $DOMAIN"
+    # NTFS metadata would not match the disk we are about to edit. Only the write
+    # direction has that problem: a read leaves the image byte-for-byte as it
+    # found it, so a saved guest can be read out of and resumed afterwards.
+    if (( ! GUEST_RO )); then
+        "${VIRSH[@]}" dominfo "$DOMAIN" \
+            | awk '/^[Mm]anaged [Ss]ave: *[Yy]es/ {found=1} END {exit !found}' \
+            && die "$DOMAIN has a managed-save image; resuming it after editing the disk" \
+                   "would corrupt the filesystem. Run: virsh managedsave-remove $DOMAIN"
+    fi
 
     trap guest_finish EXIT
 
@@ -330,13 +339,15 @@ guest_open() {
         echo "   shut off"
     fi
 
-    # Top of the backing chain: writing to the base would corrupt the guest.
+    # Top of the backing chain, and it has to be the top in both directions:
+    # writing to the base would corrupt the guest, and reading it would answer
+    # with the state the guest had before its newest overlay.
     IMG="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
            | awk '$2=="disk" && !found {print $4; found=1}')"
     [[ -f "$IMG" ]] || die "could not resolve disk image for $DOMAIN"
     echo "image: $IMG"
 
-    nbd_connect "$IMG"
+    if (( GUEST_RO )); then nbd_connect "$IMG" -r; else nbd_connect "$IMG"; fi
 
     local PART; PART="$(nbd_find_part ntfs)"
     if [[ -z "$PART" ]]; then
@@ -348,7 +359,12 @@ guest_open() {
     "${SUDO[@]}" mkdir -p "$MNT"
 
     # uid=/gid= hand the tree over, so the copy phase needs no privilege.
-    "${SUDO[@]}" mount -t ntfs-3g -o "uid=$(id -u),gid=$(id -g)" "$PART" "$MNT"
+    local mopts="uid=$(id -u),gid=$(id -g)"
+    (( GUEST_RO )) && mopts="ro,$mopts"
+    "${SUDO[@]}" mount -t ntfs-3g -o "$mopts" "$PART" "$MNT"
+
+    # A read asked for read-only and got it; there is nothing left to check.
+    (( GUEST_RO )) && return 0
 
     # Stop here rather than let the copy phase discover it file by file.
     mnt_writable || die \

@@ -11,7 +11,7 @@ _virutil() {
   )
   transfer=(
     'sync:fetch build output from the Windows host and push into a guest'
-    'pull:copy a file or directory out of a running guest'
+    'pull:copy a file or directory out of a guest'
     'push:copy a file or directory from the host into a guest'
   )
   guest=(
@@ -125,10 +125,21 @@ _virutil_sync() {
   esac
 }
 
-# pull and push take the same shape: VM SRC DST. Only the side each path lives
-# on differs, so only the middle argument completes differently.
+# pull and push take the same shape -- [--disk] VM SRC DST -- and the same flag.
+# Only the side each path lives on differs, so only the operands complete
+# differently. --disk may sit anywhere before them, so the positions are counted
+# past the flag rather than fixed.
 _virutil_pull() {
-  case $CURRENT in
+  local -i shift_by=0 i
+  for (( i = 2; i < CURRENT; i++ )); do
+    [[ ${words[i]} == --disk ]] && shift_by=1
+  done
+  if [[ $words[CURRENT] == -* ]]; then
+    _values 'option' '--disk[read the disk image instead, with the guest shut down]' \
+                     '--help[usage]'
+    return
+  fi
+  case $(( CURRENT - shift_by )) in
     3) _virutil_domains ;;
     4) ;;                             # the guest-side source: nothing to complete
     5) _files -/ ;;

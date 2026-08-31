@@ -1,69 +1,54 @@
-# pull -- copy files out of a running guest's C: drive to the host
+# pull -- copy a file or directory out of a guest's C: drive to the host.
+#
+# push's two transports, taken in the other direction. Both live in modules/xfer,
+# and --disk chooses between them exactly as it does for push:
+#
+#   default  SMB over the guest's own NIC, driven by the guest agent. The host
+#            exports the destination directory *writable* and the guest
+#            robocopies into it, so a re-pull of a build that changed one file
+#            moves one file. The guest keeps running, sees no new device, and
+#            its disk image is not touched at all -- no snapshot, no overlay,
+#            no commit. Needs an agent, a route back to this host, and root
+#            here to bind port 445.
+#   --disk   the guest's disk image, mounted read-only on the host. A running
+#            guest is shut down around the copy and started again afterwards,
+#            which is the whole cost of it -- but it needs nothing of the guest.
+#
+# The read used to run off a live disk-only snapshot that was blockcommitted
+# back afterwards. It does not any more: that rearranged the backing chain on
+# every pull, and the commit -- which merges the whole chain unless told
+# otherwise -- flattened away the disk state that the domain's own snapshots
+# were defined against. A transfer has no business rewriting the images
+# underneath a snapshot, so neither transport here goes near them.
 
 SUDO=()
-DISK=""; SNAP=""; OVERLAY=""
 
 pull_usage() {
     printf '%s\n' \
-        "usage: virutil pull VM SRC DST" \
+        "usage: virutil pull [--disk] VM SRC DST" \
         "" \
-        "  VM   libvirt domain to read from; it has to be running" \
+        "  VM   libvirt domain to read from; it has to be running, since the" \
+        "       copy is driven from inside it. With --disk its disk image is" \
+        "       read instead, so a running one is shut down first and started" \
+        "       again afterwards" \
         "  SRC  guest path, relative to C:\\. Wildcards are allowed and match" \
         "       case-insensitively. Backslashes and a C:\\ prefix are tolerated;" \
         "       '..' is refused." \
         "  DST  host directory to copy into (created if needed)" \
+        "" \
+        "      --disk              read the guest's disk image instead of" \
+        "                          copying over the guest's own network." \
+        "                          Mounts the image read-only on the host, so a" \
+        "                          running guest is shut down for the copy and" \
+        "                          started again afterwards -- but it needs" \
+        "                          nothing of the guest: no agent, no route" \
+        "                          back here and no privileged port." \
         "  -h, --help              this message" \
         "" \
-        "A directory source is copied recursively. The guest keeps running" \
-        "throughout: the read is taken off a disk-only snapshot. See README.md." >&2
+        "A directory source is copied recursively. By default the guest copies" \
+        "it out itself with robocopy, and so moves only what changed; see" \
+        "README.md." >&2
     exit "${1:-1}"
-}
-
-pull_finish() {
-    if mnt_mounted; then
-        sync
-        "${SUDO[@]}" umount "$MNT" || true
-    fi
-    if nbd_attached; then
-        "${SUDO[@]}" qemu-nbd -d "$NBD" >/dev/null 2>&1 || true
-    fi
-    sync
-
-    # The blockcommit must only run once the base image is provably free, so
-    # teardown is verified from observed state rather than exit codes.
-    if mnt_mounted || nbd_attached; then
-        warn "" \
-             "teardown could not be verified -- the snapshot is left in place." \
-             "The guest keeps running on $OVERLAY and its data is safe, but the" \
-             "disk now has a backing chain. Fold the overlay back by hand:" \
-             "  sudo umount $MNT" \
-             "  sudo qemu-nbd -d $NBD" \
-             "  ${VIRSH[*]} blockcommit $DOMAIN $DISK --active --pivot --wait" \
-             "  ${VIRSH[*]} snapshot-delete $DOMAIN $SNAP --metadata" \
-             "  sudo rm -f $OVERLAY"
-        exit 1
-    fi
-
-    [[ -n "$SNAP" ]] || return 0
-
-    echo "merging overlay into base..."
-    if ! "${VIRSH[@]}" blockcommit "$DOMAIN" "$DISK" --active --pivot --wait \
-            >/dev/null 2>&1; then
-        warn "" \
-             "blockcommit failed -- the guest is running on the overlay, which" \
-             "is safe, but the disk now has a backing chain. Retry by hand:" \
-             "  ${VIRSH[*]} blockcommit $DOMAIN $DISK --active --pivot --wait" \
-             "  ${VIRSH[*]} snapshot-delete $DOMAIN $SNAP --metadata" \
-             "  sudo rm -f $OVERLAY"
-        exit 1
-    fi
-
-    if "${VIRSH[@]}" snapshot-list --name 2>/dev/null \
-        | awk -v s="$SNAP" '$0 == s {found=1} END {exit !found}'; then
-        "${VIRSH[@]}" snapshot-delete "$DOMAIN" "$SNAP" --metadata >/dev/null 2>&1 \
-            || { warn "snapshot metadata delete failed; leaving $OVERLAY in place"; return 1; }
-    fi
-    "${SUDO[@]}" rm -f "$OVERLAY" || true
 }
 
 # Normalise a guest-side SRC into a C:-relative path: strip a drive prefix, turn
@@ -87,75 +72,8 @@ pull_norm_src() {
     printf '%s' "$out"
 }
 
-# Take a disk-only live snapshot so the guest's writes go to an overlay, attach
-# the frozen base read-only, and mount it at MNT. The guest is never touched,
-# which is what makes this need no agent inside it.
-#
-# The checkpoint is at the QCOW2 level, not the filesystem level: the guest's
-# page cache is absent and the NTFS journal may be mid-transaction. Fine for
-# build output; do not audit a live database this way.
-pull_open_disk() {
-    MNT="${MNT:-$(virutils_mnt "$DOMAIN")}"
-
-    if (( ${#SUDO[@]} )); then
-        command -v sudo >/dev/null || die "sudo not installed; nbd and mount need it"
-        sudo -v || die "sudo authentication failed"
-    fi
-
-    nbd_attached && die "$NBD is already attached; free it first" \
-                        "  sudo qemu-nbd -d $NBD"
-    mnt_mounted && die "$MNT is already mounted; unmount it first" \
-                       "  sudo umount $MNT"
-
-    local state="$("${VIRSH[@]}" domstate "$DOMAIN")"
-    echo "domain: $DOMAIN ($state)"
-    [[ "$state" == running ]] \
-        || die "$DOMAIN is '$state'; the read goes through a snapshot of the" \
-               "live disk. Start it, or copy the other way with virutil push."
-
-    DISK="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
-           | awk '$2=="disk" && !found {print $3; found=1}')"
-    IMG="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
-          | awk '$2=="disk" && !found {print $4; found=1}')"
-    [[ -n "$DISK" ]] || die "no disk device found for $DOMAIN"
-    [[ -f "$IMG" ]] || die "could not resolve disk image for $DOMAIN"
-
-    nbd_reload
-    trap pull_finish EXIT
-
-    local snap_name="pull-$(date +%Y%m%d-%H%M%S)"
-    OVERLAY="$VIRUTILS_IMAGE_DIR/$DOMAIN.$snap_name.qcow2"
-    mkdir -p "$(dirname -- "$OVERLAY")"
-    paths_qemu_warn "$(dirname -- "$OVERLAY")"
-    echo "snapshot: $snap_name"
-    "${VIRSH[@]}" snapshot-create-as --domain "$DOMAIN" --name "$snap_name" \
-        --disk-only --atomic \
-        --diskspec "$DISK,snapshot=external,file=$OVERLAY" \
-        || die "snapshot creation failed -- nothing was touched"
-    SNAP="$snap_name"
-
-    local top
-    top="$("${VIRSH[@]}" domblklist "$DOMAIN" --details \
-          | awk -v t="$DISK" '$2=="disk" && $3==t {print $4}')"
-    [[ "$top" == "$OVERLAY" ]] \
-        || die "snapshot did not take effect: $DISK still points at $top"
-    echo "   writes now go to $OVERLAY; base frozen: $IMG"
-
-    nbd_connect "$IMG" -r
-
-    local PART; PART="$(nbd_find_part ntfs)"
-    if [[ -z "$PART" ]]; then
-        lsblk -o NAME,SIZE,FSTYPE,PARTTYPENAME "$NBD" >&2 || true
-        die "no NTFS partition found on $NBD (layout above)"
-    fi
-    echo "partition: $PART ($(nbd_part_size "$PART") GiB)"
-
-    "${SUDO[@]}" mkdir -p "$MNT"
-    "${SUDO[@]}" mount -t ntfs-3g -o "ro,uid=$(id -u),gid=$(id -g)" "$PART" "$MNT"
-}
-
 pull_main() {
-    local VM="" SRC="" DST=""
+    local VM="" SRC="" DST="" DISK=0
 
     [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] \
         && die "do not run virutil pull under sudo -- run it as yourself." \
@@ -165,6 +83,7 @@ pull_main() {
     while (( $# )); do
         case "$1" in
             -h|--help)      pull_usage 0 ;;
+            --disk)         DISK=1; shift ;;
             -*)             warn "unrecognised argument: $1"; pull_usage ;;
             *)
                 if   [[ -z "$VM"  ]]; then VM="$1"
@@ -179,20 +98,28 @@ pull_main() {
 
     DOMAIN="$VM"
     domain_exists "$DOMAIN" || die "no such domain: $DOMAIN (see: virutil domain list)"
-    command -v rsync >/dev/null || die "rsync not installed"
 
     SRC="$(pull_norm_src "$SRC")" || exit 1
     [[ -n "$SRC" ]] || die "source may not be the root of C:"
 
-    xfer_check read
-
     mkdir -p "$DST" || die "could not create destination: $DST"
 
-    pull_open_disk
-
-    pull_copy "$SRC" "$DST"
-
-    echo "copy complete -> $DST"
+    if (( DISK )); then
+        command -v rsync >/dev/null || die "rsync not installed"
+        xfer_check read
+        # Read-only for the whole attach: the image is opened -r on the nbd
+        # device and mounted ro, so a pull cannot alter the guest's disk even
+        # if the copy goes wrong. guest_open arms the EXIT trap that unmounts,
+        # detaches, and starts the guest again.
+        GUEST_RO=1
+        guest_open
+        pull_copy "$SRC" "$DST"
+        echo "copy complete -> $DST"
+    else
+        xfer_check smb
+        # Reports for itself: it knows what came back and how long it took.
+        pull_smb "$SRC" "$DST"
+    fi
 }
 
 # pull_copy SRC DST -- expand SRC under MNT and rsync what it matched into DST.
@@ -221,4 +148,143 @@ pull_copy() {
 
     echo "pull: C:\\${SRC//\//\\} -> $DST (${#files[@]} file(s), ${#dirs[@]} dir(s))"
     "${RSYNC[@]}" ${dirs[@]+"${dirs[@]}"} ${files[@]+"${files[@]}"} "$DST/"
+}
+
+# --- copying out of the running guest, over SMB ------------------------------
+
+# The inversion of push_smb, and the same machinery underneath: the host stands
+# up one throwaway share on the address the guest reaches it at, and the guest's
+# own robocopy does the copying. Only the direction of the share differs -- it is
+# exported writable here, and the guest writes into it rather than reading out of
+# it. Nothing is mounted on the host, no device appears in the guest, and the
+# disk image is not opened at all.
+#
+# Why robocopy rather than the agent's own channel: a guest-exec payload is
+# base64 inside JSON inside a single argv entry, capped near 128KB. The NIC does
+# the same work three orders of magnitude faster, so the agent is used only to
+# say "copy this out", and robocopy skips whatever the host already holds
+# unchanged -- so a second pull of a build where one file changed moves one file.
+
+PULL_RC_NOMATCH=94          # nothing in the guest matched SRC
+PULL_RC_ROBO=95             # robocopy returned a failure code (>= 8)
+
+pull_smb() {
+    local SRC="$1" DST="$2"
+    local ip host export_dir rc=0 reported t0 elapsed
+
+    ip="$(domain_ip "$DOMAIN")" \
+        || die "could not work out $DOMAIN's address, so it has nowhere to" \
+               "copy to. Check 'virutil domain addr $DOMAIN'."
+    host="$(xfer_host_addr "$ip")"
+    [[ -n "$host" ]] \
+        || die "no route from this host to $DOMAIN at $ip, so the guest has" \
+               "no address to copy to. A guest on an isolated network cannot" \
+               "reach this host over its own network; pass --disk to read the" \
+               "disk image instead."
+
+    # Absolute, for the same reason push_smb resolves its source: smb.conf's
+    # `path` is resolved by smbd against smbd's working directory, which is
+    # root's and not the caller's. A relative DST -- `./out`, the ordinary way
+    # to name a directory you are standing in -- would name a path that does not
+    # exist over there, and the share would come up pointing at nothing.
+    export_dir="$(cd -- "$DST" && pwd -P)" \
+        || die "could not resolve $DST to an absolute path to serve it from"
+    [[ -w "$export_dir" ]] \
+        || die "$export_dir is not writable by you, and the guest writes into" \
+               "it as you: smbd serves the share under the invoking user."
+
+    xfer_smb_serve "$export_dir" "$host" rw
+
+    echo "pull: C:\\${SRC//\//\\} -> $DST"
+
+    t0="$(now_ms)"
+    reported="$(pull_smb_fetch "$SRC")" || rc=$?
+    elapsed=$(( $(now_ms) - t0 ))
+    (( rc == 0 )) || pull_smb_die "$rc" "$SRC" "$host"
+
+    xfer_smb_stop
+    pull_smb_report "$reported" "$elapsed"
+}
+
+# pull_smb_fetch SRC -- the guest side, one powershell run. Get-Item resolves
+# SRC, wildcards and all: Windows matches them case-insensitively itself, which
+# is what the --disk path has to spell out by hand with ci_glob.
+#
+# Files and directories are copied by two different robocopy shapes, because
+# robocopy always takes a source *directory*: a file is named as a filter
+# alongside its parent, a directory is copied whole into a subdirectory of the
+# share named after it -- which is where rsync would put it too. Files are
+# grouped by parent so a wildcard that spans directories still costs one
+# robocopy per directory rather than one per file.
+#
+# robocopy's exit code is a bitmap, not an error level: 0 means nothing needed
+# copying, bit 0 means files were copied, and only >= 8 is a real failure -- so
+# the usual "non-zero is bad" is wrong here and would call every successful copy
+# an error. The stopwatch times the copy alone, without the agent round trip and
+# powershell start-up that this host's wall clock would fold in.
+pull_smb_fetch() {
+    local SRC="$1" script src_win
+
+    src_win="C:\\${SRC//\//\\}"
+    script=$(printf '%s\n' \
+        '$ErrorActionPreference = "Stop"' \
+        "\$src = $(push_ps_quote "$src_win")" \
+        "\$dst = $(push_ps_quote "$XFER_SMB_UNC")" \
+        '$items = @(Get-Item -Path $src -Force -ErrorAction SilentlyContinue)' \
+        "if (\$items.Count -eq 0) { [Console]::Error.WriteLine(\"no match for \$src\"); exit $PULL_RC_NOMATCH }" \
+        '$files = @($items | Where-Object { -not $_.PSIsContainer })' \
+        '$dirs  = @($items | Where-Object { $_.PSIsContainer })' \
+        '$flags = @("/R:1","/W:1","/NP","/NFL","/NDL","/NJH","/NJS")' \
+        '$rc = 0' \
+        '$sw = [Diagnostics.Stopwatch]::StartNew()' \
+        'foreach ($g in @($files | Group-Object DirectoryName)) {' \
+        '  & robocopy $g.Name $dst @($g.Group | ForEach-Object { $_.Name }) @flags | Out-Null' \
+        '  if ($LASTEXITCODE -ge 8) { $rc = $LASTEXITCODE } }' \
+        'foreach ($d in $dirs) {' \
+        '  & robocopy $d.FullName (Join-Path $dst $d.Name) /E @flags | Out-Null' \
+        '  if ($LASTEXITCODE -ge 8) { $rc = $LASTEXITCODE } }' \
+        '$sw.Stop()' \
+        "if (\$rc -ge 8) { [Console]::Error.WriteLine(\"robocopy exit \$rc\"); exit $PULL_RC_ROBO }" \
+        '"$($files.Count) $($dirs.Count) $([int]$sw.Elapsed.TotalMilliseconds)"')
+
+    exec_ps_text "$script"
+}
+
+# pull_smb_report REPORTED MS -- what came back. REPORTED is the guest's own
+# line, "files dirs ms". The duration is the guest's stopwatch rather than MS:
+# MS is this host's wall clock and holds an agent round trip and a powershell
+# starting up, which for a small payload is nearly all of it.
+pull_smb_report() {
+    local reported="$1" ms="$2" files dirs gms what
+    read -r files dirs gms <<<"$reported"
+    files="${files:-0}"; dirs="${dirs:-0}"
+
+    what=""
+    if (( files )) || (( ! dirs )); then
+        what="$files file"; (( files == 1 )) || what+="s"
+    fi
+    if (( dirs )); then
+        [[ -n "$what" ]] && what+=" and "
+        what+="$dirs director"; (( dirs == 1 )) && what+="y" || what+="ies"
+    fi
+    echo "$DOMAIN: $what pulled in $(fmt_duration "${gms:-$ms}")"
+}
+
+# pull_smb_die RC SRC HOST -- name what went wrong; the guest has already
+# printed its own line above. Shares push_smb's shape because the failures are
+# the same ones seen from the other end.
+pull_smb_die() {
+    local rc="$1" src="$2" host="$3"
+    case "$rc" in
+        "$PULL_RC_NOMATCH")
+            die "no match in $DOMAIN for C:\\${src//\//\\}" ;;
+        "$PULL_RC_ROBO")
+            die "robocopy could not complete the copy in the guest (its exit" \
+                "code is above). Anything it did copy is left where it landed." ;;
+        *)
+            die "the guest failed to copy the files out (exit $rc); its own" \
+                "error is above. If it could not reach $host, check the" \
+                "guest's outbound firewall, or pass --disk to read the disk" \
+                "image instead." ;;
+    esac
 }
