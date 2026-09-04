@@ -117,6 +117,193 @@ guest_agent_wait() {
     done
 }
 
+# --- which OS is on the other side -----------------------------------------
+#
+# sync is told, by @guest in its config. push and pull have no config to be told
+# by, so they ask -- and the asking is free, because the transport they would use
+# already requires the agent to drive the copy, so there is a round trip to
+# spend either way.
+#
+# Asked rather than flagged on purpose. A --linux flag is one more thing to get
+# wrong on a command whose failure mode is "the guest was told to run robocopy
+# and does not have it", and the guest already knows the answer.
+
+GUEST_OS_DEFAULT=windows
+
+# guest_osinfo_id VM -- the agent's own os id, or nothing. 'mswindows' on
+# Windows, the distribution id ('ubuntu', 'fedora') on Linux. guest-get-osinfo
+# arrived in QEMU 5.1, so an older qemu-ga answers with an error and this
+# returns nothing rather than treating the error text as an id.
+guest_osinfo_id() {
+    "${VIRSH_Q[@]}" qemu-agent-command "$1" '{"execute":"guest-get-osinfo"}' \
+        2>/dev/null | jq -r '.return.id // empty' 2>/dev/null
+}
+
+# guest_osinfo_meta VM -- the libosinfo os id recorded in the domain XML, or
+# nothing. virt-install writes it, so every domain 'virutil domain create' makes
+# carries one; a domain defined by hand may not. Readable with the guest shut
+# off, which is why it is the fallback rather than the other way round -- it
+# describes what the domain was created to run, where the agent describes what
+# is actually running now.
+guest_osinfo_meta() {
+    "${VIRSH[@]}" dumpxml "$1" 2>/dev/null \
+        | grep -o 'libosinfo:os id="[^"]*"' | head -1 | sed 's/.*id="//; s/"$//'
+}
+
+# guest_os VM -- 'windows' or 'linux'. The agent first, the domain's metadata
+# second, and the historical default last, so a host where neither answers keeps
+# behaving exactly as it did before any of this existed.
+#
+# Anything that is not Windows is driven as Linux: /bin/sh and rsync, which is
+# also true of the BSDs even though this vocabulary has no name for them. The
+# alternative -- an allow-list of distribution ids -- would refuse to work on a
+# guest that would have been fine, and would need editing every time a new one
+# appeared.
+guest_os() {
+    local vm="$1" id
+    id="$(guest_osinfo_id "$vm")"
+    if [[ -n "$id" ]]; then
+        case "$id" in
+            mswindows|windows) printf windows ;;
+            *)                 printf linux ;;
+        esac
+        return 0
+    fi
+
+    id="$(guest_osinfo_meta "$vm")"
+    if [[ -n "$id" ]]; then
+        case "$id" in
+            *microsoft.com/win*|*microsoft.com/msdos*) printf windows ;;
+            *)                                        printf linux ;;
+        esac
+        return 0
+    fi
+
+    warn "could not tell what OS $vm runs: its agent does not answer" \
+         "guest-get-osinfo (it predates QEMU 5.1) and the domain carries no" \
+         "libosinfo metadata. Assuming $GUEST_OS_DEFAULT, which is what this" \
+         "has always done."
+    printf '%s' "$GUEST_OS_DEFAULT"
+}
+
+# --- the guest's rsync -----------------------------------------------------
+#
+# sync, push and pull all drive the same rsync on a Linux guest, so they all
+# meet the same handful of ways it can fail. Said once, with the caller naming
+# what was being moved.
+
+# Distinct from every code rsync itself uses (its highest is in the thirties),
+# so "the guest has no rsync" can be told apart from "rsync failed".
+GUEST_RC_NO_RSYNC=90
+
+# guest_sh_need_rsync -- the guest-side lines that refuse early and legibly when
+# rsync is missing, rather than letting sh report "not found" with exit 127 and
+# leaving the host to guess which command it meant.
+#
+# Interpolate it as one argument of the caller's own printf --
+# "$(guest_sh_need_rsync)" -- so that printf supplies the newline after it.
+# Appending it to a script with += does not: command substitution strips the
+# trailing newline, so the block's closing brace lands on the same line as
+# whatever follows and the whole script fails to parse.
+guest_sh_need_rsync() {
+    printf '%s\n' \
+        'command -v rsync >/dev/null 2>&1 || {' \
+        '  echo "rsync is not installed in this guest" >&2' \
+        "  exit $GUEST_RC_NO_RSYNC" \
+        '}'
+}
+
+# guest_rsync_die RC HOST WHAT -- name what went wrong. rsync's exit codes are
+# specific enough to be worth naming, which robocopy's bitmap never is.
+guest_rsync_die() {
+    local rc="$1" host="$2" what="$3"
+    case "$rc" in
+        "$GUEST_RC_NO_RSYNC")
+            die "the guest has no rsync, and $what is the guest copying with" \
+                "it. Install it there -- 'apt install rsync' or" \
+                "'dnf install rsync' -- and run this again." ;;
+        10|11)
+            die "the guest could not reach $host (rsync exit $rc, a socket or" \
+                "file I/O error; its own message is above). Check the guest's" \
+                "firewall -- the daemon was listening on an ephemeral port, not" \
+                "a well-known one, so a rule that allows only 22 and 80 will" \
+                "block it." ;;
+        23|24)
+            # Either side can raise this, and which one is the whole diagnosis
+            # -- so the tag that says which is pointed at explicitly rather
+            # than guessed at. A first version of this message assumed the
+            # destination and sent someone looking at the wrong host.
+            die "only part of $what crossed (rsync exit $rc). What did move is" \
+                "in place, and rsync's own lines above name the files that did" \
+                "not." \
+                "" \
+                "Read the tag on the 'rsync:' line to see which side refused:" \
+                "  [sender]    this host could not READ the file. The daemon" \
+                "              serves the payload as you, so a file it cannot" \
+                "              read is one you cannot read -- check its mode" \
+                "              and owner here, not in the guest." \
+                "  [receiver]  the guest could not WRITE it: a read-only path," \
+                "              a full filesystem, or a file in use." \
+                "" \
+                "The '[generator=...]' on the last line is only which process" \
+                "reported the summary and its version -- not the side at" \
+                "fault." ;;
+        2|4)
+            die "the guest's rsync and this host's could not agree on a" \
+                "protocol (exit $rc). That is a version or build mismatch" \
+                "rather than anything about this transfer; its own message is" \
+                "above." ;;
+        *)
+            die "the guest failed to move $what (rsync exit $rc); its own" \
+                "error is above. If it could not reach $host, check the" \
+                "guest's firewall." ;;
+    esac
+}
+
+# --- guest-relative paths ---------------------------------------------------
+#
+# A path a caller gave for the far side, normalised into one relative to the
+# guest's root: no drive letter, no leading slash, no empty or '.' components,
+# and never a '..'. '..' is refused rather than resolved away, because every use
+# of these names a path under a root virutil owns -- a mount point, or an export
+# standing in for one -- and '..' would leave it.
+#
+# Two flavours, and the difference between them is the one thing that cannot be
+# shared: on Windows a backslash is a separator, and on Linux it is a legal
+# character in a filename, so flipping it there would turn one name into two.
+
+# guest_norm_split PATH WHAT ORIGINAL -- the component walk both flavours share.
+# ORIGINAL is carried separately so the error names the path as the caller wrote
+# it rather than as it looked halfway through being rewritten.
+guest_norm_split() {
+    local s="$1" what="$2" orig="$3" out="" comp
+    while [[ -n "$s" ]]; do
+        while [[ "$s" == /* ]]; do s="${s#/}"; done
+        comp="${s%%/*}"
+        [[ -n "$comp" ]] || break
+        case "$comp" in
+            '.') ;;
+            '..') die "$what may not contain '..': $orig" ;;
+            *)    out="${out:+$out/}$comp" ;;
+        esac
+        s="${s#"$comp"}"
+    done
+    printf '%s' "$out"
+}
+
+# guest_norm_win PATH [WHAT] -- relative to C:\.
+guest_norm_win() {
+    local s="$1"
+    s="${s#[Cc]:}"
+    s="${s//\\//}"
+    guest_norm_split "$s" "${2:-path}" "$1"
+}
+
+# guest_norm_posix PATH [WHAT] -- relative to /.
+guest_norm_posix() {
+    guest_norm_split "$1" "${2:-path}" "$1"
+}
+
 # guest_time VM -- the guest's clock, in seconds since the epoch, or nothing.
 guest_time() {
     "${VIRSH[@]}" domtime "$1" 2>/dev/null \

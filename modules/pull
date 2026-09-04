@@ -3,16 +3,17 @@
 # push's two transports, taken in the other direction. Both live in modules/xfer,
 # and --disk chooses between them exactly as it does for push:
 #
-#   default  SMB over the guest's own NIC, driven by the guest agent. The host
-#            exports the destination directory *writable* and the guest
-#            robocopies into it, so a re-pull of a build that changed one file
-#            moves one file. The guest keeps running, sees no new device, and
-#            its disk image is not touched at all -- no snapshot, no overlay,
-#            no commit. Needs an agent, a route back to this host, and root
-#            here to bind port 445.
+#   default  over the guest's own NIC, driven by the guest agent. The host
+#            exports the destination directory *writable* and the guest copies
+#            into it, so a re-pull of a build that changed one file moves one
+#            file. The guest keeps running, sees no new device, and its disk
+#            image is not touched at all -- no snapshot, no overlay, no commit.
+#            Needs an agent and a route back to this host; a Windows guest also
+#            needs smbd and root here to bind port 445, a Linux one neither.
 #   --disk   the guest's disk image, mounted read-only on the host. A running
 #            guest is shut down around the copy and started again afterwards,
-#            which is the whole cost of it -- but it needs nothing of the guest.
+#            which is the whole cost of it -- but it needs nothing of the
+#            guest. Windows guests only: it mounts NTFS.
 #
 # The read used to run off a live disk-only snapshot that was blockcommitted
 # back afterwards. It does not any more: that rearranged the backing chain on
@@ -31,9 +32,12 @@ pull_usage() {
         "       copy is driven from inside it. With --disk its disk image is" \
         "       read instead, so a running one is shut down first and started" \
         "       again afterwards" \
-        "  SRC  guest path, relative to C:\\. Wildcards are allowed and match" \
-        "       case-insensitively. Backslashes and a C:\\ prefix are tolerated;" \
-        "       '..' is refused." \
+        "  SRC  guest path, relative to the guest's root -- C:\\ on Windows," \
+        "       / on Linux. Wildcards are allowed; they match" \
+        "       case-INsensitively on Windows and case-sensitively on Linux," \
+        "       since each guest's own matching is what does it. On Windows," \
+        "       backslashes and a C:\\ prefix are tolerated; '..' is refused" \
+        "       either way." \
         "  DST  host directory to copy into (created if needed)" \
         "" \
         "      --disk              read the guest's disk image instead of" \
@@ -43,33 +47,24 @@ pull_usage() {
         "                          started again afterwards -- but it needs" \
         "                          nothing of the guest: no agent, no route" \
         "                          back here and no privileged port." \
+        "                          Windows guests only." \
         "  -h, --help              this message" \
         "" \
         "A directory source is copied recursively. By default the guest copies" \
-        "it out itself with robocopy, and so moves only what changed; see" \
-        "README.md." >&2
+        "it out itself -- robocopy on Windows, rsync on Linux -- and so moves" \
+        "only what changed. The guest's OS is detected; see README.md." >&2
     exit "${1:-1}"
 }
 
-# Normalise a guest-side SRC into a C:-relative path: strip a drive prefix, turn
-# backslashes into slashes, drop empty and '.' components, refuse '..' so the
-# source can never resolve outside the mount point.
+# Normalise a guest-side SRC into a path relative to the guest's root, in the
+# flavour that guest spells. See guest_norm_win/guest_norm_posix in
+# modules/guest.
 pull_norm_src() {
-    local s="$1" out="" comp
-    s="${s#[Cc]:}"
-    s="${s//\\//}"
-    while [[ -n "$s" ]]; do
-        while [[ "$s" == /* ]]; do s="${s#/}"; done
-        comp="${s%%/*}"
-        [[ -n "$comp" ]] || break
-        case "$comp" in
-            '.') ;;
-            '..') die "source may not contain '..': $1" ;;
-            *)    out="${out:+$out/}$comp" ;;
-        esac
-        s="${s#"$comp"}"
-    done
-    printf '%s' "$out"
+    if [[ "${GUEST_OS:-windows}" == linux ]]; then
+        guest_norm_posix "$1" source
+    else
+        guest_norm_win "$1" source
+    fi
 }
 
 pull_main() {
@@ -99,12 +94,23 @@ pull_main() {
     DOMAIN="$VM"
     domain_exists "$DOMAIN" || die "no such domain: $DOMAIN (see: virutil domain list)"
 
+    # Before SRC is normalised: which flavour of path that is depends on it.
+    # See guest_os in modules/guest.
+    GUEST_OS="$(guest_os "$DOMAIN")"
+
     SRC="$(pull_norm_src "$SRC")" || exit 1
-    [[ -n "$SRC" ]] || die "source may not be the root of C:"
+    [[ -n "$SRC" ]] \
+        || die "source may not be the root of $(pull_guest_root)"
 
     mkdir -p "$DST" || die "could not create destination: $DST"
 
     if (( DISK )); then
+        [[ "$GUEST_OS" == linux ]] \
+            && die "--disk cannot read a Linux guest's disk image: it mounts" \
+                   "the largest NTFS partition on it, which $DOMAIN does not" \
+                   "have. Nothing was read and $DOMAIN was not shut down." \
+                   "Drop --disk; the default path reads out of a running Linux" \
+                   "guest and needs no root at all."
         command -v rsync >/dev/null || die "rsync not installed"
         xfer_check read
         # Read-only for the whole attach: the image is opened -r on the nbd
@@ -116,9 +122,9 @@ pull_main() {
         pull_copy "$SRC" "$DST"
         echo "copy complete -> $DST"
     else
-        xfer_check smb
+        xfer_check net
         # Reports for itself: it knows what came back and how long it took.
-        pull_smb "$SRC" "$DST"
+        pull_net "$SRC" "$DST"
     fi
 }
 
@@ -152,7 +158,7 @@ pull_copy() {
 
 # --- copying out of the running guest, over SMB ------------------------------
 
-# The inversion of push_smb, and the same machinery underneath: the host stands
+# The inversion of push_net, and the same machinery underneath: the host stands
 # up one throwaway share on the address the guest reaches it at, and the guest's
 # own robocopy does the copying. Only the direction of the share differs -- it is
 # exported writable here, and the guest writes into it rather than reading out of
@@ -168,7 +174,33 @@ pull_copy() {
 PULL_RC_NOMATCH=94          # nothing in the guest matched SRC
 PULL_RC_ROBO=95             # robocopy returned a failure code (>= 8)
 
-pull_smb() {
+# The guest's root, and a guest-side path under it, as that guest spells them.
+# Cosmetic: nothing is addressed through either.
+pull_guest_root() {
+    if [[ "${GUEST_OS:-windows}" == linux ]]; then printf '/'; else printf 'C:\\'; fi
+}
+
+pull_show_src() {
+    if [[ "${GUEST_OS:-windows}" == linux ]]; then printf '/%s' "$1"
+    else                                          printf 'C:\\%s' "${1//\//\\}"; fi
+}
+
+pull_net_serve() {
+    if [[ "$GUEST_OS" == linux ]]; then xfer_rsyncd_serve "$1" "$2" rw
+    else                                xfer_smb_serve    "$1" "$2" rw; fi
+}
+
+pull_net_fetch() {
+    if [[ "$GUEST_OS" == linux ]]; then pull_lin_fetch "$@"
+    else                                pull_smb_fetch "$@"; fi
+}
+
+pull_net_die() {
+    if [[ "$GUEST_OS" == linux ]]; then pull_lin_die "$@"
+    else                                pull_smb_die "$@"; fi
+}
+
+pull_net() {
     local SRC="$1" DST="$2"
     local ip host export_dir rc=0 reported t0 elapsed
 
@@ -182,7 +214,7 @@ pull_smb() {
                "reach this host over its own network; pass --disk to read the" \
                "disk image instead."
 
-    # Absolute, for the same reason push_smb resolves its source: smb.conf's
+    # Absolute, for the same reason push_net resolves its source: smb.conf's
     # `path` is resolved by smbd against smbd's working directory, which is
     # root's and not the caller's. A relative DST -- `./out`, the ordinary way
     # to name a directory you are standing in -- would name a path that does not
@@ -191,18 +223,18 @@ pull_smb() {
         || die "could not resolve $DST to an absolute path to serve it from"
     [[ -w "$export_dir" ]] \
         || die "$export_dir is not writable by you, and the guest writes into" \
-               "it as you: smbd serves the share under the invoking user."
+               "it as you: both servers export it under the invoking user."
 
-    xfer_smb_serve "$export_dir" "$host" rw
+    pull_net_serve "$export_dir" "$host"
 
-    echo "pull: C:\\${SRC//\//\\} -> $DST"
+    echo "pull: $(pull_show_src "$SRC") -> $DST"
 
     t0="$(now_ms)"
-    reported="$(pull_smb_fetch "$SRC")" || rc=$?
+    reported="$(pull_net_fetch "$SRC")" || rc=$?
     elapsed=$(( $(now_ms) - t0 ))
-    (( rc == 0 )) || pull_smb_die "$rc" "$SRC" "$host"
+    (( rc == 0 )) || pull_net_die "$rc" "$SRC" "$host"
 
-    xfer_smb_stop
+    xfer_stop
     pull_smb_report "$reported" "$elapsed"
 }
 
@@ -271,7 +303,7 @@ pull_smb_report() {
 }
 
 # pull_smb_die RC SRC HOST -- name what went wrong; the guest has already
-# printed its own line above. Shares push_smb's shape because the failures are
+# printed its own line above. Shares push_net's shape because the failures are
 # the same ones seen from the other end.
 pull_smb_die() {
     local rc="$1" src="$2" host="$3"
@@ -286,5 +318,72 @@ pull_smb_die() {
                 "error is above. If it could not reach $host, check the" \
                 "guest's outbound firewall, or pass --disk to read the disk" \
                 "image instead." ;;
+    esac
+}
+
+# --- the Linux guest side ---------------------------------------------------
+
+# pull_lin_fetch SRC -- the guest side, one rsync.
+#
+# One invocation for every shape, where the Windows side needs a loop per parent
+# directory: robocopy always takes a source *directory*, so a file has to be
+# named as a filter alongside its parent and a wildcard spanning directories
+# costs one robocopy per directory. rsync takes the paths themselves, so the
+# whole match list goes in one call -- directories land as named subdirectories
+# of the export and files land at its top, which is where the Windows shapes put
+# them too, and where rsync would put them anyway.
+#
+# The pattern is expanded by the guest, and it travels as data rather than as
+# shell source: with IFS empty, `set -- $pat` does no field splitting and the
+# glob still expands to one field per match, so a path with a space or a `;` in
+# it is a path and not a syntax accident. See sync_lin_cleanup_fn, which uses
+# the same technique for the same reason.
+#
+# Note the case sensitivity: this glob is the guest's shell, so it matches
+# case-sensitively, where the Windows side leans on Windows matching
+# case-insensitively itself (and the --disk path spells that out with ci_glob).
+# A Linux guest has no case-insensitive matching to borrow, and inventing one
+# would be a worse surprise than the plain shell behaviour.
+#
+# Only pathname expansion happens: a glob only ever yields paths that exist, so
+# the one arrangement in which an argument can be missing is a pattern that
+# matched nothing and was left as its own literal text. That is exactly the
+# no-match case, and it is detected rather than handed to rsync, which would
+# report it as a partial transfer.
+pull_lin_fetch() {
+    local SRC="$1" script
+
+    script=$(printf '%s\n' \
+        "$(guest_sh_need_rsync)" \
+        "pat=$(sh_quote "/$SRC")" \
+        "dst=$(sh_quote "$XFER_RSYNCD_URL/")" \
+        'oldifs=$IFS; IFS=""; set -- $pat; IFS=$oldifs' \
+        'if [ $# -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; then' \
+        '  echo "no match for $pat" >&2' \
+        "  exit $PULL_RC_NOMATCH" \
+        'fi' \
+        'nf=0 nd=0' \
+        'for f do' \
+        '  if [ -d "$f" ] && [ ! -L "$f" ]; then nd=$((nd+1)); else nf=$((nf+1)); fi' \
+        'done' \
+        't0=$(date +%s%N)' \
+        'rsync -rlptD "$@" "$dst"' \
+        't1=$(date +%s%N)' \
+        'echo "$nf $nd $(( (t1 - t0) / 1000000 ))"')
+
+    exec_sh_text "$script"
+}
+
+# pull_lin_die RC SRC HOST -- the no-match case is pull's own; everything else
+# is rsync's, and is named where every other rsync failure is.
+pull_lin_die() {
+    local rc="$1" src="$2" host="$3"
+    case "$rc" in
+        "$PULL_RC_NOMATCH")
+            die "no match in $DOMAIN for /$src." \
+                "The pattern is expanded by the guest's own shell, so it" \
+                "matches case-sensitively -- unlike the Windows side, where" \
+                "Windows does the matching." ;;
+        *)  guest_rsync_die "$rc" "$host" "the files being read out" ;;
     esac
 }

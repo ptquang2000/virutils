@@ -1,17 +1,27 @@
-# xfer -- the transports behind sync, pull and push. There are two, and they
-# differ in what they cost the guest rather than in what they can carry.
+# xfer -- the transports behind sync, pull and push. There are two kinds, and
+# they differ in what they cost the guest rather than in what they can carry.
 #
-# Live, SMB over the guest's own NIC. The default for sync, push and pull, and
-# the reason is incrementality:
-#   xfer_check smb -> xfer_smb_serve -> guest copies with robocopy
-#   The host serves a tree on the address the guest already reaches it at, and
-#   robocopy copies only what differs from what the other side already has -- so
-#   a re-push of a build that changed one file moves one file. Direction is the
-#   share's, not the transport's: read-only and the guest fetches from it
-#   (sync, push), writable and the guest copies into it (pull). Nothing is
-#   mounted on either side, no device appears in the guest, and the guest keeps
-#   running. Costs a rootful smbd on port 445. See the section at the foot of
-#   this file.
+# Live, over the guest's own NIC. The default for sync, push and pull, and the
+# reason is incrementality: the host serves a tree on the address the guest
+# already reaches it at, and the guest's own copier takes only what differs from
+# what it already holds -- so a re-push of a build that changed one file moves
+# one file. Nothing is mounted on either side, no device appears in the guest,
+# and the guest keeps running.
+#
+# There are two servers behind that, one per guest OS, because the copier on the
+# far side is whatever the guest actually has:
+#
+#   xfer_check net -> xfer_smb_serve    -> Windows guest copies with robocopy
+#   xfer_check net -> xfer_rsyncd_serve -> Linux guest copies with rsync
+#
+#   Windows gets SMB because robocopy speaks it and nothing else, which costs a
+#   rootful smbd on port 445 -- the one privileged port virutil binds, and not
+#   negotiable, since 445 is what SMB means to a Windows client. Linux gets an
+#   rsync daemon on an ephemeral port, which needs no root at all and no
+#   privileged port to collide with. Direction is the export's, not the
+#   transport's: read-only and the guest fetches from it (sync, push), writable
+#   and the guest copies into it (pull). See the sections at the foot of this
+#   file.
 #
 # Offline, the guest's own qcow2 over qemu-nbd, mounted on the host. Behind
 # --disk in both directions:
@@ -84,9 +94,11 @@ xfer_check() {
                     ;;
             esac
             ;;
-        smb)
+        net)
             # Nothing is written to the disk image, so the only requirement is
-            # that the guest is up with an agent to drive it.
+            # that the guest is up with an agent to drive it. The same for both
+            # servers: which one gets stood up is decided by the guest's OS, and
+            # neither can be driven without an agent to say "fetch this".
             [[ "$state" == running ]] \
                 || die "$dom has to be running for this; it is '$state'." \
                        "The copy goes over the guest's own network and is" \
@@ -102,7 +114,7 @@ xfer_check() {
                        "guest, or pass --disk to use the disk image instead," \
                        "which needs no agent."
             ;;
-        *) die "internal: xfer_check wants write, read or smb, got '$mode'" ;;
+        *) die "internal: xfer_check wants write, read or net, got '$mode'" ;;
     esac
 }
 
@@ -251,12 +263,21 @@ xfer_room_for() {
                "somewhere with room, or push fewer files."
 }
 
-XFER_SMB_PID=""              # the smbd; killed by xfer_smb_stop
-XFER_SMB_RUN=""              # short-path runtime dir for smbd's sockets
-XFER_SMB_STAGE=""            # scratch under VIRUTILS_TMP_DIR, only the file case
+# Shared by both live servers, and cleared by xfer_stop however the run ends.
+XFER_RUN=""                  # short-path runtime dir for the server's own state
+XFER_RUN_ROOT=0              # was anything in it created by a root process?
+XFER_STAGE=""                # scratch under VIRUTILS_TMP_DIR for the payload tree
+
+XFER_SMB_PID=""              # the smbd; killed by xfer_stop
 XFER_SMB_CONF=""             # the throwaway smb.conf, also our kill key
 XFER_SMB_SHARE=""            # the random share name the guest is told
 XFER_SMB_UNC=""              # \\ADDR\<share>, the guest's source path
+
+XFER_RSYNCD_PID=""           # the rsync daemon; killed by xfer_stop
+XFER_RSYNCD_CONF=""          # the throwaway rsyncd.conf, also our kill key
+XFER_RSYNCD_MODULE=""        # the random module name the guest is told
+XFER_RSYNCD_PORT=""          # the ephemeral port it was given
+XFER_RSYNCD_URL=""           # rsync://ADDR:PORT/<module>, the guest's source path
 
 # 445 cannot be moved for a Windows client, so a listener already on it is a
 # hard stop rather than something to work around. On WSL that listener is
@@ -274,22 +295,24 @@ xfer_smb_free() {
     fi
 }
 
-# smbd keeps its lock, message and pid state in a set of directories and opens
-# an AF_UNIX socket under them -- whose path is capped near 108 bytes. The
-# scratch tree virutil uses elsewhere is far too long for that (it is what made
-# a first attempt fail with "File name too long"), so the runtime dirs go under
-# a short /tmp path of their own, separate from any payload.
-xfer_smb_run_dir() {
-    [[ -n "$XFER_SMB_RUN" ]] && return 0
-    XFER_SMB_RUN="$(mktemp -d /tmp/vsmb.XXXXXX)" \
-        || die "could not create a runtime directory for smbd"
-    trap xfer_smb_stop EXIT
+# Where a live server keeps its own state -- conf, log, pid, sockets -- for the
+# one transfer it lives for. A short /tmp path rather than the scratch tree
+# virutil uses elsewhere, and that is smbd's requirement rather than a
+# preference: it opens an AF_UNIX socket under its runtime dirs, whose path is
+# capped near 108 bytes, and the usual tree is far too long for that (it is what
+# made a first attempt fail with "File name too long"). rsyncd needs none of
+# that, and shares the directory anyway so there is one thing to clean up.
+xfer_run_dir() {
+    [[ -n "$XFER_RUN" ]] && return 0
+    XFER_RUN="$(mktemp -d /tmp/vxfer.XXXXXX)" \
+        || die "could not create a runtime directory for the transfer"
+    trap xfer_stop EXIT
     # An EXIT trap alone does not cover a run killed at the sudo password
     # prompt: the shell dies from the signal and never reaches its exit. That
     # leaves the runtime directory and its conf on disk, which is where the one
-    # stray /tmp/vsmb.* on this host came from. These handlers do no cleanup of
-    # their own -- they only turn the signal into an exit, which is what runs
-    # the trap above.
+    # stray /tmp/vsmb.* this once left behind came from. These handlers do no
+    # cleanup of their own -- they only turn the signal into an exit, which is
+    # what runs the trap above.
     trap 'exit 130' INT
     trap 'exit 143' TERM
 }
@@ -332,7 +355,7 @@ xfer_smb_alive() {
 # every time, so a failure here is something about the surrounding run, and
 # narrowing it needs the process tree rather than more of smbd's silence.
 xfer_smb_diag() {
-    local f="$XFER_SMB_RUN/diag"
+    local f="$XFER_RUN/diag"
     {
         echo "== launcher $XFER_SMB_PID"
         ps -o pid,ppid,pgid,sess,tpgid,stat,wchan:25,args -p "$XFER_SMB_PID" 2>&1
@@ -359,8 +382,8 @@ xfer_smb_nobind() {
     # || true on both: a file that was never created makes the *assignment*
     # fail, which under set -e takes the whole run down here -- silently, and
     # only ever on the path whose entire job is to explain a failure.
-    out="$(cat "$XFER_SMB_RUN/out" 2>/dev/null)" || true
-    log="$(tail -n 20 "$XFER_SMB_RUN/log" 2>/dev/null)" || true
+    out="$(cat "$XFER_RUN/out" 2>/dev/null)" || true
+    log="$(tail -n 20 "$XFER_RUN/log" 2>/dev/null)" || true
     [[ -n "$out" ]] && warn "$out"
     [[ -n "$log" ]] && warn "$log"
 
@@ -370,7 +393,7 @@ xfer_smb_nobind() {
     xfer_smb_diag
     keep="$VIRUTILS_TMP_DIR/smb-failed.$$"
     mkdir -p "$VIRUTILS_TMP_DIR" 2>/dev/null || true
-    cp -a "$XFER_SMB_RUN" "$keep" 2>/dev/null || true
+    cp -a "$XFER_RUN" "$keep" 2>/dev/null || true
     [[ -d "$keep" ]] || keep=""
 
     # An exit needs no timeout to explain it, and its status is readable only
@@ -449,9 +472,12 @@ xfer_smb_serve() {
 
     xfer_privilege
     xfer_smb_free
-    xfer_smb_run_dir
+    xfer_run_dir
+    # smbd will write its log and databases in there as root, so the removal at
+    # the end has to be root's too.
+    XFER_RUN_ROOT=1
     XFER_SMB_SHARE="$(xfer_share_token)"
-    XFER_SMB_CONF="$XFER_SMB_RUN/smb.conf"
+    XFER_SMB_CONF="$XFER_RUN/smb.conf"
 
     # guest account is the invoking user so smbd reads the payload as its owner
     # rather than as nobody; under sudo that is still the real user, since
@@ -463,13 +489,13 @@ xfer_smb_serve() {
     map to guest = Bad User
     guest account = ${SUDO_USER:-$USER}
     security = user
-    private dir = $XFER_SMB_RUN
-    lock directory = $XFER_SMB_RUN
-    state directory = $XFER_SMB_RUN
-    cache directory = $XFER_SMB_RUN
-    pid directory = $XFER_SMB_RUN
-    ncalrpc dir = $XFER_SMB_RUN
-    log file = $XFER_SMB_RUN/log
+    private dir = $XFER_RUN
+    lock directory = $XFER_RUN
+    state directory = $XFER_RUN
+    cache directory = $XFER_RUN
+    pid directory = $XFER_RUN
+    ncalrpc dir = $XFER_RUN
+    log file = $XFER_RUN/log
     bind interfaces only = yes
     interfaces = lo $addr
     disable netbios = yes
@@ -506,7 +532,7 @@ CONF
     local -a launch=("${SUDO[@]}")
     (( ${#SUDO[@]} )) && launch+=(-n)
     launch+=(smbd -s "$XFER_SMB_CONF" -F --no-process-group --debug-stdout)
-    "${launch[@]}" >"$XFER_SMB_RUN/out" 2>&1 </dev/null &
+    "${launch[@]}" >"$XFER_RUN/out" 2>&1 </dev/null &
     XFER_SMB_PID=$!
 
     # The bind is done when 445 answers; poll for it, and stop early if smbd has
@@ -521,24 +547,203 @@ CONF
     XFER_SMB_UNC="\\\\$addr\\$XFER_SMB_SHARE"
 }
 
-# Retire the server and clear its scratch, however the run ends. smbd is root
-# and leaves helper children (notifyd, cleanupd); killing by the unique conf
-# path catches the lot, where killing one pid would not. The EXIT trap is armed
-# in xfer_smb_run_dir.
-xfer_smb_stop() {
-    # Escalate only if smbd was actually launched (XFER_SMB_PID set). Before
-    # that the runtime dir is the user's own mktemp and the kill has nothing to
-    # aim at, so a failure that never got as far as binding does not need -- and
-    # should not noisily attempt -- a root pkill and rm it cannot run anyway.
-    if [[ -n "$XFER_SMB_PID" ]]; then
-        [[ -n "$XFER_SMB_CONF" ]] \
-            && { "${SUDO[@]}" pkill -f "smbd -s $XFER_SMB_CONF" 2>/dev/null || true; }
-        [[ -n "$XFER_SMB_RUN" && -d "$XFER_SMB_RUN" ]] \
-            && { "${SUDO[@]}" rm -rf "$XFER_SMB_RUN" || true; }
-    else
-        [[ -n "$XFER_SMB_RUN" && -d "$XFER_SMB_RUN" ]] && rm -rf "$XFER_SMB_RUN"
+# xfer_stop -- retire whichever server is up and clear the scratch, however the
+# run ends. The EXIT trap is armed in xfer_run_dir; the copy phases also call
+# this directly, to put the server away before the cleanup and post rules that
+# follow, so every part of it is idempotent and the trap firing afterwards costs
+# nothing.
+xfer_stop() {
+    xfer_smb_kill
+    xfer_rsyncd_kill
+    xfer_scratch_clear
+}
+
+# smbd is root and leaves helper children (notifyd, cleanupd); killing by the
+# unique conf path catches the lot, where killing one pid would not. Nothing is
+# escalated unless smbd was actually launched: before that the kill has nothing
+# to aim at, so a failure that never got as far as binding does not need -- and
+# should not noisily attempt -- a root pkill.
+xfer_smb_kill() {
+    [[ -n "$XFER_SMB_PID" ]] || return 0
+    [[ -n "$XFER_SMB_CONF" ]] \
+        && { "${SUDO[@]}" pkill -f "smbd -s $XFER_SMB_CONF" 2>/dev/null || true; }
+    XFER_SMB_PID=""; XFER_SMB_CONF=""
+}
+
+# rsyncd is this user's own process and forks a child per connection, so the
+# same kill-by-unique-conf catches the parent and any child still draining one.
+# No sudo anywhere in it: an unprivileged port needed none to bind, and asking
+# for root to clean up after something that never had it would be its own bug.
+xfer_rsyncd_kill() {
+    [[ -n "$XFER_RSYNCD_PID" ]] || return 0
+    [[ -n "$XFER_RSYNCD_CONF" ]] \
+        && { pkill -f "rsync --daemon --no-detach --config=$XFER_RSYNCD_CONF" \
+                 2>/dev/null || true; }
+    XFER_RSYNCD_PID=""; XFER_RSYNCD_CONF=""
+}
+
+# The runtime directory and the payload tree. Whether removing the first needs
+# root is not a guess: smbd runs as root and writes its log and tdb databases in
+# there as root, so the invoking user cannot unlink them afterwards -- while
+# rsyncd wrote its own as that user, and must not be sudo'd for. XFER_RUN_ROOT
+# is set by whichever server actually escalated.
+xfer_scratch_clear() {
+    if [[ -n "$XFER_RUN" && -d "$XFER_RUN" ]]; then
+        if (( XFER_RUN_ROOT )); then
+            "${SUDO[@]}" rm -rf "$XFER_RUN" || true
+        else
+            rm -rf "$XFER_RUN"
+        fi
     fi
-    XFER_SMB_PID=""
-    [[ -n "$XFER_SMB_STAGE" && -d "$XFER_SMB_STAGE" ]] && rm -rf "$XFER_SMB_STAGE"
-    XFER_SMB_RUN=""; XFER_SMB_STAGE=""; XFER_SMB_CONF=""
+    [[ -n "$XFER_STAGE" && -d "$XFER_STAGE" ]] && rm -rf "$XFER_STAGE"
+    XFER_RUN=""; XFER_RUN_ROOT=0; XFER_STAGE=""
+}
+
+# --- the live path, over an rsync daemon --------------------------------------
+#
+# How sync delivers into a running Linux guest. Same shape as the SMB path
+# above -- the host serves the payload tree on the address the guest already
+# reaches it at, and the guest's own copier takes only what differs -- with a
+# different server behind it, because a Linux guest has rsync and does not have
+# robocopy.
+#
+#   xfer_rsyncd_serve DIR ADDR -> guest rsyncs from rsync://ADDR:PORT/<module>
+#
+# This is the cheaper of the two transports, and every way in which it is
+# cheaper comes from one thing: rsync's port is not fixed. SMB has to be 445 to
+# a Windows client, which is what makes the other path bind a privileged port,
+# escalate to do it, need a terminal to prime the credential on, and refuse to
+# run when the Windows host's own file sharing already holds 445. An rsync
+# daemon takes any port at all, so this asks for no root, prompts for nothing,
+# and cannot collide with what is already listening. It is also a real delta
+# transfer rather than a timestamp comparison, and no mount, device or share
+# appears in the guest either way.
+#
+# The module name is the same one-transfer random token the SMB share uses, and
+# for the same reason: the export is anonymous, so what keeps it from being
+# reachable by anything else on that network is that nothing else can name it.
+# `list = no` keeps it out of a module listing as well.
+
+# How long to wait for the bind, in 0.1s steps. rsyncd binds immediately -- it
+# has no databases to build, which is what most of the SMB budget is for -- so
+# this is short and is really only here to cover a loaded host.
+XFER_RSYNCD_TRIES=50
+
+# Is anything listening on PORT?
+xfer_port_bound() {
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]$1\$"
+}
+
+# A free port in the ephemeral-but-unregistered range, or nothing. Checked
+# before the bind rather than after a failure, because "address already in use"
+# from rsyncd says nothing about which port it wanted.
+#
+# There is an unavoidable race between the check and the bind, and it is
+# harmless: something else taking the port in that window fails this transfer
+# with rsyncd's own message and no other side effect, where the same race on 445
+# would be a privileged bind fighting over the one port SMB can use.
+xfer_pick_port() {
+    local i port
+    for (( i = 0; i < 64; i++ )); do
+        port=$(( 20000 + RANDOM % 20000 ))
+        xfer_port_bound "$port" || { printf '%s' "$port"; return 0; }
+    done
+    return 1
+}
+
+# xfer_rsyncd_serve DIR ADDR [rw] -- export DIR on ADDR at an ephemeral port,
+# once, under a random module name, and set XFER_RSYNCD_URL. Read-only unless
+# the third argument is `rw`. The bind address is ADDR alone, the one that
+# reaches the guest -- not the wildcard, which would offer the export to every
+# network this host is on, and which a writable export makes a worse idea still.
+xfer_rsyncd_serve() {
+    local dir="$1" addr="$2" mode="${3:-ro}" i readonly=yes
+
+    [[ "$mode" == rw || "$mode" == ro ]] \
+        || die "internal: xfer_rsyncd_serve wants ro or rw, got '$mode'"
+    [[ "$mode" == rw ]] && readonly=no
+
+    command -v rsync >/dev/null 2>&1 \
+        || die "delivering into a running Linux guest serves the payload from" \
+               "an rsync daemon and needs rsync on the host; it is not" \
+               "installed."
+    command -v ss >/dev/null 2>&1 \
+        || die "the delivery needs ss (iproute2) to find a free port to serve" \
+               "the payload on, and to tell whether the daemon has bound it;" \
+               "it is not on PATH. Install iproute2."
+
+    XFER_RSYNCD_PORT="$(xfer_pick_port)" \
+        || die "could not find a free port to serve the payload on after 64" \
+               "tries, which means something on this host is listening on" \
+               "most of 20000-40000. Nothing was served."
+
+    xfer_run_dir
+    XFER_RSYNCD_MODULE="$(xfer_share_token)"
+    XFER_RSYNCD_CONF="$XFER_RUN/rsyncd.conf"
+
+    # No uid/gid: those are for a daemon started as root, which drops to them.
+    # This one is already the invoking user, so it reads the payload as its
+    # owner and any setuid directive would only be refused. `use chroot = no`
+    # for the same reason -- chroot is root's to call -- and it costs nothing
+    # here, since the export is one directory this run just built.
+    #
+    # `reverse lookup = no` because the log line is the only thing that would
+    # use the name, and a host with no reverse zone for its guest network makes
+    # every connection wait on a DNS timeout to write it.
+    cat > "$XFER_RSYNCD_CONF" <<CONF
+port = $XFER_RSYNCD_PORT
+address = $addr
+use chroot = no
+reverse lookup = no
+max connections = 4
+log file = $XFER_RUN/log
+pid file = $XFER_RUN/pid
+lock file = $XFER_RUN/lock
+
+[$XFER_RSYNCD_MODULE]
+    path = $dir
+    read only = $readonly
+    list = no
+    timeout = 600
+CONF
+
+    # Backgrounded and never escalated, so unlike the SMB launch there is no
+    # credential to prime, nothing that can be stopped by touching the terminal
+    # from the background, and no reason for this to need a terminal at all --
+    # which is what makes the Linux path the one that works unattended.
+    rsync --daemon --no-detach --config="$XFER_RSYNCD_CONF" \
+        >"$XFER_RUN/out" 2>&1 </dev/null &
+    XFER_RSYNCD_PID=$!
+
+    for (( i = 0; i < XFER_RSYNCD_TRIES; i++ )); do
+        xfer_port_bound "$XFER_RSYNCD_PORT" && break
+        kill -0 "$XFER_RSYNCD_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if ! xfer_port_bound "$XFER_RSYNCD_PORT"; then xfer_rsyncd_nobind "$addr"; fi
+
+    XFER_RSYNCD_URL="rsync://$addr:$XFER_RSYNCD_PORT/$XFER_RSYNCD_MODULE"
+}
+
+# xfer_rsyncd_nobind ADDR -- the daemon was launched and its port never
+# answered. Everything it has to say is in one of two files this shell owns, so
+# both are quoted here rather than pointed at: the EXIT trap removes the runtime
+# directory immediately after this returns.
+xfer_rsyncd_nobind() {
+    local addr="$1" out log rc=0
+    out="$(cat "$XFER_RUN/out" 2>/dev/null)" || true
+    log="$(tail -n 20 "$XFER_RUN/log" 2>/dev/null)" || true
+    [[ -n "$out" ]] && warn "$out"
+    [[ -n "$log" ]] && warn "$log"
+
+    if ! kill -0 "$XFER_RSYNCD_PID" 2>/dev/null; then
+        wait "$XFER_RSYNCD_PID" 2>/dev/null || rc=$?
+        die "the rsync daemon exited with status $rc without binding" \
+            "$addr:$XFER_RSYNCD_PORT.${out:+ Its own output is above.}" \
+            "Run it by hand to see it live:" \
+            "  rsync --daemon --no-detach --config=$XFER_RSYNCD_CONF"
+    fi
+    die "the rsync daemon started but has not bound $addr:$XFER_RSYNCD_PORT" \
+        "after $(( XFER_RSYNCD_TRIES / 10 ))s; whatever it logged is above." \
+        "Nothing was delivered."
 }

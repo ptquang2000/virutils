@@ -1,10 +1,18 @@
-# exec -- run commands inside a Windows guest via the QEMU guest agent.
+# exec -- run commands inside a guest via the QEMU guest agent.
 #
 #   virutil exec ping VM                 check that the guest agent is responding
-#   virutil exec cmd  VM [-d] CMD...     run CMD via cmd.exe /c
-#   virutil exec ps   VM [-d] SCRIPT...  run SCRIPT via powershell (quoting-safe)
+#   virutil exec cmd  VM [-d] CMD...     run CMD via cmd.exe /c        (Windows)
+#   virutil exec ps   VM [-d] SCRIPT...  run SCRIPT via powershell     (Windows)
+#   virutil exec sh   VM [-d] SCRIPT...  run SCRIPT via /bin/sh -c     (Linux)
 #
-# Commands run as SYSTEM and the guest exit code becomes ours. Flags sit between
+# Which of the three a guest answers to is the guest's business, not the agent's:
+# guest-exec carries a path and an argv either way, so the only thing that
+# differs is what is on the other side to receive it. Nothing here probes for it
+# -- the caller knows which guest it is addressing, and sync learns it from
+# @guest in its config.
+#
+# Commands run as SYSTEM on Windows and as root on Linux -- qemu-ga is a service
+# in both cases -- and the guest exit code becomes ours. Flags sit between
 # the VM name and the command; parsing stops at the first non-flag, and `--`
 # forces the end of flags so a command may start with `-`.
 #
@@ -20,12 +28,22 @@
 CMDLINE_MAX=32767
 CMD_EXE_MAX=8191
 
+# Linux has no command-line limit to speak of, but it does cap a single argv
+# entry at MAX_ARG_STRLEN -- 32 pages, which is 128KB on every architecture
+# virutil runs on. A sh script is passed as one such entry, so this is the
+# ceiling that matters, and it is enforced host-side for the same reason the
+# Windows ones are: over it, execve fails in the guest as E2BIG, which surfaces
+# as an unrelated-looking spawn error rather than as "your script is too long".
+SH_ARG_MAX=131072
+
 DETACH=0
 INPUT_B64=
 
 exec_usage() {
     printf '%s\n' \
-        "usage: virutil exec {ping|cmd|ps} VM [FLAGS] [ARGS]" \
+        "usage: virutil exec {ping|cmd|ps|sh} VM [FLAGS] [ARGS]" \
+        "" \
+        "  cmd, ps        a Windows guest; sh a Linux one." \
         "" \
         "  -d, --detach   fire and forget: print the guest pid and exit 0." \
         "                 No output and no exit code, but the command survives" \
@@ -161,6 +179,45 @@ exec_ps_text() {
         '["-NoProfile","-NonInteractive","-OutputFormat","Text","-EncodedCommand",$e]')"
 }
 
+# sh_quote STR -- STR as a single-quoted /bin/sh word. The sh counterpart of
+# push_ps_quote, and the same one rule: inside single quotes every character is
+# literal except the quote itself, which is closed, escaped and reopened.
+sh_quote() {
+    local s="$1"
+    s=${s//\'/\'\\\'\'}
+    printf "'%s'" "$s"
+}
+
+# exec_sh_text SCRIPT -- run SCRIPT in $VM's /bin/sh, return its exit code.
+# Shared with the transports in modules/xfer, exactly as exec_ps_text is.
+#
+# No base64 layer, and this is the one place the Linux side is *simpler* rather
+# than merely different. The Windows encoding exists because qemu-ga there has
+# to flatten argv into a single CreateProcess command line, which re-quotes as
+# it goes -- that is what mangles an embedded quote through cmd.exe. On Linux
+# qemu-ga execve's the argv array it was handed, so the script arrives as one
+# argument byte for byte, whatever is in it.
+#
+# set -e to match $ErrorActionPreference = "Stop" on the other side: a run rule
+# exists to make the copy land correctly, so the first failing statement in one
+# has to end it rather than let the rest carry on against a guest that is not in
+# the state the rule was meant to put it in.
+exec_sh_text() {
+    local SCRIPT
+    SCRIPT="set -e
+$1"
+
+    # + "-c" and the argv overhead around it
+    if [ $(( ${#SCRIPT} + 64 )) -gt "$SH_ARG_MAX" ]; then
+        echo "virutil: script is ${#SCRIPT} chars, over Linux's $SH_ARG_MAX" \
+             "single-argument limit; shorten it, or stage a script in the" \
+             "guest and run that" >&2
+        exit 1
+    fi
+
+    gexec /bin/sh "$(jq -nc --arg c "$SCRIPT" '["-c",$c]')"
+}
+
 exec_main() {
     local CMD VM
     CMD="${1:-}"
@@ -200,6 +257,12 @@ exec_main() {
         set -- ${E_REST[@]+"${E_REST[@]}"}
         resolve_text "$@" || { echo "usage: virutil exec ps VM [-d] SCRIPT..." >&2; exit 1; }
         exec_ps_text "$TEXT"
+        ;;
+    sh)
+        parse_flags "$@"
+        set -- ${E_REST[@]+"${E_REST[@]}"}
+        resolve_text "$@" || { echo "usage: virutil exec sh VM [-d] SCRIPT..." >&2; exit 1; }
+        exec_sh_text "$TEXT"
         ;;
     *)
         exec_usage

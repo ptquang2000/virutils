@@ -2,14 +2,19 @@
 #
 # Two transports, chosen by --disk, both in modules/xfer:
 #
-#   default  SMB over the guest's own NIC, driven by the guest agent. The guest
-#            keeps running and sees no new device; robocopy copies only what
-#            differs from what it already has, so a re-push of a build that
-#            changed one file moves one file. Needs an agent, a route back to
-#            this host, and root here to bind port 445.
+#   default  over the guest's own NIC, driven by the guest agent. The guest
+#            keeps running and sees no new device, and its copier takes only
+#            what differs from what it already has, so a re-push of a build
+#            that changed one file moves one file. Needs an agent and a route
+#            back to this host; a Windows guest also needs smbd and root here
+#            to bind port 445, where a Linux one needs neither.
 #   --disk   the guest's disk image, mounted on the host. A running guest is
 #            shut down around the copy and started again afterwards, which is
 #            the whole cost of it -- but it needs nothing of the guest.
+#            Windows guests only: it mounts NTFS.
+#
+# Which guest is on the other side is asked, not flagged -- see guest_os in
+# modules/guest. DST is spelled in that guest's own flavour either way.
 
 push_usage() {
     printf '%s\n' \
@@ -20,9 +25,10 @@ push_usage() {
         "       image is written instead, so a running one is shut down first" \
         "       and started again afterwards" \
         "  SRC  host file or directory to copy" \
-        "  DST  guest path, relative to C:\\; a trailing slash means a" \
-        "       directory, exactly as with rsync. Backslashes and a C:\\" \
-        "       prefix are tolerated; '..' is refused." \
+        "  DST  guest path, relative to the guest's root -- C:\\ on Windows," \
+        "       / on Linux. A trailing slash means a directory, exactly as" \
+        "       with rsync. On Windows, backslashes and a C:\\ prefix are" \
+        "       tolerated; '..' is refused either way." \
         "" \
         "      --disk              write the guest's disk image instead of" \
         "                          delivering over the network. Mounts the" \
@@ -30,35 +36,59 @@ push_usage() {
         "                          shut down for the copy and started again" \
         "                          afterwards -- but it needs nothing of the" \
         "                          guest: no agent, no route back here and no" \
-        "                          privileged port." \
+        "                          privileged port. Windows guests only." \
         "  -h, --help              this message" \
         "" \
         "A directory source is copied recursively. By default the payload is" \
-        "served to the running guest, which fetches it with robocopy and so" \
-        "moves only what changed; see README.md." >&2
+        "served to the running guest, which fetches it itself -- robocopy on" \
+        "Windows, rsync on Linux -- and so moves only what changed. The" \
+        "guest's OS is detected; see README.md." >&2
     exit "${1:-1}"
 }
 
-# Normalise a guest-side DST into a C:-relative path: strip a drive prefix, turn
-# backslashes into slashes, drop empty and '.' components, refuse '..' so the
-# destination can never resolve outside the mount point. The caller handles the
-# trailing slash that marks a directory before this strips it.
+# Normalise a guest-side DST into a path relative to the guest's root, in the
+# flavour that guest spells. The caller handles the trailing slash that marks a
+# directory before this strips it. See guest_norm_win/guest_norm_posix in
+# modules/guest for what "normalise" means and why the two flavours differ.
 push_norm_dst() {
-    local s="$1" out="" comp
-    s="${s#[Cc]:}"
-    s="${s//\\//}"
-    while [[ -n "$s" ]]; do
-        while [[ "$s" == /* ]]; do s="${s#/}"; done
-        comp="${s%%/*}"
-        [[ -n "$comp" ]] || break
-        case "$comp" in
-            '.') ;;
-            '..') die "destination may not contain '..': $1" ;;
-            *)    out="${out:+$out/}$comp" ;;
-        esac
-        s="${s#"$comp"}"
-    done
-    printf '%s' "$out"
+    if [[ "${GUEST_OS:-windows}" == linux ]]; then
+        guest_norm_posix "$1" destination
+    else
+        guest_norm_win "$1" destination
+    fi
+}
+
+# push_check_readable SRC -- refuse a payload holding files this user cannot
+# read, before anything is served.
+#
+# The -r test above covers only the top of the tree, and a directory push serves
+# its contents: the export is read as the invoking user by both servers, so a
+# file that user cannot read is one the guest will be offered and denied. rsync
+# reports that as exit 23 *after* transferring everything else, and the message
+# names the file but not the side -- which is exactly the shape of failure this
+# refuses to produce. Same reasoning as xfer_room_for: check before the spend.
+#
+# ! -readable is GNU find's, which is what is on any host that got this far.
+push_check_readable() {
+    local src="$1" bad count shown
+    [[ -d "$src" ]] || return 0
+
+    bad="$(find "$src" ! -readable -print 2>/dev/null)"
+    [[ -n "$bad" ]] || return 0
+
+    count="$(printf '%s\n' "$bad" | wc -l)"
+    shown="$(printf '%s\n' "$bad" | head -10)"
+    (( count > 10 )) && shown+=$'\n'"  ... and $(( count - 10 )) more"
+
+    die "$src holds $count path(s) $(id -un) cannot read, and the payload is" \
+        "served as you -- so the guest would be offered them and refused," \
+        "and rsync would fail with exit 23 after moving everything else." \
+        "Nothing was served." \
+        "" \
+        "$shown" \
+        "" \
+        "Check their mode and owner here on the host. Either fix those, or" \
+        "push a subdirectory that does not include them."
 }
 
 push_main() {
@@ -95,21 +125,34 @@ push_main() {
 
     [[ -e "$SRC" ]] || die "source not found: $SRC"
     [[ -r "$SRC" ]] || die "source not readable: $SRC"
+    push_check_readable "$SRC"
 
     DOMAIN="$VM"
     domain_exists "$DOMAIN" || die "no such domain: $DOMAIN (see: virutil domain list)"
 
+    # Which guest, and so which copier, which shell and which path flavour.
+    # Asked rather than flagged -- see guest_os in modules/guest -- and asked
+    # before either branch, because --disk needs it too: to refuse an image it
+    # cannot mount rather than shut the domain down and find out.
+    GUEST_OS="$(guest_os "$DOMAIN")"
+
     if (( DISK )); then
+        [[ "$GUEST_OS" == linux ]] \
+            && die "--disk cannot write a Linux guest's disk image: it mounts" \
+                   "the largest NTFS partition on it, which $DOMAIN does not" \
+                   "have. Nothing was touched and $DOMAIN was not shut down." \
+                   "Drop --disk; the default path delivers into a running Linux" \
+                   "guest and needs no root at all."
         xfer_check write
         # guest_open arms the EXIT trap that unmounts and detaches again.
         guest_open
         push_copy "$SRC" "$DST"
         echo "copied -> $DOMAIN"
     else
-        xfer_check smb
+        xfer_check net
         # Reports for itself: it knows what landed and how long it took, which
         # is more than "copied" says.
-        push_smb "$SRC" "$DST"
+        push_net "$SRC" "$DST"
     fi
 }
 
@@ -129,7 +172,7 @@ push_copy() {
     "${RSYNC[@]}" "$SRC" "$dst_arg"
 }
 
-# --- delivering into the running guest, over SMB ----------------------------
+# --- delivering into the running guest, over its own network ----------------
 
 # A path inside a single-quoted powershell string. Backslashes are literal
 # there, which is the whole reason for preferring it over the double-quoted
@@ -139,26 +182,70 @@ push_ps_quote() {
     printf "'%s'" "${s//\'/\'\'}"
 }
 
-# push_smb SRC DST -- what push does unless --disk says otherwise. The host
-# exports the payload as a read-only share and the running guest pulls it with
-# robocopy, which copies only the files that differ from what it already holds --
+# push_net SRC DST -- what push does unless --disk says otherwise. The host
+# exports the payload read-only and the running guest pulls it with its own
+# copier, which takes only the files that differ from what it already holds --
 # so a second push of a build that changed one file moves one file, and leaves
-# the rest alone down to their timestamps. A file source is served from a
-# one-entry staging directory (robocopy and Copy-Item both want a directory to
-# point at, not a bare file over UNC); a directory source is served in place, no
-# pack and no copy.
+# the rest alone down to their timestamps.
 #
-# The guest side is one powershell run, and nothing in it uses `throw`: a
-# terminating error in powershell arrives as eight lines of CategoryInfo and
+# A file source is served from a one-entry staging directory; a directory source
+# is served in place, no pack and no copy. That is not a Windows quirk it would
+# be nice to drop on Linux: an SMB share and an rsync module are both a
+# *directory*, so a bare file has to be given one to sit in either way.
+#
+# Everything up to the export is shared. What differs is the pair at the far end
+# -- server and copier -- chosen by the dispatchers above.
+#
+# The Windows guest side is one powershell run, and nothing in it uses `throw`:
+# a terminating error in powershell arrives as eight lines of CategoryInfo and
 # FullyQualifiedErrorId wrapped around one useful sentence, and buries the
 # message that says whether the network or the destination was at fault. So each
-# failure writes one line and exits with a code the host can name below.
+# failure writes one line and exits with a code the host can name below. The
+# Linux side exits with rsync's own code, which needs no such translation.
 PUSH_RC_MKDIR=92            # the destination directory could not be created
 PUSH_RC_ROBO=93             # robocopy returned a failure code (>= 8)
 
-push_smb() {
+push_net_serve() {
+    if [[ "$GUEST_OS" == linux ]]; then xfer_rsyncd_serve "$1" "$2"
+    else                                xfer_smb_serve    "$1" "$2"; fi
+}
+
+push_net_fetch() {
+    if [[ "$GUEST_OS" == linux ]]; then push_lin_fetch "$@"
+    else                                push_smb_fetch "$@"; fi
+}
+
+push_net_report() {
+    if [[ "$GUEST_OS" == linux ]]; then push_lin_report "$@"
+    else                                push_smb_report "$@"; fi
+}
+
+push_net_die() {
+    if [[ "$GUEST_OS" == linux ]]; then
+        guest_rsync_die "$1" "$2" "the payload"
+    else
+        push_smb_die "$1" "$2"
+    fi
+}
+
+# push_show_dst DST IS_DIR -- the destination as the guest spells it, for the
+# line a person reads. Cosmetic only; nothing is addressed through it.
+push_show_dst() {
+    local p
+    if [[ "$GUEST_OS" == linux ]]; then
+        p="/$1"
+        (( $2 )) && p="${p%/}/"
+        printf '%s' "$p"
+    else
+        p="${1//\//\\}"
+        (( $2 )) && p="${p:+$p\\}"
+        printf 'C:\\%s' "$p"
+    fi
+}
+
+push_net() {
     local SRC="$1" DST="$2" VM="$DOMAIN"
-    local DST_IS_DIR export_dir base ip host rc=0 reported t0 elapsed win_dst
+    local DST_IS_DIR export_dir base ip host rc=0 reported t0 elapsed
 
     if [[ "$DST" == */ || "$DST" == *'\' ]]; then DST_IS_DIR=1; else DST_IS_DIR=0; fi
     DST="$(push_norm_dst "$DST")" || exit 1
@@ -181,6 +268,7 @@ push_smb() {
     #
     # Absolute, and not as a tidiness: smb.conf's `path` is resolved by smbd
     # against smbd's own working directory, which is root's and not the caller's.
+    # rsyncd's `path` has the same problem for the same reason, so both need it.
     # A relative SRC -- `./build/`, the ordinary way to name a directory you are
     # standing in -- would name a path that does not exist over there, and the
     # share would come up pointing at nothing. The guest's robocopy then fails
@@ -193,28 +281,36 @@ push_smb() {
     else
         mkdir -p "$VIRUTILS_TMP_DIR" \
             || die "could not create $VIRUTILS_TMP_DIR for the transfer payload"
-        XFER_SMB_STAGE="$(mktemp -d "$VIRUTILS_TMP_DIR/smb.XXXXXX")" \
+        XFER_STAGE="$(mktemp -d "$VIRUTILS_TMP_DIR/smb.XXXXXX")" \
             || die "could not create a staging directory for the transfer"
         base="$(basename -- "$SRC")"
-        ln "$SRC" "$XFER_SMB_STAGE/$base" 2>/dev/null \
-            || cp -- "$SRC" "$XFER_SMB_STAGE/$base" \
+        # -p on the fallback, and it is not cosmetic: both copiers decide what
+        # to move by comparing timestamps, so a staged copy stamped with the
+        # current time is newer than anything in the guest and gets re-sent on
+        # every push -- which quietly costs a file push the incrementality that
+        # is the whole reason for this transport.
+        #
+        # The fallback is not the rare case it looks like. `ln` fails across
+        # filesystems, and it also fails under fs.protected_hardlinks (default
+        # on since Linux 3.6) for any file this user neither owns nor can
+        # write -- which is every root-owned build artifact.
+        ln "$SRC" "$XFER_STAGE/$base" 2>/dev/null \
+            || cp -p -- "$SRC" "$XFER_STAGE/$base" \
             || die "could not stage $SRC for transfer"
-        export_dir="$XFER_SMB_STAGE"
+        export_dir="$XFER_STAGE"
     fi
 
-    xfer_smb_serve "$export_dir" "$host"
+    push_net_serve "$export_dir" "$host"
 
-    win_dst="${DST//\//\\}"
-    (( DST_IS_DIR )) && win_dst="${win_dst:+$win_dst\\}"
-    echo "push: $SRC -> C:\\$win_dst"
+    echo "push: $SRC -> $(push_show_dst "$DST" "$DST_IS_DIR")"
 
     t0="$(now_ms)"
-    reported="$(push_smb_fetch "$SRC" "$DST" "$DST_IS_DIR")" || rc=$?
+    reported="$(push_net_fetch "$SRC" "$DST" "$DST_IS_DIR")" || rc=$?
     elapsed=$(( $(now_ms) - t0 ))
-    (( rc == 0 )) || push_smb_die "$rc" "$host"
+    (( rc == 0 )) || push_net_die "$rc" "$host"
 
-    xfer_smb_stop
-    push_smb_report "$SRC" "$reported" "$elapsed"
+    xfer_stop
+    push_net_report "$SRC" "$reported" "$elapsed"
 }
 
 # push_smb_fetch SRC DST DST_IS_DIR -- the guest side, one powershell run.
@@ -291,11 +387,121 @@ push_smb_report() {
         if (( copied )); then what+=" present (some copied)"; else what+=" present (all up to date)"; fi
         echo "$DOMAIN: $what in $(fmt_duration "${gms:-$ms}")"
     else
-        local bytes gms
-        read -r bytes gms <<<"$reported"
-        rate="$(fmt_rate "$bytes" "${gms:-0}")"
-        echo "$DOMAIN: done ($(fmt_bytes "${bytes:-0}")) in $(fmt_duration "${gms:-$ms}")${rate:+ ($rate on the wire)}"
+        push_report_bytes "$reported" "$ms"
     fi
+}
+
+# push_report_bytes REPORTED MS -- a single file's landing, reported the same
+# way whatever copied it: "bytes ms" from the guest. The rate comes from the
+# guest's stopwatch rather than from MS, which is this host's wall clock and
+# holds an agent round trip -- for a small payload, nearly all of it.
+push_report_bytes() {
+    local reported="$1" ms="$2" note="${3:-}" bytes gms rate
+    read -r bytes gms <<<"$reported"
+    rate="$(fmt_rate "$bytes" "${gms:-0}")"
+    # No rate when nothing crossed: a throughput figure for a transfer that did
+    # not happen describes the round trip, not the wire.
+    [[ -n "$note" ]] && rate=""
+    echo "$DOMAIN: done ($(fmt_bytes "${bytes:-0}")$note) in" \
+         "$(fmt_duration "${gms:-$ms}")${rate:+ ($rate on the wire)}"
+}
+
+# --- the Linux guest side ---------------------------------------------------
+
+# push_lin_fetch SRC DST DST_IS_DIR -- the guest side, one rsync.
+#
+# One invocation for both shapes, where the Windows side needs two entirely
+# different commands: robocopy cannot rename onto a new name, so a single file
+# has to go through Copy-Item and loses the skip-what-matches behaviour that was
+# the reason for robocopy in the first place. rsync renames and skips at once,
+# so a file push here is incremental where the Windows one is not.
+#
+# The trailing-slash rule is rsync's own, which is where push borrowed it from:
+# `SRC/` means "the contents", `SRC` means "the directory itself". It costs
+# nothing to honour here because the copier *is* rsync.
+#
+# The destination directory has its own mode put back afterwards. With -p rsync
+# applies the source tree root's mode to the destination root, so pushing a
+# 0700 directory into / would chmod the guest's / to 0700 -- which locks every
+# non-root user out of every path on the system. Modes *inside* the payload are
+# still preserved; it is only the directory that was already there, and whose
+# mode this transfer was never asked to change, that is left alone. Restored on
+# failure as well as success, for the same reason.
+push_lin_fetch() {
+    local SRC="$1" DST="$2" is_dir="$3" script dst base src_url
+
+    base="$(basename -- "$SRC")"
+
+    if [[ -d "$SRC" ]]; then
+        if [[ "$SRC" == */ ]]; then dst="/$DST"
+        else                        dst="/${DST:+$DST/}$base"
+        fi
+        script=$(printf '%s\n' \
+            "$(guest_sh_need_rsync)" \
+            "src=$(sh_quote "$XFER_RSYNCD_URL/")" \
+            "dst=$(sh_quote "$dst")" \
+            "mkdir -p \"\$dst\" || { echo \"cannot create \$dst\" >&2; exit $PUSH_RC_MKDIR; }" \
+            'log=$(mktemp)' \
+            'dstmode=$(stat -c %a "$dst")' \
+            't0=$(date +%s%N)' \
+            'rc=0' \
+            'rsync -rlptD --out-format="%i %n" "$src" "$dst/" >"$log" || rc=$?' \
+            'chmod "$dstmode" "$dst"' \
+            '[ "$rc" = 0 ] || exit "$rc"' \
+            't1=$(date +%s%N)' \
+            'n=$(grep -c "^[<>]" "$log" || true)' \
+            'rm -f "$log"' \
+            'total=$(find "$dst" -type f | wc -l)' \
+            'echo "$n $total $(( (t1 - t0) / 1000000 ))"')
+    else
+        src_url="$XFER_RSYNCD_URL/$base"
+        if (( is_dir )); then dst="/${DST:+$DST/}$base"
+        else                  dst="/$DST"
+        fi
+        script=$(printf '%s\n' \
+            "$(guest_sh_need_rsync)" \
+            "src=$(sh_quote "$src_url")" \
+            "dst=$(sh_quote "$dst")" \
+            'dir=$(dirname "$dst")' \
+            "mkdir -p \"\$dir\" || { echo \"cannot create \$dir\" >&2; exit $PUSH_RC_MKDIR; }" \
+            'log=$(mktemp)' \
+            't0=$(date +%s%N)' \
+            'rsync -lptD --out-format="%i %n" "$src" "$dst" >"$log"' \
+            't1=$(date +%s%N)' \
+            'n=$(grep -c "^[<>]" "$log" || true)' \
+            'rm -f "$log"' \
+            'echo "$n $(wc -c < "$dst") $(( (t1 - t0) / 1000000 ))"')
+    fi
+
+    exec_sh_text "$script"
+}
+
+# push_lin_report SRC REPORTED MS -- REPORTED is the guest's own line: "copied
+# total ms" from a directory push, or "bytes ms" from a file one. The directory
+# form carries a real count, where the Windows side can only say whether
+# anything moved: rsync's --out-format is not localised, so counting its
+# itemised lines is safe in a guest of any language.
+push_lin_report() {
+    local SRC="$1" reported="$2" ms="$3"
+    local copied total gms what
+
+    # The file form carries the same "did it move" flag the directory form
+    # does, which the Windows side cannot: there a file push is Copy-Item and
+    # always copies, so there would be nothing to report. Worth the extra field
+    # -- "already current" is the answer a re-push is asked for.
+    if [[ ! -d "$SRC" ]]; then
+        read -r copied _ _ <<<"$reported"
+        push_report_bytes "${reported#* }" "$ms" \
+            "$( (( ${copied:-0} > 0 )) || printf ' (already current)' )"
+        return 0
+    fi
+
+    read -r copied total gms <<<"$reported"
+    what="$total file"; (( ${total:-0} == 1 )) || what+="s"
+    if (( ${copied:-0} > 0 )); then what+=" present, $copied copied"
+    else                            what+=" present (all up to date)"
+    fi
+    echo "$DOMAIN: $what in $(fmt_duration "${gms:-$ms}")"
 }
 
 # push_smb_die RC HOST -- name what went wrong; the guest has already printed

@@ -21,13 +21,14 @@ transfer
 
   sync and push deliver into a running guest over its own network, touching
   neither the disk image nor the guest's uptime, and move only what changed -- so
-  a re-run after rebuilding one file moves one file. Both take --disk to write
-  the guest's disk image instead, which shuts a running guest down (and starts it
-  again after) but needs nothing of the guest. pull only ever reads the disk
-  image, and leaves the guest running while it does.
+  a re-run after rebuilding one file moves one file. pull reads back the same
+  way. All three work on a Windows or a Linux guest and detect which (sync is
+  told, by @guest in its config). All three take --disk to use the guest's disk
+  image instead, which shuts a running guest down (and starts it again after) but
+  needs nothing of the guest -- and which is Windows-only, since it mounts NTFS.
 
 guest
-  exec       run commands inside a Windows guest via the QEMU guest agent
+  exec       run commands inside a guest via the QEMU guest agent
 
 hardware
   usb        USB passthrough end to end from the Windows host under WSL

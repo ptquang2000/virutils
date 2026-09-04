@@ -79,15 +79,16 @@ _virutil_osinfo() {
 _virutil_exec() {
   local -a cmds=(
     'ping:check the guest agent is responding'
-    'cmd:run a command via cmd.exe /c'
-    'ps:run a script via powershell'
+    'cmd:run a command via cmd.exe /c (Windows)'
+    'ps:run a script via powershell (Windows)'
+    'sh:run a script via /bin/sh -c (Linux)'
   )
   case $CURRENT in
     3) _describe -t command 'command' cmds ;;
     4) _virutil_domains ;;
     *)
       case $words[3] in
-        cmd|ps)
+        cmd|ps|sh)
           (( CURRENT == 5 )) && _values 'option' \
             '-d[fire and forget, print guest pid]' \
             '--detach[fire and forget, print guest pid]' \

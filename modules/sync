@@ -1,12 +1,11 @@
 # sync -- fetch a project's build output from the Windows host, then push it
-# into a Windows guest's C: drive. Config format: see README.md.
+# into a guest's system drive. Config format: see README.md.
 #
 # Two delivery modes for that second half, chosen by --disk:
 #
-#   default  the host exports the delivery tree as a read-only SMB share and
-#            the running guest pulls it with robocopy, which copies only the
-#            files that differ from what it already holds. The guest keeps
-#            running; it costs a rootful smbd on the host's port 445.
+#   default  the host exports the delivery tree read-only and the running guest
+#            pulls it with its own copier, which takes only the files that
+#            differ from what it already holds. The guest keeps running.
 #   --disk   the guest's disk image, mounted on the host. A running guest is
 #            shut down around the copy and started again afterwards, and every
 #            mapped file is written whether it changed or not -- but it needs
@@ -14,6 +13,19 @@
 #
 # The fetch is identical either way: it is host-to-host and knows nothing about
 # how what it stages will be delivered.
+#
+# @guest says which OS is on the other side, and it changes only the guest half
+# of the default delivery -- what serves the payload, what fetches it, and what
+# runs the run and cleanup rules:
+#
+#   windows  a read-only SMB share on port 445, robocopy, powershell. Costs a
+#            rootful smbd, since 445 is what SMB means to a Windows client.
+#   linux    an rsync daemon on an ephemeral port, rsync, /bin/sh. Needs no
+#            root and no privileged port, so it also runs unattended.
+#
+# Everything before that point -- the fetch, the staging tree, the excludes, the
+# map rules and the layout they build -- is identical for both, because it is
+# all host-side. --disk is Windows-only, and says so rather than guessing.
 
 # Prefixed per module: every module is sourced into one shell.
 # Configs are looked up in $VIRUTILS_CONF_DIR first, then the legacy
@@ -41,6 +53,49 @@ SYNC_STAGING_ROOT="${VIRUTILS_STAGING_ROOT:-$VIRUTILS_ROOT/staging}"
 REPO=""; STAGING=""; DEST=""
 FETCH=(); MAPPINGS=(); EXCLUDES=(); CLEANUP=(); RUN_PRE=(); RUN_POST=()
 
+# Which OS the guest runs, from @guest. Defaulted rather than probed: an agent
+# that is not answering yet would make the same config mean different things on
+# different runs, and the person writing it already knows which guest it is.
+# windows, because that is what every config written before @guest existed
+# means, and none of them says so.
+GUEST_OS="windows"
+
+# The guest's own spelling of a path under the root the map rules deliver to,
+# for the lines a person reads. Only ever cosmetic -- nothing is addressed
+# through this -- but a Linux guest reporting progress in C:\ would be a lie
+# about where the files went.
+guest_show() {
+    if [[ "$GUEST_OS" == linux ]]; then
+        printf '/%s' "$1"
+    else
+        printf 'C:\\%s' "${1//\//\\}"
+    fi
+}
+
+# The guest's root, spelled the same way, for a line that names it alone.
+guest_root_show() {
+    if [[ "$GUEST_OS" == linux ]]; then printf '/'; else printf 'C:\\'; fi
+}
+
+# sync_set_guest WHERE VALUE -- @guest, validated. A function rather than a case
+# inline in the parser because the parser's nesting leaves no room to say what
+# went wrong: die prints one line per argument, and at that indentation an
+# argument long enough to be a sentence does not fit on a line.
+sync_set_guest() {
+    case "$2" in
+        windows|linux) GUEST_OS="$2" ;;
+        *) die "$1: unknown @guest value '$2'." \
+               "It wants 'windows' or 'linux'." ;;
+    esac
+}
+
+# exec_ps_text or exec_sh_text, by guest. Both take one script and return its
+# exit code, so every caller here is written against whichever this names.
+guest_exec_text() {
+    if [[ "$GUEST_OS" == linux ]]; then exec_sh_text "$@"
+    else                                exec_ps_text "$@"; fi
+}
+
 sync_usage() {
     printf '%s\n' \
         "usage: virutil sync [--disk] VM [-c NAME|PATH]" \
@@ -64,13 +119,19 @@ sync_usage() {
         "                          written whether it changed or not. Needs" \
         "                          nothing of the guest -- no agent, no route" \
         "                          back here, no privileged port -- and works" \
-        "                          on a guest that is shut off." \
+        "                          on a guest that is shut off. Windows guests" \
+        "                          only: it mounts an NTFS partition." \
         "  -h, --help              this message" \
         "" \
         "The config is the whole interface; see README.md for its format." \
         "" \
         "By default the delivery moves only what changed, so a re-run after a" \
-        "rebuild of one file moves one file." >&2
+        "rebuild of one file moves one file." \
+        "" \
+        "@guest in the config says which OS the guest runs: 'windows' (the" \
+        "default) delivers over SMB and drives robocopy and powershell;" \
+        "'linux' delivers from an rsync daemon and drives rsync and /bin/sh," \
+        "which needs no root and no privileged port. --disk is Windows-only." >&2
     exit "${1:-1}"
 }
 
@@ -89,9 +150,12 @@ sync_dst_rel() {
 }
 
 # sync_map_into ROOT -- run every map rule, delivering into ROOT/<dst>. ROOT is
-# the guest's own C: when it is a mount and the root of the SMB share when it is
-# not; the rules cannot tell the difference, because $dst_rel is the same
-# C:-relative path either way and the share is served with that same layout.
+# the guest's own system drive when it is a mount and the root of the export
+# standing in for it when it is not; the rules cannot tell the difference,
+# because $dst_rel is the same root-relative path either way and the export is
+# served with that same layout. Which is also why the guest's OS does not reach
+# this far: the tree is built the same for both, and only what carries it and
+# what unpacks it differ.
 sync_map_into() {
     local root="$1" rule globs rel dst_rel g m
     local -a patterns files matches
@@ -122,7 +186,7 @@ sync_map_into() {
         done
         (( ${#files[@]} )) || { warn "skipping '$dst_rel': nothing matched"; continue; }
 
-        echo "-> C:\\${dst_rel//\//\\} (${#files[@]} item(s))"
+        echo "-> $(guest_show "$dst_rel") (${#files[@]} item(s))"
         "${RSYNC[@]}" --whole-file "${EXCLUDES[@]}" "${files[@]}" "$root/$dst_rel/"
     done
 
@@ -175,10 +239,15 @@ empty_guest_dirs() {
     done
 }
 
-# sync_run WHEN CMD... -- run each command in the guest's powershell, in config
-# order. Fatal on the first failure: a run rule exists to make the copy land
-# correctly ("stop the service", "run the installer"), so carrying on past one
-# that did not happen would deliver a half-installed guest and report success.
+# sync_run WHEN CMD... -- run each command in the guest's own shell, in config
+# order: powershell on a Windows guest, /bin/sh on a Linux one, which is the
+# whole of the difference. A command is free text either way, so a config's run
+# rules are written for the guest it names in @guest and nothing here translates
+# between them.
+#
+# Fatal on the first failure: a run rule exists to make the copy land correctly
+# ("stop the service", "run the installer"), so carrying on past one that did
+# not happen would deliver a half-installed guest and report success.
 sync_run() {
     local when="$1"; shift
     local VM="$DOMAIN"   # what the agent helpers in modules/exec address
@@ -197,7 +266,7 @@ sync_run() {
 
     for cmd in "$@"; do
         echo "run ($when): $cmd"
-        exec_ps_text "$cmd" \
+        guest_exec_text "$cmd" \
             || die "$when run rule failed in $DOMAIN: $cmd" \
                    "Its output is above. Nothing after it was run."
     done
@@ -248,7 +317,7 @@ sync_main() {
 
     # Parsed up front so a malformed config fails before anything is touched.
     local key val
-    REPO=""; STAGING=""; DEST=""
+    REPO=""; STAGING=""; DEST=""; GUEST_OS="windows"
     FETCH=(); MAPPINGS=(); EXCLUDES=(); CLEANUP=(); RUN_PRE=(); RUN_POST=()
     lineno=0
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -264,6 +333,7 @@ sync_main() {
                      repo)             REPO="$val" ;;
                      staging)          STAGING="$val" ;;
                      dest)             DEST="$val" ;;
+                     guest)            sync_set_guest "$CONF:$lineno" "$val" ;;
                      domain)           die "$CONF:$lineno: @domain is no longer a setting" \
                                            "-- pass the domain as an argument: virutil sync $val" ;;
                      nbd)              NBD="$val" ;;
@@ -323,9 +393,29 @@ sync_main() {
     echo "  ${#FETCH[@]} fetch, ${#MAPPINGS[@]} map, ${#EXCLUDES[@]} exclude," \
          "${#CLEANUP[@]} cleanup, $(( ${#RUN_PRE[@]} + ${#RUN_POST[@]} )) run"
     echo "  staging: $STAGING"
-    echo "  domain: $DOMAIN"
+    echo "  domain: $DOMAIN ($GUEST_OS)"
+
+    # Before the line that would announce the delivery, because there is no
+    # delivery to announce. guest_open looks for the largest NTFS partition on
+    # the image and mounts it with ntfs-3g, so on a Linux guest --disk would get
+    # as far as shutting the domain down and only then fail with "no NTFS
+    # partition found" -- a real cost for an answer that was knowable from the
+    # config alone. Refused rather than quietly downgraded to the network path,
+    # since the flag asks for a transport with different side effects on the
+    # guest's uptime and the caller has to know which one they got.
+    if (( DISK )) && [[ "$GUEST_OS" == linux ]]; then
+        die "--disk cannot write a Linux guest's disk image: it mounts the" \
+            "largest NTFS partition on it, which $DOMAIN does not have." \
+            "Nothing was touched and $DOMAIN was not shut down." \
+            "Drop --disk -- the default delivery is the better path for a" \
+            "Linux guest anyway: it needs no root and no privileged port," \
+            "leaves the guest running, and moves only what changed."
+    fi
+
     if (( DISK )); then
         echo "  delivery: the disk image, with $DOMAIN shut down"
+    elif [[ "$GUEST_OS" == linux ]]; then
+        echo "  delivery: rsync into the running guest"
     else
         echo "  delivery: SMB into the running guest"
     fi
@@ -341,10 +431,29 @@ sync_main() {
     if (( ${#RUN_PRE[@]} + ${#RUN_POST[@]} )) && (( DISK )); then
         warn "   note: --disk copies with the guest shut down, so the" \
              "$(( ${#RUN_PRE[@]} + ${#RUN_POST[@]} )) run rule(s) in $CONF are skipped." \
-             "Drop --disk to deliver over SMB, which leaves $DOMAIN running and" \
-             "runs them."
+             "Drop --disk to deliver over the network, which leaves $DOMAIN" \
+             "running and runs them."
     fi
-    if (( DISK )); then xfer_check write; else xfer_check smb; fi
+
+    if (( DISK )); then xfer_check write; else xfer_check net; fi
+
+    # @guest against what the guest says it is. Only on the network path, and
+    # only after xfer_check: that is what established there is an agent to ask,
+    # and asking costs a round trip which --disk has no reason to spend.
+    #
+    # A warning and not a correction. @guest decides which transport was stood
+    # up and which shell the run rules were written for, so silently switching
+    # would run a config's powershell through /bin/sh -- and the config is the
+    # thing a person can actually fix.
+    if (( ! DISK )); then
+        local detected; detected="$(guest_os "$DOMAIN")"
+        if [[ "$detected" != "$GUEST_OS" ]]; then
+            warn "   warning: $CONF says @guest=$GUEST_OS, but $DOMAIN reports" \
+                 "$detected. The delivery and the run rules are about to be" \
+                 "$GUEST_OS-shaped. If that is wrong, fix @guest rather than" \
+                 "reading past this -- the copier and the shell both come from it."
+        fi
+    fi
 
     # --- fetch: Windows build tree -> staging -------------------------------
     (( ${#FETCH[@]} )) || die "no fetch rules in $CONF"
@@ -369,7 +478,7 @@ sync_main() {
     [[ -d "$STAGING" ]] || die "staging dir not found: $STAGING"
     (( ${#MAPPINGS[@]} )) || die "no map rules in $CONF"
 
-    if (( ! DISK )); then sync_smb_push; return 0; fi
+    if (( ! DISK )); then sync_net_push; return 0; fi
 
     # MNT is the guest's C:, mounted from its disk image; guest_open arms the
     # EXIT trap that unmounts and detaches it again (see modules/guest).
@@ -384,21 +493,52 @@ sync_main() {
     echo "copy complete -> $DOMAIN"
 }
 
-# --- delivery over SMB ------------------------------------------------------
+# --- delivery over the network ----------------------------------------------
 #
-# The map rules already say where each file belongs on C:, so the delivery tree
-# they build on the host *is* the layout the guest wants -- which makes the whole
-# guest side one robocopy of that tree onto C:\. robocopy compares what it finds
-# against what it already has and copies only the difference, which is the point:
-# a sync is run over and over against a build tree that changed a little, and
-# the disk path resends all of it every time (and takes the guest down to do it).
+# The map rules already say where each file belongs under the guest's root, so
+# the delivery tree they build on the host *is* the layout the guest wants --
+# which makes the whole guest side one copy of that tree onto the root. The
+# copier compares what it finds against what it already has and takes only the
+# difference, which is the point: a sync is run over and over against a build
+# tree that changed a little, and the disk path resends all of it every time
+# (and takes the guest down to do it).
 #
 # The tree is built with the same rsync the disk path uses, into a scratch
-# directory instead of into the mount, so excludes, globs and destinations behave
-# identically and robocopy needs no /XF or /XD of its own.
+# directory instead of into the mount, so excludes, globs and destinations
+# behave identically and the guest-side copier needs no exclusions of its own.
+#
+# Everything above is true of both guests. What differs is only the pair at the
+# far end -- server and copier -- and the four dispatchers below are where that
+# choice is made, once each, so the orchestration reads the same for both.
 
-sync_smb_push() {
-    # VM is what the agent helpers in modules/exec address, as in push_smb.
+sync_net_serve() {
+    if [[ "$GUEST_OS" == linux ]]; then xfer_rsyncd_serve "$1" "$2"
+    else                                xfer_smb_serve    "$1" "$2"; fi
+}
+
+sync_net_fetch() {
+    if [[ "$GUEST_OS" == linux ]]; then sync_lin_fetch; else sync_win_fetch; fi
+}
+
+sync_net_fetch_die() {
+    if [[ "$GUEST_OS" == linux ]]; then
+        guest_rsync_die "$1" "$2" "the delivery"
+    else
+        push_smb_die "$1" "$2"
+    fi
+}
+
+sync_net_report() {
+    if [[ "$GUEST_OS" == linux ]]; then sync_lin_report "$@"
+    else                                sync_win_report "$@"; fi
+}
+
+sync_net_cleanup() {
+    if [[ "$GUEST_OS" == linux ]]; then sync_lin_cleanup; else sync_win_cleanup; fi
+}
+
+sync_net_push() {
+    # VM is what the agent helpers in modules/exec address, as in push_net.
     local VM="$DOMAIN"
     local ip host deliver files bytes rc=0 reported t0 elapsed
 
@@ -412,16 +552,26 @@ sync_smb_push() {
                "cannot be delivered to over its own network; pass --disk to" \
                "write to the disk image instead."
 
-    # Under VIRUTILS_TMP_DIR, and held in XFER_SMB_STAGE so xfer_smb_stop
-    # clears it however the run ends. The EXIT trap is armed here rather than
-    # left to xfer_smb_serve: the tree is built before the server starts, and a
-    # failure in that build must not leave it behind.
+    # Under VIRUTILS_TMP_DIR, and held in XFER_STAGE so xfer_stop clears it
+    # however the run ends. The EXIT trap is armed here rather than left to the
+    # serve: the tree is built before the server starts, and a failure in that
+    # build must not leave it behind.
     mkdir -p "$VIRUTILS_TMP_DIR" \
         || die "could not create $VIRUTILS_TMP_DIR for the delivery tree"
-    XFER_SMB_STAGE="$(mktemp -d "$VIRUTILS_TMP_DIR/sync.XXXXXX")" \
+    XFER_STAGE="$(mktemp -d "$VIRUTILS_TMP_DIR/sync.XXXXXX")" \
         || die "could not create a delivery directory for the transfer"
-    trap xfer_smb_stop EXIT
-    deliver="$XFER_SMB_STAGE"
+    trap xfer_stop EXIT
+    deliver="$XFER_STAGE"
+
+    # mktemp -d creates 0700, which is right for scratch and wrong for this:
+    # the tree's own root stands for the guest's root, so its mode is a mode
+    # that can be copied onto the guest's root. It has been: an early version
+    # of the Linux delivery left this at 0700 and rsync -p faithfully applied
+    # it to /, which locked every non-root user out of the whole filesystem and
+    # took the desktop down with it. The guest-side fetch guards against this
+    # too; this makes the value being guarded sane in the first place.
+    chmod 755 "$deliver" \
+        || die "could not set the delivery tree's mode: $deliver"
 
     # The delivery tree is a real copy of every mapped file, not a listing of
     # them, so it is priced before it is built rather than after: an rsync that
@@ -442,16 +592,14 @@ sync_smb_push() {
                        "nothing to deliver. The warnings above say which."
     bytes="$(du -sb --apparent-size "$deliver" | cut -f1)"
 
-    xfer_smb_serve "$deliver" "$host"
+    sync_net_serve "$deliver" "$host"
 
     # The size goes on the line printed before the transfer because it is the
-    # number that says how long to wait. It is the
-    # whole tree, though, and robocopy will move only part of it -- so the line
-    # after the transfer is the one that says what actually crossed.
-    # printf, not echo: this line ends in a lone backslash, and echo interprets
-    # a trailing one under xpg_echo -- printf '%s' never interprets anything.
-    printf 'deliver: %s file(s), %s -> %s C:\\\n' \
-        "$files" "$(fmt_bytes "$bytes")" "$DOMAIN"
+    # number that says how long to wait. It is the whole tree, though, and the
+    # guest will move only part of it -- so the line after the transfer is the
+    # one that says what actually crossed.
+    printf 'deliver: %s file(s), %s -> %s %s\n' \
+        "$files" "$(fmt_bytes "$bytes")" "$DOMAIN" "$(guest_root_show)"
 
     # Here, and no sooner: the delivery tree is built and served, so a rule that
     # frees a locked file ("stop the service") is not holding the guest open
@@ -459,17 +607,17 @@ sync_smb_push() {
     if (( ${#RUN_PRE[@]} )); then sync_run pre "${RUN_PRE[@]}"; fi
 
     t0="$(now_ms)"
-    reported="$(sync_smb_fetch)" || rc=$?
+    reported="$(sync_net_fetch)" || rc=$?
     elapsed=$(( $(now_ms) - t0 ))
-    (( rc == 0 )) || push_smb_die "$rc" "$host"
+    (( rc == 0 )) || sync_net_fetch_die "$rc" "$host"
 
-    xfer_smb_stop
-    sync_smb_report "$files" "$reported" "$elapsed"
+    xfer_stop
+    sync_net_report "$files" "$reported" "$elapsed"
 
     # After the delivery, as on the disk path: a cleanup pattern that overlaps a
     # map destination has always emptied it last, and moving it earlier would
     # quietly change what a config means.
-    if (( ${#CLEANUP[@]} )); then sync_smb_cleanup; fi
+    if (( ${#CLEANUP[@]} )); then sync_net_cleanup; fi
 
     # Last, so a rule that starts the service or runs an installer sees the
     # delivered files and the emptied directories.
@@ -478,7 +626,9 @@ sync_smb_push() {
     echo "copy complete -> $DOMAIN"
 }
 
-# sync_smb_fetch -- the guest side, one robocopy of the whole share onto C:\.
+# --- the Windows guest side -------------------------------------------------
+
+# sync_win_fetch -- the guest side, one robocopy of the whole share onto C:\.
 # /E and not /MIR: /MIR deletes everything under the destination that the source
 # does not have, and the destination here is the root of C:. Deletions are the
 # cleanup rules' job, which name the directories they are allowed to empty.
@@ -486,7 +636,7 @@ sync_smb_push() {
 # robocopy's exit code is a bitmap, not an error level: 0 means nothing needed
 # copying, bit 0 means files were copied, and only >= 8 is a real failure -- so
 # the usual "non-zero is bad" would call every successful delivery an error.
-sync_smb_fetch() {
+sync_win_fetch() {
     local script
     script=$(printf '%s\n' \
         '$ErrorActionPreference = "Stop"' \
@@ -502,15 +652,16 @@ sync_smb_fetch() {
     exec_ps_text "$script"
 }
 
-# sync_smb_report FILES REPORTED MS -- what was offered and whether any of it
+# sync_win_report FILES REPORTED MS -- what was offered and whether any of it
 # had to move. REPORTED is the guest's own "copied ms": bit 0 of robocopy's exit
 # code, and its stopwatch, which is the copy alone without the agent round trip
 # and powershell start-up the host's wall clock folds in.
 #
 # There is no file count or byte count from the guest on purpose: robocopy's
 # summary is the only place it holds them, and that summary is localised -- a
-# non-English guest would have it parsed wrong rather than not at all.
-sync_smb_report() {
+# non-English guest would have it parsed wrong rather than not at all. The Linux
+# side has no such problem and does report a count.
+sync_win_report() {
     local files="$1" reported="$2" ms="$3" copied gms what
     read -r copied gms <<<"$reported"
 
@@ -523,16 +674,16 @@ sync_smb_report() {
     echo "$DOMAIN: $what in $(fmt_duration "${gms:-$ms}")"
 }
 
-# sync_smb_cleanup -- the cleanup rules, run in the guest instead of through the
+# sync_win_cleanup -- the cleanup rules, run in the guest instead of through the
 # mount. Same semantics as empty_guest_dirs: each pattern is expanded in the
 # guest, every directory it names has its contents removed but not itself, and
 # every file it names is deleted. The two-levels-down rule is enforced twice,
 # once here on the pattern and once in the guest on what the pattern actually
 # resolved to -- a wildcard can only be checked after it has been expanded, and
 # that happens guest-side.
-sync_smb_cleanup() {
+sync_win_cleanup() {
     local VM="$DOMAIN"
-    local pat win joined="" script out line kind rest n path
+    local pat win joined="" script out
     local -a pats
 
     for pat in "${CLEANUP[@]}"; do
@@ -580,6 +731,160 @@ sync_smb_cleanup() {
         || die "the guest could not run the cleanup rules; its own error is" \
                "above. What was delivered is already in place."
 
+    sync_cleanup_report "$out"
+}
+
+# --- the Linux guest side ---------------------------------------------------
+
+# sync_lin_fetch -- the guest side, one rsync of the whole export onto /.
+# No --delete, for the same reason robocopy gets /E and not /MIR: the
+# destination is the guest's root, and deletions are the cleanup rules' job,
+# which name the directories they are allowed to empty.
+#
+# -rlptD rather than -a: -a would add -g and -o, and the guest runs this as
+# root, so it would try to reproduce the daemon's uid and gid on every delivered
+# file. What is wanted is what a package would leave behind -- root-owned, with
+# the permissions the staging fetch already set -- so ownership is left to the
+# umask and only the mode, times, links and specials are carried across.
+#
+# The itemised output is counted rather than parsed for a summary, and that is
+# the one place this reports better than the Windows side: rsync's --out-format
+# is not localised, so the count is trustworthy in a guest of any language. `<`
+# or `>` in the first column of an itemised line means a file's contents were
+# transferred; a directory or an unchanged file never shows either.
+#
+# rsync's own exit status has to survive, so the transfer is not the left-hand
+# side of a pipeline -- grep's success there would mask an rsync failure and
+# report a delivery that never happened as "0 files copied".
+#
+# / has its own mode put back afterwards, and this is not belt-and-braces: with
+# -p, rsync applies the *source* tree root's mode to the destination root, and
+# the source root here is a scratch directory on the host. Getting that wrong
+# once chmod'ed a guest's / to 0700, which locks every non-root user out of
+# every path on the system -- the session survives because it is already
+# running, and everything it tries to launch afterwards fails with EACCES. It
+# is restored whether the transfer succeeded or not, because the mode of / is
+# not this transfer's to change either way.
+sync_lin_fetch() {
+    local script
+    script=$(printf '%s\n' \
+        "$(guest_sh_need_rsync)" \
+        "src=$(sh_quote "$XFER_RSYNCD_URL/")" \
+        'log=$(mktemp)' \
+        'rootmode=$(stat -c %a /)' \
+        't0=$(date +%s%N)' \
+        'rc=0' \
+        'rsync -rlptD --out-format="%i %n" "$src" / >"$log" || rc=$?' \
+        'chmod "$rootmode" /' \
+        '[ "$rc" = 0 ] || exit "$rc"' \
+        't1=$(date +%s%N)' \
+        'n=$(grep -c "^[<>]" "$log" || true)' \
+        'rm -f "$log"' \
+        'echo "$n $(( (t1 - t0) / 1000000 ))"')
+
+    exec_sh_text "$script"
+}
+
+# sync_lin_report FILES REPORTED MS -- REPORTED is the guest's own "count ms":
+# how many files rsync actually transferred, and how long it spent doing it,
+# which is the copy alone without the agent round trip the host's wall clock
+# folds in.
+sync_lin_report() {
+    local files="$1" reported="$2" ms="$3" copied gms what
+    read -r copied gms <<<"$reported"
+
+    what="$files file"; (( files == 1 )) || what+="s"
+    if (( ${copied:-0} > 0 )); then
+        what+=" offered, $copied copied"
+    else
+        what+=" offered, all already current in the guest"
+    fi
+    echo "$DOMAIN: $what in $(fmt_duration "${gms:-$ms}")"
+}
+
+# The guest-side sh for the cleanup rules: one shell function, called once per
+# pattern with the pattern as its argument.
+#
+# The globbing is the whole design problem here. A pattern has to be expanded by
+# the guest, and the obvious way -- writing it into the script as source, where
+# the shell can see it -- makes every pattern shell source, so a path with a
+# space word-splits and one with a `;` runs. The way out is that field splitting
+# and pathname expansion are separate steps, and only the first reads IFS: with
+# IFS empty, `set -- $pat` splits into no fields, and the glob still expands to
+# one field per match. So the pattern travels as data in a single-quoted
+# variable, whatever is in it, and still globs.
+#
+# Existence is tested rather than left to the glob: POSIX sh has no nullglob, so
+# a pattern that matches nothing arrives as its own literal text, which would
+# otherwise be reported as a path that is present and then quietly skipped --
+# the same trap ci_glob has on the mounted path.
+sync_lin_cleanup_fn() {
+    printf '%s\n' \
+        'clean() {' \
+        '  pat=$1 hit=0 oldifs=$IFS' \
+        '  IFS=""; set -- $pat; IFS=$oldifs' \
+        '  for f do' \
+        '    [ -e "$f" ] || [ -L "$f" ] || continue' \
+        '    hit=1' \
+        '    rel=${f#/}' \
+        '    case $rel in */*) ;; *) echo "unsafe $f"; continue ;; esac' \
+        '    if [ -d "$f" ] && [ ! -L "$f" ]; then' \
+        '      n=0' \
+        '      for k in "$f"/* "$f"/.[!.]* "$f"/..?*; do' \
+        '        [ -e "$k" ] || [ -L "$k" ] || continue' \
+        '        if rm -rf -- "$k" 2>/dev/null; then n=$((n+1))' \
+        '        else echo "locked $k"; fi' \
+        '      done' \
+        '      echo "emptied $n $f"' \
+        '    elif rm -f -- "$f" 2>/dev/null; then echo "deleted $f"' \
+        '    else echo "locked $f"' \
+        '    fi' \
+        '  done' \
+        '  [ "$hit" = 1 ] || echo "absent $pat"' \
+        '}'
+}
+
+# sync_lin_cleanup -- the cleanup rules, run in the guest. Same semantics as
+# empty_guest_dirs and as the Windows side: each pattern is expanded in the
+# guest, every directory it names has its contents removed but not itself, and
+# every file it names is deleted. The two-levels-down rule is enforced twice,
+# once here on the pattern and once in the guest on what it resolved to, since
+# a wildcard can only be checked after expansion.
+sync_lin_cleanup() {
+    local VM="$DOMAIN"
+    local pat script out
+    local -a pats=()
+
+    for pat in "${CLEANUP[@]}"; do
+        pat="$(guest_norm_posix "$pat" "cleanup path")" || exit 1
+        if [[ "$pat" != */* ]]; then
+            warn "refusing unsafe cleanup pattern: /$pat"
+            continue
+        fi
+        pats+=("/$pat")
+    done
+    (( ${#pats[@]} )) || return 0
+
+    script="$(sync_lin_cleanup_fn)"
+    for pat in "${pats[@]}"; do
+        script+=$'\n'"clean $(sh_quote "$pat")"
+    done
+
+    out="$(exec_sh_text "$script")" \
+        || die "the guest could not run the cleanup rules; its own error is" \
+               "above. What was delivered is already in place."
+
+    sync_cleanup_report "$out"
+}
+
+# --- shared ------------------------------------------------------------------
+
+# sync_cleanup_report OUT -- print what the guest reported, in the same shape
+# the mounted path prints. Both guest sides speak the one line-per-outcome
+# protocol, so the printing is written once: 'absent PATH', 'unsafe PATH',
+# 'locked PATH', 'deleted PATH', 'emptied N PATH'.
+sync_cleanup_report() {
+    local line kind rest n path
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
         kind="${line%% *}"; rest="${line#* }"
@@ -592,5 +897,5 @@ sync_smb_cleanup() {
                      echo "   emptied $path ($n entries)" ;;
             *)       echo "   $line" ;;
         esac
-    done <<<"$out"
+    done <<<"$1"
 }
