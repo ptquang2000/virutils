@@ -773,7 +773,8 @@ domain_rm() {
 #
 #   forwards      domain_port_file      relay pid plus state and log file
 #   mount points  virutils_mnt          bare, plus -usb and -xfer, left by the
-#                                       removed usb media and volume commands
+#                                       removed disk transport and the removed
+#                                       usb media and volume commands
 #   images        $DOMAIN_IMAGE_DIR     snapshot overlays and memory files, plus
 #                                       the -usb and -xfer leftovers
 #   share dir     share/virutil-VM      left by the removed virtio-fs transport

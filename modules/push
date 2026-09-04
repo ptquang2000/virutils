@@ -1,48 +1,33 @@
 # push -- copy a file or directory from the host into a guest's C: drive.
 #
-# Two transports, chosen by --disk, both in modules/xfer:
-#
-#   default  over the guest's own NIC, driven by the guest agent. The guest
-#            keeps running and sees no new device, and its copier takes only
-#            what differs from what it already has, so a re-push of a build
-#            that changed one file moves one file. Needs an agent and a route
-#            back to this host; a Windows guest also needs smbd and root here
-#            to bind port 445, where a Linux one needs neither.
-#   --disk   the guest's disk image, mounted on the host. A running guest is
-#            shut down around the copy and started again afterwards, which is
-#            the whole cost of it -- but it needs nothing of the guest.
-#            Windows guests only: it mounts NTFS.
+# One transport, in modules/xfer: over the guest's own NIC, driven by the guest
+# agent. The guest keeps running and sees no new device, and its copier takes
+# only what differs from what it already has, so a re-push of a build that
+# changed one file moves one file. Needs an agent and a route back to this host;
+# a Windows guest also needs smbd and root here to bind port 445, where a Linux
+# one needs neither.
 #
 # Which guest is on the other side is asked, not flagged -- see guest_os in
-# modules/guest. DST is spelled in that guest's own flavour either way.
+# modules/guest. DST is spelled in that guest's own flavour.
 
 push_usage() {
     printf '%s\n' \
-        "usage: virutil push [--disk] VM SRC DST" \
+        "usage: virutil push VM SRC DST" \
         "" \
         "  VM   libvirt domain to copy into; it has to be running, since the" \
-        "       copy is delivered over its own network. With --disk its disk" \
-        "       image is written instead, so a running one is shut down first" \
-        "       and started again afterwards" \
+        "       copy is delivered over its own network" \
         "  SRC  host file or directory to copy" \
         "  DST  guest path, relative to the guest's root -- C:\\ on Windows," \
         "       / on Linux. A trailing slash means a directory, exactly as" \
         "       with rsync. On Windows, backslashes and a C:\\ prefix are" \
         "       tolerated; '..' is refused either way." \
         "" \
-        "      --disk              write the guest's disk image instead of" \
-        "                          delivering over the network. Mounts the" \
-        "                          image on the host, so a running guest is" \
-        "                          shut down for the copy and started again" \
-        "                          afterwards -- but it needs nothing of the" \
-        "                          guest: no agent, no route back here and no" \
-        "                          privileged port. Windows guests only." \
         "  -h, --help              this message" \
         "" \
-        "A directory source is copied recursively. By default the payload is" \
-        "served to the running guest, which fetches it itself -- robocopy on" \
-        "Windows, rsync on Linux -- and so moves only what changed. The" \
-        "guest's OS is detected; see README.md." >&2
+        "A directory source is copied recursively. The payload is served to" \
+        "the running guest, which fetches it itself -- robocopy on Windows," \
+        "rsync on Linux -- and so moves only what changed. The guest's OS is" \
+        "detected; see README.md." >&2
     exit "${1:-1}"
 }
 
@@ -92,25 +77,27 @@ push_check_readable() {
 }
 
 push_main() {
-    local VM="" SRC="" DST="" DISK=0
+    local VM="" SRC="" DST=""
 
     while (( $# )); do
         case "$1" in
             -h|--help)      push_usage 0 ;;
-            --disk)         DISK=1; shift ;;
             # Rejected rather than ignored, and each for its own reason. --smb
             # is what push now does, and silently accepting it would teach
-            # nothing; --live named a transport that no longer exists, and
-            # silently accepting it would send the payload by a route the
-            # caller did not ask for.
+            # nothing; --live and --disk named transports that no longer
+            # exist, and silently accepting either would send the payload by a
+            # route the caller did not ask for.
             --smb)          die "--smb is gone: delivering into the running" \
-                                "guest over SMB is what push does by default" \
-                                "now. Drop the flag." ;;
+                                "guest over SMB is what push does now." \
+                                "Drop the flag." ;;
             --live)         die "--live is gone: the HTTP transport it named" \
                                 "has been removed. Delivering into the running" \
-                                "guest is the default and uses SMB, which" \
-                                "moves only what changed; drop the flag for" \
-                                "that, or pass --disk to write the disk image." ;;
+                                "guest is what push does now and uses SMB," \
+                                "which moves only what changed; drop the flag." ;;
+            --disk)         die "--disk is gone: writing the guest's disk" \
+                                "image has been removed. push delivers into" \
+                                "the running guest over its own network;" \
+                                "drop the flag and start the guest." ;;
             -*)             warn "unrecognised argument: $1"; push_usage ;;
             *)
                 if   [[ -z "$VM"  ]]; then VM="$1"
@@ -131,45 +118,13 @@ push_main() {
     domain_exists "$DOMAIN" || die "no such domain: $DOMAIN (see: virutil domain list)"
 
     # Which guest, and so which copier, which shell and which path flavour.
-    # Asked rather than flagged -- see guest_os in modules/guest -- and asked
-    # before either branch, because --disk needs it too: to refuse an image it
-    # cannot mount rather than shut the domain down and find out.
+    # Asked rather than flagged -- see guest_os in modules/guest.
     GUEST_OS="$(guest_os "$DOMAIN")"
 
-    if (( DISK )); then
-        [[ "$GUEST_OS" == linux ]] \
-            && die "--disk cannot write a Linux guest's disk image: it mounts" \
-                   "the largest NTFS partition on it, which $DOMAIN does not" \
-                   "have. Nothing was touched and $DOMAIN was not shut down." \
-                   "Drop --disk; the default path delivers into a running Linux" \
-                   "guest and needs no root at all."
-        xfer_check write
-        # guest_open arms the EXIT trap that unmounts and detaches again.
-        guest_open
-        push_copy "$SRC" "$DST"
-        echo "copied -> $DOMAIN"
-    else
-        xfer_check net
-        # Reports for itself: it knows what landed and how long it took, which
-        # is more than "copied" says.
-        push_net "$SRC" "$DST"
-    fi
-}
-
-# push_copy SRC DST -- resolve DST under MNT and run the copy. A trailing slash
-# on DST means "this is a directory, create it if needed".
-push_copy() {
-    local SRC="$1" DST="$2" dst_arg win_dst DST_IS_DIR
-    if [[ "$DST" == */ || "$DST" == *'\' ]]; then DST_IS_DIR=1; else DST_IS_DIR=0; fi
-    DST="$(push_norm_dst "$DST")" || exit 1
-    dst_arg="$MNT"
-    [[ -n "$DST" ]] && dst_arg="$MNT/$DST"
-    [[ $DST_IS_DIR = 1 ]] && dst_arg="$dst_arg/"
-
-    win_dst="${DST//\//\\}"
-    [[ $DST_IS_DIR = 1 ]] && win_dst="${win_dst:+$win_dst\\}"
-    echo "push: $SRC -> C:\\$win_dst"
-    "${RSYNC[@]}" "$SRC" "$dst_arg"
+    xfer_check net
+    # Reports for itself: it knows what landed and how long it took, which is
+    # more than "copied" says.
+    push_net "$SRC" "$DST"
 }
 
 # --- delivering into the running guest, over its own network ----------------
@@ -182,8 +137,8 @@ push_ps_quote() {
     printf "'%s'" "${s//\'/\'\'}"
 }
 
-# push_net SRC DST -- what push does unless --disk says otherwise. The host
-# exports the payload read-only and the running guest pulls it with its own
+# push_net SRC DST -- what push does. The host exports the payload read-only
+# and the running guest pulls it with its own
 # copier, which takes only the files that differ from what it already holds --
 # so a second push of a build that changed one file moves one file, and leaves
 # the rest alone down to their timestamps.
@@ -259,8 +214,7 @@ push_net() {
     [[ -n "$host" ]] \
         || die "no route from this host to $DOMAIN at $ip, so the guest has" \
                "no address to fetch from. A guest on an isolated network" \
-               "cannot be delivered to over its own network; pass --disk to" \
-               "write to the disk image instead."
+               "cannot be delivered to over its own network."
 
     # What gets exported. A directory is served where it lies; a file is
     # hardlinked (or, across filesystems, copied) into a scratch directory of
@@ -518,7 +472,6 @@ push_smb_die() {
         *)
             die "the guest failed to fetch the payload (exit $rc); its own" \
                 "error is above. If it could not reach $host, check the" \
-                "guest's outbound firewall, or pass --disk to write the disk" \
-                "image instead." ;;
+                "guest's outbound firewall." ;;
     esac
 }

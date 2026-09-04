@@ -14,18 +14,25 @@ export LC_ALL=C
 
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
-for module in parser paths guest xfer domain snapshot sync pull push exec usb; do
+# parser bootstraps: it declares MODULES and the helpers every other module
+# calls, so it is the one file named here. The rest are discovered -- the shared
+# libraries (everything parser does not list) before the command modules, since
+# they set the roots a command module reads as it loads.
+source "$HERE/modules/parser"
+
+for module in "$HERE"/modules/*; do
+    name="${module##*/}"
+    [[ "$name" == parser ]] && continue
+    for m in "${MODULES[@]}"; do [[ "$name" == "$m" ]] && continue 2; done
+    source "$module"
+done
+
+for module in "${MODULES[@]}"; do
     source "$HERE/modules/$module"
 done
 
 parse_dispatch "$@"
 
-case "$MODULE" in
-    domain)   domain_main   "${REST[@]}" ;;
-    snapshot) snapshot_main "${REST[@]}" ;;
-    sync)     sync_main     "${REST[@]}" ;;
-    pull)     pull_main     "${REST[@]}" ;;
-    push)     push_main     "${REST[@]}" ;;
-    exec)     exec_main     "${REST[@]}" ;;
-    usb)      usb_main      "${REST[@]}" ;;
-esac
+# parse_dispatch admits nothing outside MODULES, and every module declares
+# <name>_main, so the name is the dispatch.
+"${MODULE}_main" "${REST[@]}"

@@ -1,22 +1,16 @@
 # sync -- fetch a project's build output from the Windows host, then push it
 # into a guest's system drive. Config format: see README.md.
 #
-# Two delivery modes for that second half, chosen by --disk:
+# The delivery for that second half: the host exports the delivery tree
+# read-only and the running guest pulls it with its own copier, which takes only
+# the files that differ from what it already holds. The guest keeps running.
 #
-#   default  the host exports the delivery tree read-only and the running guest
-#            pulls it with its own copier, which takes only the files that
-#            differ from what it already holds. The guest keeps running.
-#   --disk   the guest's disk image, mounted on the host. A running guest is
-#            shut down around the copy and started again afterwards, and every
-#            mapped file is written whether it changed or not -- but it needs
-#            nothing of the guest, and works on one that is shut off.
-#
-# The fetch is identical either way: it is host-to-host and knows nothing about
-# how what it stages will be delivered.
+# The fetch knows nothing about that: it is host-to-host, and only stages what
+# the delivery will carry.
 #
 # @guest says which OS is on the other side, and it changes only the guest half
-# of the default delivery -- what serves the payload, what fetches it, and what
-# runs the run and cleanup rules:
+# of the delivery -- what serves the payload, what fetches it, and what runs the
+# run and cleanup rules:
 #
 #   windows  a read-only SMB share on port 445, robocopy, powershell. Costs a
 #            rootful smbd, since 445 is what SMB means to a Windows client.
@@ -25,7 +19,7 @@
 #
 # Everything before that point -- the fetch, the staging tree, the excludes, the
 # map rules and the layout they build -- is identical for both, because it is
-# all host-side. --disk is Windows-only, and says so rather than guessing.
+# all host-side.
 
 # Prefixed per module: every module is sourced into one shell.
 # Configs are looked up in $VIRUTILS_CONF_DIR first, then the legacy
@@ -98,40 +92,28 @@ guest_exec_text() {
 
 sync_usage() {
     printf '%s\n' \
-        "usage: virutil sync [--disk] VM [-c NAME|PATH]" \
+        "usage: virutil sync VM [-c NAME|PATH]" \
         "" \
         "  VM                      libvirt domain delivered into. It has to be" \
         "                          running, since the delivery goes over its" \
-        "                          own network. With --disk its disk image is" \
-        "                          written instead, so a running one is shut" \
-        "                          down first and started again afterwards" \
+        "                          own network" \
         "  -c, --config NAME|PATH  config to use. A value containing '/' is a" \
         "                          path, taken as given; anything else names a" \
         "                          config looked up in $CONF_DIR first, then" \
         "                          $SYNC_LEGACY_CONF_DIR" \
         "                          ('.conf' is appended when absent)." \
         "                          default: $SYNC_DEFAULT_CONF" \
-        "      --disk              write the guest's disk image instead of" \
-        "                          delivering over its network: the image is" \
-        "                          mounted on the host, so a running guest is" \
-        "                          shut down for the copy and started again" \
-        "                          afterwards, and every mapped file is" \
-        "                          written whether it changed or not. Needs" \
-        "                          nothing of the guest -- no agent, no route" \
-        "                          back here, no privileged port -- and works" \
-        "                          on a guest that is shut off. Windows guests" \
-        "                          only: it mounts an NTFS partition." \
         "  -h, --help              this message" \
         "" \
         "The config is the whole interface; see README.md for its format." \
         "" \
-        "By default the delivery moves only what changed, so a re-run after a" \
-        "rebuild of one file moves one file." \
+        "The delivery moves only what changed, so a re-run after a rebuild of" \
+        "one file moves one file." \
         "" \
         "@guest in the config says which OS the guest runs: 'windows' (the" \
         "default) delivers over SMB and drives robocopy and powershell;" \
         "'linux' delivers from an rsync daemon and drives rsync and /bin/sh," \
-        "which needs no root and no privileged port. --disk is Windows-only." >&2
+        "which needs no root and no privileged port." >&2
     exit "${1:-1}"
 }
 
@@ -150,12 +132,11 @@ sync_dst_rel() {
 }
 
 # sync_map_into ROOT -- run every map rule, delivering into ROOT/<dst>. ROOT is
-# the guest's own system drive when it is a mount and the root of the export
-# standing in for it when it is not; the rules cannot tell the difference,
-# because $dst_rel is the same root-relative path either way and the export is
-# served with that same layout. Which is also why the guest's OS does not reach
-# this far: the tree is built the same for both, and only what carries it and
-# what unpacks it differ.
+# the root of the export standing in for the guest's own system drive: $dst_rel
+# is a root-relative path and the export is served with that same layout, so the
+# rules need know nothing about the transport. Which is also why the guest's OS
+# does not reach this far: the tree is built the same for both, and only what
+# carries it and what unpacks it differ.
 sync_map_into() {
     local root="$1" rule globs rel dst_rel g m
     local -a patterns files matches
@@ -193,52 +174,6 @@ sync_map_into() {
     shopt -u nullglob
 }
 
-# A function so IFS can be scoped to newlines: a glob containing spaces
-# ("Program Files") would otherwise split into separate words.
-#
-# A pattern that names a directory has its contents removed and the directory
-# itself kept; one that names a file deletes that file. Which of the two a rule
-# is doing is decided by what the pattern resolved to, not by how it is written:
-# a driver's .sys and a log directory are both "state the guest must not keep",
-# and spelling them differently would only be a trap.
-empty_guest_dirs() {
-    local IFS=$'\n'
-    local pat targets real rel n
-
-    for pat in "${CLEANUP[@]}"; do
-        # Filtered by existence rather than left to nullglob: ci_glob turns every
-        # letter into a bracket expression, and a pattern that matches nothing
-        # would otherwise arrive here as its own literal text -- reported as a
-        # path that is present and then quietly skipped.
-        targets=()
-        for real in "$MNT"/$(ci_glob "$pat"); do
-            [[ -e "$real" ]] && targets+=("$real")
-        done
-        (( ${#targets[@]} )) \
-            || { echo "   not present, skipped: C:\\${pat//\//\\}"; continue; }
-
-        for real in "${targets[@]}"; do
-
-            # Two levels down minimum, so a mistyped pattern cannot empty C:\ --
-            # applied to a file as much as to a directory, since 'Windows' alone
-            # is as wrong a thing to delete either way.
-            rel="${real#"$MNT/"}"
-            if [[ "$real" != "$MNT/"* || "$rel" != */* ]]; then
-                warn "refusing unsafe cleanup path: $real"
-                continue
-            fi
-
-            if [[ -d "$real" ]]; then
-                n="$(find "$real" -mindepth 1 -delete -print | wc -l)"
-                echo "   emptied $real ($n entries)"
-            else
-                rm -f -- "$real" && echo "   deleted $real" \
-                    || warn "   could not delete $real"
-            fi
-        done
-    done
-}
-
 # sync_run WHEN CMD... -- run each command in the guest's own shell, in config
 # order: powershell on a Windows guest, /bin/sh on a Linux one, which is the
 # whole of the difference. A command is free text either way, so a config's run
@@ -273,27 +208,29 @@ sync_run() {
 }
 
 sync_main() {
-    local CONF_ARG CONF lineno line VM DISK
+    local CONF_ARG CONF lineno line VM
 
-    CONF_ARG=""; VM=""; DISK=0
+    CONF_ARG=""; VM=""
     while (( $# )); do
         case "$1" in
             -c|--config)    (( $# >= 2 )) || { warn "$1 needs a value"; sync_usage; }
                             CONF_ARG="$2"; shift 2 ;;
-            --disk)         DISK=1; shift ;;
             # Rejected rather than ignored: --smb is what sync now does, and
-            # --live named a transport that has been removed. Silently
-            # accepting either would deliver by a route the caller did not ask
-            # for -- and in --live's case, one that no longer exists.
+            # --live and --disk named transports that have been removed.
+            # Silently accepting any of them would deliver by a route the
+            # caller did not ask for -- and in --live's and --disk's case, one
+            # that no longer exists.
             --smb)          die "--smb is gone: delivering into the running" \
-                                "guest over SMB is what sync does by default" \
-                                "now. Drop the flag." ;;
+                                "guest over SMB is what sync does now." \
+                                "Drop the flag." ;;
             --live)         die "--live is gone: the HTTP transport it named" \
                                 "has been removed. Delivering into the running" \
-                                "guest is the default and uses SMB, which" \
-                                "moves only what changed; drop the flag for" \
-                                "that, or pass --disk to write the disk" \
-                                "image." ;;
+                                "guest is what sync does now and uses SMB," \
+                                "which moves only what changed; drop the flag." ;;
+            --disk)         die "--disk is gone: writing the guest's disk" \
+                                "image has been removed. sync delivers into" \
+                                "the running guest over its own network;" \
+                                "drop the flag and start the guest." ;;
             -h|--help)      sync_usage 0 ;;
             -*)             warn "unrecognised argument: $1"; sync_usage ;;
             *)              [[ -z "$VM" ]] || { warn "unexpected argument: $1"; sync_usage; }
@@ -336,16 +273,15 @@ sync_main() {
                      guest)            sync_set_guest "$CONF:$lineno" "$val" ;;
                      domain)           die "$CONF:$lineno: @domain is no longer a setting" \
                                            "-- pass the domain as an argument: virutil sync $val" ;;
-                     nbd)              NBD="$val" ;;
-                     mnt)              MNT="$val" ;;
+                     nbd|mnt|shutdown_timeout)
+                                       die "$CONF:$lineno: @$key is no longer a setting" \
+                                           "-- it configured the disk-image delivery, which has" \
+                                           "been removed. Drop the line; the delivery goes into" \
+                                           "the running guest over its own network." ;;
                      transport)        die "$CONF:$lineno: @transport is no longer a setting" \
-                                           "-- the transport is chosen on the command line." \
-                                           "Drop the line; delivering into the running guest is" \
-                                           "the default, and --disk writes the disk image." ;;
-                     shutdown_timeout) [[ "$val" =~ ^[0-9]+$ ]] \
-                                           || die "$CONF:$lineno: @shutdown_timeout wants a whole" \
-                                                  "number of seconds, got '$val'"
-                                       SHUTDOWN_TIMEOUT="$val" ;;
+                                           "-- the disk-image delivery it could name has been" \
+                                           "removed. Drop the line; the delivery goes into the" \
+                                           "running guest over its own network." ;;
                      *) die "$CONF:$lineno: unknown setting '$key'" ;;
                  esac ;;
             !*)  local -a pats
@@ -395,64 +331,32 @@ sync_main() {
     echo "  staging: $STAGING"
     echo "  domain: $DOMAIN ($GUEST_OS)"
 
-    # Before the line that would announce the delivery, because there is no
-    # delivery to announce. guest_open looks for the largest NTFS partition on
-    # the image and mounts it with ntfs-3g, so on a Linux guest --disk would get
-    # as far as shutting the domain down and only then fail with "no NTFS
-    # partition found" -- a real cost for an answer that was knowable from the
-    # config alone. Refused rather than quietly downgraded to the network path,
-    # since the flag asks for a transport with different side effects on the
-    # guest's uptime and the caller has to know which one they got.
-    if (( DISK )) && [[ "$GUEST_OS" == linux ]]; then
-        die "--disk cannot write a Linux guest's disk image: it mounts the" \
-            "largest NTFS partition on it, which $DOMAIN does not have." \
-            "Nothing was touched and $DOMAIN was not shut down." \
-            "Drop --disk -- the default delivery is the better path for a" \
-            "Linux guest anyway: it needs no root and no privileged port," \
-            "leaves the guest running, and moves only what changed."
-    fi
-
-    if (( DISK )); then
-        echo "  delivery: the disk image, with $DOMAIN shut down"
-    elif [[ "$GUEST_OS" == linux ]]; then
+    if [[ "$GUEST_OS" == linux ]]; then
         echo "  delivery: rsync into the running guest"
     else
         echo "  delivery: SMB into the running guest"
     fi
 
     # Before the fetch: a guest in the wrong state is worth saying so before
-    # spending minutes pulling a build tree off the Windows host. The two
-    # deliveries want opposite states -- the default needs the guest up with an
-    # agent, --disk needs one it may shut down.
+    # spending minutes pulling a build tree off the Windows host. The delivery
+    # needs the guest up with an agent.
     domain_exists "$DOMAIN" || die "no such domain: $DOMAIN (see: virutil domain list)"
-    # Run rules go through the guest agent, so they only happen on a guest that
-    # is up: said once here rather than per rule, since --disk copies with the
-    # guest shut down and will never reach any of them.
-    if (( ${#RUN_PRE[@]} + ${#RUN_POST[@]} )) && (( DISK )); then
-        warn "   note: --disk copies with the guest shut down, so the" \
-             "$(( ${#RUN_PRE[@]} + ${#RUN_POST[@]} )) run rule(s) in $CONF are skipped." \
-             "Drop --disk to deliver over the network, which leaves $DOMAIN" \
-             "running and runs them."
-    fi
 
-    if (( DISK )); then xfer_check write; else xfer_check net; fi
+    xfer_check net
 
-    # @guest against what the guest says it is. Only on the network path, and
-    # only after xfer_check: that is what established there is an agent to ask,
-    # and asking costs a round trip which --disk has no reason to spend.
+    # @guest against what the guest says it is. Only after xfer_check: that is
+    # what established there is an agent to ask.
     #
     # A warning and not a correction. @guest decides which transport was stood
     # up and which shell the run rules were written for, so silently switching
     # would run a config's powershell through /bin/sh -- and the config is the
     # thing a person can actually fix.
-    if (( ! DISK )); then
-        local detected; detected="$(guest_os "$DOMAIN")"
-        if [[ "$detected" != "$GUEST_OS" ]]; then
-            warn "   warning: $CONF says @guest=$GUEST_OS, but $DOMAIN reports" \
-                 "$detected. The delivery and the run rules are about to be" \
-                 "$GUEST_OS-shaped. If that is wrong, fix @guest rather than" \
-                 "reading past this -- the copier and the shell both come from it."
-        fi
+    local detected; detected="$(guest_os "$DOMAIN")"
+    if [[ "$detected" != "$GUEST_OS" ]]; then
+        warn "   warning: $CONF says @guest=$GUEST_OS, but $DOMAIN reports" \
+             "$detected. The delivery and the run rules are about to be" \
+             "$GUEST_OS-shaped. If that is wrong, fix @guest rather than" \
+             "reading past this -- the copier and the shell both come from it."
     fi
 
     # --- fetch: Windows build tree -> staging -------------------------------
@@ -478,19 +382,7 @@ sync_main() {
     [[ -d "$STAGING" ]] || die "staging dir not found: $STAGING"
     (( ${#MAPPINGS[@]} )) || die "no map rules in $CONF"
 
-    if (( ! DISK )); then sync_net_push; return 0; fi
-
-    # MNT is the guest's C:, mounted from its disk image; guest_open arms the
-    # EXIT trap that unmounts and detaches it again (see modules/guest).
-    guest_open
-
-    sync_map_into "$MNT"
-
-    if (( ${#CLEANUP[@]} )); then empty_guest_dirs; fi
-
-    # The unmount and detach happen in the EXIT trap, which also starts the
-    # guest again if it was running when this started.
-    echo "copy complete -> $DOMAIN"
+    sync_net_push
 }
 
 # --- delivery over the network ----------------------------------------------
@@ -500,12 +392,11 @@ sync_main() {
 # which makes the whole guest side one copy of that tree onto the root. The
 # copier compares what it finds against what it already has and takes only the
 # difference, which is the point: a sync is run over and over against a build
-# tree that changed a little, and the disk path resends all of it every time
-# (and takes the guest down to do it).
+# tree that changed a little.
 #
-# The tree is built with the same rsync the disk path uses, into a scratch
-# directory instead of into the mount, so excludes, globs and destinations
-# behave identically and the guest-side copier needs no exclusions of its own.
+# The tree is built into a scratch directory on the host with the same rsync the
+# map rules would use anywhere else, so excludes, globs and destinations behave
+# the same and the guest-side copier needs no exclusions of its own.
 #
 # Everything above is true of both guests. What differs is only the pair at the
 # far end -- server and copier -- and the four dispatchers below are where that
@@ -549,8 +440,7 @@ sync_net_push() {
     [[ -n "$host" ]] \
         || die "no route from this host to $DOMAIN at $ip, so the guest has" \
                "no address to fetch from. A guest on an isolated network" \
-               "cannot be delivered to over its own network; pass --disk to" \
-               "write to the disk image instead."
+               "cannot be delivered to over its own network."
 
     # Under VIRUTILS_TMP_DIR, and held in XFER_STAGE so xfer_stop clears it
     # however the run ends. The EXIT trap is armed here rather than left to the
@@ -614,9 +504,9 @@ sync_net_push() {
     xfer_stop
     sync_net_report "$files" "$reported" "$elapsed"
 
-    # After the delivery, as on the disk path: a cleanup pattern that overlaps a
-    # map destination has always emptied it last, and moving it earlier would
-    # quietly change what a config means.
+    # After the delivery: a cleanup pattern that overlaps a map destination has
+    # always emptied it last, and moving it earlier would quietly change what a
+    # config means.
     if (( ${#CLEANUP[@]} )); then sync_net_cleanup; fi
 
     # Last, so a rule that starts the service or runs an installer sees the
@@ -674,10 +564,9 @@ sync_win_report() {
     echo "$DOMAIN: $what in $(fmt_duration "${gms:-$ms}")"
 }
 
-# sync_win_cleanup -- the cleanup rules, run in the guest instead of through the
-# mount. Same semantics as empty_guest_dirs: each pattern is expanded in the
-# guest, every directory it names has its contents removed but not itself, and
-# every file it names is deleted. The two-levels-down rule is enforced twice,
+# sync_win_cleanup -- the cleanup rules, run in the guest: each pattern is
+# expanded there, every directory it names has its contents removed but not
+# itself, and every file it names is deleted. The two-levels-down rule is enforced twice,
 # once here on the pattern and once in the guest on what the pattern actually
 # resolved to -- a wildcard can only be checked after it has been expanded, and
 # that happens guest-side.
@@ -700,10 +589,9 @@ sync_win_cleanup() {
         joined+="${joined:+, }$(push_ps_quote "$win")"
     done
 
-    # One line per outcome, so the host can print it in the same shape the disk
-    # path does. Remove-Item is caught per entry: one locked file should cost
-    # that file, not the rest of the cleanup, which is what find -delete does
-    # on the mounted path.
+    # One line per outcome, so the host can print it in one shape for both
+    # guests. Remove-Item is caught per entry: one locked file should cost that
+    # file, not the rest of the cleanup.
     script=$(printf '%s\n' \
         '$ErrorActionPreference = "Stop"' \
         "foreach (\$p in @($joined)) {" \
@@ -816,8 +704,7 @@ sync_lin_report() {
 #
 # Existence is tested rather than left to the glob: POSIX sh has no nullglob, so
 # a pattern that matches nothing arrives as its own literal text, which would
-# otherwise be reported as a path that is present and then quietly skipped --
-# the same trap ci_glob has on the mounted path.
+# otherwise be reported as a path that is present and then quietly skipped.
 sync_lin_cleanup_fn() {
     printf '%s\n' \
         'clean() {' \
@@ -844,9 +731,8 @@ sync_lin_cleanup_fn() {
         '}'
 }
 
-# sync_lin_cleanup -- the cleanup rules, run in the guest. Same semantics as
-# empty_guest_dirs and as the Windows side: each pattern is expanded in the
-# guest, every directory it names has its contents removed but not itself, and
+# sync_lin_cleanup -- the cleanup rules, run in the guest. Same semantics as the
+# Windows side: each pattern is expanded in the guest, every directory it names has its contents removed but not itself, and
 # every file it names is deleted. The two-levels-down rule is enforced twice,
 # once here on the pattern and once in the guest on what it resolved to, since
 # a wildcard can only be checked after expansion.
@@ -879,9 +765,8 @@ sync_lin_cleanup() {
 
 # --- shared ------------------------------------------------------------------
 
-# sync_cleanup_report OUT -- print what the guest reported, in the same shape
-# the mounted path prints. Both guest sides speak the one line-per-outcome
-# protocol, so the printing is written once: 'absent PATH', 'unsafe PATH',
+# sync_cleanup_report OUT -- print what the guest reported. Both guest sides
+# speak the one line-per-outcome protocol, so the printing is written once: 'absent PATH', 'unsafe PATH',
 # 'locked PATH', 'deleted PATH', 'emptied N PATH'.
 sync_cleanup_report() {
     local line kind rest n path

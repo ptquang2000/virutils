@@ -1,12 +1,9 @@
-# xfer -- the transports behind sync, pull and push. There are two kinds, and
-# they differ in what they cost the guest rather than in what they can carry.
-#
-# Live, over the guest's own NIC. The default for sync, push and pull, and the
-# reason is incrementality: the host serves a tree on the address the guest
-# already reaches it at, and the guest's own copier takes only what differs from
-# what it already holds -- so a re-push of a build that changed one file moves
-# one file. Nothing is mounted on either side, no device appears in the guest,
-# and the guest keeps running.
+# xfer -- the transport behind sync, pull and push: live, over the guest's own
+# NIC. The reason it is the only one is incrementality: the host serves a tree
+# on the address the guest already reaches it at, and the guest's own copier
+# takes only what differs from what it already holds -- so a re-push of a build
+# that changed one file moves one file. Nothing is mounted on either side, no
+# device appears in the guest, and the guest keeps running.
 #
 # There are two servers behind that, one per guest OS, because the copier on the
 # far side is whatever the guest actually has:
@@ -22,16 +19,6 @@
 #   transport's: read-only and the guest fetches from it (sync, push), writable
 #   and the guest copies into it (pull). See the sections at the foot of this
 #   file.
-#
-# Offline, the guest's own qcow2 over qemu-nbd, mounted on the host. Behind
-# --disk in both directions:
-#   Write direction:  xfer_check write -> guest_open    -> caller writes into $MNT
-#   Read direction:   xfer_check read  -> guest_open ro -> caller reads  from $MNT
-#   MNT is the root of the guest's C: -- literally, since the mount *is* C:, so
-#   a copy into it needs no delivery step afterwards. A running guest is shut
-#   down around it, which is the whole cost of this transport: nothing about the
-#   disk image is rearranged, so no snapshot, overlay or commit is involved in
-#   either direction.
 
 # Escalate only what needs root: under sudo $HOME is root's, so config
 # discovery would read /root.
@@ -46,54 +33,15 @@ xfer_running() {
     [[ "$("${VIRSH[@]}" domstate "$1" 2>/dev/null)" == running ]]
 }
 
-# xfer_check MODE -- the guest has to be in the right state for the direction
-# about to be taken, and the two directions want opposite ones:
-#
-#   write  the mount writes straight to the disk image. A guest that is running
-#          is fine: guest_open shuts it down and the EXIT trap starts it again.
-#          What is not fine is paused or pmsuspended, whose RAM would no longer
-#          match the disk being edited.
-#   read   the mount reads the disk image, so the guest must not be writing to
-#          it. Same states as write, and for a near-enough reason: a running
-#          guest is shut down first, and paused or pmsuspended RAM holds writes
-#          the image on disk does not have yet.
-#
-# Checked here, up front, rather than inside the open: the guest's state decides
-# whether the run can happen at all, so it is settled before the fetch or any
-# other work that would be thrown away.
+# xfer_check MODE -- the guest has to be in the right state for the copy about
+# to be made. Checked here, up front: the guest's state decides whether the run
+# can happen at all, so it is settled before the fetch or any other work that
+# would be thrown away.
 xfer_check() {
     local mode="$1" dom="$DOMAIN" state
     state="$("${VIRSH[@]}" domstate "$dom" 2>/dev/null)"
 
     case "$mode" in
-        write)
-            case "$state" in
-                running|"shut off") ;;
-                *)  # paused / pmsuspended: RAM that would not match the disk.
-                    die "$dom is '$state'; --disk writes straight to the" \
-                        "disk image. Running and shut off are both fine (a" \
-                        "running guest is shut down first and restarted" \
-                        "afterwards), but this state cannot be shut down and" \
-                        "brought back around a write. Shut it down by hand and" \
-                        "run again."
-                    ;;
-            esac
-            ;;
-        read)
-            case "$state" in
-                running|"shut off") ;;
-                *)  # paused / pmsuspended: writes still in RAM, and no clean
-                    # way to get them onto the image before reading it.
-                    die "$dom is '$state'; --disk reads the disk image" \
-                        "directly. Running and shut off are both fine (a" \
-                        "running guest is shut down first and started again" \
-                        "afterwards), but this state cannot be shut down, and" \
-                        "its RAM holds writes the image does not. Shut it down" \
-                        "by hand and run again, or drop --disk to copy over" \
-                        "the guest's own network instead."
-                    ;;
-            esac
-            ;;
         net)
             # Nothing is written to the disk image, so the only requirement is
             # that the guest is up with an agent to drive it. The same for both
@@ -104,105 +52,18 @@ xfer_check() {
                        "The copy goes over the guest's own network and is" \
                        "driven from inside it, so there has to be a guest at" \
                        "the other end. Start it with" \
-                       "'virutil domain start $dom', or pass --disk to use the" \
-                       "disk image instead, which works on a guest that is" \
-                       "shut off."
+                       "'virutil domain start $dom'."
             guest_agent_wait "$dom" 5 \
                 || die "$dom is running but its QEMU guest agent is not" \
                        "answering, and the agent is what starts the copy" \
                        "inside the guest. Check that qemu-ga is running in the" \
-                       "guest, or pass --disk to use the disk image instead," \
-                       "which needs no agent."
+                       "guest."
             ;;
-        *) die "internal: xfer_check wants write, read or net, got '$mode'" ;;
+        *) die "internal: xfer_check wants net, got '$mode'" ;;
     esac
 }
 
 # --- host-side primitives ---------------------------------------------------
-
-# max_part only takes effect at module load, so a module already up without it
-# has to be reloaded or the partition nodes never appear.
-nbd_reload() {
-    if [[ ! -e /sys/module/nbd/parameters/max_part ]] \
-       || (( $(< /sys/module/nbd/parameters/max_part) < 1 )); then
-        "${SUDO[@]}" rmmod nbd 2>/dev/null || true
-        "${SUDO[@]}" modprobe nbd max_part=8
-    fi
-}
-
-# nbd_connect IMG [-r] -- attach IMG at $NBD and settle the partition table.
-nbd_connect() {
-    local img="$1" ro="${2:-}"
-    nbd_reload
-    "${SUDO[@]}" qemu-nbd ${ro:+-r} -c "$NBD" "$img"
-    nbd_settle
-}
-
-# Does $NBD have at least one partition node yet?
-nbd_has_parts() {
-    local dev
-    for dev in "$NBD"p*; do [[ -b "$dev" ]] && return 0; done
-    return 1
-}
-
-# Is $NBD serving reads? Straight after qemu-nbd -c it may be sized but not yet
-# answering: that is what makes partx report "failed to read partition table".
-nbd_readable() {
-    "${SUDO[@]}" dd if="$NBD" bs=512 count=1 status=none >/dev/null 2>&1
-}
-
-nbd_has_table() {
-    [[ -n "$("${SUDO[@]}" blkid -p -s PTTYPE -o value "$NBD" 2>/dev/null)" ]]
-}
-
-# nbd_settle -- wait for the kernel's partition scan to land.
-#
-# qemu-nbd -c returns as soon as the device is sized, but the scan is
-# asynchronous and udevadm settle cannot wait for a uevent that has not been
-# queued yet. A deep backing chain opens slowly enough that the nodes appear
-# after the caller has already globbed for them, which reads as "no partition
-# found" on a perfectly good image.
-#
-# The wait is gated on a partition table actually being there: an image with no
-# table has nothing to wait for, and must not stall for the whole timeout.
-NBD_SETTLE_TRIES=50          # x 0.2s
-nbd_settle() {
-    local i
-    for (( i = 0; i < NBD_SETTLE_TRIES; i++ )); do
-        "${SUDO[@]}" partx -a "$NBD" >/dev/null 2>&1 || true   # force a rescan
-        udevadm settle
-
-        nbd_has_parts && return 0
-        # Readable with no table: an unpartitioned image, nothing to wait for.
-        nbd_readable && ! nbd_has_table && return 0
-
-        sleep 0.2
-    done
-    # Not fatal here: the caller reports the layout it actually found.
-    warn "$NBD still shows no partitions after" \
-         "$(( NBD_SETTLE_TRIES / 5 ))s of waiting for the kernel to scan it"
-}
-
-# nbd_find_part TYPE... -- the largest partition on $NBD whose filesystem is one
-# of TYPE. blkid directly: lsblk's FSTYPE column can lag behind udev.
-nbd_find_part() {
-    local dev fstype size want=" $* " best=0 part=""
-    for dev in "$NBD"p*; do
-        [[ -b "$dev" ]] || continue
-        fstype="$("${SUDO[@]}" blkid -o value -s TYPE "$dev" 2>/dev/null)"
-        [[ -n "$fstype" && "$want" == *" $fstype "* ]] || continue
-        size="$("${SUDO[@]}" blockdev --getsize64 "$dev")"
-        (( size > best )) && { best="$size"; part="$dev"; }
-    done
-    printf '%s' "$part"
-}
-
-# nbd_part_size DEV -- its size in whole GiB.
-nbd_part_size() {
-    local bytes; bytes="$("${SUDO[@]}" blockdev --getsize64 "$1" 2>/dev/null || echo 0)"
-    printf '%s' "$(( bytes / 1024 / 1024 / 1024 ))"
-}
-
 
 # xfer_host_addr GUEST_IP -- the address the guest reaches this host at, which
 # is the source address the kernel would use to reach the guest. Asking the
@@ -215,7 +76,7 @@ xfer_host_addr() {
 
 # --- the live path, over SMB -------------------------------------------------
 #
-# How sync and push deliver unless --disk says otherwise. The host serves the
+# How sync and push deliver. The host serves the
 # payload as a live tree and the guest fetches it with robocopy, which compares
 # the tree it already has against the one being served and copies only what
 # differs -- so a second push of a build where one file changed moves one file,
@@ -289,9 +150,8 @@ xfer_smb_free() {
     if xfer_smb_bound; then
         die "something already holds TCP 445 on this host, and SMB cannot" \
             "be served on any other port to a Windows guest. On WSL this is" \
-            "usually the Windows host's own file sharing; stop it, or pass" \
-            "--disk instead, which writes the disk image and needs no" \
-            "privileged port."
+            "usually the Windows host's own file sharing; stop it and run" \
+            "again."
     fi
 }
 
@@ -429,15 +289,11 @@ xfer_smb_nobind() {
             "check whether the Windows host is holding 445 -- the check this" \
             "run made looks at Linux's own sockets and cannot see Windows'." \
             "${keep:+Its runtime state is kept at $keep, where diag holds the}" \
-            "${keep:+process tree at the moment it gave up -- read that first.}" \
-            "Or pass --disk, which writes the disk image and needs no" \
-            "privileged port."
+            "${keep:+process tree at the moment it gave up -- read that first.}"
     fi
     die "smbd exited without binding $addr:445; its own output is above." \
         "If it says nothing, run it by hand to see why:" \
-        "  sudo smbd -s $XFER_SMB_CONF -F --no-process-group --debug-stdout" \
-        "Or pass --disk, which writes the disk image and needs no" \
-        "privileged port."
+        "  sudo smbd -s $XFER_SMB_CONF -F --no-process-group --debug-stdout"
 }
 
 # xfer_smb_serve DIR ADDR [rw] -- export DIR on ADDR:445, once, under a random
@@ -459,8 +315,7 @@ xfer_smb_serve() {
     command -v smbd >/dev/null 2>&1 \
         || die "delivering into a running guest serves the payload over SMB" \
                "and needs smbd (the Samba server) on the host; it is not" \
-               "installed. Install it, or pass --disk to write to the disk" \
-               "image instead."
+               "installed. Install it and run again."
     # Both the "is 445 taken" check and the "has smbd bound it yet" wait read
     # ss. Without it each would silently answer no, which reads as a free port
     # and then as an smbd that never started -- so it is required outright
@@ -468,7 +323,7 @@ xfer_smb_serve() {
     command -v ss >/dev/null 2>&1 \
         || die "the delivery needs ss (iproute2) to tell whether port 445 is" \
                "free and whether smbd has bound it; it is not on PATH." \
-               "Install iproute2, or pass --disk to write to the disk image."
+               "Install iproute2 and run again."
 
     xfer_privilege
     xfer_smb_free
@@ -513,8 +368,7 @@ CONF
     # terminal to reach.
     if (( ${#SUDO[@]} )); then
         "${SUDO[@]}" -v || die "could not obtain the root privilege needed to bind port 445" \
-            "and serve the payload. Pass --disk to write to the disk image" \
-            "instead, which needs no privileged port."
+            "and serve the payload."
     fi
     # --debug-stdout so everything smbd has to say lands in one file this shell
     # owns. Without it, its first messages go to the compiled-in

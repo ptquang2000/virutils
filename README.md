@@ -18,7 +18,6 @@ step and no dependencies beyond the utilities it calls.
 - [How files move](#how-files-move)
    - [Which guest is on the other side](#which-guest-is-on-the-other-side)
    - [Delivering](#delivering)
-   - [Using the disk image](#using-the-disk-image)
    - [What used to read through a snapshot](#what-used-to-read-through-a-snapshot)
    - [What used to be here](#what-used-to-be-here)
    - [Snapshots name every drive, and snapshot only the disks](#snapshots-name-every-drive-and-snapshot-only-the-disks)
@@ -40,7 +39,6 @@ step and no dependencies beyond the utilities it calls.
    - [Example](#example)
    - [How the delivery works](#how-the-delivery-works)
       - [On a Linux guest](#on-a-linux-guest)
-   - [Writing the disk image instead](#writing-the-disk-image-instead)
    - [Notes](#notes)
 - [virutil pull](#virutil-pull)
 - [virutil push](#virutil-push)
@@ -103,10 +101,10 @@ in one go. The layout, and what fills each subdirectory:
 | Path | Filled by |
 | --- | --- |
 | `~/.virutils/conf/` | sync configs (`sync.conf`, `NAME.conf`) |
-| `~/.virutils/images/` | domain disks (`domain create`), snapshot overlays and memory files (`snapshot`, `pull`) |
+| `~/.virutils/images/` | domain disks (`domain create`), snapshot overlays and memory files (`snapshot`) |
 | `~/.virutils/staging/` | sync's incremental staging trees (`@staging` names) |
 | `~/.virutils/ports/` | `domain port` forward state and relay logs |
-| `~/.virutils/mnt/` | host mount points for guest filesystems (`<VM>`) |
+| `~/.virutils/mnt/` | host mount points left by removed commands, swept by `domain delete` (`<VM>`) |
 
 Installation links are the exception and follow the [installation
 above](#installation): `virutil` in `~/.local/bin` and `_virutil` in the zsh
@@ -171,9 +169,9 @@ host-side machinery in `modules/xfer` and `modules/guest`, which is
 
 | Module | Purpose | Usage |
 | --- | --- | --- |
-| `sync` | Fetch a project's build output from a Windows host and push it into a guest's `C:` drive. | `virutil sync [--disk] VM [-c NAME\|PATH]` |
+| `sync` | Fetch a project's build output from a Windows host and push it into a guest's `C:` drive. | `virutil sync VM [-c NAME\|PATH]` |
 | `pull` | Copy a file or directory out of a **running** guest. | `virutil pull VM SRC DST` |
-| `push` | Copy a file or directory from the host into a guest's `C:` drive. | `virutil push [--disk] VM SRC DST` |
+| `push` | Copy a file or directory from the host into a guest's `C:` drive. | `virutil push VM SRC DST` |
 
 ### guest
 
@@ -189,8 +187,8 @@ host-side machinery in `modules/xfer` and `modules/guest`, which is
 
 All three write the same C:-shaped tree — see
 [How files move](#how-files-move). `sync` and `push` deliver into a **running**
-guest over its own NIC, moving only what changed; both take `--disk` to write
-the guest's disk image instead, which is the only thing `pull` has ever done.
+guest over its own NIC, moving only what changed; `pull` reads back the same
+way.
 
 `virutil` alone, or `virutil help`, prints the module list. `modules/parser`
 handles the top-level dispatch plus the helpers every module shares; each
@@ -201,10 +199,10 @@ document covers `virutil sync`, then `virutil pull`, then `virutil push`, then
 
 ## How files move
 
-`sync`, `pull` and `push` differ in *what* they move. There are two ways it
-moves, and every command has both.
+`sync`, `pull` and `push` differ in *what* they move. There is one way it
+moves, and all three share it.
 
-**Over the guest's own network, by default.** The host stands up one throwaway
+**Over the guest's own network.** The host stands up one throwaway
 export on the address the guest already reaches it at, and the guest's own
 copier does the copying, driven through the QEMU guest agent. Nothing is
 mounted on either side, no drive letter or device appears in the guest, and the
@@ -234,30 +232,21 @@ need a terminal to prime the credential on, and refuse to run when something
 already holds 445 — on WSL, usually the Windows host's own file sharing. None of
 that applies to a Linux guest, so that path also runs unattended.
 
-All three commands also take **`--disk`**, which uses the disk image instead of
-the network. The host attaches the guest's own qcow2 with `qemu-nbd`, mounts its
-largest NTFS partition with `ntfs-3g`, and reads or writes that directly — and
-the mount *is* `C:`, so there is no second copy step afterwards. It costs the
-guest's uptime and moves every mapped file whether it changed or not, and it
-buys you a transport that needs **nothing of the guest**: no agent, no route
-back to this host, no privileged port, and a guest that is shut off works as
-well as one that is up.
-
 Direction is the share's, not the transport's. `sync` and `push` export the
 payload read-only and the guest fetches from it; `pull` exports the destination
 directory writable and the guest copies into it. Same `smbd`, same random
 one-transfer share name, same single bind address, same `robocopy` on the far
 side skipping whatever the other end already holds.
 
-| | over the network (`sync`, `push`, `pull`) | `--disk` (`sync`, `push`, `pull`) |
-| --- | --- | --- |
-| Guest must be | **running**, with its agent answering | running or **shut off** |
-| Guest OS | Windows or Linux | **Windows only** — it mounts NTFS |
-| What is mounted | nothing | the disk image itself — read-write to write, read-only to read |
-| Guest side | `robocopy` or `rsync`, via the agent | nothing |
-| Host needs | `smbd` + root for 445 (Windows guest), or `rsync` and no root at all (Linux guest) | `qemu-nbd`, `ntfs-3g`, root to mount |
-| Fixed cost per run | an agent round trip | a shutdown and boot, only when it was running |
-| Moves on a re-run | only what changed | everything mapped |
+| | over the network (`sync`, `push`, `pull`) |
+| --- | --- |
+| Guest must be | **running**, with its agent answering |
+| Guest OS | Windows or Linux |
+| What is mounted | nothing |
+| Guest side | `robocopy` or `rsync`, via the agent |
+| Host needs | `smbd` + root for 445 (Windows guest), or `rsync` and no root at all (Linux guest) |
+| Fixed cost per run | an agent round trip |
+| Moves on a re-run | only what changed |
 
 ### Which guest is on the other side
 
@@ -290,10 +279,6 @@ is also true of the BSDs even though this vocabulary has no name for them. The
 alternative, an allow-list of distribution ids, would refuse to work on a guest
 that would have been fine and would need editing every time a new one appeared.
 
-The metadata source is readable with the guest **shut off**, which is what lets
-`--disk` refuse a Linux guest's image up front instead of shutting the domain
-down and then failing to find an NTFS partition.
-
 `sync` uses the same probe as a cross-check: if the guest reports something
 other than `@guest` says, it warns and carries on with what the config asked
 for. It does not silently switch — `@guest` decides which shell the config's run
@@ -315,10 +300,8 @@ so there is no privileged bind, no `sudo`, no credential to prime, and nothing
 for the Windows host's file sharing to collide with. `rsync` has to be installed
 in the guest — it is the copier — and the run says so plainly if it is not.
 
-When one of those four is missing, virutil **says which and stops**. It never
-quietly falls back to `--disk`, and the reason is that the fallback would be a
-larger side effect than the failure: writing the disk image means shutting the
-guest down, which is not something to do to somebody who did not ask for it.
+When one of those four is missing, virutil **says which and stops**, naming the
+piece that is missing rather than falling back to anything.
 
 ```sh
 virutil sync win11              # guest keeps running; only changed files cross
@@ -329,46 +312,12 @@ Because the credential for port 445 is primed synchronously, before `smbd` is
 backgrounded, **a delivery to a Windows guest needs a terminal to ask on.** Run
 without one — from `cron`, from CI, from a detached script — and it stops at once
 with `sudo: a terminal is required`, rather than hanging. Give `smbd` a
-`NOPASSWD` rule if you need this unattended, or use `--disk`, which needs `sudo`
-too but is equally blocked without a terminal.
+`NOPASSWD` rule if you need this unattended.
 
 **A delivery to a Linux guest has no such requirement**, and this is the
 practical difference between the two paths rather than a footnote: it escalates
 nothing, so it is the one transport here that works from `cron` or CI as it
 stands.
-
-### Using the disk image
-
-`--disk` is **Windows-only**: it looks for the largest NTFS partition on the
-image and mounts it with `ntfs-3g`, so there is nothing for it to do on a Linux
-guest. `sync` refuses it outright when `@guest=linux` rather than shutting the
-domain down and then failing — the answer was knowable from the config.
-
-`--disk` shuts a running guest down, and only then touches its disk. The guest
-holds the same qcow2 open, and two writers on one image is the one mistake
-nothing here can undo — so a guest that is on is first asked to shut down
-(`virsh shutdown`, via the guest agent when it answers, ACPI otherwise), waited
-for to reach `shut off`, and started again when the run is over, on success and
-on failure. A guest that is already off is used as-is. What is refused outright
-is paused and `pmsuspended`: that RAM no longer matches the disk, holding writes
-the image does not have and cannot be brought down cleanly to receive. One thing is never done —
-forced off. There is no `virsh destroy` anywhere in this path; cutting power
-leaves the NTFS volume dirty, so the disk would be unmountable read-write on the
-next run, and an interrupted write can leave the guest unbootable.
-
-So a running guest needs nothing from you beyond the flag:
-
-```sh
-virutil sync --disk win11        # running -> shut down -> copy -> started again
-virutil push --disk win11 ./f.txt 'C:\'
-virutil pull --disk win11 'build/out' ./out
-```
-
-The read direction attaches the image `-r` and mounts it `ro`, so a `pull --disk`
-cannot alter the guest's disk even if the copy goes wrong. That is also why it is
-the one path here that tolerates a managed-save image: it leaves the image
-byte-for-byte as it found it, so a saved guest can be read out of and resumed
-afterwards.
 
 ### What used to read through a snapshot
 
@@ -382,18 +331,17 @@ memory images stayed where they were, and the next `snapshot revert` restored
 old RAM onto a newer disk, which Windows answers with a bluescreen.
 
 A transfer has no business rewriting the images underneath a snapshot. So the
-live read is now the same SMB transport as the live write, in the other
-direction, and it does not open the disk image at all.
+read is now the same SMB transport as the write, in the other direction, and it
+does not open the disk image at all.
 
 ### What used to be here
 
-Two transports have been removed, and neither is coming back:
+Three transports have been removed, and none of them is coming back:
 
 - **virtio-fs**, selected with `-t`/`--transport` or `@transport`. Gone, and with
    it the share device and the shared-memfd memory backing it needed. Sync's
    `>pre`/`>post` run rules outlived it: they run through the guest agent
-   against a guest that stays up, which is what the default SMB delivery does
-   anyway. `--disk` cannot promise that, so it skips them with a note.
+   against a guest that stays up, which is what the SMB delivery does anyway.
 - **HTTP**, selected with `--live`: the host served one payload with `python3`
    and the guest fetched it with `curl.exe`, carrying a directory as a single
    `tar` that was unpacked whole every time. SMB does the same job and compares
@@ -401,10 +349,20 @@ Two transports have been removed, and neither is coming back:
    nothing left for HTTP to be better at. `tar.exe` is no longer needed in the
    guest, and `python3` is no longer part of any transfer — `virutil exec` still
    uses it.
+- **The disk image**, selected with `--disk`: the host attached the guest's own
+   qcow2 with `qemu-nbd`, mounted its largest NTFS partition with `ntfs-3g` and
+   read or wrote it directly, with a running guest shut down around the copy.
+   It needed nothing of the guest, and that was the whole of what it was better
+   at — it cost the guest's uptime, moved every mapped file whether it had
+   changed or not, worked on Windows guests only, and needed `qemu-nbd`,
+   `ntfs-3g` and root to mount on the host. `sync`'s `>pre`/`>post` run rules
+   were skipped under it, and its cleanup rules ran through a mount rather than
+   in the guest.
 
-A config still carrying `@transport` is rejected with its line number rather
-than quietly ignored, `-t` is no longer accepted on the command line, and `--live` and `--smb` each stop with a message naming what replaced
-them rather than being silently accepted.
+A config still carrying `@transport`, `@nbd`, `@mnt` or `@shutdown_timeout` is
+rejected with its line number rather than quietly ignored, `-t` is no longer
+accepted on the command line, and `--live`, `--smb` and `--disk` each stop with
+a message naming what replaced them rather than being silently accepted.
 
 A domain created by an older virutil may still have a `virtio-fs` share in its
 definition. Nothing here uses it, and libvirt will refuse to start the domain if
@@ -471,15 +429,10 @@ be delivered to. It is also what `virutil exec`, `virutil domain time`,
 `virutil domain port` on a statically addressed guest, and
 `virsh shutdown --mode agent` need.
 
-`--disk` and `pull` are the exception — they work on the disk image from the host
-and never talk to the guest, so they need none of this beyond the virtio drivers
-that let the guest boot at all. That makes `--disk` the way into a guest whose
-agent is broken or missing.
-
 | What | Where it comes from | Needed by |
 | --- | --- | --- |
 | **virtio drivers** (`viostor`, `NetKVM`) | `virtio-win` ISO, or `virtio-win-guest-tools.exe` on it | booting at all — the installer cannot see a virtio disk without `viostor` |
-| **QEMU guest agent** (`qemu-ga`) | `virtio-win-guest-tools.exe`, or `guest-agent\qemu-ga-x86_64.msi` on the ISO | `sync` and `push` (not `--disk`), `virutil exec`, `virutil domain time`, and `virsh shutdown --mode agent` |
+| **QEMU guest agent** (`qemu-ga`) | `virtio-win-guest-tools.exe`, or `guest-agent\qemu-ga-x86_64.msi` on the ISO | `sync`, `push` and `pull`, `virutil exec`, `virutil domain time`, and `virsh shutdown --mode agent` |
 | **SPICE guest agent** (`spice-vdagent`) | [spice-guest-tools](https://www.spice-space.org/download/windows/spice-guest-tools/spice-guest-tools-latest.exe) | the `spice` display and `spicevmc` channel of every `virutil domain create` domain — clipboard sharing and display auto-resize |
 
 ### A Linux guest
@@ -552,22 +505,12 @@ makes, so nothing has to be added on the host side. Confirm it from the host:
 virutil exec ping VM        # the agent answers
 ```
 
-Two settings in Windows matter for the transfers that mount the disk image —
-`--disk` and `pull` — and for those they are not optional:
-
-- **Fast Startup must be off** (`powercfg /h off`). With it on, Windows leaves
-   the NTFS volume dirty on shutdown and `ntfs-3g` refuses to mount it
-   read-write — which makes `sync --disk` and `push --disk` fail on a guest that
-   is properly shut off. The default delivery never mounts the volume, so it is
-   indifferent to this.
-- **A single disk** whose system volume is the largest NTFS partition on it.
-
 ## virutil sync
 
 ### Synopsis
 
 ```
-virutil sync [--disk] VM [-c NAME|PATH]
+virutil sync VM [-c NAME|PATH]
 virutil sync -h
 ```
 
@@ -585,16 +528,16 @@ build tree --(fetch)--> staging dir --(map)--> guest filesystem
 The guest may be Windows (the default) or Linux, set by
 [`@guest`](#settings). It changes only the guest half of the delivery; the fetch,
 the staging tree, the excludes and the map rules are host-side and identical for
-both. `--disk` is Windows-only.
+both.
 
 **Fetch** mirrors selected directories out of the build tree into a staging
 directory under `~/.virutils/staging/`, applying the exclude patterns. The staging layout is
 normally arranged to mirror what will land in the guest, so the map rules stay
 trivial.
 
-**Push** (the default) runs the map rules into a delivery tree on the host — the
-same rsync, the same excludes and destinations, into a scratch directory instead
-of into a mount — exports that tree read-only on the address the guest reaches
+**Push** runs the map rules into a delivery tree on the host — the
+same rsync, the same excludes and destinations, into a scratch directory —
+exports that tree read-only on the address the guest reaches
 this host at, and has the guest copy it onto its own root: an SMB share and
 `robocopy` onto `C:` for a Windows guest, an `rsync` daemon and `rsync` onto `/`
 for a Linux one. Only the
@@ -604,26 +547,14 @@ before it fetches, any directories listed for cleanup are emptied in the guest
 afterwards, `>post` rules run last, and the share and the tree are torn down
 however the run ends. Nothing is mounted and nothing is shut down.
 
-With **`--disk`** this half is replaced by a write to the disk image: the guest is
-shut down if it is running (waiting up to `@shutdown_timeout` for it to reach
-`shut off`), its image is attached with `qemu-nbd`, the largest NTFS partition on
-it is mounted, the staged files are copied to their destinations, the cleanup
-directories are emptied, and the mount is torn down. A guest that was running is
-started again — on success and on failure; one that was already off stays off.
-Every mapped file is written whether it changed or not, and any `>pre`/`>post`
-run rules are skipped: they need the guest up. See
-[Writing the disk image instead](#writing-the-disk-image-instead).
-
 Run it as yourself, **not** under `sudo`. It refuses to start when invoked under
 `sudo`, because `$HOME` — and therefore config discovery — resolves to root's
 home on any host whose sudoers sets `always_set_home`. Only the commands that
-genuinely need root are escalated individually — `smbd` on the default path, and
-`modprobe`, `qemu-nbd`, `partx`, `blkid`, `blockdev`, `mkdir`, `mount`, `umount`
-under `--disk` — and you are prompted once, before anything is served or
-attached. Every `virsh` call runs unprivileged, which requires membership of the
-`libvirt` group. The delivery tree is built as you, and under `--disk` the guest
-filesystem is mounted with `uid=`/`gid=` set to the invoking user, so both copy
-phases and the cleanup pass need no privilege of their own.
+genuinely need root is escalated individually — `smbd`, and only for a Windows
+guest — and you are prompted once, before anything is served. Every `virsh` call
+runs unprivileged, which requires membership of the `libvirt` group. The
+delivery tree is built as you, so the copy phase and the cleanup pass need no
+privilege of their own.
 
 Because the prompt comes before `smbd` is backgrounded, a run needs a terminal to
 ask on: see [Delivering](#delivering).
@@ -632,11 +563,10 @@ ask on: see [Delivering](#delivering).
 
 | Argument | Description |
 | --- | --- |
-| `VM` | libvirt domain delivered into. It has to be **running**, since the delivery goes over its own network. With `--disk` its disk image is written instead, so a running one is shut down first and started again afterwards. Required. |
+| `VM` | libvirt domain delivered into. It has to be **running**, since the delivery goes over its own network. Required. |
 
 | Option | Description |
 | --- | --- |
-| `--disk` | Write the guest's disk image instead of delivering over its network. Mounts the image on the host, so a running guest is shut down for the copy and started again afterwards, and every mapped file is written whether it changed or not. Needs nothing of the guest — no agent, no route back here, no privileged port — and works on a guest that is shut off. See [Writing the disk image instead](#writing-the-disk-image-instead). |
 | `-c`, `--config NAME\|PATH` | Config to use. A value containing `/` is a path, taken as given. Anything else names a config, looked up in `~/.virutils/conf/` first and then `~/.config/virutils/`, with `.conf` appended when absent — so `-c win11` reads `~/.virutils/conf/win11.conf` if it exists, else `~/.config/virutils/win11.conf`. Defaults to `sync.conf`, resolved the same way. |
 | `-h`, `--help` | Print usage and exit. |
 
@@ -660,7 +590,6 @@ config.
 | `~/.config/virutils/sync.conf` | Legacy location, searched when the new one has no `sync.conf` — so existing installs keep working untouched. |
 | `~/.virutils/conf/NAME.conf` | Additional configs, selected with `-c NAME` (searched before the legacy `~/.config/virutils/NAME.conf`). |
 | `~/.virutils/staging/<@staging>` | Staging directory, refreshed from `@repo` on every run. |
-| `~/.virutils/mnt/<VM>` | Default mount point for the guest filesystem, overridable with `@mnt`. |
 
 A missing config is a fatal error naming the exact path that was looked for.
 Nothing is generated for you, and nothing else is touched first.
@@ -692,11 +621,8 @@ and is rejected.
 | --- | --- | --- | --- |
 | `@repo` | yes | — | Root of the build tree on the host. Fetch sources are relative to it. |
 | `@staging` | yes | — | Staging directory *name*. Always placed under `~/.virutils/staging/`, whatever is written here. |
-| `@guest` | no | `windows` | Which OS the guest runs: `windows` or `linux`. It selects the guest half of the delivery — SMB + `robocopy` + PowerShell, or an `rsync` daemon + `rsync` + `/bin/sh`. `--disk` is Windows-only and is refused when this is `linux`. |
+| `@guest` | no | `windows` | Which OS the guest runs: `windows` or `linux`. It selects the guest half of the delivery — SMB + `robocopy` + PowerShell, or an `rsync` daemon + `rsync` + `/bin/sh`. |
 | `@dest` | no | *(empty)* | Install directory in the guest, relative to the guest's root — `C:\`, or `/` when `@guest=linux`. Every map destination hangs off it, so the install path is spelled once. Empty means that root itself. |
-| `@nbd` | no | `/dev/nbd0` | NBD device used to attach the disk image. |
-| `@mnt` | no | `~/.virutils/mnt/<VM>` | Host mount point for the guest filesystem. |
-| `@shutdown_timeout` | no | `180` | Seconds to wait for a running guest to shut down before aborting the run. The guest is never forced off. |
 
 #### Fetch rules
 
@@ -760,7 +686,7 @@ that is not present is reported and skipped, and one the guest has locked costs
 that entry a warning, not the rest of the cleanup.
 
 Two safety rules apply, so a mistyped pattern cannot empty a top-level
-directory: the expansion must stay inside the mount point, and it must be at
+directory: the expansion must stay inside the guest's root, and it must be at
 least two levels deep.
 
 #### Run rules
@@ -781,10 +707,9 @@ correctly, so carrying on past one that did not happen would deliver a
 half-installed guest and report success.
 
 They need the guest up and answering on the agent, so they run only when it is —
-which the default delivery already requires. Under `--disk` the guest is shut
-down for the copy, so the rules are **skipped** with a note saying so, and the
-delivery goes ahead; a guest that went away mid-run is skipped the same way
-rather than failing the copy that already landed.
+which the delivery already requires. A guest that went away mid-run has its
+rules **skipped** with a note saying so, rather than failing the copy that
+already landed.
 
 ### Example
 
@@ -887,7 +812,7 @@ build tree --(fetch)--> staging --(map)--> delivery tree --(rsync)--> /
 See [On a Linux guest](#on-a-linux-guest) for what differs.
 
 The map rules build their `C:`-shaped tree in a scratch directory under
-`~/.virutils/tmp/` instead of in a mount; the host exports that directory as a
+`~/.virutils/tmp/`; the host exports that directory as a
 read-only, anonymous SMB share on the one address the guest reaches it at; and
 the guest is told, through the guest agent, to `robocopy` the whole share onto
 `C:\`. Because the delivery tree's layout already *is* the layout the rules asked
@@ -897,12 +822,11 @@ Two things follow, and between them they are the reason it exists:
 
 * **The guest stays up.** Nothing is mounted on the host, nothing is shut down,
   no drive letter or device appears in the guest, and its disk image is never
-  opened. No Fast Startup rule, no managed-save rule, no teardown to verify.
+  opened.
 * **Only what changed crosses.** `robocopy` compares every file against what the
   guest already holds and skips the ones that match, so re-syncing a build in
-  which one DLL changed moves one DLL. `--disk` rewrites every mapped file on
-  every run, and takes the guest down to do it — which is the wrong trade for the
-  thing `sync` is actually for, a build tree resynced over and over.
+  which one DLL changed moves one DLL — which is what `sync` is actually for, a
+  build tree resynced over and over.
 
 ```
 $ virutil sync win11
@@ -935,10 +859,9 @@ and `powershell.exe` starting up.
 tree is built, so what the guest is offered is already filtered and `robocopy`
 needs no `/XF` or `/XD`.
 
-**Cleanup rules run in the guest.** With no mount to unlink through, each
-`-pattern` becomes a `Remove-Item` driven by the agent: the pattern is expanded
-guest-side (so still case-insensitively, and still after the delivery, exactly as
-on the disk path), every directory it names has its contents removed but never
+**Cleanup rules run in the guest.** Each `-pattern` becomes a `Remove-Item`
+driven by the agent: the pattern is expanded guest-side (so case-insensitively,
+and after the delivery), every directory it names has its contents removed but never
 itself, and every file it names is deleted. The two-levels-down rule is enforced twice — once here on the pattern,
 once in the guest on what the pattern actually resolved to, since a wildcard can
 only be judged after it expands. A file the guest has locked costs that file a
@@ -960,14 +883,13 @@ What it needs, and what it does when it cannot have it:
 | Guest running | Refused, naming the state and pointing at `domain start`. |
 | QEMU guest agent answering | Refused; there is nothing to drive the fetch. |
 | A route from the guest back to this host | Refused; a guest on an isolated network cannot be delivered to. |
-| `smbd` (Samba) on the host — *Windows guest only* | Refused, pointing at `--disk`. |
+| `smbd` (Samba) on the host — *Windows guest only* | Refused, naming the package to install. |
 | Root on the host to bind TCP 445 — *Windows guest only* | Prompted for once, up front, before `smbd` is backgrounded — where the prompt still has a terminal. Without a terminal the run stops rather than hanging. |
 | Nothing else already on TCP 445 — *Windows guest only* | Refused. SMB cannot be served to a Windows client on any other port; under WSL the listener is usually the Windows host's own file sharing. |
 | `rsync` on the host and in the guest — *Linux guest only* | Refused, naming which side is missing it. |
 
-Every one of those is a refusal naming `--disk`, never an automatic fallback.
-Downgrading on its own would shut a running guest down to do it, which is a
-larger thing to do unasked than stopping is.
+Every one of those is a refusal that names what is missing, never a silent
+fallback to some other route.
 
 The share is as narrow as it can be made: a random name, read-only, guest-only,
 bound to the one address that reaches the guest rather than the wildcard, holding
@@ -992,23 +914,23 @@ that reaches the guest, under a random one-transfer module name with
 `rsync -rlptD` the whole module onto `/`.
 
 ```
-$ virutil sync ubuntu -c grsc-linux
-config: /home/me/.config/virutils/grsc-linux.conf
+$ virutil sync ubuntu -c myproject-linux
+config: /home/me/.config/virutils/myproject-linux.conf
   4 fetch, 1 map, 10 exclude, 2 cleanup, 3 run
-  staging: /home/me/.virutils/staging/grsc-linux
+  staging: /home/me/.virutils/staging/myproject-linux
   domain: ubuntu (linux)
   delivery: rsync into the running guest
-fetch: /home/me/work/grsc-linux
+fetch: /home/me/work/myproject
    build/bin -> bin
    build/lib -> lib
    build/plugins -> plugins
    build/qml -> qml
--> /usr/bin/opswatclient (4 item(s))
+-> /usr/bin/myproduct (4 item(s))
 deliver: 1114 file(s), 227.0 MiB -> ubuntu /
-run (pre): systemctl stop opswatclient || true
+run (pre): systemctl stop myproduct || true
 ubuntu: 1114 files offered, 2 copied in 158ms
-   emptied /var/log/opswat (3 entries)
-run (post): systemctl start opswatclient
+   emptied /var/log/myproduct (3 entries)
+run (post): systemctl start myproduct
 copy complete -> ubuntu
 ```
 
@@ -1063,128 +985,7 @@ Two details worth knowing:
   legitimately fail needs its own `|| true`; see the
   [example](#a-linux-guest).
 
-`--disk` does not work on a Linux guest and is refused rather than attempted.
-
-### Writing the disk image instead
-
-`--disk` replaces that whole second half with a write to the guest's own disk
-image, mounted on the host. The fetch is untouched, and the map rules run exactly
-as they do above — the same rsync, the same excludes, the same destinations — only
-into the mount rather than into a delivery tree:
-
-```
-Windows build tree --(fetch)--> staging --(map)--> guest NTFS (mounted on the host)
-```
-
-```sh
-virutil sync --disk win11
-```
-
-What changes:
-
-* **The guest goes down.** If it is running it is asked to shut down, waited for,
-  written to, and started again afterwards — on success and on failure. One that
-  is already off stays off. Paused and `pmsuspended` are refused outright.
-* **Everything mapped is rewritten**, whether it changed or not. There is no
-  comparison against what the guest already holds, because nothing in the guest
-  is running to be asked.
-* **Cleanup runs on the host**, unlinking through the mount rather than through
-  the agent.
-* **Run rules are skipped**, with a note before the fetch: `>pre`/`>post` go
-  through the guest agent, and there is no guest up to answer it.
-* **Fast Startup and a clean NTFS volume start to matter**, since the volume has
-  to be mounted read-write; see [Guest prerequisites](#guest-prerequisites).
-
-Why it is still here: it needs **nothing of the guest**. No agent, no route back
-to this host, no privileged port on the host, and no running guest. That makes it
-the way into a guest whose agent is broken, whose network is isolated, or which is
-simply shut off — and the only way to write one you would rather not start.
-
 ### Notes
-
-Everything here concerns `--disk`, the half of the run that writes the disk
-image. On the default path none of it is reached: nothing is mounted, nothing is
-shut down and the disk image is never opened.
-
-**Windows Fast Startup must be disabled in the guest.** With it on, Windows
-leaves the NTFS volume dirty on shutdown and `ntfs-3g` refuses to mount it
-read-write.
-
-**A running guest is shut down and started again for you.** virutil asks it to
-shut down (`virsh shutdown` — via the guest agent when it answers, ACPI
-otherwise), waits up to `@shutdown_timeout` seconds for it to reach `shut off`,
-does the copy, and starts it again — on success and on failure. A guest that was
-already off stays off. What is refused is paused and `pmsuspended`: that RAM no
-longer matches the disk, so it cannot be brought down and back around a write.
-Shut those down by hand first.
-
-**`@shutdown_timeout` bounds the wait.** Default 180 seconds. A graceful shutdown
-of a healthy Windows guest usually takes seconds, but a modal dialog or "an app
-is preventing shutdown" can hold it open indefinitely. If the timeout is hit,
-nothing is written, the guest is left running, and the run fails naming the fix.
-
-**Nothing is ever forced off.** There is no `virsh destroy` anywhere in this
-path. Cutting power to a live Windows leaves the NTFS volume dirty — the same
-state Fast Startup causes above — so the disk would be unmountable read-write
-on the next run, and an interrupted write can leave the guest unbootable. If
-you decide to force it, do that by hand and expect to boot Windows once to let
-it check the volume.
-
-**Install `qemu-guest-agent` in the guest.** `--disk` itself does not need it —
-the copy is made from the host with the guest shut off — but the default delivery
-does, and even under `--disk` it is what makes the automatic shutdown fast.
-`virutil exec` requires it outright, and it is what
-lets you shut the guest down with
-`virsh --connect qemu:///system shutdown VM --mode agent`, which calls Windows'
-own shutdown with applications forced closed rather than an ACPI power-button
-event Windows is free to deliberate over. Either way it is a real shutdown, so
-Windows closes the NTFS volume and the disk is left clean. Without it, the
-automatic shutdown falls back to ACPI, which can run the wait to the full
-`@shutdown_timeout`. See [Guest prerequisites](#guest-prerequisites), then
-confirm the host can see it:
-
-```
-virutil exec ping DOMAIN      # confirms qemu-ga is answering
-```
-
-The agent channel is part of every domain `virutil domain create` makes, so
-nothing is needed on the host side.
-
-**Case matters in map destinations.** The guest's NTFS is case-insensitive, but
-the `ntfs-3g` mount is not. `@dest` and map destinations are used verbatim, so
-their case must match what the guest already has, or you will silently create a
-second directory differing only in case. Cleanup paths are the exception — they
-are matched case-insensitively.
-
-**A domain with a managed-save image is refused.** Resuming from saved RAM would
-restore NTFS metadata that no longer matches the disk just written. Clear it
-first:
-
-```
-virsh managedsave-remove DOMAIN
-```
-
-**Paused and suspended domains are refused** for the same reason — as is a
-running one. Shut the domain down yourself first.
-
-**Teardown is verified before you are told the disk is free.** After unmounting
-and detaching, `virutil sync` re-reads `/proc/mounts` and
-`/sys/block/<nbd>/{pid,size}` to confirm — observed state rather than exit codes,
-and both readable without privilege, so the check cannot fail merely because
-`sudo` could not authenticate. If teardown cannot be verified, the run exits
-non-zero telling you **not to start the domain yet**, and prints the recovery
-commands. Starting it with the image still attached to NBD would put two
-writers on one qcow2.
-
-**A stale attachment aborts the run before anything is touched.** If the NBD
-device is already attached, or the mount point already mounted, `virutil sync` exits
-rather than risk detaching or unmounting something that is not its own.
-
-**There is no `sudo` keep-alive.** The copy phases run unprivileged, so nothing
-refreshes the `sudo` timestamp while they run. On a copy longer than
-`timestamp_timeout` (15 minutes by default) you are asked for your password
-again at teardown. If nobody answers, teardown fails and the recovery commands
-are printed, per the rule above.
 
 **The staging directory is always under `~/.virutils/staging/`.** Whatever
 `@staging` says is treated as a name relative to that root, including an
@@ -1202,17 +1003,16 @@ location.
 ## virutil pull
 
 `pull` is `push` reversed, transport included: copy one file or directory out of
-a guest's system drive onto the host. By default the guest copies it out itself
-over its own network and keeps running; `--disk` reads the disk image instead —
-see [How files move](#how-files-move).
+a guest's system drive onto the host. The guest copies it out itself over its
+own network and keeps running — see [How files move](#how-files-move).
 
 Works on a Windows or a Linux guest, and
 [detects which](#which-guest-is-on-the-other-side). Two things differ on Linux,
 both because the guest's own shell does the expanding:
 
 * **`SRC` matches case-sensitively.** On Windows, `pull` leans on Windows
-  matching case-insensitively itself (which the `--disk` path has to reproduce by
-  hand with `ci_glob`). A Linux guest has no case-insensitive matching to borrow,
+  matching case-insensitively itself. A Linux guest has no case-insensitive
+  matching to borrow,
   and inventing one would be a worse surprise than the plain shell behaviour.
   `virutil pull ubuntu 'BUILD/logs' ./out` finds nothing if the directory is
   `build`.
@@ -1221,13 +1021,10 @@ both because the guest's own shell does the expanding:
   glob still expands one field per match — so a path with a space or a `;` in it
   is a path.
 
-`--disk` is Windows-only and is refused up front on a Linux guest, before the
-domain is shut down.
-
 ### Synopsis
 
 ```
-virutil pull [--disk] VM SRC DST
+virutil pull VM SRC DST
 virutil pull -h
 ```
 
@@ -1235,17 +1032,15 @@ virutil pull -h
 
 | Argument | Meaning |
 | --- | --- |
-| `VM` | libvirt domain to read from. Must be **running**, unless `--disk`. |
+| `VM` | libvirt domain to read from. Must be **running**. |
 | `SRC` | Guest path, relative to the root of `C:`. Wildcards allowed. |
 | `DST` | Host directory to copy into. Created if it does not exist. |
-| `--disk` | Read the disk image instead of copying over the network. A running guest is shut down for it and started again afterwards. |
 
 `SRC` may be spelled with backslashes and an optional `C:`/`C:\` prefix, and is
 normalised to a `C:`-relative path; one containing `..` is refused. It is
 matched **case-insensitively** — the guest's NTFS is, and the path is what
-Windows would see — so `program files/…` and `Program Files/…` both work. Over
-the network Windows does that matching itself; with `--disk` the host rewrites
-the glob to do it, since an `ntfs-3g` mount is case-sensitive where NTFS is not.
+Windows would see — so `program files/…` and `Program Files/…` both work:
+Windows does that matching itself.
 
 Each match is classified as a file or a directory: a directory is pulled
 **recursively** into a subdirectory of `DST` named after it, a file is copied
@@ -1257,7 +1052,6 @@ nothing is an error, not a warning.
 virutil pull win11 'ProgramData/Example/logs/*.log' ~/logs
 virutil pull win11 '"Program Files (x86)/Example/Product"' ~/out
 virutil pull win11 'Users/me/Desktop/note.txt' ~/
-virutil pull --disk win11 'Users/me/Desktop/note.txt' ~/
 ```
 
 Quote the source in the shell: the wildcards are for the guest to match, not
@@ -1265,7 +1059,7 @@ the host.
 
 ### How the read is taken
 
-The default transport is `push`'s, pointed the other way. The host stands up one
+The transport is `push`'s, pointed the other way. The host stands up one
 throwaway SMB share on the address the guest reaches it at — random 24-character
 share name, bound to that single address, anonymous, and **writable** — and the
 guest's own `robocopy` copies into it:
@@ -1281,33 +1075,22 @@ where one file changed moves one file. Writable is the only difference from the
 push direction, and it is why the bind address matters as much as it does: the
 share is offered to the one address that reaches the guest, never the wildcard.
 
-With `--disk` the guest is shut down instead, its disk image attached with
-`qemu-nbd -r`, mounted `ro` with `ntfs-3g`, rsynced out, and the guest started
-again — on success and on failure. Read-only end to end, so the image comes back
-byte-for-byte as it was found.
-
 ### Notes
 
-**The guest must be running, unless `--disk`.** The default copy is driven from
-inside the guest, so there has to be a guest to drive. `--disk` takes a running
-or a shut-off one; paused and `pmsuspended` are refused either way.
+**The guest must be running.** The copy is driven from inside the guest, so
+there has to be a guest to drive.
 
 **The destination must be writable by you.** `smbd` serves the share under the
 invoking user, and the guest writes into it as that user, so `DST` and the files
 that land in it are yours. This is checked before the server starts.
 
 **Nothing about the disk image is rearranged.** No snapshot, no overlay, no
-`blockcommit`, in either transport. `pull` used to take a disk-only snapshot and
+`blockcommit`. `pull` used to take a disk-only snapshot and
 commit it back at the end, and that commit — which merges the whole backing
 chain unless told otherwise — flattened post-snapshot writes into the image that
 the domain's `virutil snapshot` records were defined against, leaving a later
 `snapshot revert` restoring old RAM onto a newer disk. That is a bluescreen, and
 the fix was to stop a transfer touching the images underneath a snapshot at all.
-
-**A single disk is assumed with `--disk`.** The first `disk`-type device in
-`virsh domblklist` is the one mounted — the same single-disk assumption `sync`
-documents. The network transport has no such limit: it copies out of `C:` as
-Windows presents it.
 
 ## virutil push
 
@@ -1316,12 +1099,10 @@ host into a guest's system drive with no config file. It exists for the cases
 that do not deserve a config: a config file you edited by hand, a build artifact
 you want in the guest right now, a one-off test file.
 
-By default the payload is delivered into the **running** guest over its own
-network, which fetches it itself — `robocopy` on Windows, `rsync` on Linux — so
-nothing is mounted, nothing is shut down, and a re-push of a directory moves only
-the files that differ from what the guest already has. `--disk` writes the
-guest's disk image instead, shutting a running guest down around the copy and
-starting it again afterwards, exactly as `sync --disk` does. See
+The payload is delivered into the **running** guest over its own network, which
+fetches it itself — `robocopy` on Windows, `rsync` on Linux — so nothing is
+mounted, nothing is shut down, and a re-push of a directory moves only the files
+that differ from what the guest already has. See
 [How files move](#how-files-move).
 
 Works on a Windows or a Linux guest, and
@@ -1332,13 +1113,10 @@ cannot rename onto a new name, so a Windows file push falls back to `Copy-Item`
 and re-sends the whole file every time; `rsync` renames and skips-what-matches in
 the same call.
 
-`--disk` is Windows-only and is refused up front on a Linux guest, before the
-domain is shut down.
-
 ### Synopsis
 
 ```
-virutil push [--disk] VM SRC DST
+virutil push VM SRC DST
 virutil push -h
 ```
 
@@ -1346,14 +1124,13 @@ virutil push -h
 
 | Argument | Meaning |
 | --- | --- |
-| `VM` | libvirt domain to copy into. Has to be **running**, unless `--disk` is passed. |
+| `VM` | libvirt domain to copy into. Has to be **running**. |
 | `SRC` | Host file or directory to copy. Must exist and be readable. |
 | `DST` | Guest path, relative to the root of `C:`. |
-| `--disk` | Write the guest's disk image instead of delivering over its network. Mounts the image on the host, so a running guest is shut down for the copy and started again afterwards. Needs nothing of the guest — no agent, no route back here, no privileged port — and works on a guest that is shut off. |
 
 `DST` may be spelled with backslashes and an optional `C:`/`C:\` prefix; it is
 normalised to a `C:`-relative path. A destination containing `..` is refused,
-so a mistyped path can never resolve to a write outside the mount point.
+so a mistyped path can never resolve to a write outside the guest's root.
 
 ### File or directory?
 
@@ -1378,7 +1155,7 @@ ending in `/` or `\` always means a directory, even one that does not exist yet.
 
 ### Delivering the payload
 
-The default push copies into a guest that stays running. Nothing is mounted on
+A push copies into a guest that stays running. Nothing is mounted on
 the host, nothing is written to the disk image, and no device appears in the
 guest — the bytes cross the guest's own NIC:
 
@@ -1429,13 +1206,12 @@ What it needs, and what it does when it cannot have it:
 | Guest running | Refused, naming the state and pointing at `domain start`. |
 | QEMU guest agent answering | Refused; there is nothing to drive the fetch. |
 | A route from the guest back to this host | Refused; a guest on an isolated network cannot be delivered to. |
-| `smbd` (Samba) on the host | Refused, pointing at `--disk`. |
+| `smbd` (Samba) on the host | Refused, naming the package to install. |
 | Root on the host to bind TCP 445 | Prompted for once, up front, before `smbd` is backgrounded — where the prompt still has a terminal. Without a terminal the run stops rather than hanging. |
 | Nothing else already on TCP 445 | Refused. SMB cannot be served to a Windows client on any other port; under WSL the listener is usually the Windows host's own file sharing. |
 
-Each of those is a refusal naming `--disk`, never an automatic fallback:
-downgrading would shut the running guest down, which is a larger thing to do
-unasked than stopping is.
+Each of those is a refusal that names what is missing, never a silent fallback
+to some other route.
 
 A failure is named rather than guessed at. The guest exits with a code the host
 can read — `robocopy`'s own where the copy failed, virutil's where the destination
@@ -1453,29 +1229,22 @@ redirector read, so the guest mounts nothing and keeps no share of its own; `net
 use` in the guest stays empty.
 
 `sync` delivers the same way, for the same reason; see
-[How the delivery works](#how-the-delivery-works). `pull` does not — there is no
-live read, and never has been.
+[How the delivery works](#how-the-delivery-works). `pull` is the same share
+pointed the other way — see [virutil pull](#virutil-pull).
 
-Two transports that earlier versions carried are gone, and
-[What used to be here](#what-used-to-be-here) records both: virtio-fs, with its
-share device and `-t`/`@transport` knob, and the HTTP payload `--live` served with
-`python3` for the guest to fetch with `curl.exe`. `--live` and `--smb` both stop
-with a message naming what replaced them rather than being quietly accepted, and
-`tar.exe` is no longer needed in the guest.
+Three transports that earlier versions carried are gone, and
+[What used to be here](#what-used-to-be-here) records all of them: virtio-fs,
+with its share device and `-t`/`@transport` knob; the HTTP payload `--live`
+served with `python3` for the guest to fetch with `curl.exe`; and the disk
+image `--disk` mounted on the host with `qemu-nbd` and `ntfs-3g`. `--live`,
+`--smb` and `--disk` all stop with a message naming what replaced them rather
+than being quietly accepted, and `tar.exe` is no longer needed in the guest.
 
 ### Notes
 
 `push` must be run as yourself, not under `sudo`, exactly as `sync` must.
 
-Under `--disk` it also shares every safety rule `sync` documents for that path,
-wholesale: a running guest is shut down and started again around the copy, while
-a paused or suspended one is refused rather than shut down; a domain with a
-managed-save image is refused; teardown is verified from observed state before
-you are told the disk is free; Fast Startup must be off. That machinery lives in
-the shared `modules/guest`, and on the default path none of it is reached —
-nothing is mounted, nothing is shut down and the disk image is never opened.
-
-There are no excludes either way — `push` copies exactly what you name, which is
+There are no excludes — `push` copies exactly what you name, which is
 the point of having it at all.
 
 ## virutil domain
@@ -1619,7 +1388,7 @@ under `~/.virutils/`, each found by the same name the module that wrote it uses:
 | Artifact | Path |
 | --- | --- |
 | Snapshot overlays and memory files | `images/VM.SNAP.*.qcow2`, `images/VM.SNAP.mem` |
-| Host mount points | `mnt/VM`, and `mnt/VM-usb` and `mnt/VM-xfer` if an older virutil left them |
+| Host mount points | `mnt/VM`, `mnt/VM-usb` and `mnt/VM-xfer`, if an older virutil left them |
 | Leftovers of removed commands | `images/VM-usb.qcow2`, `images/VM-xfer.qcow2`, `share/virutil-VM/` |
 | Open port forwards | the `socat` relay, plus `ports/tcp-PORT` and its `.log` |
 
@@ -1845,8 +1614,7 @@ Host:
    [Description](#description). A terminal to answer it on, too: see
    [Delivering](#delivering)
 
-Host, to deliver into a running **Windows** guest — what `sync` and `push` do by
-default:
+Host, to deliver into a running **Windows** guest — what `sync` and `push` do:
 
 - `smbd` (Samba), and root to bind TCP 445
 - `ss` (`iproute2`), to tell whether 445 is free and whether `smbd` has taken it
@@ -1857,13 +1625,6 @@ Host, to deliver into or read from a running **Linux** guest (`sync` with
 - `rsync` — already required above; it serves the payload as well as staging it
 - `ss` (`iproute2`), to find a free port and tell whether the daemon has bound it
 - **no root, and no privileged port**
-
-Host, for `--disk` and for `virutil pull` — the transports that mount the image:
-
-- `qemu-nbd` and the `nbd` kernel module, loaded with `max_part` ≥ 1 —
-   `virutil sync` reloads it if necessary
-- `ntfs-3g`
-- `util-linux` (`partx`, `blkid`, `blockdev`, `lsblk`, `mount`)
 
 Host, for `virutil domain`:
 
@@ -1881,24 +1642,19 @@ Host, for `virutil domain`:
 Guest — see [Guest prerequisites](#guest-prerequisites) for where each of
 these comes from and how to install it:
 
-- The QEMU guest agent — **required** by `sync` and `push`, which drive the
-   fetch through it, and by `virutil exec` and `virutil domain time`. On a Linux
-   guest that is the `qemu-guest-agent` package. It is also
-   what shuts the guest down with `--mode agent` instead of waiting on ACPI.
-   `--disk` and `virutil pull` are the exception and need none of it
+- The QEMU guest agent — **required** by `sync`, `push` and `pull`, which drive
+   the copy through it, and by `virutil exec` and `virutil domain time`. On a
+   Linux guest that is the `qemu-guest-agent` package. It is also
+   what shuts the guest down with `--mode agent` instead of waiting on ACPI
 - The SPICE guest tools, for the `spice` display and `spicevmc` channel every
    `virutil domain create` guest has — without the vdagent there is no
    clipboard sharing and the display does not auto-resize
 - `rsync`, on a Linux guest — it is the guest-side copier for `sync`, `push`
    and `pull`
-- For `--disk` and `virutil pull`: Windows with Fast Startup disabled, and a
-   single disk whose system volume is the largest NTFS partition on it. The
-   default delivery never mounts the volume and is indifferent to both.
-   `--disk` and `pull` do not work on a Linux guest at all
 
 The `org.qemu.guest_agent.0` channel itself is part of every domain
 `virutil domain create` makes; nothing has to be added on the host side.
 
 ## See also
 
-`virsh(1)`, `qemu-nbd(8)`, `ntfs-3g(8)`, `rsync(1)`, `rsyncd.conf(5)`, `smbd(8)`, `usbipd(1)`
+`virsh(1)`, `rsync(1)`, `rsyncd.conf(5)`, `smbd(8)`, `usbipd(1)`

@@ -1,37 +1,28 @@
 # pull -- copy a file or directory out of a guest's C: drive to the host.
 #
-# push's two transports, taken in the other direction. Both live in modules/xfer,
-# and --disk chooses between them exactly as it does for push:
-#
-#   default  over the guest's own NIC, driven by the guest agent. The host
-#            exports the destination directory *writable* and the guest copies
-#            into it, so a re-pull of a build that changed one file moves one
-#            file. The guest keeps running, sees no new device, and its disk
-#            image is not touched at all -- no snapshot, no overlay, no commit.
-#            Needs an agent and a route back to this host; a Windows guest also
-#            needs smbd and root here to bind port 445, a Linux one neither.
-#   --disk   the guest's disk image, mounted read-only on the host. A running
-#            guest is shut down around the copy and started again afterwards,
-#            which is the whole cost of it -- but it needs nothing of the
-#            guest. Windows guests only: it mounts NTFS.
+# push's transport, taken in the other direction, and it lives in modules/xfer:
+# over the guest's own NIC, driven by the guest agent. The host exports the
+# destination directory *writable* and the guest copies into it, so a re-pull of
+# a build that changed one file moves one file. The guest keeps running, sees no
+# new device, and its disk image is not touched at all -- no snapshot, no
+# overlay, no commit. Needs an agent and a route back to this host; a Windows
+# guest also needs smbd and root here to bind port 445, a Linux one neither.
 #
 # The read used to run off a live disk-only snapshot that was blockcommitted
 # back afterwards. It does not any more: that rearranged the backing chain on
 # every pull, and the commit -- which merges the whole chain unless told
 # otherwise -- flattened away the disk state that the domain's own snapshots
 # were defined against. A transfer has no business rewriting the images
-# underneath a snapshot, so neither transport here goes near them.
+# underneath a snapshot, so this one does not go near them.
 
 SUDO=()
 
 pull_usage() {
     printf '%s\n' \
-        "usage: virutil pull [--disk] VM SRC DST" \
+        "usage: virutil pull VM SRC DST" \
         "" \
         "  VM   libvirt domain to read from; it has to be running, since the" \
-        "       copy is driven from inside it. With --disk its disk image is" \
-        "       read instead, so a running one is shut down first and started" \
-        "       again afterwards" \
+        "       copy is driven from inside it" \
         "  SRC  guest path, relative to the guest's root -- C:\\ on Windows," \
         "       / on Linux. Wildcards are allowed; they match" \
         "       case-INsensitively on Windows and case-sensitively on Linux," \
@@ -40,19 +31,11 @@ pull_usage() {
         "       either way." \
         "  DST  host directory to copy into (created if needed)" \
         "" \
-        "      --disk              read the guest's disk image instead of" \
-        "                          copying over the guest's own network." \
-        "                          Mounts the image read-only on the host, so a" \
-        "                          running guest is shut down for the copy and" \
-        "                          started again afterwards -- but it needs" \
-        "                          nothing of the guest: no agent, no route" \
-        "                          back here and no privileged port." \
-        "                          Windows guests only." \
         "  -h, --help              this message" \
         "" \
-        "A directory source is copied recursively. By default the guest copies" \
-        "it out itself -- robocopy on Windows, rsync on Linux -- and so moves" \
-        "only what changed. The guest's OS is detected; see README.md." >&2
+        "A directory source is copied recursively. The guest copies it out" \
+        "itself -- robocopy on Windows, rsync on Linux -- and so moves only" \
+        "what changed. The guest's OS is detected; see README.md." >&2
     exit "${1:-1}"
 }
 
@@ -68,7 +51,7 @@ pull_norm_src() {
 }
 
 pull_main() {
-    local VM="" SRC="" DST="" DISK=0
+    local VM="" SRC="" DST=""
 
     [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] \
         && die "do not run virutil pull under sudo -- run it as yourself." \
@@ -78,7 +61,13 @@ pull_main() {
     while (( $# )); do
         case "$1" in
             -h|--help)      pull_usage 0 ;;
-            --disk)         DISK=1; shift ;;
+            # Rejected rather than ignored: --disk named a transport that has
+            # been removed, and silently accepting it would read by a route
+            # the caller did not ask for.
+            --disk)         die "--disk is gone: reading the guest's disk" \
+                                "image has been removed. pull copies out of" \
+                                "the running guest over its own network;" \
+                                "drop the flag and start the guest." ;;
             -*)             warn "unrecognised argument: $1"; pull_usage ;;
             *)
                 if   [[ -z "$VM"  ]]; then VM="$1"
@@ -104,56 +93,9 @@ pull_main() {
 
     mkdir -p "$DST" || die "could not create destination: $DST"
 
-    if (( DISK )); then
-        [[ "$GUEST_OS" == linux ]] \
-            && die "--disk cannot read a Linux guest's disk image: it mounts" \
-                   "the largest NTFS partition on it, which $DOMAIN does not" \
-                   "have. Nothing was read and $DOMAIN was not shut down." \
-                   "Drop --disk; the default path reads out of a running Linux" \
-                   "guest and needs no root at all."
-        command -v rsync >/dev/null || die "rsync not installed"
-        xfer_check read
-        # Read-only for the whole attach: the image is opened -r on the nbd
-        # device and mounted ro, so a pull cannot alter the guest's disk even
-        # if the copy goes wrong. guest_open arms the EXIT trap that unmounts,
-        # detaches, and starts the guest again.
-        GUEST_RO=1
-        guest_open
-        pull_copy "$SRC" "$DST"
-        echo "copy complete -> $DST"
-    else
-        xfer_check net
-        # Reports for itself: it knows what came back and how long it took.
-        pull_net "$SRC" "$DST"
-    fi
-}
-
-# pull_copy SRC DST -- expand SRC under MNT and rsync what it matched into DST.
-# The glob is rewritten case-insensitively: NTFS is, an ntfs-3g mount is not,
-# and nocaseglob alone would not do -- see ci_glob in modules/guest.
-pull_copy() {
-    local SRC="$1" DST="$2" m
-    local -a matches files dirs
-
-    shopt -s nullglob
-    local IFS=$'\n'
-    matches=("$MNT/"$(ci_glob "$SRC"))
-    unset IFS
-    shopt -u nullglob
-
-    (( ${#matches[@]} )) || die "no match in $DOMAIN for C:\\${SRC//\//\\}"
-
-    files=(); dirs=()
-    for m in "${matches[@]}"; do
-        if   [[ -d "$m" ]]; then dirs+=("$m")
-        elif [[ -f "$m" ]]; then files+=("$m")
-        else warn "   skipped (neither file nor dir): ${m#"$MNT/"}"
-        fi
-    done
-    (( ${#files[@]} + ${#dirs[@]} )) || die "nothing to copy"
-
-    echo "pull: C:\\${SRC//\//\\} -> $DST (${#files[@]} file(s), ${#dirs[@]} dir(s))"
-    "${RSYNC[@]}" ${dirs[@]+"${dirs[@]}"} ${files[@]+"${files[@]}"} "$DST/"
+    xfer_check net
+    # Reports for itself: it knows what came back and how long it took.
+    pull_net "$SRC" "$DST"
 }
 
 # --- copying out of the running guest, over SMB ------------------------------
@@ -211,8 +153,7 @@ pull_net() {
     [[ -n "$host" ]] \
         || die "no route from this host to $DOMAIN at $ip, so the guest has" \
                "no address to copy to. A guest on an isolated network cannot" \
-               "reach this host over its own network; pass --disk to read the" \
-               "disk image instead."
+               "reach this host over its own network."
 
     # Absolute, for the same reason push_net resolves its source: smb.conf's
     # `path` is resolved by smbd against smbd's working directory, which is
@@ -239,8 +180,7 @@ pull_net() {
 }
 
 # pull_smb_fetch SRC -- the guest side, one powershell run. Get-Item resolves
-# SRC, wildcards and all: Windows matches them case-insensitively itself, which
-# is what the --disk path has to spell out by hand with ci_glob.
+# SRC, wildcards and all: Windows matches them case-insensitively itself.
 #
 # Files and directories are copied by two different robocopy shapes, because
 # robocopy always takes a source *directory*: a file is named as a filter
@@ -316,8 +256,7 @@ pull_smb_die() {
         *)
             die "the guest failed to copy the files out (exit $rc); its own" \
                 "error is above. If it could not reach $host, check the" \
-                "guest's outbound firewall, or pass --disk to read the disk" \
-                "image instead." ;;
+                "guest's outbound firewall." ;;
     esac
 }
 
@@ -341,8 +280,8 @@ pull_smb_die() {
 #
 # Note the case sensitivity: this glob is the guest's shell, so it matches
 # case-sensitively, where the Windows side leans on Windows matching
-# case-insensitively itself (and the --disk path spells that out with ci_glob).
-# A Linux guest has no case-insensitive matching to borrow, and inventing one
+# case-insensitively itself. A Linux guest has no case-insensitive matching to
+# borrow, and inventing one
 # would be a worse surprise than the plain shell behaviour.
 #
 # Only pathname expansion happens: a glob only ever yields paths that exist, so

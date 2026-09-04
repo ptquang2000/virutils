@@ -60,7 +60,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # "module|command command ..." -- one line per group in `virutil help`.
 REQUIRED=(
     "core            |virsh awk"
-    "sync pull push  |qemu-nbd rsync sudo partx blkid blockdev lsblk mount smbd ss"
+    "sync pull push  |rsync sudo smbd ss"
     "domain          |virt-install virt-xml qemu-img"
     "exec            |jq python3"
     "usb             |jq usbipd.exe powershell.exe"
@@ -70,7 +70,6 @@ OPTIONAL=(
     "domain: detecting --osinfo from an install ISO|osinfo-detect"
     "domain: fixing ISO permissions under a 0700 home|setfacl"
     "domain port: the relay that carries a guest port to the host|socat"
-    "sync pull push: NTFS volumes on the guest disk|mount.ntfs-3g"
 )
 
 check_deps() {
@@ -98,11 +97,6 @@ check_deps() {
         done
     done
 
-    # The nbd module backs every qemu-nbd mount.
-    if [[ ! -e /sys/module/nbd ]] && ! modinfo nbd >/dev/null 2>&1; then
-        warn "the nbd kernel module is unavailable -- sync, pull and push need it"
-        missing_any=1
-    fi
     [[ -e /dev/kvm ]] || warn "no /dev/kvm -- virutil domain cannot start a guest (nested virtualisation, under WSL2)"
     if have id && ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx libvirt; then
         warn "$USER is not in the libvirt group -- qemu:///system will prompt or fail"

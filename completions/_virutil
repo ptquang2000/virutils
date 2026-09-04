@@ -104,7 +104,6 @@ _virutil_sync() {
   local state line
   _arguments \
     '(-c --config)'{-c,--config}'[config NAME or PATH]:config:->config' \
-    '--disk[write the disk image instead, with the guest shut down]' \
     '(-h --help)'{-h,--help}'[print usage and exit]' \
     '2:domain:->domain'   # 1 is the module word itself; _arguments skips words[1]
   case $state in
@@ -126,21 +125,14 @@ _virutil_sync() {
   esac
 }
 
-# pull and push take the same shape -- [--disk] VM SRC DST -- and the same flag.
-# Only the side each path lives on differs, so only the operands complete
-# differently. --disk may sit anywhere before them, so the positions are counted
-# past the flag rather than fixed.
+# pull and push take the same shape -- VM SRC DST. Only the side each path lives
+# on differs, so only the operands complete differently.
 _virutil_pull() {
-  local -i shift_by=0 i
-  for (( i = 2; i < CURRENT; i++ )); do
-    [[ ${words[i]} == --disk ]] && shift_by=1
-  done
   if [[ $words[CURRENT] == -* ]]; then
-    _values 'option' '--disk[read the disk image instead, with the guest shut down]' \
-                     '--help[usage]'
+    _values 'option' '--help[usage]'
     return
   fi
-  case $(( CURRENT - shift_by )) in
+  case $CURRENT in
     3) _virutil_domains ;;
     4) ;;                             # the guest-side source: nothing to complete
     5) _files -/ ;;
@@ -163,19 +155,12 @@ _virutil_vcpus() {
   _values -w 'vcpus' $n
 }
 
-# --disk may sit anywhere before the operands, so the positions are counted past
-# the flag rather than fixed: with it typed, VM is one word further along.
 _virutil_push() {
-  local -i shift_by=0 i
-  for (( i = 2; i < CURRENT; i++ )); do
-    [[ ${words[i]} == --disk ]] && shift_by=1
-  done
   if [[ $words[CURRENT] == -* ]]; then
-    _values 'option' '--disk[write the disk image instead, with the guest shut down]' \
-                     '--help[usage]'
+    _values 'option' '--help[usage]'
     return
   fi
-  case $(( CURRENT - shift_by )) in
+  case $CURRENT in
     3) _virutil_domains ;;
     4) _files ;;
     5) ;;                             # the guest-side destination: nothing to complete
