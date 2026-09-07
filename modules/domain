@@ -19,13 +19,7 @@ domain_usage() {
         "       virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]" \
         "       virutil domain shutdown VM" \
         "       virutil domain addr     VM" \
-        "       virutil domain time     VM" \
         "       virutil domain port     VM [SPEC] [-c PORT]" \
-        "" \
-        "time sets the guest's clock from the host's, through the guest agent." \
-        "It happens on its own after 'snapshot revert' and before every transfer;" \
-        "this is for the times you want it in between. VIRUTIL_TIME_SYNC=0 turns" \
-        "the automatic ones off." \
         "" \
         "port options (SPEC is PORT, or HOSTPORT:GUESTPORT when the two differ;" \
         "with no SPEC it lists the open forwards for VM):" \
@@ -86,7 +80,6 @@ domain_main() {
         list)     "${VIRSH[@]}" list --all ;;
         shutdown) domain_need_vm shutdown "$@"; "${VIRSH[@]}" shutdown  "$1" ;;
         addr)     domain_need_vm addr     "$@"; "${VIRSH[@]}" domifaddr "$1" --full ;;
-        time)     domain_time   "$@" ;;
         port)     domain_port   "$@" ;;
         *)        die "virutil domain: unknown command: $CMD (see: virutil domain -h)" ;;
     esac
@@ -401,40 +394,6 @@ domain_create() {
             "makes the virtio disk visible." \
             "See the guest prerequisites in README.md for what to install after."
     fi
-}
-
-# domain_time VM -- report both clocks and put the guest's on the host's. The
-# sync itself is guest_time_sync in modules/guest, which every automatic caller
-# uses too; this only adds the before/after a person asking by hand wants to see.
-domain_time() {
-    local VM="${1:-}"
-    case "$VM" in
-        "")           domain_usage 1 ;;
-        -h|--help)    domain_usage 0 ;;
-        -*)           die "virutil domain time: unknown option: $VM" ;;
-    esac
-    (( $# <= 1 )) || die "virutil domain time: unexpected argument: $2"
-
-    domain_exists "$VM" || die "no such domain: $VM (see: virutil domain list)"
-    [[ "$("${VIRSH[@]}" domstate "$VM" 2>/dev/null)" == running ]] \
-        || die "$VM is not running; its clock is set from the host's RTC when" \
-               "it boots, so there is nothing to sync while it is off."
-
-    local before
-    before="$(guest_time "$VM")"
-    [[ "$before" =~ ^[0-9]+$ ]] \
-        && say "guest:  $(date -d "@$before" '+%F %T %z')" \
-               "host:   $(date '+%F %T %z')"
-
-    # VIRUTIL_TIME_SYNC turns off the syncs virutil does on its own. Asking for
-    # one by name is not one of those, so it does not gate this.
-    local VIRUTIL_TIME_SYNC=1
-    guest_time_sync "$VM"
-
-    local after
-    after="$(guest_time "$VM")"
-    [[ "$after" =~ ^[0-9]+$ ]] && say "guest:  $(date -d "@$after" '+%F %T %z') (now)"
-    return 0
 }
 
 domain_console() {

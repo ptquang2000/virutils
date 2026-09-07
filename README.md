@@ -49,7 +49,6 @@ step and no dependencies beyond the utilities it calls.
    - [delete](#delete)
    - [start](#start)
    - [list, shutdown, addr](#list-shutdown-addr)
-   - [time](#time)
    - [port](#port)
 - [virutil usb](#virutil-usb)
 - [Requirements](#requirements)
@@ -162,7 +161,7 @@ host-side machinery in `modules/xfer` and `modules/guest`, which is
 
 | Module | Purpose | Usage |
 | --- | --- | --- |
-| `domain` | The domain lifecycle: create one from an install ISO with a KVM-tuned profile, delete one along with its disks, and the everyday operations in between. | `virutil domain {create\|delete\|list\|start\|shutdown\|addr\|time\|port} [VM] [ISO] [OPTIONS]` |
+| `domain` | The domain lifecycle: create one from an install ISO with a KVM-tuned profile, delete one along with its disks, and the everyday operations in between. | `virutil domain {create\|delete\|list\|start\|shutdown\|addr\|port} [VM] [ISO] [OPTIONS]` |
 | `snapshot` | External snapshots (disk and memory) for libvirt domains. | `virutil snapshot {create\|list\|revert\|delete} VM [SNAP]` |
 
 ### transfer
@@ -425,14 +424,13 @@ once:
 
 The **QEMU guest agent is required to move files into a guest**: `sync` and
 `push` drive the fetch through it, so a guest without `qemu-ga` answering cannot
-be delivered to. It is also what `virutil exec`, `virutil domain time`,
-`virutil domain port` on a statically addressed guest, and
-`virsh shutdown --mode agent` need.
+be delivered to. It is also what `virutil exec`, `virutil domain port` on a
+statically addressed guest, and `virsh shutdown --mode agent` need.
 
 | What | Where it comes from | Needed by |
 | --- | --- | --- |
 | **virtio drivers** (`viostor`, `NetKVM`) | `virtio-win` ISO, or `virtio-win-guest-tools.exe` on it | booting at all — the installer cannot see a virtio disk without `viostor` |
-| **QEMU guest agent** (`qemu-ga`) | `virtio-win-guest-tools.exe`, or `guest-agent\qemu-ga-x86_64.msi` on the ISO | `sync`, `push` and `pull`, `virutil exec`, `virutil domain time`, and `virsh shutdown --mode agent` |
+| **QEMU guest agent** (`qemu-ga`) | `virtio-win-guest-tools.exe`, or `guest-agent\qemu-ga-x86_64.msi` on the ISO | `sync`, `push` and `pull`, `virutil exec`, and `virsh shutdown --mode agent` |
 | **SPICE guest agent** (`spice-vdagent`) | [spice-guest-tools](https://www.spice-space.org/download/windows/spice-guest-tools/spice-guest-tools-latest.exe) | the `spice` display and `spicevmc` channel of every `virutil domain create` domain — clipboard sharing and display auto-resize |
 
 ### A Linux guest
@@ -441,7 +439,7 @@ Two things, and both are usually a package away:
 
 | What | Where it comes from | Needed by |
 | --- | --- | --- |
-| **QEMU guest agent** (`qemu-ga`) | `apt install qemu-guest-agent`, `dnf install qemu-guest-agent` | `virutil sync`, `virutil exec sh`, `virutil domain time` |
+| **QEMU guest agent** (`qemu-ga`) | `apt install qemu-guest-agent`, `dnf install qemu-guest-agent` | `virutil sync`, `virutil exec sh` |
 | **rsync** | `apt install rsync`, `dnf install rsync` | `virutil sync`, `push` and `pull` — it is the guest-side copier for all three |
 
 No drivers to install: virtio storage and net are in every distribution kernel,
@@ -1260,7 +1258,6 @@ virutil domain list
 virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]
 virutil domain shutdown VM
 virutil domain addr     VM
-virutil domain time     VM
 ```
 
 ### create
@@ -1323,7 +1320,7 @@ What the profile actually sets, and why:
    rather than dropping them.
 - **The qemu-guest-agent channel** (`org.qemu.guest_agent.0`). `virt-manager`
    does not add it and nothing inside the guest can, yet it is what
-   `virutil exec` talks to, what sets the guest clock, and what makes
+   `virutil exec` talks to, and what makes
    `virsh shutdown --mode agent` Windows' own shutdown with apps forced closed
    rather than an ACPI event the guest may sit on. It needs a cold plug, so it
    cannot be added to a running domain later. It costs one virtio-serial port,
@@ -1360,8 +1357,6 @@ profile once, or prefix a single `create` with them.
 | `VIRUTIL_VIRTIO` | `virtio-win*.iso` beside the install ISO | Default for `-v`: driver ISO to attach as a second cdrom, or `none`. |
 | `VIRUTIL_NETWORK` | `network=default,model=virtio` | Passed to `virt-install --network`. |
 | `VIRUTIL_FIRMWARE` | `uefi` | `bios` selects SeaBIOS instead. Windows 11 will not install without UEFI. |
-| `VIRUTIL_TIME_SYNC` | `1` | `0` stops virutil syncing the guest clock on its own after a snapshot revert. See [time](#time). |
-| `VIRUTIL_TIME_SYNC_WAIT` | `60` | Seconds to wait for the guest agent after a snapshot revert before giving up on the clock. |
 
 ```
 VIRUTIL_FIRMWARE=bios VIRUTIL_VIRTIO=none \
@@ -1492,53 +1487,6 @@ guest-agent path that `sync` and `push` use, see `modules/guest`.
 Note that `addr` is `virsh domifaddr`; the shorter name is deliberate, since the
 `dom` prefix is redundant under a module already called `domain`.
 
-### time
-
-```
-virutil domain time VM
-```
-
-Set the guest's clock from the host's, through the guest agent, and print both
-sides:
-
-```
-guest:  2026-08-14 09:12:44 +0700
-host:   2026-08-14 22:41:03 +0700
-clock: win11 was 48499s behind -> synced to the host
-guest:  2026-08-14 22:41:03 +0700 (now)
-```
-
-**This mostly happens on its own.** A guest's clock stops whenever the guest
-does, and a reverted snapshot restores memory whose clock stopped when the
-snapshot was taken — so a guest reverted to a week-old checkpoint wakes up a
-week behind and stays there. Windows will not fix it promptly on its own: the
-time provider it would use is a Hyper-V device KVM does not present, which
-leaves `w32tm`, whose own resync schedule is measured in hours and needs a
-reachable time server it may not have.
-
-That skew is not cosmetic. `rsync` skips a file whose destination is not older
-than the source, so a guest whose clock ran ahead while it was up leaves
-timestamps on `C:` that a later transfer reads as newer than the host's. So
-virutil syncs the clock at the point the skew appears:
-
-- after `virutil snapshot revert`, waiting up to `VIRUTIL_TIME_SYNC_WAIT`
-   seconds (default 60) for the agent to come back up with the guest.
-
-A guest already within two seconds of the host is left alone and nothing is
-printed. Transfers do not sync the clock themselves: they are made from the host
-against a shut-off or snapshotted disk, and a guest reads the host's RTC when it
-boots. `VIRUTIL_TIME_SYNC=0` turns off the automatic sync;
-`virutil domain time` ignores it, since asking by name is not automatic.
-
-Under the hood this is `virsh domtime --now`, not `--sync`: `--sync` re-reads
-the emulated RTC, whose offset a Windows guest interprets as local time, so it
-can only ever hand back the answer the guest already had.
-
-A guest with no `qemu-ga` cannot be synced at all; the sync says so once and the
-transfer or revert carries on. Nothing here touches the *host* clock — under
-WSL2 that one drifts across a Windows sleep on its own, and
-`sudo hwclock -s` on the WSL side is the fix for that, not virutil.
-
 ### port
 
 ```
@@ -1643,8 +1591,8 @@ Guest — see [Guest prerequisites](#guest-prerequisites) for where each of
 these comes from and how to install it:
 
 - The QEMU guest agent — **required** by `sync`, `push` and `pull`, which drive
-   the copy through it, and by `virutil exec` and `virutil domain time`. On a
-   Linux guest that is the `qemu-guest-agent` package. It is also
+   the copy through it, and by `virutil exec`. On a Linux guest that is the
+   `qemu-guest-agent` package. It is also
    what shuts the guest down with `--mode agent` instead of waiting on ACPI
 - The SPICE guest tools, for the `spice` display and `spicevmc` channel every
    `virutil domain create` guest has — without the vdagent there is no
