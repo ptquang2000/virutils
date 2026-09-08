@@ -1,0 +1,234 @@
+# ui -- launch a process on a Windows guest's *interactive* desktop.
+#
+#   virutil ui setup VM [-f]     cache PsExec on the host, deliver it to the guest
+#   virutil ui run   VM APP...   run APP on the logged-in user's desktop
+#
+# Why this exists at all. Everything virutil runs in a Windows guest goes through
+# qemu-ga, which is a service in session 0. A process it spawns is invisible: it
+# lands on session 0's window station, not the desktop the logged-in user is
+# looking at. Getting a *visible* process onto session 1 means binding it to that
+# session's desktop from outside the session -- which Session 0 Isolation walls
+# off, and which a bare CreateProcessAsUser from qemu-ga cannot do (it fails at
+# process init with STATUS_DLL_INIT_FAILED). The one in-box path across that wall
+# is a helper that already knows how to do it: Sysinternals PsExec, `-i`.
+#
+# So `run` is a thin wrapper over `PsExec.exe -accepteula -i <console> -d APP`
+# (the console session is resolved in the guest -- see ui_run for why a bare `-i`
+# is wrong here), and `setup` is what puts PsExec where `run` expects it.
+#
+# The tool is NOT vendored. The Sysinternals licence forbids redistributing it
+# ("you may not publish the software for others to copy"), but freely allows
+# installing copies on your own devices -- so setup fetches it from the official
+# download host into a host-side cache, once, and pushes that copy into each
+# guest. The repo carries a URL, never the binary.
+
+# The official Sysinternals bundle. HTTPS to Microsoft's own host is the trust
+# anchor; there is no separate signature check here on purpose (see setup).
+UI_URL="https://download.sysinternals.com/files/PSTools.zip"
+
+# Where PsExec lives, host and guest. The guest path is fixed at C:\virutil\ so
+# `run` never has to be told where setup put it.
+UI_CACHE="$VIRUTILS_CACHE_DIR/pstools"
+UI_CACHE_EXE="$UI_CACHE/PsExec.exe"
+UI_GUEST_DIR='virutil'                       # under C:\, so C:\virutil\
+UI_GUEST_EXE='C:\virutil\PsExec.exe'
+
+# run maps this one guest exit code back to "PsExec is not there yet". Chosen
+# clear of PsExec's own codes (it returns the launched PID under -d) and of the
+# 0/1 the powershell wrapper uses.
+UI_RC_NO_PSEXEC=97
+
+ui_usage() {
+    printf '%s\n' \
+        "usage: virutil ui {setup|run} VM [ARGS]" \
+        "" \
+        "  setup VM [-f]   fetch PsExec into the host cache (once) and deliver" \
+        "                  it to the guest at C:\\virutil\\. -f re-downloads even" \
+        "                  if the host cache already holds it." \
+        "" \
+        "  run VM APP...   launch APP on the interactive (console) desktop via" \
+        "                  PsExec -i. APP is a full guest path plus any" \
+        "                  arguments. The process runs as SYSTEM on that" \
+        "                  desktop, detached, and virutil returns as soon as" \
+        "                  PsExec has started it." \
+        "" \
+        "  Run 'virutil ui setup VM' once per guest before 'run'. If run reports" \
+        "  PsExec missing, that is the fix." \
+        "" \
+        "  setup delivers over the same SMB transport as 'virutil push', so on a" \
+        "  Windows guest it needs smbd and root on this host." >&2
+    exit "${1:-1}"
+}
+
+# ui_fetch_cache FORCE -- ensure $UI_CACHE_EXE exists on the host. Downloads the
+# PSTools bundle and lifts PsExec.exe out of it; a no-op when the cache is
+# already warm and FORCE is not 1. This is the "cache on the host" half: the
+# network is touched once, not once per guest.
+ui_fetch_cache() {
+    local force="$1" tmp zip
+
+    if [[ -f "$UI_CACHE_EXE" && "$force" != 1 ]]; then
+        say "PsExec cached: $UI_CACHE_EXE"
+        return 0
+    fi
+
+    mkdir -p "$UI_CACHE" || die "could not create the host cache dir: $UI_CACHE"
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/virutil-pstools.XXXXXX")" \
+        || die "could not create a temp dir for the download"
+    zip="$tmp/PSTools.zip"
+
+    say "downloading PsExec from $UI_URL"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fSL --retry 2 -o "$zip" "$UI_URL" \
+            || { rm -rf "$tmp"; die "download failed (curl). Check this host's" \
+                                    "connection to download.sysinternals.com."; }
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$zip" "$UI_URL" \
+            || { rm -rf "$tmp"; die "download failed (wget). Check this host's" \
+                                    "connection to download.sysinternals.com."; }
+    else
+        rm -rf "$tmp"; die "need curl or wget on this host to download PsExec."
+    fi
+
+    # Lift just PsExec.exe out of the bundle, flattening any path. unzip first;
+    # bsdtar reads a zip too and is the fallback on a host that has one but not
+    # the other -- both were present when this was written.
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -o -j "$zip" PsExec.exe -d "$UI_CACHE" >/dev/null \
+            || { rm -rf "$tmp"; die "could not extract PsExec.exe from the bundle (unzip)."; }
+    elif command -v bsdtar >/dev/null 2>&1; then
+        bsdtar -x -f "$zip" -C "$UI_CACHE" PsExec.exe \
+            || { rm -rf "$tmp"; die "could not extract PsExec.exe from the bundle (bsdtar)."; }
+    else
+        rm -rf "$tmp"; die "need unzip or bsdtar on this host to extract PsExec."
+    fi
+
+    rm -rf "$tmp"
+    [[ -f "$UI_CACHE_EXE" ]] || die "the bundle did not contain PsExec.exe as expected."
+    say "PsExec cached: $UI_CACHE_EXE"
+}
+
+# ui_setup ARGS -- warm the host cache, then (if a VM was named) deliver PsExec
+# into it. Delivery reuses push wholesale: same SMB transport, same "moves only
+# what changed" so a second setup of an unchanged binary moves nothing.
+ui_setup() {
+    local VM="" force=0 a
+    for a in "$@"; do
+        case "$a" in
+            -f|--force) force=1 ;;
+            -h|--help)  ui_usage 0 ;;
+            -*)         warn "unrecognised argument: $a"; ui_usage ;;
+            *)          if [[ -z "$VM" ]]; then VM="$a"; else warn "unexpected argument: $a"; ui_usage; fi ;;
+        esac
+    done
+
+    ui_fetch_cache "$force"
+
+    # No VM: host cache only. Useful for pre-seeding before a guest exists.
+    [[ -n "$VM" ]] || { say "host cache ready; pass a VM to deliver it into a guest."; return 0; }
+
+    # A trailing separator makes DST a directory, so PsExec.exe lands at
+    # C:\virutil\PsExec.exe and push creates the directory if it is missing.
+    push_main "$VM" "$UI_CACHE_EXE" "$UI_GUEST_DIR\\"
+    say "$VM: ready -- 'virutil ui run $VM <app>' will launch on the desktop."
+}
+
+# ui_build_script PSARGS_LINE -- the guest powershell for one launch, with
+# PSARGS_LINE (a line that assigns $psargs, and may reference the $sid computed
+# just above it) spliced in. Two callers differ only in that one line: the CLI
+# builds an argv array, sync builds a raw command line.
+#
+# `-i` is given the active console session explicitly. Bare `-i` does NOT do the
+# right thing here: PsExec is started by qemu-ga, which is a session-0 service,
+# so with no session number PsExec targets session 0 -- and the process lands
+# invisibly there rather than on the desktop the user is looking at. So the guest
+# resolves its own console session with WTSGetActiveConsoleSessionId (one call,
+# no locale-sensitive text to parse) and PsExec is told `-i <that>`. `-d` returns
+# as soon as the process starts instead of waiting on it, so virutil does not
+# block on a GUI the user will close by hand. The process runs as SYSTEM on that
+# desktop; add -u/-p yourself if it must run as the logged-in user.
+#
+# PsExec writes its whole progress narrative -- banner, "Starting PSEXESVC", and
+# the closing "started ... with process ID N" -- to stderr. Through PowerShell's
+# call operator each line becomes an ErrorRecord that decorates or mis-stringifies
+# (a NativeCommandError block, or the bare type name RemoteException), and even a
+# 2> file redirect leaks the first line back. Start-Process with its streams
+# redirected to files keeps PowerShell's object pipeline out of it entirely, so
+# the files hold PsExec's own bytes and nothing else. A PsExec that is not there
+# makes Start-Process -ErrorAction Stop throw, which the catch turns into
+# UI_RC_NO_PSEXEC -- the run never has to stat the path first.
+ui_build_script() {
+    printf '%s\n' \
+        "\$exe = '$UI_GUEST_EXE'" \
+        "Add-Type -Name Wts -Namespace Vu -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern uint WTSGetActiveConsoleSessionId();'" \
+        '$sid = [Vu.Wts]::WTSGetActiveConsoleSessionId()' \
+        'if ($sid -eq 0xFFFFFFFF) { [Console]::Error.WriteLine("no interactive session is attached to the console (no one is logged in)."); exit 1 }' \
+        "$1" \
+        '$o = [IO.Path]::GetTempFileName(); $e = [IO.Path]::GetTempFileName()' \
+        'try {' \
+        '  Start-Process -FilePath $exe -ArgumentList $psargs -Wait -NoNewWindow -RedirectStandardOutput $o -RedirectStandardError $e -ErrorAction Stop | Out-Null' \
+        '} catch {' \
+        '  Remove-Item -LiteralPath $o,$e -Force -ErrorAction SilentlyContinue' \
+        "  exit $UI_RC_NO_PSEXEC" \
+        '}' \
+        '$txt = (Get-Content -Raw -LiteralPath $e -ErrorAction SilentlyContinue) + (Get-Content -Raw -LiteralPath $o -ErrorAction SilentlyContinue)' \
+        'Remove-Item -LiteralPath $o,$e -Force -ErrorAction SilentlyContinue' \
+        'if ($txt) { [Console]::Out.Write($txt.Trim()) }' \
+        'exit 0'
+}
+
+# ui_dispatch VM PSARGS_LINE -- run one launch and map "PsExec absent" to a
+# message that names the fix. The local VM is what exec_ps_text's agent helpers
+# address, by dynamic scope.
+ui_dispatch() {
+    local VM="$1" psline="$2" script rc=0
+    script="$(ui_build_script "$psline")"
+    exec_ps_text "$script" || rc=$?
+    if [[ "$rc" == "$UI_RC_NO_PSEXEC" ]]; then
+        die "PsExec is not installed in $VM at $UI_GUEST_EXE." \
+            "Run 'virutil ui setup $VM' first."
+    fi
+    return "$rc"
+}
+
+# ui_run VM APP... -- the CLI launch. Each APP token becomes one single-quoted
+# powershell string in an argv array, so a path with spaces stays one argument
+# and Start-Process quotes each element back onto PsExec's command line.
+ui_run() {
+    local VM="${1:-}"
+    [[ -n "$VM" ]] || ui_usage
+    shift
+    [[ $# -gt 0 ]] || ui_usage
+
+    local -a q=()
+    local a
+    for a in "$@"; do q+=("$(push_ps_quote "$a")"); done
+    local joined
+    joined="$(printf '%s,' "${q[@]}")"; joined="${joined%,}"
+
+    ui_dispatch "$VM" "\$psargs = @('-accepteula','-i',\"\$sid\",'-d',$joined)"
+}
+
+# ui_run_cmdline VM CMDLINE -- launch a whole guest command line on the desktop,
+# passed verbatim after PsExec's options. This is what sync's ui run rules use:
+# a config line is free text the way a command line is, so quoting a space-path
+# is the author's to do (>post-ui "C:\Program Files\app\a.exe" --flag), exactly
+# as at a prompt. $psargs is built as a single string, which Start-Process hands
+# to PsExec as the raw command line rather than re-quoting element by element.
+ui_run_cmdline() {
+    local VM="$1" cmdline="$2" q
+    q="$(push_ps_quote "$cmdline")"
+    ui_dispatch "$VM" "\$psargs = '-accepteula -i ' + \$sid + ' -d ' + $q"
+}
+
+ui_main() {
+    local CMD="${1:-}"
+    [[ -n "$CMD" ]] || ui_usage
+    shift || true
+    case "$CMD" in
+        setup)     ui_setup "$@" ;;
+        run)       ui_run "$@" ;;
+        -h|--help) ui_usage 0 ;;
+        *)         ui_usage ;;
+    esac
+}

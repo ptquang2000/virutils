@@ -199,11 +199,27 @@ sync_run() {
         return 0
     fi
 
-    for cmd in "$@"; do
-        echo "run ($when): $cmd"
-        guest_exec_text "$cmd" \
-            || die "$when run rule failed in $DOMAIN: $cmd" \
-                   "Its output is above. Nothing after it was run."
+    local entry mode
+    for entry in "$@"; do
+        mode="${entry%%$'\t'*}"
+        cmd="${entry#*$'\t'}"
+        if [[ "$mode" == ui ]]; then
+            # ui rules cross Session 0 Isolation with PsExec, which is a Windows
+            # notion; a Linux guest has no equivalent, so refuse rather than run
+            # the command in the guest shell as if the tag were not there.
+            [[ "$GUEST_OS" == windows ]] \
+                || die "a >$when-ui run rule needs a Windows guest, but this one" \
+                       "is $GUEST_OS: $cmd"
+            echo "run ($when/ui): $cmd"
+            ui_run_cmdline "$VM" "$cmd" \
+                || die "$when-ui run rule failed in $DOMAIN: $cmd" \
+                       "Its output is above. Nothing after it was run."
+        else
+            echo "run ($when): $cmd"
+            guest_exec_text "$cmd" \
+                || die "$when run rule failed in $DOMAIN: $cmd" \
+                       "Its output is above. Nothing after it was run."
+        fi
     done
 }
 
@@ -299,12 +315,20 @@ sync_main() {
                  cmd="${cmd#"${cmd%%[![:space:]]*}"}"
                  [[ -n "$cmd" ]] \
                      || die "$CONF:$lineno: run rule has no command: $line"
+                 # Each rule is stored tagged with how it runs -- "sh" in the
+                 # guest shell as SYSTEM, or "ui" on the interactive desktop via
+                 # PsExec -- so sync_run can dispatch while keeping pre/post
+                 # order intact. The tab never appears in a hand-written command.
                  case "$when" in
-                     pre)  RUN_PRE+=("$cmd") ;;
-                     post) RUN_POST+=("$cmd") ;;
-                     *) die "$CONF:$lineno: run rule needs 'pre' or 'post': $line" \
-                            "  >pre  COMMAND   before the files reach the guest" \
-                            "  >post COMMAND   after they have" ;;
+                     pre)     RUN_PRE+=("sh"$'\t'"$cmd") ;;
+                     post)    RUN_POST+=("sh"$'\t'"$cmd") ;;
+                     pre-ui)  RUN_PRE+=("ui"$'\t'"$cmd") ;;
+                     post-ui) RUN_POST+=("ui"$'\t'"$cmd") ;;
+                     *) die "$CONF:$lineno: run rule needs 'pre', 'post', 'pre-ui' or 'post-ui': $line" \
+                            "  >pre  COMMAND      before the files reach the guest (guest shell, as SYSTEM)" \
+                            "  >post COMMAND      after they have" \
+                            "  >pre-ui  COMMAND   same timing, launched on the interactive desktop (Windows guest, PsExec)" \
+                            "  >post-ui COMMAND   likewise -- e.g. relaunch a GUI app the sync replaced" ;;
                  esac ;;
             \<*) [[ "$line" == *"|"* ]] \
                      || die "$CONF:$lineno: fetch rule needs '|': $line"

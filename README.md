@@ -608,6 +608,8 @@ unknown setting or an unrecognised directive is reported with its line number.
 | `-path` | Delete this guest path after copying — a directory is emptied and kept, a file is removed. |
 | `>pre CMD` | Run `CMD` in the guest's shell before the files reach it — PowerShell, or `/bin/sh` when `@guest=linux`. |
 | `>post CMD` | Run `CMD` in the guest's shell after they have. |
+| `>pre-ui CMD` | Like `>pre`, but launch `CMD` on the guest's *interactive desktop* via PsExec (see `virutil ui`). Windows guest only. |
+| `>post-ui CMD` | Like `>post`, on the interactive desktop — e.g. relaunch a GUI app the sync replaced. |
 
 Map rules are the only unsigilled form. A line starting with punctuation that is
 not one of the sigils above is treated as a mistyped directive, not as a glob,
@@ -708,6 +710,27 @@ They need the guest up and answering on the agent, so they run only when it is �
 which the delivery already requires. A guest that went away mid-run has its
 rules **skipped** with a note saying so, rather than failing the copy that
 already landed.
+
+`>pre-ui` and `>post-ui` run at the same two points, but launch on the guest's
+**interactive desktop** instead of in the session-0 agent shell:
+
+```
+>post Stop-Service -Name myapp
+>post-ui "C:\Program Files\MyApp\MyApp.exe" --restored
+```
+
+An ordinary `>post` command runs as SYSTEM in session 0, where a window it opens
+is invisible to the logged-in user. A `>post-ui` command is handed to PsExec's
+`-i` so it lands on the desktop the user is looking at — the usual reason being
+to relaunch a GUI app the sync just replaced. It is fire-and-forget: the rule
+returns as soon as the process starts, and the process runs as SYSTEM on that
+desktop (add `-u`/`-p` to the command if it must be the logged-in user).
+
+The command is a command line, not a bare exe, so quote a path that contains
+spaces exactly as you would at a prompt. These rules are Windows-only — a
+`@guest=linux` config that carries one is refused — and they need PsExec staged
+in the guest first (`virutil ui setup VM`); a config that runs before that fails
+with the same "run `virutil ui setup`" message `virutil ui run` gives.
 
 ### Example
 
