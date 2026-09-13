@@ -1,6 +1,6 @@
 # parser -- top-level dispatch plus the helpers every module shares
 
-MODULES=(domain snapshot sync pull push exec usb ui)
+MODULES=(domain snapshot sync pull push exec ui usb)
 
 die()  { printf '%s\n' "$@" >&2; exit 1; }
 warn() { printf '%s\n' "$@" >&2; }
@@ -30,7 +30,7 @@ guest
   ui         launch a process on a Windows guest's interactive desktop (PsExec)
 
 hardware
-  usb        USB passthrough end to end from the Windows host under WSL
+  usb        pass a host USB device through to a guest
 
 Run 'virutil <module>' for a module's own usage.
 EOF

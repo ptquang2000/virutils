@@ -63,7 +63,6 @@ REQUIRED=(
     "sync pull push  |rsync sudo smbd ss"
     "domain          |virt-install virt-xml qemu-img"
     "exec            |jq python3"
-    "usb             |jq usbipd.exe powershell.exe"
 )
 OPTIONAL=(
     "domain: TPM 2.0 device, which a stock Windows 11 installer requires|swtpm"

@@ -51,6 +51,7 @@ step and no dependencies beyond the utilities it calls.
    - [list, shutdown, addr](#list-shutdown-addr)
    - [port](#port)
 - [virutil usb](#virutil-usb)
+   - [USB passthrough under WSL, with usbipd](#usb-passthrough-under-wsl-with-usbipd)
 - [Requirements](#requirements)
 - [See also](#see-also)
 
@@ -173,6 +174,11 @@ host-side machinery in `modules/xfer` and `modules/guest`, which is
 | `pull` | Copy a file or directory out of a **running** guest. | `virutil pull VM SRC DST` |
 | `push` | Copy a file or directory from the host into a guest's `C:` drive. | `virutil push VM SRC DST` |
 
+All three write the same C:-shaped tree — see
+[How files move](#how-files-move). `sync` and `push` deliver into a **running**
+guest over its own NIC, moving only what changed; `pull` reads back the same
+way.
+
 ### guest
 
 | Module | Purpose | Usage |
@@ -183,12 +189,7 @@ host-side machinery in `modules/xfer` and `modules/guest`, which is
 
 | Module | Purpose | Usage |
 | --- | --- | --- |
-| `usb` | USB passthrough end to end from a Windows host under WSL: `usbipd` bind, import over `vhci_hcd`, then attach to the domain. | `virutil usb {list\|show\|attach\|detach\|unbind} [VM] [BUSID]` |
-
-All three write the same C:-shaped tree — see
-[How files move](#how-files-move). `sync` and `push` deliver into a **running**
-guest over its own NIC, moving only what changed; `pull` reads back the same
-way.
+| `usb` | Pass a physical host USB device through to a guest, hot-plugged: a libvirt `<hostdev>` here, `device_add` over the QEMU monitor on the Windows driver. | `virutil usb {list\|show\|attach\|detach} [VM] [VENDOR:PRODUCT]` |
 
 `virutil` alone, or `virutil help`, prints the module list. `modules/parser`
 handles the top-level dispatch plus the helpers every module shares; each
@@ -1560,25 +1561,147 @@ own firewall allows the port — no host-side plumbing works around either.
 
 ## virutil usb
 
-Physical USB devices shared from the Windows host: `usbipd` binds a device on
-Windows, imports it into WSL over `vhci_hcd`, and attaches it to the domain as a
-USB host controller device; `detach` and `unbind` hand it back.
+Pass a physical USB device from the host through to a guest. Both drivers have
+it, spelled the same way; what differs is what carries it — a libvirt
+`<hostdev>` on a Linux host, `device_add usb-host` over the QEMU monitor on a
+Windows one.
 
 ```
 virutil usb list
 virutil usb show   VM
-virutil usb attach VM BUSID
-virutil usb detach VM BUSID|VENDOR:PRODUCT
-virutil usb unbind BUSID
+virutil usb attach VM VENDOR:PRODUCT
+virutil usb detach VM VENDOR:PRODUCT
 ```
 
-`BUSID` is the first column of `virutil usb list`. It names a port, so it is
-only meaningful while something is plugged into it; `VENDOR:PRODUCT` (lowercase
-hex, from the device's hardware id) names a device that is currently unplugged,
-which `detach` needs to clear a leftover hostdev. Only `bind` and `unbind` need
-Administrator on Windows, and a bind is persistent — expect one UAC prompt per
-physical device ever. A `detach` stops short of unbinding: the device stays
-usable in Windows.
+`VENDOR:PRODUCT` is lowercase hex and is the first column of `virutil usb
+list`, which reads the host's own device list — sysfs on Linux, PnP on Windows:
+
+```
+$ virutil usb list
+0951:1666  Kingston DataTraveler 3.0
+8087:0033  Intel(R) Wireless Bluetooth(R)
+
+$ virutil usb attach win11 0951:1666
+libvirt: attaching 0951:1666 to win11 (live)
+Device attached successfully
+```
+
+It names the **device**, not the port it is plugged into, so it survives moving
+the device between sockets. Both libvirt and qemu accept a bus/port address as
+well; neither driver offers one, for exactly that reason.
+
+An attach is two things at once, as a port forward is: the running guest, so
+the device arrives now, and the persistent record, so it is still there after
+the next boot — the domain XML on Linux, the `.cmd` launcher on Windows.
+`detach` undoes both, and on a shut-off domain `attach` writes the persistent
+half alone and says so. `show` prints both views, because a device in the
+persistent config but not in the running guest is the one that surprises you at
+the next boot:
+
+```
+$ virutil usb show win11
+=== live ===
+    <hostdev mode='subsystem' type='usb' managed='yes'>
+      <source>
+        <vendor id='0x0951'/>
+        <product id='0x1666'/>
+      </source>
+    </hostdev>
+=== persistent ===
+    ...
+```
+
+**Getting the device away from the host is the host's business, and the two
+differ.** On Linux, `managed='yes'` is in the XML, so libvirt detaches the
+device from its host driver itself and gives it back on detach — nothing to do.
+On Windows, qemu reaches USB through libusb, which *cannot* open a device that a
+Windows class driver already owns: the `device_add` succeeds and the guest sees
+nothing. Install [UsbDk](https://github.com/daynix/UsbDk) to let it capture one
+anyway, or bind WinUSB to that device with [Zadig](https://zadig.akeo.ie/);
+`install.ps1` reports whether UsbDk is present.
+
+One more asymmetry, in the XML rather than in the command: the persisted
+`<hostdev>` carries `startupPolicy='optional'`, without which libvirt refuses to
+start a domain whose passed-through device is unplugged. qemu waits for the
+device instead, so the Windows driver has nothing equivalent to set.
+
+The guest side needs no preparation on either driver: a libvirt domain gets a
+USB controller by default, and every domain `virutil domain create` makes on
+Windows already carries `-device qemu-xhci`.
+
+### USB passthrough under WSL, with usbipd
+
+`virutil usb` cannot do this half, and neither driver tries. When libvirt runs
+inside WSL and the device is plugged into Windows, the device is on the far side
+of the kernel boundary — `virutil usb list` in WSL is empty until something
+brings it across, and that something is a `usbipd` round trip. virutil used to
+carry a module that automated it, but it only ever worked on that one host shape
+and it was three moving parts wide; what it did is short enough to run yourself.
+
+The two compose: once usbipd has imported the device, it is an ordinary device
+in the WSL kernel's sysfs, `virutil usb list` shows it, and `virutil usb attach`
+takes it from there. Only the import below is done by hand.
+
+[usbipd-win](https://github.com/dorssel/usbipd-win) shares the device from
+Windows; the `vhci_hcd` module in the WSL kernel receives it; `virutil usb`
+hands it to the domain.
+
+**Share the device (Windows, Administrator — once per physical device).**
+`bind` is persistent, so this is one UAC prompt ever:
+
+```powershell
+usbipd list                   # BUSID is the first column
+usbipd bind -b 3-3
+```
+
+**Import it into WSL** (no Administrator; `ARCHLINUX` is your distro name from
+`wsl -l`):
+
+```powershell
+usbipd attach --wsl ARCHLINUX -b 3-3
+```
+
+Confirm it arrived before going further. The import is what libvirt will look
+up, and a device that never landed surfaces later as a libvirt error blaming the
+VM layer instead:
+
+```sh
+virutil usb list              # the device is here now
+```
+
+**Attach it to the domain** — from here it is ordinary
+[`virutil usb`](#virutil-usb), documented above:
+
+```sh
+virutil usb attach VM 0951:1666
+```
+
+**Hand it back.** Detach from the domain first, then from WSL. The device stays
+bound — still usable in Windows, and ready for a prompt-free reattach:
+
+```sh
+virutil usb detach VM 0951:1666
+```
+
+```powershell
+usbipd detach -b 3-3
+usbipd unbind -b 3-3          # Administrator; stops sharing altogether
+```
+
+**What to check when it does not work.**
+
+- `usbipd attach` reporting *"Device busy"* or *"used by Windows"* is usually
+  usbipd's own leftover export from an import that died half way. Run
+  `usbipd detach -b BUSID` and attach again.
+- If it is genuinely Windows holding the device — a plain `bind` leaves the
+  Windows driver in place, and for mass storage an open Explorer window is
+  enough — only `usbipd bind --force -b BUSID` settles it, by swapping in the
+  stub driver for good. Administrator, so leave it for last.
+- `usbipd state` shows whether a device is bound, forced, and which client
+  address holds it. A recorded client address is not proof the import landed —
+  `lsusb` in WSL is.
+- A busid names a *port*, so it changes when you move the device between
+  sockets. Vendor:product names the device.
 
 ## Requirements
 

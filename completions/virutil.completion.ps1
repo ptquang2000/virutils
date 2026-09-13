@@ -8,11 +8,11 @@
 
   install.ps1 adds that line for you.
 
-  This completes the *Windows* driver, so it offers domain and exec and
-  nothing else. snapshot, sync, push, pull, ui and usb are in the bash tree
+  This completes the *Windows* driver, so it offers domain, exec and usb and
+  nothing else. snapshot, sync, push, pull and ui are in the bash tree
   only, and offering a name this driver would reject is worse than offering
   nothing -- $MODULES in modules\parser.ps1 is the list to keep this in step
-  with.
+  with. usb is on both drivers, spelled the same way on each.
 
   Everything lives inside the scriptblock rather than in functions beside it:
   a completer dot-sourced into a profile should leave nothing behind in the
@@ -71,6 +71,32 @@ $completer = {
             ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_.Name) }
     }
 
+    # The host's USB devices as VENDOR:PRODUCT, the way `usb list` spells
+    # them, with the Windows name as the tooltip. ~200ms on this host, which is
+    # inside what a keypress can spend; the WQL filter is what keeps it there.
+    function Get-UsbIds {
+        $seen = @{}
+        Get-CimInstance -ClassName Win32_PnPEntity -Filter "DeviceID LIKE 'USB\\VID[_]%'" -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $m = [regex]::Match([string]$_.PNPDeviceID, '^USB\\VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})')
+                if (-not $m.Success) { return }
+                $id = ('{0}:{1}' -f $m.Groups[1].Value, $m.Groups[2].Value).ToLowerInvariant()
+                if ($seen.ContainsKey($id)) { return }
+                $seen[$id] = $true
+                [pscustomobject]@{ Text = $id; Tip = $_.Name }
+            }
+    }
+
+    # The devices one domain passes through, read out of its launcher -- the
+    # same place `usb show` reads them, so detach completes only what is there.
+    function Get-DomainUsbIds([string]$Vm) {
+        $path = Join-Path $imageDir "$Vm.cmd"
+        if (-not (Test-Path -LiteralPath $path)) { return @() }
+        $text = Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue
+        [regex]::Matches([string]$text, '-device\s+"?usb-host,vendorid=0x([0-9a-fA-F]{4}),productid=0x([0-9a-fA-F]{4})') |
+            ForEach-Object { ('{0}:{1}' -f $_.Groups[1].Value, $_.Groups[2].Value).ToLowerInvariant() }
+    }
+
     # The host ports this domain currently forwards; the guest side is the
     # tooltip, as in the zsh completion.
     function Get-Ports([string]$Vm) {
@@ -98,6 +124,7 @@ $completer = {
     $modules = [ordered]@{
         domain = 'the domain lifecycle: create, delete, list, start, shutdown, addr, port'
         exec   = 'run commands inside a guest via the QEMU guest agent'
+        usb    = 'pass a host USB device through to a guest'
         help   = 'the module list'
     }
 
@@ -109,6 +136,13 @@ $completer = {
         shutdown = 'ask the guest to shut itself down over ACPI'
         addr     = "the guest's address"
         port     = 'list, open or close a host->guest port forward'
+    }
+
+    $usbVerbs = [ordered]@{
+        list   = 'the host USB devices, as VENDOR:PRODUCT'
+        show   = 'what a domain passes through, live and persistent'
+        attach = 'pass a host device through to a domain'
+        detach = 'take one back from a domain'
     }
 
     $execVerbs = [ordered]@{
@@ -165,6 +199,7 @@ $completer = {
         1 {
             if ($module -eq 'domain') { foreach ($k in $domainVerbs.Keys) { Add-Match $k $domainVerbs[$k] } }
             elseif ($module -eq 'exec') { foreach ($k in $execVerbs.Keys) { Add-Match $k $execVerbs[$k] } }
+            elseif ($module -eq 'usb') { foreach ($k in $usbVerbs.Keys) { Add-Match $k $usbVerbs[$k] } }
         }
         2 {
             # `domain create` names a domain that does not exist yet, and
@@ -174,6 +209,9 @@ $completer = {
                 foreach ($d in Get-Domains) { Add-Match $d 'domain' }
             }
             elseif ($module -eq 'exec') {
+                foreach ($d in Get-Domains) { Add-Match $d 'domain' }
+            }
+            elseif ($module -eq 'usb' -and $verb -ne 'list') {
                 foreach ($d in Get-Domains) { Add-Match $d 'domain' }
             }
         }
@@ -187,6 +225,14 @@ $completer = {
             # `domain port VM SPEC` -- PORT, or HOSTPORT:GUESTPORT.
             if ($module -eq 'domain' -and $verb -eq 'port') {
                 foreach ($p in Get-Ports $positional[2]) { Add-Match $p.Text $p.Tip }
+            }
+            # attach names a device on the host; detach names one the domain
+            # already has, which is a much shorter and more useful list.
+            elseif ($module -eq 'usb' -and $verb -eq 'attach') {
+                foreach ($u in Get-UsbIds) { Add-Match $u.Text $u.Tip }
+            }
+            elseif ($module -eq 'usb' -and $verb -eq 'detach') {
+                foreach ($u in Get-DomainUsbIds $positional[2]) { Add-Match $u 'attached' }
             }
         }
     }

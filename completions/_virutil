@@ -18,7 +18,7 @@ _virutil() {
     'exec:run commands inside a Windows guest via the QEMU guest agent'
   )
   hardware=(
-    'usb:USB passthrough from the Windows host under WSL'
+    'usb:pass a host USB device through to a guest'
   )
   other=(
     'help:this message'
@@ -169,11 +169,10 @@ _virutil_push() {
 
 _virutil_usb() {
   local -a cmds=(
-    'list:list host USB devices and sharing state'
-    'show:show devices passed to a VM, live and persistent'
-    'attach:share on Windows, import into WSL, attach to the VM'
-    'detach:return a device to the Windows host'
-    'unbind:stop sharing a device on Windows'
+    'list:the host USB devices, as VENDOR:PRODUCT'
+    'show:what a domain passes through, live and persistent'
+    'attach:pass a host device through to a domain'
+    'detach:take one back from a domain'
   )
   case $CURRENT in
     3) _describe -t command 'command' cmds ;;
@@ -181,27 +180,41 @@ _virutil_usb() {
       case $words[3] in
         show|attach|detach)
           (( CURRENT == 4 )) && { _virutil_domains; return; }
-          (( CURRENT == 5 )) && _virutil_usb_busids
-          ;;
-        unbind)
-          _virutil_usb_busids
+          # attach names a device on the host; detach names one the domain
+          # already has, which is a much shorter and more useful list.
+          (( CURRENT == 5 )) || return
+          case $words[3] in
+            attach) _virutil_usb_host_ids ;;
+            detach) _virutil_usb_domain_ids ${words[4]} ;;
+          esac
           ;;
       esac
       ;;
   esac
 }
 
-_virutil_usb_busids() {
-  local usbipd="/mnt/c/Program Files/usbipd-win/usbipd.exe" busids
-  # only the device rows start with a busid, which skips the header and the section
-  # titles; the rest of the row (hardware id, name, state) becomes the description
-  if [[ -x $usbipd ]]; then
-    busids=(${(f)"$($usbipd list 2>/dev/null | tr -d '\r' |
-      awk '$1 ~ /^[0-9]+-[0-9.]+$/ { id = $1; $1 = ""
-                                     sub(/^ +/, ""); sub(/ +$/, "")
-                                     print id ":" $0 }')"})
-  fi
-  _describe -t device 'busid' busids
+# The same sysfs walk modules/usb does, and for the same reason: no usbutils.
+_virutil_usb_host_ids() {
+  local -a ids
+  local d
+  for d in /sys/bus/usb/devices/[0-9]*-[0-9]*(/N); do
+    [[ -r $d/idVendor ]] || continue
+    # _describe splits a spec on the first unescaped colon, and the value
+    # here has one of its own, so the id's colon is escaped and the one before
+    # the description is not.
+    ids+=("${(L)$(<$d/idVendor)}\:${(L)$(<$d/idProduct)}:$(<$d/product 2>/dev/null)")
+  done
+  _describe -t device 'device' ids
+}
+
+# Read back out of the domain's persistent config, which is where an attach
+# leaves it -- libvirt writes <vendor> before <product>, so successive ids pair.
+_virutil_usb_domain_ids() {
+  local -a ids
+  ids=(${(f)"$(virsh -c qemu:///system dumpxml --inactive $1 2>/dev/null |
+    sed -n "s/.*<\(vendor\|product\) id='0x\([0-9a-f]*\)'.*/\2/p" |
+    paste -d: - -)"})
+  _describe -t device 'attached' ids
 }
 
 _virutil_snapshot() {

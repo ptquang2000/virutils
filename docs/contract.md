@@ -48,11 +48,15 @@ virutil pull VM SRC DST
 virutil exec {ping|cmd|ps|sh} VM [-d] [--] [CMD...|-]
 
 virutil ui  {setup|run} VM [ARGS]
+
+virutil usb {list|show|attach|detach} [VM] [VENDOR:PRODUCT]
 ```
 
-`usb` is deliberately absent: it is WSL-only and ports to neither driver (see
-section 7). Its grammar is recorded there, not here, because there is no second
-implementation to hold to it.
+`usb` is on both drivers and holds to one grammar over two mechanisms -- a
+libvirt `<hostdev>` on the bash side, `device_add` over the QEMU monitor on the
+Windows one. What is on neither is the WSL case, where the device is plugged
+into Windows and the domain is inside the Linux kernel's view: getting it across
+is a `usbipd` recipe in the README rather than a command. See section 7.
 
 `domain create -p SPEC` (a port forward, repeatable) and `-N` (create without
 starting) exist on the Windows driver only, and are marked as such above. They
@@ -215,7 +219,8 @@ half-ported.
 **Where it actually is:** `domain` and `exec` are ported, and the guest agent
 channel they both stand on is in place. `sync`, `push` and `pull` are not, and
 they are blocked on one unanswered question rather than on effort -- see
-"The transfer layer" below. `snapshot`, `ui` and `usb` are bash-only.
+"The transfer layer" below. `snapshot` and `ui` are bash-only. `usb` is on
+both, and was the last thing to become so.
 
 ### `snapshot`: not yet, and the criterion for changing that
 
@@ -279,21 +284,55 @@ security decision, not a plumbing one. **Verify the client-side refusal against
 the actual guest before designing around it** -- it is stated here from
 documented Windows defaults, not from a measurement on this host.
 
-**`usb` is WSL-only and ports to neither driver.** It is the one module that
-needs both hosts at once: `usbipd.exe` on the Windows side, `vhci_hcd` in the
-WSL kernel to receive the import, and `virsh attach-device` to hand the result
-to the domain (`modules/usb:2`). A plain Linux host has no usbipd; a native
-Windows driver has no vhci_hcd and no libvirt. It also hardcodes
-`DISTRO=archlinux` and reads the import address off `eth0`, both of which are
-facts about one WSL setup rather than about USB.
+**`usb` is one grammar over two mechanisms, and the WSL case is not a command
+at all.** There used to be a bash `usb` module that drove `usbipd.exe` on the
+Windows side, `vhci_hcd` in the WSL kernel to receive the import, and `virsh
+attach-device` to hand the result to the domain. It was three moving parts held
+together by facts about one WSL setup -- a hardcoded distro name, the import
+address read off `eth0` -- and only the last of the three was about USB
+passthrough at all.
 
-So `usb` stays where it is, in the bash tree, gated on WSL, and the Windows
-driver's USB support -- if it ever wants any -- is a **different mechanism
-sharing only the grammar**: QEMU and the device are already on the same
-machine, so it is `-device usb-host,vendorid=...,productid=...` on the command
-line, with no usbipd bind/attach round trip at all. Under that mechanism
-`attach`/`detach` mean re-launching or hot-plugging via the QEMU monitor, and
-`unbind` has no meaning and should not be implemented for the sake of symmetry.
+What replaced it is the same four verbs on each driver, each carrying them the
+way its own host does:
+
+| | bash driver | Windows driver |
+| --- | --- | --- |
+| attach | `virsh attach-device` with a `<hostdev>` | `device_add usb-host` over the QEMU monitor |
+| detach | `virsh detach-device` | `device_del` |
+| persists in | the domain's XML (`--config`) | the `.cmd` launcher |
+| host devices | sysfs | Win32 PnP |
+
+That is the host axis of section 1 doing exactly what it is for: the grammar
+and the naming are the contract, and the plumbing under them is the fork.
+
+The usbipd round trip did not survive the split and should not be added back to
+either driver. On a WSL host the device is on the Windows side of the kernel
+boundary, so `virutil usb list` in WSL is empty until usbipd hands a device
+over -- and once it has, the ordinary bash `attach` takes it from there, because
+by then it is just a device in sysfs. That is the whole seam: usbipd puts the
+device in front of the Linux kernel, and virutil passes a device the kernel can
+see through to a guest. The README documents the first half as a recipe.
+
+Three things hold across both drivers and are part of the contract, not of
+either implementation:
+
+- **A device is named by `VENDOR:PRODUCT`, lowercase hex, never by a bus path.**
+  Both qemu and libvirt accept a bus/port address, and it is the more precise of
+  the two, but it names a *port* -- it changes when the device moves sockets.
+  The old module's busids were the single most common way to get that wrong.
+- **An attach is live and persistent at once**, so a device attached once is
+  still attached after the next boot, and a detach removes both. `domain port`
+  works the same way for the same reason.
+- **What it takes for the device to actually arrive is the host's business.**
+  libvirt with `managed='yes'` detaches it from the host driver itself; qemu on
+  Windows goes through libusb, which cannot open a device a Windows class driver
+  owns, so it needs UsbDk or WinUSB. Only the second one has to be said out
+  loud, and it is, in `virutil usb -h` and the README.
+
+One asymmetry is real and is in the XML: the bash driver writes
+`startupPolicy='optional'` on a persisted hostdev, because libvirt otherwise
+refuses to start a domain whose passed-through device is unplugged. qemu just
+waits for the device, so the Windows driver has nothing to set.
 
 ## 8. Conformance
 

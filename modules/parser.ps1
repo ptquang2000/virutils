@@ -10,10 +10,14 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # What this driver answers to. Shorter than the bash tree's list on purpose:
-# `snapshot`, `sync`, `ui` and `usb` are not ported yet, and four modules that
+# `snapshot`, `sync` and `ui` are not ported yet, and four modules that
 # work beat ten half-ported (contract section 7). A name absent here is refused
 # by name rather than dispatched to a function that does not exist.
-$script:MODULES = @('domain', 'exec')
+#
+# `usb` is on both drivers, by two mechanisms: device_add over the QEMU monitor
+# here, a libvirt <hostdev> there. What is on neither is the WSL case, where
+# the device is on the far side of the kernel boundary -- see contract 7.
+$script:MODULES = @('domain', 'exec', 'usb')
 
 # --- saying things ----------------------------------------------------------
 #
@@ -73,9 +77,12 @@ function Get-TopUsage {
         'guest'
         '  exec       run commands inside a guest via the QEMU guest agent'
         ''
+        'hardware'
+        '  usb        pass a host USB device through to a guest'
+        ''
         'This is the Windows-host driver: raw QEMU under WHPX, no libvirt. It'
         'shares a contract with the bash driver rather than any source; see'
-        'docs/contract.md. snapshot, sync, push, pull, ui and usb are in the'
+        'docs/contract.md. snapshot, sync, push, pull and ui are in the'
         'bash tree only so far.'
         ''
         "Run 'virutil <module>' for a module's own usage."

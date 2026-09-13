@@ -90,8 +90,8 @@ printf '\n-- virutil.ps1 (PowerShell driver) --\n'
 if [[ -z "$PWSH" ]]; then
     skip 'no pwsh or powershell on PATH -- the Windows driver was not exercised'
 else
-    # Shorter than the bash list on purpose: snapshot, sync, push, pull, ui and
-    # usb are not ported. The list is read out of the driver itself rather than
+    # Shorter than the bash list on purpose: snapshot, sync, push, pull and ui
+    # are not ported. The list is read out of the driver itself rather than
     # repeated here, so a module added there is tested here without an edit.
     mapfile -t PS_MODULES < <("$PWSH" -NoProfile -Command \
         ". '$WROOT/modules/parser.ps1'; \$MODULES" 2>/dev/null | tr -d '\r')
@@ -122,8 +122,10 @@ else
     #   exec.ps1    the guest's exit code becomes virutil's (contract section 5)
     #               -- including for a process killed by a signal, where
     #               qemu-ga sends no exitcode at all.
+    #   usb.ps1     an attach is a line in that same launcher, inserted
+    #               into the middle of it rather than appended.
     printf '\n-- PowerShell unit tests --\n'
-    for t in domain exec; do
+    for t in domain exec usb; do
         if out="$("$PWSH" -NoProfile -File "$ROOT/tests/$t.ps1" 2>&1)"; then
             printf '%s\n' "$out" | sed 's/^/  /'
             ok "tests/$t.ps1"

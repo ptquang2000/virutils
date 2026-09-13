@@ -129,6 +129,17 @@ function Test-Deps {
         $missing = 1
     }
 
+    # Optional, and only `usb` wants it: qemu reaches a device through libusb,
+    # which cannot open one a Windows class driver already owns. UsbDk is what
+    # lets it capture one anyway; short of that the device needs WinUSB bound to
+    # it by hand (Zadig). Not counted as missing -- everything but passing a
+    # device through works without it.
+    if (Get-Service -Name 'UsbDk' -ErrorAction SilentlyContinue) {
+        Ok 'UsbDk -- present; virutil usb can take a device from Windows'
+    } else {
+        Log 'UsbDk -- not installed; virutil usb can only pass a device with WinUSB bound to it'
+    }
+
     # Needs elevation to read, so a failure to answer is reported as unknown
     # rather than as absent.
     try {
