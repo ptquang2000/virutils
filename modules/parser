@@ -27,12 +27,14 @@ transfer
 
 guest
   exec       run commands inside a guest via the QEMU guest agent
-  ui         launch a process on a Windows guest's interactive desktop (PsExec)
+  ui         deliver PsExec into a Windows guest, then launch a process on its
+             interactive desktop
 
 hardware
-  usb        pass a host USB device through to a guest
+  usb        pass a host USB device through to a guest: list, show, attach, detach
 
-Run 'virutil <module>' for a module's own usage.
+Run 'virutil <module>' for a module's own usage. Every module takes -h/--help,
+which exits 0; a usage error exits 1.
 EOF
     exit "${1:-1}"
 }

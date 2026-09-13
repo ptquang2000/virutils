@@ -40,7 +40,9 @@ usb_usage() {
         "" \
         "Under WSL a device plugged into Windows is not here until usbipd has" \
         "imported it; see the README. This module only ever sees the Linux" \
-        "side." >&2
+        "side." \
+        "" \
+        "  -h, --help  this message" >&2
     exit "${1:-1}"
 }
 

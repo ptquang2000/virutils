@@ -40,10 +40,12 @@ UI_RC_NO_PSEXEC=97
 
 ui_usage() {
     printf '%s\n' \
-        "usage: virutil ui {setup|run} VM [ARGS]" \
+        "usage: virutil ui setup [VM] [-f]" \
+        "       virutil ui run   VM APP..." \
         "" \
-        "  setup VM [-f]   fetch PsExec into the host cache (once) and deliver" \
-        "                  it to the guest at C:\\virutil\\. -f re-downloads even" \
+        "  setup [VM] [-f] fetch PsExec into the host cache (once) and deliver" \
+        "                  it to the guest at C:\\virutil\\. With no VM it warms" \
+        "                  the host cache and stops there. -f re-downloads even" \
         "                  if the host cache already holds it." \
         "" \
         "  run VM APP...   launch APP on the interactive (console) desktop via" \
@@ -56,7 +58,10 @@ ui_usage() {
         "  PsExec missing, that is the fix." \
         "" \
         "  setup delivers over the same SMB transport as 'virutil push', so on a" \
-        "  Windows guest it needs smbd and root on this host." >&2
+        "  Windows guest it needs smbd and root on this host." \
+        "" \
+        "  -f, --force    re-download PsExec even if the host cache holds it" \
+        "  -h, --help     this message" >&2
     exit "${1:-1}"
 }
 

@@ -50,7 +50,8 @@ exec_usage() {
         "                 the channel dropping -- the only way to run a reboot" \
         "                 or a long installer." \
         "  --             end of flags" \
-        "  -              read the command from stdin" >&2
+        "  -              read the command from stdin" \
+        "  -h, --help     this message" >&2
     exit "${1:-1}"
 }
 

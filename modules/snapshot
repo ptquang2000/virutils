@@ -22,7 +22,9 @@ snapshot_usage() {
         "" \
         "A running domain gets a memory snapshot too; a shut-off one cannot," \
         "so its snapshot is disk-only -- the guest boots fresh from the" \
-        "disk state on a revert." >&2
+        "disk state on a revert." \
+        "" \
+        "  -h, --help  this message" >&2
     exit "${1:-1}"
 }
 

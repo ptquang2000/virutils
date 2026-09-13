@@ -1,5 +1,11 @@
 #compdef virutil
-# zsh completion for virutil -- mirrors the dispatch in modules/parser.
+# zsh completion for virutil -- mirrors the dispatch in modules/parser, the way
+# completions/virutil.completion.ps1 mirrors modules/parser.ps1.
+#
+# This completes the *bash* driver, so it offers every module in $MODULES:
+# domain, snapshot, sync, pull, push, exec, ui, usb. The Windows driver carries
+# domain, exec and usb only, and its completer says so; usb is on both, spelled
+# the same way on each.
 
 _virutil() {
   # One tag per group in `virutil help`, so zstyle group-name can render them
@@ -15,7 +21,8 @@ _virutil() {
     'push:copy a file or directory from the host into a guest'
   )
   guest=(
-    'exec:run commands inside a Windows guest via the QEMU guest agent'
+    'exec:run commands inside a guest via the QEMU guest agent'
+    'ui:deliver PsExec into a Windows guest, then launch on its desktop'
   )
   hardware=(
     'usb:pass a host USB device through to a guest'
@@ -40,6 +47,7 @@ _virutil() {
     pull)     _virutil_pull ;;
     push)     _virutil_push ;;
     exec)     _virutil_exec ;;
+    ui)       _virutil_ui ;;
     usb)      _virutil_usb ;;
   esac
 }
@@ -76,6 +84,12 @@ _virutil_osinfo() {
   _describe -t osinfo 'osinfo id' ids
 }
 
+# -h/--help is on every module (docs/contract.md section 2), so every completer
+# below answers a leading '-' with it before anything positional.
+_virutil_help_flag() {
+  _values 'option' '-h[this message]' '--help[this message]'
+}
+
 _virutil_exec() {
   local -a cmds=(
     'ping:check the guest agent is responding'
@@ -84,11 +98,14 @@ _virutil_exec() {
     'sh:run a script via /bin/sh -c (Linux)'
   )
   case $CURRENT in
-    3) _describe -t command 'command' cmds ;;
+    3) [[ $words[CURRENT] == -* ]] && { _virutil_help_flag; return }
+       _describe -t command 'command' cmds ;;
     4) _virutil_domains ;;
     *)
       case $words[3] in
         cmd|ps|sh)
+          # Flags sit between VM and the command, and everything after the
+          # command is the guest's to read -- so they are offered once.
           (( CURRENT == 5 )) && _values 'option' \
             '-d[fire and forget, print guest pid]' \
             '--detach[fire and forget, print guest pid]' \
@@ -97,6 +114,29 @@ _virutil_exec() {
           ;;
       esac
       ;;
+  esac
+}
+
+# setup warms the host cache and delivers PsExec into a guest; run launches an
+# app on the interactive desktop. run's APP is a guest path, so it completes to
+# nothing -- offering host files there would be offering the wrong filesystem.
+_virutil_ui() {
+  local -a cmds=(
+    'setup:cache PsExec on the host and deliver it into the guest'
+    'run:launch an app on the guest interactive desktop (PsExec -i)'
+  )
+  if [[ $words[CURRENT] == -* ]]; then
+    case $words[3] in
+      setup) _values 'option' \
+               '(-f --force)'{-f,--force}'[re-download even if the host cache holds it]' \
+               '-h[this message]' '--help[this message]' ;;
+      *)     _virutil_help_flag ;;
+    esac
+    return
+  fi
+  case $CURRENT in
+    3) _describe -t command 'command' cmds ;;
+    4) _virutil_domains ;;    # setup's VM is optional: with none it warms the cache
   esac
 }
 
@@ -129,7 +169,7 @@ _virutil_sync() {
 # on differs, so only the operands complete differently.
 _virutil_pull() {
   if [[ $words[CURRENT] == -* ]]; then
-    _values 'option' '--help[usage]'
+    _virutil_help_flag
     return
   fi
   case $CURRENT in
@@ -157,7 +197,7 @@ _virutil_vcpus() {
 
 _virutil_push() {
   if [[ $words[CURRENT] == -* ]]; then
-    _values 'option' '--help[usage]'
+    _virutil_help_flag
     return
   fi
   case $CURRENT in
@@ -174,6 +214,10 @@ _virutil_usb() {
     'attach:pass a host device through to a domain'
     'detach:take one back from a domain'
   )
+  if [[ $words[CURRENT] == -* ]]; then
+    _virutil_help_flag
+    return
+  fi
   case $CURRENT in
     3) _describe -t command 'command' cmds ;;
     *)
@@ -218,6 +262,10 @@ _virutil_usb_domain_ids() {
 }
 
 _virutil_snapshot() {
+  if [[ $words[CURRENT] == -* ]]; then
+    _virutil_help_flag
+    return
+  fi
   local -a cmds=(
     'create:create an external snapshot (default name snap-<timestamp>; disk-only when shut off)'
     'list:list snapshots as a tree'
@@ -240,6 +288,10 @@ _virutil_snapshot() {
 }
 
 _virutil_domain() {
+  if [[ $words[CURRENT] == -* && $CURRENT == 3 ]]; then
+    _virutil_help_flag
+    return
+  fi
   local -a cmds=(
     'create:define a domain and boot the installer'
     'delete:undefine a domain and delete its disks'
@@ -264,11 +316,12 @@ _virutil_domain() {
              -c|--close) _virutil_domain_ports $words[4]; return ;;
            esac
            _values 'option' \
-             '(-c --close)'{-c,--close}'[close the forward on host PORT]'
+             '(-c --close)'{-c,--close}'[close the forward on host PORT]' \
+             '-h[this message]' '--help[this message]'
            ;;
       esac
       ;;
-    list) ;;                        # takes no arguments
+    list) ;;                        # takes no arguments, beyond -h
     start)
       case $CURRENT in
         3) _describe -t command 'command' cmds ;;
@@ -283,7 +336,8 @@ _virutil_domain() {
              '(-s --size)'{-s,--size}'[grow the disk image, GiB]' \
              '(-m --memory)'{-m,--memory}'[guest RAM, MiB]' \
              '(-c --vcpus)'{-c,--vcpus}'[virtual CPUs]' \
-             '(-G --no-gui)'{-G,--no-gui}'[start it without opening the console]'
+             '(-G --no-gui)'{-G,--no-gui}'[start it without opening the console]' \
+             '-h[this message]' '--help[this message]'
            ;;
       esac
       ;;
@@ -307,7 +361,8 @@ _virutil_domain() {
              '(-m --memory)'{-m,--memory}'[guest RAM, MiB]' \
              '(-c --vcpus)'{-c,--vcpus}'[virtual CPUs]' \
              '(-o --osinfo)'{-o,--osinfo}'[libosinfo id; detected from the ISO by default]' \
-             '(-v --virtio)'{-v,--virtio}'[virtio-win ISO to attach, or none]'
+             '(-v --virtio)'{-v,--virtio}'[virtio-win ISO to attach, or none]' \
+             '-h[this message]' '--help[this message]'
            ;;
       esac
       ;;
