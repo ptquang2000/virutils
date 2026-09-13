@@ -210,11 +210,12 @@ an intention.
 
 ## 7. Scope
 
-Not every module ports. The Windows driver is complete at:
+Not every module ports. What the Windows driver ships today is:
 
-`domain`, `sync`, `push`, `pull`, `exec` -- and `snapshot`, which has now been
-weighed and does not earn it yet (below). Four modules that work beat ten
-half-ported.
+`domain`, `exec` and `usb`. `sync`, `push` and `pull` are the intended surface
+and are blocked rather than unwritten; `snapshot` has now been weighed and does
+not earn it yet; `ui` is bash-only. All four are below. A module that works
+beats two half-ported.
 
 **Where it actually is:** `domain` and `exec` are ported, and the guest agent
 channel they both stand on is in place. `sync`, `push` and `pull` are not, and

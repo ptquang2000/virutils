@@ -10,9 +10,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # What this driver answers to. Shorter than the bash tree's list on purpose:
-# `snapshot`, `sync` and `ui` are not ported yet, and four modules that
-# work beat ten half-ported (contract section 7). A name absent here is refused
-# by name rather than dispatched to a function that does not exist.
+# `snapshot`, `sync`, `push`, `pull` and `ui` are not ported yet, and a module
+# that works beats two half-ported (contract section 7). A name absent here is
+# refused by name rather than dispatched to a function that does not exist.
 #
 # `usb` is on both drivers, by two mechanisms: device_add over the QEMU monitor
 # here, a libvirt <hostdev> there. What is on neither is the WSL case, where
