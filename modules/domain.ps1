@@ -12,9 +12,10 @@
 # launcher already holds every one of those facts because qemu needs them.
 #
 # Four settings differ from the Linux driver, each measured on this host rather
-# than assumed, and each documented in HANDOFF.md with the bisect that found it.
-# They are not preferences and must not be "fixed" back toward the Linux
-# original; see docs/contract.md section 9.
+# than assumed. They are not preferences and must not be "fixed" back toward the
+# Linux original; see docs/contract.md section 9. Each is written out below with
+# what it was measured against, because this comment is now the only record of
+# it -- the bisect that found them was in a handoff note that is gone.
 #
 #   -cpu Skylake-Client, not host-passthrough. Under WHPX both `host` and `max`
 #   hang OVMF in CpuMpPei, before any display output; every named model boots.
@@ -757,8 +758,9 @@ function Get-DomainQemuArgs {
         # this is the only place that is written down. A boot reaching the EFI
         # shell writes ~110 KB, one hanging in MP init stops at ~7.8 KB with
         # "CpuMpPei: 5-Level Paging = 0" as its last line, and that size
-        # difference is how -cpu, -smp, cache= and -vga were each settled. See
-        # HANDOFF.md. `domain delete` takes it away with the rest.
+        # difference is how -cpu, -smp, cache= and -vga were each settled --
+        # see the header of this file. `domain delete` takes it away with the
+        # rest.
         '-debugcon', "file:$(Get-DomainOvmfLog $Vm)"
         '-global', 'isa-debugcon.iobase=0x402'
 

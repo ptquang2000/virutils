@@ -361,8 +361,9 @@ create` leaving exactly the files section 3 names.
 
 ## 9. Host-specific behaviour that is *not* contract
 
-Documented so nobody "fixes" one driver to match the other. See `HANDOFF.md`
-for how each was bisected on the Windows host: `-cpu Skylake-Client` rather
+Documented so nobody "fixes" one driver to match the other. The header of
+`modules/domain.ps1` records how each was bisected on the Windows host, and is
+the place to read before changing one: `-cpu Skylake-Client` rather
 than host-passthrough, `threads=1` rather than an SMT topology,
 `cache=writeback` rather than `cache=none,io=io_uring`, `-vga std` rather than
 virtio. No kvm (WHPX instead, so no hyperv enlightenments), no swtpm, no
