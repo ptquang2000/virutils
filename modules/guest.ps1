@@ -48,21 +48,42 @@ function Format-Rate {
 # --- the guest agent --------------------------------------------------------
 #
 # Every far-side operation in this tool runs through qemu-ga. The channel is one
-# duplex named pipe per domain, created by qemu with
+# loopback socket per domain, created by qemu with
 #
-#   -chardev pipe,id=qga0,path=<Get-GuestAgentPipe VM>
+#   -chardev socket,id=qga0,host=127.0.0.1,port=<Get-GuestAgentPort VM>,server=on,wait=off
 #   -device  virtio-serial
 #   -device  virtserialport,chardev=qga0,name=org.qemu.guest_agent.0
 #
 # and spoken as newline-delimited JSON: one object out, one object back.
+#
+# It was a named pipe until it was measured: `-chardev pipe` on Windows blocks
+# qemu's startup until a client connects, which hung every `domain create` --
+# see the chardev in Get-DomainQemuArgs for the whole diagnosis.
 
-# The pipe name is derived from the domain name and nothing else, so there is no
-# per-VM record to keep in step with the launcher. qemu prefixes it with
-# \\.\pipe\ itself, so what goes on the command line is the bare name and what
-# a client opens is the same name.
-function Get-GuestAgentPipe {
+# Read back out of the launcher, the same way the monitor port is: the launcher
+# is the domain, and a port allocated at create time has nowhere else to live.
+function Get-GuestAgentPort {
     param([Parameter(Mandatory)][string]$Vm)
-    return "virutil-$Vm-qga"
+    $text = Get-DomainLauncherText $Vm
+    # The optional quote is not cosmetic: the launcher quotes any value holding
+    # a comma, and this one always holds several.
+    $m = [regex]::Match($text, '-chardev\s+"?socket,id=qga0,host=127\.0\.0\.1,port=(\d+)')
+    if ($m.Success) { return [int]$m.Groups[1].Value }
+
+    if ($text -match '-chardev\s+"?pipe,id=qga0') {
+        Die @(
+            "$Vm was created with a pipe guest agent channel, which hangs qemu"
+            'on this host: it blocks until something opens the pipe, before the'
+            'display or the monitor come up at all. Recreate the domain --'
+            "'virutil domain delete $Vm' then 'virutil domain create $Vm <iso>'"
+            '-- to get the loopback socket that replaced it.'
+        )
+    }
+    Die @(
+        "$Vm's launcher opens no guest agent channel, so there is nothing to run"
+        'anything inside the guest with. Recreate the domain, or add the qga0'
+        "chardev to $(Get-DomainLauncher $Vm) by hand."
+    )
 }
 
 # --- one channel for the whole run ------------------------------------------
@@ -131,16 +152,20 @@ function Reset-GuestAgentChannel {
 function Open-GuestAgent {
     param([Parameter(Mandatory)][string]$Vm, [int]$TimeoutMs = 2000)
 
-    $pipe = New-Object System.IO.Pipes.NamedPipeClientStream(
-        '.', (Get-GuestAgentPipe $Vm),
-        [System.IO.Pipes.PipeDirection]::InOut,
-        [System.IO.Pipes.PipeOptions]::Asynchronous)
+    $tcp = New-Object Net.Sockets.TcpClient
     try {
-        $pipe.Connect($TimeoutMs)
+        if (-not $tcp.ConnectAsync('127.0.0.1', (Get-GuestAgentPort $Vm)).Wait($TimeoutMs)) {
+            $tcp.Close()
+            return $null
+        }
     } catch {
-        $pipe.Dispose()
+        $tcp.Close()
         return $null
     }
+    # The stream, not the client: everything below reads and writes a Stream,
+    # and NetworkStream honours the same ReadAsync the pipe did. Disposing it
+    # closes the socket with it.
+    $pipe = $tcp.GetStream()
 
     $id = Get-Random -Minimum 1 -Maximum ([int]::MaxValue)
     # The delimiter is a raw 0xFF byte and is prepended as one. Putting U+00FF
@@ -228,7 +253,7 @@ function Invoke-GuestAgent {
     $pipe = Get-GuestAgentChannel $Vm
     if ($null -eq $pipe) {
         Die @(
-            "$Vm's QEMU guest agent is not answering on \\.\pipe\$(Get-GuestAgentPipe $Vm)."
+            "$Vm's QEMU guest agent is not answering on 127.0.0.1:$(Get-GuestAgentPort $Vm)."
             'The agent is what runs anything inside the guest, so nothing can'
             'proceed without it. Check that the domain is running, and that'
             'qemu-ga is running in the guest -- on a Windows guest that is the'

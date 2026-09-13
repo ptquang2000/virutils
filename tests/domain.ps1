@@ -49,19 +49,22 @@ try {
         -Qemu @{ Code = 'C:\q\share\edk2-x86_64-code.fd' } `
         -Disk (Get-DomainDisk $vm) -Nvram (Get-DomainNvram $vm) `
         -Iso 'C:\iso\win.iso' -Virtio '' -Memory 8192 -Vcpus 4 `
-        -Ports @('13389:3389', '2222:22') -MonitorPort 44444
+        -Ports @('13389:3389', '2222:22') -MonitorPort 44444 -AgentPort 44445
 
     Write-DomainLauncher (Get-DomainLauncher $vm) 'C:\q\qemu-system-x86_64.exe' $qemuArgs $vm
 
     Check 'the launcher is the domain'   $true              (Test-Domain $vm)
     Check 'the monitor port reads back'  44444              (Get-DomainMonitorPort $vm)
-    Check 'the agent pipe is named'      'virutil-testvm-qga' (Get-GuestAgentPipe $vm)
+    Check 'the agent port reads back'    44445              (Get-GuestAgentPort $vm)
 
     # The channel that makes everything else possible has to actually be on the
     # command line; without it there is no qemu-ga, and exec, guest_os, push and
     # pull all stop before they start.
     $line = ($qemuArgs -join ' ')
     Check 'the agent chardev is present' $true ($line -match 'virtserialport,chardev=qga0,name=org\.qemu\.guest_agent\.0')
+    # wait=off or qemu blocks on the command line waiting for a client, which
+    # is the whole reason the pipe chardev was replaced.
+    Check 'the agent chardev is wait=off' $true ($line -match 'socket,id=qga0,.*server=on,wait=off')
     Check 'virtio-serial is present'     $true ($line -match '-device virtio-serial')
 
     $fwd = Get-DomainForwards $vm

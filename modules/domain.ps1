@@ -600,6 +600,7 @@ function New-Domain {
     }
 
     $monitorPort = Get-FreeLoopbackPort
+    $agentPort   = Get-FreeLoopbackPort $monitorPort
     New-VirutilsDir $script:VirutilsImageDir | Out-Null
 
     Say ('{0,-10}{1}' -f 'domain:',   "$vm (whpx, $($script:DomainCpu))")
@@ -619,12 +620,12 @@ function New-Domain {
 
     $qemuArgs = Get-DomainQemuArgs -Vm $vm -Qemu $qemu -Disk $disk -Nvram $nvram `
         -Iso $iso -Virtio $virtio -Memory $memory -Vcpus $vcpus `
-        -Ports $ports -MonitorPort $monitorPort
+        -Ports $ports -MonitorPort $monitorPort -AgentPort $agentPort
 
     Write-DomainLauncher $launcher $qemu.System $qemuArgs $vm
     Say ('{0,-10}{1}' -f 'launcher:', $launcher)
     Say ('{0,-10}{1}' -f 'monitor:',  "127.0.0.1:$monitorPort")
-    Say ('{0,-10}{1}' -f 'agent:',    "\\.\pipe\$(Get-GuestAgentPipe $vm)")
+    Say ('{0,-10}{1}' -f 'agent:',    "127.0.0.1:$agentPort")
 
     if ($noStart) { return }
 
@@ -701,20 +702,30 @@ function Get-QemuTools {
               Code = $code; VarsTemplate = $vars }
 }
 
-# A free loopback port for the monitor. Bound and released rather than scanned:
-# asking the OS for port 0 is the only way to be told a port that is actually
-# free, and the race between releasing it and qemu binding it is one transfer
-# wide and fails loudly if it is lost.
+# A free loopback port. Bound and released rather than scanned: asking the OS
+# for port 0 is the only way to be told a port that is actually free, and the
+# race between releasing it and qemu binding it is one transfer wide and fails
+# loudly if it is lost.
+#
+# Exclude is the ports already handed out in this same breath -- the OS is free
+# to answer port 0 with the number it just released, so two calls in a row can
+# name the same port and the second chardev would then fail to bind.
 function Get-FreeLoopbackPort {
-    $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
-    $l.Start()
-    try { return ([Net.IPEndPoint]$l.LocalEndpoint).Port } finally { $l.Stop() }
+    param([int[]]$Exclude = @())
+    foreach ($i in 1..20) {
+        $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+        $l.Start()
+        try { $p = ([Net.IPEndPoint]$l.LocalEndpoint).Port } finally { $l.Stop() }
+        if ($p -notin $Exclude) { return $p }
+    }
+    Die 'could not find a free loopback port'
 }
 
 function Get-DomainQemuArgs {
     param(
         [string]$Vm, $Qemu, [string]$Disk, [string]$Nvram, [string]$Iso,
-        [string]$Virtio, [int]$Memory, [int]$Vcpus, [string[]]$Ports, [int]$MonitorPort
+        [string]$Virtio, [int]$Memory, [int]$Vcpus, [string[]]$Ports, [int]$MonitorPort,
+        [int]$AgentPort
     )
 
     $hostfwd = ($Ports | ForEach-Object {
@@ -766,10 +777,24 @@ function Get-DomainQemuArgs {
 
         # The guest agent channel, and nothing downstream of domain works
         # without it: exec runs through it, guest_os asks it what OS is there,
-        # and push and pull both wait on it before they start. A named pipe
-        # rather than the unix socket the Linux driver's libvirt would make --
-        # qemu prefixes the path with \\.\pipe\ itself.
-        '-chardev', "pipe,id=qga0,path=$(Get-GuestAgentPipe $Vm)"
+        # and push and pull both wait on it before they start.
+        #
+        # A loopback socket with wait=off, and **not** the `pipe` chardev this
+        # used to be. `-chardev pipe` on Windows blocks in ConnectNamedPipe
+        # until something opens the pipe, and qemu does that while it is still
+        # reading its own command line -- so nothing after this point ever
+        # happens. Measured on this host: the window opened black and empty,
+        # the monitor port declared below never bound, no OVMF log was written,
+        # and the process sat there forever. `domain start` then found no
+        # monitor, concluded the domain was not running, and launched a second
+        # qemu that could not open the qcow2 the first one already held. That
+        # is the "create leaves a process behind and the domain will not start"
+        # bug, and it is entirely this one flag.
+        #
+        # wait=off is the load-bearing half of the replacement: a socket
+        # chardev in server mode waits for its first client by default and
+        # would hang in precisely the same way.
+        '-chardev', "socket,id=qga0,host=127.0.0.1,port=$AgentPort,server=on,wait=off"
         '-device', 'virtio-serial'
         '-device', 'virtserialport,chardev=qga0,name=org.qemu.guest_agent.0'
 
