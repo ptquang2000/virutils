@@ -1,0 +1,118 @@
+# payload -- read a guest-side script out of payloads/ and fill its holes.
+#
+# The scripts virutil sends *into* a guest are keyed on the guest's OS and never
+# on the host's, so they are byte-identical under this driver and under
+# virutil.ps1. Keeping them as data in payloads/ rather than as string arrays in
+# each language is what makes that true rather than merely intended: see
+# docs/contract.md section 6, and payloads/README.md for the grammar.
+#
+#   payload_render FILE [NAME=VALUE]...
+#
+# NAME=VALUE fills an @NAME@ hole, quoted as a string literal in the payload's
+# own language -- which the file extension decides, and which is the one thing
+# a caller never does for itself. The @@NAME@@ holes are not arguments: they are
+# the exit codes in section 5 of the contract, plus @@PROBE@@, and this file
+# owns the table.
+
+# payloads/ sits beside modules/, and both are reached through the driver's own
+# path rather than the caller's working directory -- virutil is installed as a
+# symlink and resolves through it, not around it.
+PAYLOADS_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../payloads" && pwd)"
+
+# The raw table. Every one of these is a number a caller matches on, so it is
+# written once here and not spelled again in any payload.
+payload_raw_value() {
+    case "$1" in
+        RC_NO_RSYNC)     printf '%s' "$GUEST_RC_NO_RSYNC" ;;
+        RC_PUSH_MKDIR)   printf '%s' "$PUSH_RC_MKDIR" ;;
+        RC_PUSH_ROBO)    printf '%s' "$PUSH_RC_ROBO" ;;
+        RC_PULL_NOMATCH) printf '%s' "$PULL_RC_NOMATCH" ;;
+        RC_PULL_ROBO)    printf '%s' "$PULL_RC_ROBO" ;;
+        *)               return 1 ;;
+    esac
+}
+
+# payload_text FILE -- the file with its commentary removed. A PowerShell
+# payload is base64'd as UTF-16LE onto a command line Windows caps at 32767
+# characters and an sh payload travels as one argv entry Linux caps at 128KB, so
+# the budget is for the transfer rather than for the prose. `#` opens a comment
+# in both languages, and a line whose first non-space character is `#` goes
+# whole.
+payload_text() {
+    sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' -- "$1"
+}
+
+# payload_render FILE [NAME=VALUE]... -- the rendered script on stdout.
+#
+# **Assign it, do not interpolate it.** `die` here is an `exit`, and inside
+# `$(...)` that exits the subshell rather than the run -- so `exec_ps_text
+# "$(payload_render ...)"` would print the complaint, hand the guest an empty
+# script, and call whatever came back a success. Every caller does
+#
+#     local script
+#     script="$(payload_render ...)" || exit 1
+#
+# because an assignment from a command substitution *does* carry the status out.
+payload_render() {
+    local file="$1"; shift
+    local path="$PAYLOADS_DIR/$file" text quote arg name value raw probe
+
+    [[ -r "$path" ]] || die "internal: no payload at $path"
+    case "$file" in
+        *.ps1) quote=push_ps_quote ;;
+        *.sh)  quote=sh_quote ;;
+        *)     die "internal: payload $file is in no language this can quote for" ;;
+    esac
+
+    text="$(payload_text "$path")"
+
+    # @@PROBE@@ before the code table: probe.sh carries an @@RC_NO_RSYNC@@ of
+    # its own, and it has to be there to be filled.
+    #
+    # Every replacement below is double-quoted, and that is load-bearing rather
+    # than habit: since bash 5.2 an unquoted `&` in a ${//} replacement stands
+    # for whatever the pattern matched, so an unquoted probe.sh turned its own
+    # `2>&1` into `2>@@PROBE@@1` -- a payload that would have reached a guest
+    # looking like a redirection to a file named 1.
+    if [[ "$text" == *'@@PROBE@@'* ]]; then
+        probe="$(payload_text "$PAYLOADS_DIR/probe.sh")"
+        text="${text//'@@PROBE@@'/"$probe"}"
+    fi
+
+    while [[ "$text" =~ @@([A-Z][A-Z0-9_]*)@@ ]]; do
+        name="${BASH_REMATCH[1]}"
+        raw="$(payload_raw_value "$name")" \
+            || die "internal: payload $file wants @@$name@@, which is not a" \
+                   "code this knows"
+        text="${text//"@@${name}@@"/"$raw"}"
+    done
+
+    # A value carrying a marker of its own is refused rather than substituted.
+    # This renderer fills one hole at a time, so such a value would be rescanned
+    # as the next hole; the PowerShell renderer fills them in one pass and would
+    # not. Refusing here is what keeps the two provably identical for every
+    # input either of them accepts -- which is the whole reason payloads/ is
+    # data, and is worth more than the ability to push a file with @SRC@ in its
+    # name.
+    for arg in "$@"; do
+        name="${arg%%=*}"
+        value="${arg#*=}"
+        [[ "$arg" == *=* && -n "$name" ]] \
+            || die "internal: payload_render wants NAME=VALUE, got '$arg'"
+        [[ "$text" == *"@${name}@"* ]] \
+            || die "internal: payload $file has no @$name@ to fill"
+        [[ "$value" =~ @[A-Z][A-Z0-9_]*@ ]] \
+            && die "$name is '$value', which contains ${BASH_REMATCH[0]} --" \
+                   "the spelling of a payload placeholder. virutil will not" \
+                   "send that into a guest as itself. Rename it."
+        text="${text//"@${name}@"/"$("$quote" "$value")"}"
+    done
+
+    # A hole left in it is a script that fails in the guest as an unrelated
+    # error rather than as a missing argument here.
+    if [[ "$text" =~ @([A-Z][A-Z0-9_]*)@ ]]; then
+        die "internal: payload $file was rendered with @${BASH_REMATCH[1]}@ unfilled"
+    fi
+
+    printf '%s' "$text"
+}

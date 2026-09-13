@@ -1,0 +1,207 @@
+
+===== push.ps1 dir -> dir =====
+$ErrorActionPreference = "Stop"
+$src = '\\10.0.2.2\Tok3nTok3nTok3nTok3n'
+$dst = 'C:\opt\app\tree'
+try { if (-not (Test-Path -LiteralPath $dst)) { New-Item -ItemType Directory -Force -Path $dst | Out-Null } }
+catch { [Console]::Error.WriteLine($_.Exception.Message); exit 92 }
+$sw = [Diagnostics.Stopwatch]::StartNew()
+& robocopy $src $dst /E /R:1 /W:1 /NP /NFL /NDL /NJH /NJS | Out-Null
+$rc = $LASTEXITCODE
+$sw.Stop()
+if ($rc -ge 8) { [Console]::Error.WriteLine("robocopy exit $rc"); exit 93 }
+$copied = [int][bool]($rc -band 1)
+$total  = (Get-ChildItem -LiteralPath $dst -Recurse -File).Count
+"$copied $total $([int]$sw.Elapsed.TotalMilliseconds)"
+
+===== push.ps1 dir/ -> dir =====
+$ErrorActionPreference = "Stop"
+$src = '\\10.0.2.2\Tok3nTok3nTok3nTok3n'
+$dst = 'C:\opt\app'
+try { if (-not (Test-Path -LiteralPath $dst)) { New-Item -ItemType Directory -Force -Path $dst | Out-Null } }
+catch { [Console]::Error.WriteLine($_.Exception.Message); exit 92 }
+$sw = [Diagnostics.Stopwatch]::StartNew()
+& robocopy $src $dst /E /R:1 /W:1 /NP /NFL /NDL /NJH /NJS | Out-Null
+$rc = $LASTEXITCODE
+$sw.Stop()
+if ($rc -ge 8) { [Console]::Error.WriteLine("robocopy exit $rc"); exit 93 }
+$copied = [int][bool]($rc -band 1)
+$total  = (Get-ChildItem -LiteralPath $dst -Recurse -File).Count
+"$copied $total $([int]$sw.Elapsed.TotalMilliseconds)"
+
+===== push.ps1 file -> dir =====
+$ErrorActionPreference = "Stop"
+$src = '\\10.0.2.2\Tok3nTok3nTok3nTok3n\one.txt'
+$dst = 'C:\opt\app\one.txt'
+$dir = Split-Path -Parent $dst
+try { if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null } }
+catch { [Console]::Error.WriteLine($_.Exception.Message); exit 92 }
+$sw = [Diagnostics.Stopwatch]::StartNew()
+Copy-Item -LiteralPath $src -Destination $dst -Force
+$sw.Stop()
+"$((Get-Item -LiteralPath $dst).Length) $([int]$sw.Elapsed.TotalMilliseconds)"
+
+===== push.ps1 file -> file =====
+$ErrorActionPreference = "Stop"
+$src = '\\10.0.2.2\Tok3nTok3nTok3nTok3n\one.txt'
+$dst = 'C:\opt\app\two.txt'
+$dir = Split-Path -Parent $dst
+try { if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null } }
+catch { [Console]::Error.WriteLine($_.Exception.Message); exit 92 }
+$sw = [Diagnostics.Stopwatch]::StartNew()
+Copy-Item -LiteralPath $src -Destination $dst -Force
+$sw.Stop()
+"$((Get-Item -LiteralPath $dst).Length) $([int]$sw.Elapsed.TotalMilliseconds)"
+
+===== push.sh dir -> dir =====
+command -v rsync >/dev/null 2>&1 || {
+  echo "rsync is not installed in this guest" >&2
+  exit 90
+}
+src='rsync://10.0.2.2:23456/Tok3nTok3nTok3nTok3n/'
+dst='/opt/app/tree'
+mkdir -p "$dst" || { echo "cannot create $dst" >&2; exit 92; }
+log=$(mktemp)
+dstmode=$(stat -c %a "$dst")
+t0=$(date +%s%N)
+rc=0
+rsync -rlptD --out-format="%i %n" "$src" "$dst/" >"$log" || rc=$?
+chmod "$dstmode" "$dst"
+[ "$rc" = 0 ] || exit "$rc"
+t1=$(date +%s%N)
+n=$(grep -c "^[<>]" "$log" || true)
+rm -f "$log"
+total=$(find "$dst" -type f | wc -l)
+echo "$n $total $(( (t1 - t0) / 1000000 ))"
+
+===== push.sh dir/ -> dir =====
+command -v rsync >/dev/null 2>&1 || {
+  echo "rsync is not installed in this guest" >&2
+  exit 90
+}
+src='rsync://10.0.2.2:23456/Tok3nTok3nTok3nTok3n/'
+dst='/opt/app'
+mkdir -p "$dst" || { echo "cannot create $dst" >&2; exit 92; }
+log=$(mktemp)
+dstmode=$(stat -c %a "$dst")
+t0=$(date +%s%N)
+rc=0
+rsync -rlptD --out-format="%i %n" "$src" "$dst/" >"$log" || rc=$?
+chmod "$dstmode" "$dst"
+[ "$rc" = 0 ] || exit "$rc"
+t1=$(date +%s%N)
+n=$(grep -c "^[<>]" "$log" || true)
+rm -f "$log"
+total=$(find "$dst" -type f | wc -l)
+echo "$n $total $(( (t1 - t0) / 1000000 ))"
+
+===== push.sh file -> dir =====
+command -v rsync >/dev/null 2>&1 || {
+  echo "rsync is not installed in this guest" >&2
+  exit 90
+}
+src='rsync://10.0.2.2:23456/Tok3nTok3nTok3nTok3n/one.txt'
+dst='/opt/app/one.txt'
+dir=$(dirname "$dst")
+mkdir -p "$dir" || { echo "cannot create $dir" >&2; exit 92; }
+log=$(mktemp)
+t0=$(date +%s%N)
+rsync -lptD --out-format="%i %n" "$src" "$dst" >"$log"
+t1=$(date +%s%N)
+n=$(grep -c "^[<>]" "$log" || true)
+rm -f "$log"
+echo "$n $(wc -c < "$dst") $(( (t1 - t0) / 1000000 ))"
+
+===== push.sh file -> file =====
+command -v rsync >/dev/null 2>&1 || {
+  echo "rsync is not installed in this guest" >&2
+  exit 90
+}
+src='rsync://10.0.2.2:23456/Tok3nTok3nTok3nTok3n/one.txt'
+dst='/opt/app/two.txt'
+dir=$(dirname "$dst")
+mkdir -p "$dir" || { echo "cannot create $dir" >&2; exit 92; }
+log=$(mktemp)
+t0=$(date +%s%N)
+rsync -lptD --out-format="%i %n" "$src" "$dst" >"$log"
+t1=$(date +%s%N)
+n=$(grep -c "^[<>]" "$log" || true)
+rm -f "$log"
+echo "$n $(wc -c < "$dst") $(( (t1 - t0) / 1000000 ))"
+
+===== pull.ps1 =====
+$ErrorActionPreference = "Stop"
+$src = 'C:\Users\me\out\*.log'
+$dst = '\\10.0.2.2\Tok3nTok3nTok3nTok3n'
+$items = @(Get-Item -Path $src -Force -ErrorAction SilentlyContinue)
+if ($items.Count -eq 0) { [Console]::Error.WriteLine("no match for $src"); exit 94 }
+$files = @($items | Where-Object { -not $_.PSIsContainer })
+$dirs  = @($items | Where-Object { $_.PSIsContainer })
+$flags = @("/R:1","/W:1","/NP","/NFL","/NDL","/NJH","/NJS")
+$rc = 0
+$sw = [Diagnostics.Stopwatch]::StartNew()
+foreach ($g in @($files | Group-Object DirectoryName)) {
+  & robocopy $g.Name $dst @($g.Group | ForEach-Object { $_.Name }) @flags | Out-Null
+  if ($LASTEXITCODE -ge 8) { $rc = $LASTEXITCODE } }
+foreach ($d in $dirs) {
+  & robocopy $d.FullName (Join-Path $dst $d.Name) /E @flags | Out-Null
+  if ($LASTEXITCODE -ge 8) { $rc = $LASTEXITCODE } }
+$sw.Stop()
+if ($rc -ge 8) { [Console]::Error.WriteLine("robocopy exit $rc"); exit 95 }
+"$($files.Count) $($dirs.Count) $([int]$sw.Elapsed.TotalMilliseconds)"
+
+===== pull.sh =====
+command -v rsync >/dev/null 2>&1 || {
+  echo "rsync is not installed in this guest" >&2
+  exit 90
+}
+pat='/home/me/out/*.log'
+dst='rsync://10.0.2.2:23456/Tok3nTok3nTok3nTok3n/'
+oldifs=$IFS; IFS=""; set -- $pat; IFS=$oldifs
+if [ $# -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; then
+  echo "no match for $pat" >&2
+  exit 94
+fi
+nf=0 nd=0
+for f do
+  if [ -d "$f" ] && [ ! -L "$f" ]; then nd=$((nd+1)); else nf=$((nf+1)); fi
+done
+t0=$(date +%s%N)
+rsync -rlptD "$@" "$dst"
+t1=$(date +%s%N)
+echo "$nf $nd $(( (t1 - t0) / 1000000 ))"
+
+===== sync.ps1 =====
+$ErrorActionPreference = "Stop"
+$src = '\\10.0.2.2\Tok3nTok3nTok3nTok3n'
+$dst = "C:\"
+$sw = [Diagnostics.Stopwatch]::StartNew()
+& robocopy $src $dst /E /R:1 /W:1 /NP /NFL /NDL /NJH /NJS | Out-Null
+$rc = $LASTEXITCODE
+$sw.Stop()
+if ($rc -ge 8) { [Console]::Error.WriteLine("robocopy exit $rc"); exit 93 }
+"$([int][bool]($rc -band 1)) $([int]$sw.Elapsed.TotalMilliseconds)"
+
+===== sync.sh =====
+command -v rsync >/dev/null 2>&1 || {
+  echo "rsync is not installed in this guest" >&2
+  exit 90
+}
+src='rsync://10.0.2.2:23456/Tok3nTok3nTok3nTok3n/'
+log=$(mktemp)
+rootmode=$(stat -c %a /)
+t0=$(date +%s%N)
+rc=0
+rsync -rlptD --out-format="%i %n" "$src" / >"$log" || rc=$?
+chmod "$rootmode" /
+[ "$rc" = 0 ] || exit "$rc"
+t1=$(date +%s%N)
+n=$(grep -c "^[<>]" "$log" || true)
+rm -f "$log"
+echo "$n $(( (t1 - t0) / 1000000 ))"
+
+===== probe.sh =====
+command -v rsync >/dev/null 2>&1 || {
+  echo "rsync is not installed in this guest" >&2
+  exit 90
+}

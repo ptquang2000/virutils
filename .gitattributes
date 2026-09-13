@@ -1,0 +1,22 @@
+# payloads/ must check out with LF on every host, and this is correctness rather
+# than tidiness.
+#
+# The two drivers strip the commentary out of a payload differently -- the bash
+# renderer with sed, which leaves a CR at the end of every line, and the
+# PowerShell one with Get-Content, which takes it off. On a clone with
+# core.autocrlf=true they would therefore send *different bytes* into the same
+# guest, which is precisely what section 6 of docs/contract.md promises cannot
+# happen. tests/payloads.{sh,ps1} would catch it, but only on a host that runs
+# both halves.
+payloads/** text eol=lf
+
+# Same reasoning, one step removed: the golden file is the comparison both
+# renderers are held to, so it cannot be allowed to differ between checkouts.
+tests/golden/** text eol=lf
+
+# The bash driver is run by bash wherever it is checked out, and a CR at the end
+# of a line is a syntax error there rather than whitespace.
+virutil          text eol=lf
+install.sh       text eol=lf
+modules/*        text eol=lf
+tests/*.sh       text eol=lf

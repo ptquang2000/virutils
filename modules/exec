@@ -51,7 +51,7 @@ exec_usage() {
         "                 or a long installer." \
         "  --             end of flags" \
         "  -              read the command from stdin" >&2
-    exit 1
+    exit "${1:-1}"
 }
 
 # agent JSON -> stdout; dies on an agent-level error rather than feeding jq garbage
@@ -221,6 +221,12 @@ $1"
 exec_main() {
     local CMD VM
     CMD="${1:-}"
+    # An asked-for help exits 0 and a usage error exits 1, on every module in
+    # both drivers. That is contract, so it is settled before anything else is
+    # read -- and this module used to get it wrong, exiting 1 either way.
+    case "$CMD" in
+        -h|--help) exec_usage 0 ;;
+    esac
     [ -n "$CMD" ] || exec_usage
     VM="${2:-}"
     [ -n "$VM" ] || exec_usage

@@ -179,46 +179,14 @@ pull_net() {
     pull_smb_report "$reported" "$elapsed"
 }
 
-# pull_smb_fetch SRC -- the guest side, one powershell run. Get-Item resolves
-# SRC, wildcards and all: Windows matches them case-insensitively itself.
-#
-# Files and directories are copied by two different robocopy shapes, because
-# robocopy always takes a source *directory*: a file is named as a filter
-# alongside its parent, a directory is copied whole into a subdirectory of the
-# share named after it -- which is where rsync would put it too. Files are
-# grouped by parent so a wildcard that spans directories still costs one
-# robocopy per directory rather than one per file.
-#
-# robocopy's exit code is a bitmap, not an error level: 0 means nothing needed
-# copying, bit 0 means files were copied, and only >= 8 is a real failure -- so
-# the usual "non-zero is bad" is wrong here and would call every successful copy
-# an error. The stopwatch times the copy alone, without the agent round trip and
-# powershell start-up that this host's wall clock would fold in.
+# pull_smb_fetch SRC -- the guest side, one powershell run of payloads/pull.ps1,
+# which is shared verbatim with the Windows driver and documents itself. All
+# this does is name the two ends: the pattern as the guest spells it, and the
+# UNC of the writable share it copies into.
 pull_smb_fetch() {
-    local SRC="$1" script src_win
-
-    src_win="C:\\${SRC//\//\\}"
-    script=$(printf '%s\n' \
-        '$ErrorActionPreference = "Stop"' \
-        "\$src = $(push_ps_quote "$src_win")" \
-        "\$dst = $(push_ps_quote "$XFER_SMB_UNC")" \
-        '$items = @(Get-Item -Path $src -Force -ErrorAction SilentlyContinue)' \
-        "if (\$items.Count -eq 0) { [Console]::Error.WriteLine(\"no match for \$src\"); exit $PULL_RC_NOMATCH }" \
-        '$files = @($items | Where-Object { -not $_.PSIsContainer })' \
-        '$dirs  = @($items | Where-Object { $_.PSIsContainer })' \
-        '$flags = @("/R:1","/W:1","/NP","/NFL","/NDL","/NJH","/NJS")' \
-        '$rc = 0' \
-        '$sw = [Diagnostics.Stopwatch]::StartNew()' \
-        'foreach ($g in @($files | Group-Object DirectoryName)) {' \
-        '  & robocopy $g.Name $dst @($g.Group | ForEach-Object { $_.Name }) @flags | Out-Null' \
-        '  if ($LASTEXITCODE -ge 8) { $rc = $LASTEXITCODE } }' \
-        'foreach ($d in $dirs) {' \
-        '  & robocopy $d.FullName (Join-Path $dst $d.Name) /E @flags | Out-Null' \
-        '  if ($LASTEXITCODE -ge 8) { $rc = $LASTEXITCODE } }' \
-        '$sw.Stop()' \
-        "if (\$rc -ge 8) { [Console]::Error.WriteLine(\"robocopy exit \$rc\"); exit $PULL_RC_ROBO }" \
-        '"$($files.Count) $($dirs.Count) $([int]$sw.Elapsed.TotalMilliseconds)"')
-
+    local SRC="$1" script
+    script="$(payload_render pull.ps1 \
+        SRC="C:\\${SRC//\//\\}" DST="$XFER_SMB_UNC")" || exit 1
     exec_ps_text "$script"
 }
 
@@ -272,44 +240,14 @@ pull_smb_die() {
 # of the export and files land at its top, which is where the Windows shapes put
 # them too, and where rsync would put them anyway.
 #
-# The pattern is expanded by the guest, and it travels as data rather than as
-# shell source: with IFS empty, `set -- $pat` does no field splitting and the
-# glob still expands to one field per match, so a path with a space or a `;` in
-# it is a path and not a syntax accident. See sync_lin_cleanup_fn, which uses
-# the same technique for the same reason.
-#
-# Note the case sensitivity: this glob is the guest's shell, so it matches
-# case-sensitively, where the Windows side leans on Windows matching
-# case-insensitively itself. A Linux guest has no case-insensitive matching to
-# borrow, and inventing one
-# would be a worse surprise than the plain shell behaviour.
-#
-# Only pathname expansion happens: a glob only ever yields paths that exist, so
-# the one arrangement in which an argument can be missing is a pattern that
-# matched nothing and was left as its own literal text. That is exactly the
-# no-match case, and it is detected rather than handed to rsync, which would
-# report it as a partial transfer.
+# The guest side is payloads/pull.sh, shared verbatim with the Windows driver,
+# where the globbing problem and the case sensitivity that follows from it are
+# written down. sync_lin_cleanup_fn uses the same IFS technique for the same
+# reason and is worth reading beside it.
 pull_lin_fetch() {
     local SRC="$1" script
-
-    script=$(printf '%s\n' \
-        "$(guest_sh_need_rsync)" \
-        "pat=$(sh_quote "/$SRC")" \
-        "dst=$(sh_quote "$XFER_RSYNCD_URL/")" \
-        'oldifs=$IFS; IFS=""; set -- $pat; IFS=$oldifs' \
-        'if [ $# -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; then' \
-        '  echo "no match for $pat" >&2' \
-        "  exit $PULL_RC_NOMATCH" \
-        'fi' \
-        'nf=0 nd=0' \
-        'for f do' \
-        '  if [ -d "$f" ] && [ ! -L "$f" ]; then nd=$((nd+1)); else nf=$((nf+1)); fi' \
-        'done' \
-        't0=$(date +%s%N)' \
-        'rsync -rlptD "$@" "$dst"' \
-        't1=$(date +%s%N)' \
-        'echo "$nf $nd $(( (t1 - t0) / 1000000 ))"')
-
+    script="$(payload_render pull.sh \
+        SRC="/$SRC" DST="$XFER_RSYNCD_URL/")" || exit 1
     exec_sh_text "$script"
 }
 

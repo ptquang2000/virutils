@@ -268,19 +268,18 @@ push_net() {
 }
 
 # push_smb_fetch SRC DST DST_IS_DIR -- the guest side, one powershell run.
-# robocopy for a directory (its whole reason for being: it skips unchanged
-# files); Copy-Item for a single file, which robocopy cannot rename onto a new
-# name. Both time themselves with a stopwatch so the reported duration is the
-# copy alone, without the agent round trip and powershell start-up that the
-# host's own wall clock would fold in. robocopy's exit code is a bitmap, not an
-# error level: 0 means nothing needed copying, bit 0 means files were copied,
-# and only >= 8 is a real failure -- so the usual 'non-zero is bad' is wrong
-# here and would call every successful copy an error.
+# The script itself is payloads/push-dir.ps1 or payloads/push-file.ps1, shared
+# verbatim with the Windows driver; all this decides is which of the two, and
+# what the destination is called over there.
+#
+# Two payloads and not one because robocopy cannot rename onto a new name, so a
+# single file has to go through Copy-Item -- see the head of push-file.ps1.
 push_smb_fetch() {
-    local SRC="$1" DST="$2" is_dir="$3" script dst_win base unc
+    local SRC="$1" DST="$2" is_dir="$3" dst_win base script
+
+    base="$(basename -- "$SRC")"
 
     if [[ -d "$SRC" ]]; then
-        base="$(basename -- "$SRC")"
         # Trailing slash means "contents into DST"; no slash means "DST/<name>",
         # matching rsync and the tar layout the --live path builds.
         if [[ "$SRC" == */ ]]; then
@@ -288,42 +287,19 @@ push_smb_fetch() {
         else
             dst_win="C:\\${DST:+${DST//\//\\}\\}$base"
         fi
-        script=$(printf '%s\n' \
-            '$ErrorActionPreference = "Stop"' \
-            "\$src = $(push_ps_quote "$XFER_SMB_UNC")" \
-            "\$dst = $(push_ps_quote "$dst_win")" \
-            'try { if (-not (Test-Path -LiteralPath $dst)) { New-Item -ItemType Directory -Force -Path $dst | Out-Null } }' \
-            "catch { [Console]::Error.WriteLine(\$_.Exception.Message); exit $PUSH_RC_MKDIR }" \
-            '$sw = [Diagnostics.Stopwatch]::StartNew()' \
-            '& robocopy $src $dst /E /R:1 /W:1 /NP /NFL /NDL /NJH /NJS | Out-Null' \
-            '$rc = $LASTEXITCODE' \
-            '$sw.Stop()' \
-            "if (\$rc -ge 8) { [Console]::Error.WriteLine(\"robocopy exit \$rc\"); exit $PUSH_RC_ROBO }" \
-            '$copied = [int][bool]($rc -band 1)' \
-            '$total  = (Get-ChildItem -LiteralPath $dst -Recurse -File).Count' \
-            '"$copied $total $([int]$sw.Elapsed.TotalMilliseconds)"')
+        script="$(payload_render push-dir.ps1 \
+            SRC="$XFER_SMB_UNC" DST="$dst_win")" || exit 1
+        exec_ps_text "$script"
     else
-        base="$(basename -- "$SRC")"
-        unc="$XFER_SMB_UNC\\$base"
         if (( is_dir )); then
             dst_win="C:\\${DST:+${DST//\//\\}\\}$base"
         else
             dst_win="C:\\${DST//\//\\}"
         fi
-        script=$(printf '%s\n' \
-            '$ErrorActionPreference = "Stop"' \
-            "\$src = $(push_ps_quote "$unc")" \
-            "\$dst = $(push_ps_quote "$dst_win")" \
-            '$dir = Split-Path -Parent $dst' \
-            'try { if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null } }' \
-            "catch { [Console]::Error.WriteLine(\$_.Exception.Message); exit $PUSH_RC_MKDIR }" \
-            '$sw = [Diagnostics.Stopwatch]::StartNew()' \
-            'Copy-Item -LiteralPath $src -Destination $dst -Force' \
-            '$sw.Stop()' \
-            '"$((Get-Item -LiteralPath $dst).Length) $([int]$sw.Elapsed.TotalMilliseconds)"')
+        script="$(payload_render push-file.ps1 \
+            SRC="$XFER_SMB_UNC\\$base" DST="$dst_win")" || exit 1
+        exec_ps_text "$script"
     fi
-
-    exec_ps_text "$script"
 }
 
 # push_smb_report SRC REPORTED MS -- what landed, and how fast. REPORTED is the
@@ -362,27 +338,16 @@ push_report_bytes() {
 
 # --- the Linux guest side ---------------------------------------------------
 
-# push_lin_fetch SRC DST DST_IS_DIR -- the guest side, one rsync.
-#
-# One invocation for both shapes, where the Windows side needs two entirely
-# different commands: robocopy cannot rename onto a new name, so a single file
-# has to go through Copy-Item and loses the skip-what-matches behaviour that was
-# the reason for robocopy in the first place. rsync renames and skips at once,
-# so a file push here is incremental where the Windows one is not.
+# push_lin_fetch SRC DST DST_IS_DIR -- the guest side, one rsync. The script is
+# payloads/push-dir.sh or payloads/push-file.sh, shared verbatim with the
+# Windows driver; all this decides is which of the two, and what the destination
+# is called over there.
 #
 # The trailing-slash rule is rsync's own, which is where push borrowed it from:
 # `SRC/` means "the contents", `SRC` means "the directory itself". It costs
 # nothing to honour here because the copier *is* rsync.
-#
-# The destination directory has its own mode put back afterwards. With -p rsync
-# applies the source tree root's mode to the destination root, so pushing a
-# 0700 directory into / would chmod the guest's / to 0700 -- which locks every
-# non-root user out of every path on the system. Modes *inside* the payload are
-# still preserved; it is only the directory that was already there, and whose
-# mode this transfer was never asked to change, that is left alone. Restored on
-# failure as well as success, for the same reason.
 push_lin_fetch() {
-    local SRC="$1" DST="$2" is_dir="$3" script dst base src_url
+    local SRC="$1" DST="$2" is_dir="$3" dst base script
 
     base="$(basename -- "$SRC")"
 
@@ -390,44 +355,17 @@ push_lin_fetch() {
         if [[ "$SRC" == */ ]]; then dst="/$DST"
         else                        dst="/${DST:+$DST/}$base"
         fi
-        script=$(printf '%s\n' \
-            "$(guest_sh_need_rsync)" \
-            "src=$(sh_quote "$XFER_RSYNCD_URL/")" \
-            "dst=$(sh_quote "$dst")" \
-            "mkdir -p \"\$dst\" || { echo \"cannot create \$dst\" >&2; exit $PUSH_RC_MKDIR; }" \
-            'log=$(mktemp)' \
-            'dstmode=$(stat -c %a "$dst")' \
-            't0=$(date +%s%N)' \
-            'rc=0' \
-            'rsync -rlptD --out-format="%i %n" "$src" "$dst/" >"$log" || rc=$?' \
-            'chmod "$dstmode" "$dst"' \
-            '[ "$rc" = 0 ] || exit "$rc"' \
-            't1=$(date +%s%N)' \
-            'n=$(grep -c "^[<>]" "$log" || true)' \
-            'rm -f "$log"' \
-            'total=$(find "$dst" -type f | wc -l)' \
-            'echo "$n $total $(( (t1 - t0) / 1000000 ))"')
+        script="$(payload_render push-dir.sh \
+            SRC="$XFER_RSYNCD_URL/" DST="$dst")" || exit 1
+        exec_sh_text "$script"
     else
-        src_url="$XFER_RSYNCD_URL/$base"
         if (( is_dir )); then dst="/${DST:+$DST/}$base"
         else                  dst="/$DST"
         fi
-        script=$(printf '%s\n' \
-            "$(guest_sh_need_rsync)" \
-            "src=$(sh_quote "$src_url")" \
-            "dst=$(sh_quote "$dst")" \
-            'dir=$(dirname "$dst")' \
-            "mkdir -p \"\$dir\" || { echo \"cannot create \$dir\" >&2; exit $PUSH_RC_MKDIR; }" \
-            'log=$(mktemp)' \
-            't0=$(date +%s%N)' \
-            'rsync -lptD --out-format="%i %n" "$src" "$dst" >"$log"' \
-            't1=$(date +%s%N)' \
-            'n=$(grep -c "^[<>]" "$log" || true)' \
-            'rm -f "$log"' \
-            'echo "$n $(wc -c < "$dst") $(( (t1 - t0) / 1000000 ))"')
+        script="$(payload_render push-file.sh \
+            SRC="$XFER_RSYNCD_URL/$base" DST="$dst")" || exit 1
+        exec_sh_text "$script"
     fi
-
-    exec_sh_text "$script"
 }
 
 # push_lin_report SRC REPORTED MS -- REPORTED is the guest's own line: "copied

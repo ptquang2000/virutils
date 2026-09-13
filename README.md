@@ -120,8 +120,9 @@ export VIRUTILS_DIR=/mnt/big/virutils
 
 Each piece can also be moved on its own (`VIRUTILS_CONF_DIR`,
 `VIRUTILS_IMAGE_DIR`, `VIRUTILS_STAGING_ROOT`, `VIRUTILS_PORT_DIR`,
-`VIRUTILS_MNT_ROOT`), each defaulting under the root. The
-legacy `VIRUTIL_IMAGE_DIR` is still honoured for image placement. Existing
+`VIRUTILS_MNT_ROOT`), each defaulting under the root. Every one of these is
+spelled with the plural `VIRUTILS_` prefix; the singular `VIRUTIL_*` names
+are still read, second, and say so once when they are. Existing
 configs in `~/.config/virutils/` keep working — see [virutil sync](#virutil-sync).
 
 ### A note on who owns the files
@@ -1302,17 +1303,17 @@ The flags are what you vary per domain. Everything else is a property of the
 | `-o`, `--osinfo ID` | **detected from the ISO** | libosinfo id; see `osinfo-query os`. |
 | `-v`, `--virtio ISO` | `virtio-win*.iso` beside the install ISO | Driver ISO to attach as a second cdrom. `none` attaches none. |
 
-The disk image is always `$VIRUTIL_IMAGE_DIR/VM.qcow2` (default
+The disk image is always `$VIRUTILS_IMAGE_DIR/VM.qcow2` (default
 `~/.virutils/images/VM.qcow2`). It is not an option: one domain, one disk, in
 the one directory every other module already looks in. Move the whole lot with
-[`VIRUTIL_IMAGE_DIR`](#environment).
+[`VIRUTILS_IMAGE_DIR`](#environment).
 
 **`--osinfo` is detected, not guessed.** `osinfo-detect` reads the ISO's own
 volume descriptors and reports the short-id, so a Windows 11 media identifies
 itself as `win11` and a Fedora 40 one as `fedora40`. Detection drives the
 whole Windows-specific half of the profile — Hyper-V enlightenments, the TPM,
 the virtio-win cdrom — so an ISO that is not recognised falls back to
-`$VIRUTIL_OSINFO` (itself defaulting to `win11`), and `-o` overrides both. If
+`$VIRUTILS_OSINFO` (itself defaulting to `win11`), and `-o` overrides both. If
 `osinfo-detect` is not installed, the fallback is used directly.
 
 What the profile actually sets, and why:
@@ -1349,11 +1350,11 @@ What the profile actually sets, and why:
    cannot be added to a running domain later. It costs one virtio-serial port,
    so it is not optional and there is no flag to leave it out.
 - **`--network network=default,model=virtio`**, overridable with
-   `$VIRUTIL_NETWORK`. On a host where libvirt's default NAT network is not
+   `$VIRUTILS_NETWORK`. On a host where libvirt's default NAT network is not
    available — WSL2 often, where the `nf_nat` modules may be missing — SLIRP
-   needs no host-side setup at all: `VIRUTIL_NETWORK=user,model=virtio`. That
+   needs no host-side setup at all: `VIRUTILS_NETWORK=user,model=virtio`. That
    has no inbound path, so for RDP,
-   `VIRUTIL_NETWORK='user,model=virtio,portForward.0.proto=tcp,portForward.0.hostPort=13389,portForward.0.guestPort=3389'`.
+   `VIRUTILS_NETWORK='user,model=virtio,portForward.0.proto=tcp,portForward.0.hostPort=13389,portForward.0.guestPort=3389'`.
 
 ```
 virutil domain create win11 ~/Work/iso/Win11_24H2_tiny.iso
@@ -1374,15 +1375,19 @@ profile once, or prefix a single `create` with them.
 | Variable | Default | Description |
 | --- | --- | --- |
 | `VIRUTILS_DIR` | `~/.virutils` | Root of everything virutil leaves on the host. Moves configs, images, staging, port state and mount points at once. See [Artifacts and state](#artifacts-and-state). |
-| `VIRUTILS_IMAGE_DIR` | `$VIRUTILS_DIR/images` | The images directory. |
-| `VIRUTIL_IMAGE_DIR` | `$VIRUTILS_IMAGE_DIR` | Legacy name, still honoured: where a domain's disk image goes, and where `snapshot` writes overlays. |
-| `VIRUTIL_OSINFO` | `win11` | Fallback libosinfo id when the ISO is not recognised. |
-| `VIRUTIL_VIRTIO` | `virtio-win*.iso` beside the install ISO | Default for `-v`: driver ISO to attach as a second cdrom, or `none`. |
-| `VIRUTIL_NETWORK` | `network=default,model=virtio` | Passed to `virt-install --network`. |
-| `VIRUTIL_FIRMWARE` | `uefi` | `bios` selects SeaBIOS instead. Windows 11 will not install without UEFI. |
+| `VIRUTILS_IMAGE_DIR` | `$VIRUTILS_DIR/images` | Where a domain's disk image goes, and where `snapshot` writes overlays. |
+| `VIRUTILS_OSINFO` | `win11` | Fallback libosinfo id when the ISO is not recognised. |
+| `VIRUTILS_VIRTIO` | `virtio-win*.iso` beside the install ISO | Default for `-v`: driver ISO to attach as a second cdrom, or `none`. |
+| `VIRUTILS_NETWORK` | `network=default,model=virtio` | Passed to `virt-install --network`. |
+| `VIRUTILS_FIRMWARE` | `uefi` | `bios` selects SeaBIOS instead. Windows 11 will not install without UEFI. |
+
+The same names spelled with the singular `VIRUTIL_` prefix are still read,
+second, and print one deprecation line when they are. They used to disagree:
+`VIRUTIL_IMAGE_DIR` was preferred over `VIRUTILS_IMAGE_DIR` in `modules/domain`
+and nowhere else, so one config could point two things at two directories.
 
 ```
-VIRUTIL_FIRMWARE=bios VIRUTIL_VIRTIO=none \
+VIRUTILS_FIRMWARE=bios VIRUTILS_VIRTIO=none \
     virutil domain create dev ~/iso/alpine.iso -s 20 -m 2048
 ```
 
@@ -1602,7 +1607,7 @@ Host, for `virutil domain`:
 - `virt-install` and `virt-xml` (`virt-manager`'s CLIs), and `libosinfo` —
    `osinfo-detect` is what reads the install ISO's os id
 - `/dev/kvm` — under WSL2 that means nested virtualisation enabled
-- OVMF/edk2 firmware, unless `VIRUTIL_FIRMWARE=bios`
+- OVMF/edk2 firmware, unless `VIRUTILS_FIRMWARE=bios`
 - `swtpm`, optional: without it the guest gets no TPM 2.0 device, which a
    **stock** Windows 11 ISO refuses to install without. Debloated images have the
    check removed.

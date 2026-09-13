@@ -1,6 +1,6 @@
 # domain -- libvirt domain lifecycle
 
-DOMAIN_IMAGE_DIR="${VIRUTIL_IMAGE_DIR:-$VIRUTILS_IMAGE_DIR}"
+DOMAIN_IMAGE_DIR="$VIRUTILS_IMAGE_DIR"
 
 DOMAIN_OVMF=(
     /usr/share/OVMF/x64/OVMF_CODE.4m.fd:/usr/share/OVMF/x64/OVMF_VARS.4m.fd
@@ -34,7 +34,7 @@ domain_usage() {
         "                    'none' (default: found beside ISO)" \
         "" \
         "The disk is always $DOMAIN_IMAGE_DIR/VM.qcow2;" \
-        "VIRUTIL_IMAGE_DIR moves it." \
+        "VIRUTILS_IMAGE_DIR moves it." \
         "" \
         "start options (-s/-m/-c need the domain shut off; each is written to the config):" \
         "  -s, --size GiB    grow the disk image (never shrinks)" \
@@ -51,11 +51,14 @@ domain_usage() {
         "" \
         "create reads these from the environment:" \
         "  VIRUTILS_DIR           $VIRUTILS_ROOT   root for all state (default ~/.virutils)" \
-        "  VIRUTIL_IMAGE_DIR      $DOMAIN_IMAGE_DIR" \
-        "  VIRUTIL_OSINFO         win11        fallback when the ISO is not recognised" \
-        "  VIRUTIL_VIRTIO         (auto)       virtio-win ISO path, or 'none'" \
-        "  VIRUTIL_NETWORK        network=default,model=virtio" \
-        "  VIRUTIL_FIRMWARE       uefi         or 'bios'" >&2
+        "  VIRUTILS_IMAGE_DIR     $DOMAIN_IMAGE_DIR" \
+        "  VIRUTILS_OSINFO        win11        fallback when the ISO is not recognised" \
+        "  VIRUTILS_VIRTIO        (auto)       virtio-win ISO path, or 'none'" \
+        "  VIRUTILS_NETWORK       network=default,model=virtio" \
+        "  VIRUTILS_FIRMWARE      uefi         or 'bios'" \
+        "" \
+        "The same names spelled with the singular VIRUTIL_ prefix are still" \
+        "read, second, and say so once when they are." >&2
     exit "${1:-1}"
 }
 
@@ -187,13 +190,13 @@ domain_readable_by_qemu() {
 }
 
 # domain_detect_osinfo ISO -- a libosinfo short-id read from the ISO's own
-# volume descriptors, or the VIRUTIL_OSINFO fallback. Two output formats: `-f
+# volume descriptors, or the VIRUTILS_OSINFO fallback. Two output formats: `-f
 # env` where the build has it, and the plain one every build has, which spells
 # the short-id in parentheses:
 #   Media is an installer for OS 'Microsoft Windows 11 (win11)'
 domain_detect_osinfo() {
     local out short=""
-    command -v osinfo-detect >/dev/null || { printf '%s' "${VIRUTIL_OSINFO:-win11}"; return; }
+    command -v osinfo-detect >/dev/null || { printf '%s' "$VIRUTILS_OSINFO"; return; }
 
     if out="$(osinfo-detect -f env -t media -- "$1" 2>/dev/null)" && [[ "$out" == *OSINFO_* ]]; then
         short="$(awk -F= '/^OSINFO_MEDIA_OS_SHORT_ID=/ {gsub(/"/, "", $2); print $2; exit}' \
@@ -202,7 +205,7 @@ domain_detect_osinfo() {
         out="$(osinfo-detect -t media -- "$1" 2>/dev/null || true)"
         short="$(sed -n "1s/.*for OS '.*(\([^)]*\))'.*/\1/p" <<<"$out")"
     fi
-    printf '%s' "${short:-${VIRUTIL_OSINFO:-win11}}"
+    printf '%s' "${short:-$VIRUTILS_OSINFO}"
 }
 
 # domain_topology N -- prints "CORES THREADS" for N vcpus. One socket: Windows
@@ -232,9 +235,9 @@ domain_create() {
     local VM="" ISO="" SIZE=64 MEM="" VCPUS="" IMG="" OSINFO=""
     local VIRTIO NETWORK BIOS=0 candidate
 
-    VIRTIO="${VIRUTIL_VIRTIO:-}"
-    NETWORK="${VIRUTIL_NETWORK:-network=default,model=virtio}"
-    [[ "${VIRUTIL_FIRMWARE:-uefi}" == bios ]] && BIOS=1
+    VIRTIO="$VIRUTILS_VIRTIO"
+    NETWORK="$VIRUTILS_NETWORK"
+    [[ "$VIRUTILS_FIRMWARE" == bios ]] && BIOS=1
 
     while (( $# )); do
         case "$1" in
@@ -272,7 +275,7 @@ domain_create() {
     [[ "$SIZE" =~ ^[0-9]+$ ]] || die "--size wants a whole number of GiB, got '$SIZE'"
     IMG="$DOMAIN_IMAGE_DIR/$VM.qcow2"
     [[ -e "$IMG" ]] && die "disk image already exists: $IMG" \
-                           "Remove it, or set VIRUTIL_IMAGE_DIR elsewhere."
+                           "Remove it, or set VIRUTILS_IMAGE_DIR elsewhere."
 
     MEM="${MEM:-$(domain_default_memory)}"
     VCPUS="${VCPUS:-$(domain_default_vcpus)}"
@@ -313,7 +316,7 @@ domain_create() {
             break
         done
         [[ -n "${code:-}" ]] || die \
-            "no OVMF firmware found -- install edk2-ovmf (or set VIRUTIL_FIRMWARE=bios)." \
+            "no OVMF firmware found -- install edk2-ovmf (or set VIRUTILS_FIRMWARE=bios)." \
             "Windows 11 will not install without UEFI."
         ARGS+=(--boot "loader=$code,loader.readonly=yes,loader.type=pflash,loader.secure=no,nvram.template=$vars,cdrom,hd")
     fi
@@ -513,7 +516,7 @@ domain_ip() {
 # which is the only thing that has to be unique. The relays die with WSL; the
 # state files survive, but reading is what garbage-collects them (below), so
 # the two cannot stay out of step.
-DOMAIN_PORT_DIR="${VIRUTILS_PORT_DIR:-$VIRUTILS_ROOT/ports}"
+DOMAIN_PORT_DIR="$VIRUTILS_PORT_DIR"
 
 domain_port_file() { printf '%s/%s-%s' "$DOMAIN_PORT_DIR" "$1" "$2"; }
 

@@ -156,22 +156,11 @@ guest_os() {
 # so "the guest has no rsync" can be told apart from "rsync failed".
 GUEST_RC_NO_RSYNC=90
 
-# guest_sh_need_rsync -- the guest-side lines that refuse early and legibly when
-# rsync is missing, rather than letting sh report "not found" with exit 127 and
-# leaving the host to guess which command it meant.
-#
-# Interpolate it as one argument of the caller's own printf --
-# "$(guest_sh_need_rsync)" -- so that printf supplies the newline after it.
-# Appending it to a script with += does not: command substitution strips the
-# trailing newline, so the block's closing brace lands on the same line as
-# whatever follows and the whole script fails to parse.
-guest_sh_need_rsync() {
-    printf '%s\n' \
-        'command -v rsync >/dev/null 2>&1 || {' \
-        '  echo "rsync is not installed in this guest" >&2' \
-        "  exit $GUEST_RC_NO_RSYNC" \
-        '}'
-}
+# The lines that refuse early and legibly when rsync is missing -- rather than
+# letting sh report "not found" with exit 127 and leaving the host to guess
+# which command it meant -- are payloads/probe.sh, and every .sh payload pulls
+# them in with @@PROBE@@. They are guest-side script, so they are shared with
+# the Windows driver as data; only the code they exit with lives here.
 
 # guest_rsync_die RC HOST WHAT -- name what went wrong. rsync's exit codes are
 # specific enough to be worth naming, which robocopy's bitmap never is.

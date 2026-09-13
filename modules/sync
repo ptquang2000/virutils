@@ -552,17 +552,7 @@ sync_net_push() {
 # the usual "non-zero is bad" would call every successful delivery an error.
 sync_win_fetch() {
     local script
-    script=$(printf '%s\n' \
-        '$ErrorActionPreference = "Stop"' \
-        "\$src = $(push_ps_quote "$XFER_SMB_UNC")" \
-        '$dst = "C:\"' \
-        '$sw = [Diagnostics.Stopwatch]::StartNew()' \
-        '& robocopy $src $dst /E /R:1 /W:1 /NP /NFL /NDL /NJH /NJS | Out-Null' \
-        '$rc = $LASTEXITCODE' \
-        '$sw.Stop()' \
-        "if (\$rc -ge 8) { [Console]::Error.WriteLine(\"robocopy exit \$rc\"); exit $PUSH_RC_ROBO }" \
-        '"$([int][bool]($rc -band 1)) $([int]$sw.Elapsed.TotalMilliseconds)"')
-
+    script="$(payload_render sync.ps1 SRC="$XFER_SMB_UNC")" || exit 1
     exec_ps_text "$script"
 }
 
@@ -679,21 +669,7 @@ sync_win_cleanup() {
 # not this transfer's to change either way.
 sync_lin_fetch() {
     local script
-    script=$(printf '%s\n' \
-        "$(guest_sh_need_rsync)" \
-        "src=$(sh_quote "$XFER_RSYNCD_URL/")" \
-        'log=$(mktemp)' \
-        'rootmode=$(stat -c %a /)' \
-        't0=$(date +%s%N)' \
-        'rc=0' \
-        'rsync -rlptD --out-format="%i %n" "$src" / >"$log" || rc=$?' \
-        'chmod "$rootmode" /' \
-        '[ "$rc" = 0 ] || exit "$rc"' \
-        't1=$(date +%s%N)' \
-        'n=$(grep -c "^[<>]" "$log" || true)' \
-        'rm -f "$log"' \
-        'echo "$n $(( (t1 - t0) / 1000000 ))"')
-
+    script="$(payload_render sync.sh SRC="$XFER_RSYNCD_URL/")" || exit 1
     exec_sh_text "$script"
 }
 

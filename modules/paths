@@ -11,19 +11,75 @@
 #   $VIRUTILS_TMP_DIR      scratch for transfer payloads
 #   $VIRUTILS_CACHE_DIR    third-party tools fetched once and reused (PsExec)
 
+# --- one spelling, and the other accepted -----------------------------------
+#
+# The prefix is VIRUTILS_, plural, for every variable virutil reads. It used to
+# be both: this file has always spelled the roots VIRUTILS_*, while modules
+# /domain read VIRUTIL_IMAGE_DIR (singular) *in preference to it* and the
+# Windows driver followed the singular -- so one config pointed the two drivers
+# at two different directories, which is the bug this settles. The singular is
+# still read, second, and says so once; both drivers do the same thing, which is
+# section 4 of docs/contract.md.
+VIRUTILS_DEPRECATED=()
+
+# virutils_env NAME [DEFAULT] -- $VIRUTILS_<NAME>, or the deprecated
+# $VIRUTIL_<NAME>, or DEFAULT, into $VIRUTILS_ENV. An empty value counts as
+# unset, so VIRUTILS_VIRTIO= falls through to the default rather than naming a
+# path of no characters.
+#
+# Answers in a variable rather than on stdout, and that is not a style choice: a
+# command substitution is a subshell, so the note it leaves in
+# VIRUTILS_DEPRECATED would be thrown away with it and the deprecation would
+# never be reported.
+VIRUTILS_ENV=""
+virutils_env() {
+    local new="VIRUTILS_$1" old="VIRUTIL_$1"
+    if [[ -n "${!new:-}" ]]; then VIRUTILS_ENV="${!new}"; return 0; fi
+    if [[ -n "${!old:-}" ]]; then
+        VIRUTILS_DEPRECATED+=("$old")
+        VIRUTILS_ENV="${!old}"
+        return 0
+    fi
+    VIRUTILS_ENV="${2:-}"
+}
+
+# virutils_env_warn -- said once. Deliberately not fatal: the old spelling still
+# works, and a hard failure would break a config that has been correct for as
+# long as it existed.
+virutils_env_warn() {
+    (( ${#VIRUTILS_DEPRECATED[@]} )) || return 0
+    local seen=() v
+    for v in "${VIRUTILS_DEPRECATED[@]}"; do
+        [[ " ${seen[*]:-} " == *" $v "* ]] && continue
+        seen+=("$v")
+    done
+    warn "deprecated: ${seen[*]} -- virutil reads the plural VIRUTILS_ prefix" \
+         "now, in both the bash and the PowerShell driver. Rename it to" \
+         "VIRUTILS_${seen[0]#VIRUTIL_} (and the rest likewise); the old" \
+         "spelling still works and will keep working."
+}
+
 # The default is ~/.virutils rather than an XDG directory: the staging tree has
 # to survive reboots, qemu has to reach the images, and config discovery reads
 # here first. VIRUTILS_DIR moves everything at once.
-VIRUTILS_ROOT="${VIRUTILS_DIR:-$HOME/.virutils}"
+virutils_env DIR "$HOME/.virutils";              VIRUTILS_ROOT="$VIRUTILS_ENV"
 
 # Each piece can be moved on its own; each defaults under the root.
-VIRUTILS_CONF_DIR="${VIRUTILS_CONF_DIR:-$VIRUTILS_ROOT/conf}"
-VIRUTILS_IMAGE_DIR="${VIRUTILS_IMAGE_DIR:-$VIRUTILS_ROOT/images}"
-VIRUTILS_STAGING_ROOT="${VIRUTILS_STAGING_ROOT:-$VIRUTILS_ROOT/staging}"
-VIRUTILS_PORT_DIR="${VIRUTILS_PORT_DIR:-$VIRUTILS_ROOT/ports}"
-VIRUTILS_MNT_ROOT="${VIRUTILS_MNT_ROOT:-$VIRUTILS_ROOT/mnt}"
-VIRUTILS_TMP_DIR="${VIRUTILS_TMP_DIR:-$VIRUTILS_ROOT/tmp}"
-VIRUTILS_CACHE_DIR="${VIRUTILS_CACHE_DIR:-$VIRUTILS_ROOT/cache}"
+virutils_env CONF_DIR "$VIRUTILS_ROOT/conf";     VIRUTILS_CONF_DIR="$VIRUTILS_ENV"
+virutils_env IMAGE_DIR "$VIRUTILS_ROOT/images";  VIRUTILS_IMAGE_DIR="$VIRUTILS_ENV"
+virutils_env STAGING_ROOT "$VIRUTILS_ROOT/staging"; VIRUTILS_STAGING_ROOT="$VIRUTILS_ENV"
+virutils_env PORT_DIR "$VIRUTILS_ROOT/ports";    VIRUTILS_PORT_DIR="$VIRUTILS_ENV"
+virutils_env MNT_ROOT "$VIRUTILS_ROOT/mnt";      VIRUTILS_MNT_ROOT="$VIRUTILS_ENV"
+virutils_env TMP_DIR "$VIRUTILS_ROOT/tmp";       VIRUTILS_TMP_DIR="$VIRUTILS_ENV"
+virutils_env CACHE_DIR "$VIRUTILS_ROOT/cache";   VIRUTILS_CACHE_DIR="$VIRUTILS_ENV"
+
+# The four behaviour knobs domain reads. Same two spellings, same preference.
+virutils_env OSINFO   "win11";   VIRUTILS_OSINFO="$VIRUTILS_ENV"
+virutils_env VIRTIO   "";        VIRUTILS_VIRTIO="$VIRUTILS_ENV"
+virutils_env NETWORK  "network=default,model=virtio"; VIRUTILS_NETWORK="$VIRUTILS_ENV"
+virutils_env FIRMWARE "uefi";    VIRUTILS_FIRMWARE="$VIRUTILS_ENV"
+
+virutils_env_warn
 
 virutils_mnt() { printf '%s/%s' "$VIRUTILS_MNT_ROOT" "$1"; }
 
