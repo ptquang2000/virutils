@@ -5,6 +5,13 @@ OS, never the host's, so `virutil` (bash, Linux host) and `virutil.ps1`
 (PowerShell, Windows host) send byte-identical text to a guest of a given kind.
 Keeping them here as data is rule 2 of the fork: see `docs/contract.md` §6.
 
+`mount.ps1` and `unmount.ps1` are the one exception, and §6 names them as such:
+they are keyed on the **host**, because only one host has to authenticate the
+share it is serving. A Linux host serves an anonymous share and sends neither of
+them. Both drivers still render both, and both are in the golden file, because
+that is what keeps "byte-identical" a fact rather than an intention -- the two
+renderers have to agree on text only one of them is obliged to use.
+
 They are also the most carefully bisected code in the repo. robocopy's exit code
 is a bitmap and not an error level, so `0` means "nothing needed copying" and
 only `>= 8` is a failure. robocopy always takes a source *directory*, so a file
@@ -53,10 +60,12 @@ and `@` means nothing at all to `sh`.
 | `pull.sh` | Linux guest | rsync matches of a pattern out to the daemon |
 | `sync.ps1` | Windows guest | robocopy the whole share onto `C:\` |
 | `sync.sh` | Linux guest | rsync the whole export onto `/` |
+| `mount.ps1` | Windows guest | authenticate to a credentialled share (**Windows host only**) |
+| `unmount.ps1` | Windows guest | let go of it again (**Windows host only**) |
 
 Each prints one space-separated line on stdout, which its caller parses; the
 shapes are documented at the head of each file.
 
-`tests/payloads.sh` renders every one of them with fixed inputs and diffs the
-result against `tests/golden/payloads.txt`. A change to a payload is a change to
-that golden file, deliberately.
+`tests/payloads.sh` and `tests/payloads.ps1` render every one of them with fixed
+inputs and diff the result against `tests/golden/payloads.txt`. A change to a
+payload is a change to that golden file, deliberately.

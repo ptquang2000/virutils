@@ -30,6 +30,15 @@ GUEST_OS=windows
 XFER_SMB_UNC='\\10.0.2.2\Tok3nTok3nTok3nTok3n'
 XFER_RSYNCD_URL='rsync://10.0.2.2:23456/Tok3nTok3nTok3nTok3n'
 
+# The mount pair is the one payload pair keyed on the *host* rather than on the
+# guest: only a Windows host has to authenticate its share, so this driver never
+# sends either of them. It renders them all the same, because that is the whole
+# point of the golden file -- the two renderers have to agree on text neither of
+# them is obliged to use.
+XFER_MOUNT_UNC='\\10.0.2.2\k7m3qp9wr2xz'
+XFER_MOUNT_USER='vxp-k7m3qp9wr2xz'
+XFER_MOUNT_PASS='Pa55w0rdPa55w0rdPa55w0rd'
+
 # A real directory and a real file: push branches on which SRC is.
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
@@ -51,3 +60,5 @@ section 'pull.sh'               ; pull_lin_fetch 'home/me/out/*.log'
 section 'sync.ps1'              ; sync_win_fetch
 section 'sync.sh'               ; sync_lin_fetch
 section 'probe.sh'              ; payload_render probe.sh; echo
+section 'mount.ps1'             ; payload_render mount.ps1 UNC="$XFER_MOUNT_UNC" USER="$XFER_MOUNT_USER" PASS="$XFER_MOUNT_PASS"; echo
+section 'unmount.ps1'           ; payload_render unmount.ps1 UNC="$XFER_MOUNT_UNC"; echo

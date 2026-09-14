@@ -205,3 +205,26 @@ command -v rsync >/dev/null 2>&1 || {
   echo "rsync is not installed in this guest" >&2
   exit 90
 }
+
+===== mount.ps1 =====
+$ErrorActionPreference = "Continue"
+$unc  = '\\10.0.2.2\k7m3qp9wr2xz'
+$user = 'vxp-k7m3qp9wr2xz'
+$pass = 'Pa55w0rdPa55w0rdPa55w0rd'
+$server = $unc.Split("\") | Where-Object { $_ } | Select-Object -First 1
+try {
+  foreach ($c in @(Get-SmbConnection -ServerName $server -ErrorAction SilentlyContinue)) {
+    & net use ("\\" + $server + "\" + $c.ShareName) /delete /y 2>$null | Out-Null } } catch { }
+& net use ("\\" + $server + "\IPC$") /delete /y 2>$null | Out-Null
+$said = (& net use $unc $pass /user:$user 2>&1 | Out-String)
+if ($LASTEXITCODE -ne 0) {
+  [Console]::Error.WriteLine("net use $unc /user:$user failed with exit $LASTEXITCODE")
+  [Console]::Error.WriteLine($said.Trim())
+  exit 1 }
+"ok"
+
+===== unmount.ps1 =====
+$ErrorActionPreference = "Continue"
+$unc = '\\10.0.2.2\k7m3qp9wr2xz'
+& net use $unc /delete /y 2>&1 | Out-Null
+"ok"

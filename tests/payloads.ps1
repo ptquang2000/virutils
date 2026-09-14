@@ -25,6 +25,14 @@ $moduleDir = Join-Path (Split-Path -Parent $here) 'modules'
 $unc  = '\\10.0.2.2\Tok3nTok3nTok3nTok3n'
 $url  = 'rsync://10.0.2.2:23456/Tok3nTok3nTok3nTok3n'
 
+# The mount pair is the one payload pair keyed on the *host* rather than on the
+# guest: only a Windows host has to authenticate its share. This driver is the
+# one that sends them, and the bash harness renders them anyway, because the
+# golden file is what makes "byte-identical" a fact rather than an intention.
+$munc = '\\10.0.2.2\k7m3qp9wr2xz'
+$muser = 'vxp-k7m3qp9wr2xz'
+$mpass = 'Pa55w0rdPa55w0rdPa55w0rd'
+
 # LF throughout and written to the raw stdout stream: the golden file is the
 # bash harness's output, and a CRLF here would fail a comparison that is about
 # the payloads rather than about line endings.
@@ -49,3 +57,5 @@ Section 'pull.sh'               (Invoke-Payload 'pull.sh'       @{ SRC = '/home/
 Section 'sync.ps1'              (Invoke-Payload 'sync.ps1'      @{ SRC = $unc })
 Section 'sync.sh'               (Invoke-Payload 'sync.sh'       @{ SRC = "$url/" })
 Section 'probe.sh'              (Invoke-Payload 'probe.sh')
+Section 'mount.ps1'             (Invoke-Payload 'mount.ps1'   @{ UNC = $munc; USER = $muser; PASS = $mpass })
+Section 'unmount.ps1'           (Invoke-Payload 'unmount.ps1' @{ UNC = $munc })
