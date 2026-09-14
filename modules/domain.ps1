@@ -1,4 +1,4 @@
-# domain -- the domain lifecycle, on a Windows host running QEMU natively.
+﻿# domain -- the domain lifecycle, on a Windows host running QEMU natively.
 #
 # There is no libvirt here, so there is no domain to define. `create` writes the
 # disk, the UEFI nvram and a per-VM `.cmd` launcher holding every qemu argument,
@@ -78,8 +78,9 @@
 # one of these, and restarting the domain continued Setup where it left off --
 # and pinning every domain to one vcpu to spare a Windows install its reboots
 # would be the worse trade on a host whose whole reason for WHPX is speed. So
-# the usage says it instead: install with `-c 1`, and edit the launcher
-# afterwards, which is the supported way to change a domain anyway.
+# the usage says it instead: install with `-c 1`, and put the count back with
+# `domain start VM -c N` once Setup is done. That flag writes the launcher,
+# which is the supported way to change a domain and is no longer a hand edit.
 #
 # One consequence of all this that bites elsewhere: a guest that dies this way
 # has to be killed, and a killed qemu leaves the qcow2's lazy refcounts dirty.
@@ -91,6 +92,47 @@
 # -- which is qcow2 working as designed, not corruption, and not worth chasing.
 # Prefer the monitor's `quit` to killing the process and it does not arise.
 
+# A sixth fact, and the one most easily mistaken for the fifth because it fires
+# at the same moment: **on a guest-initiated reboot the firmware itself wedges,
+# before the guest gets a vcpu back.** The signature is a domain that qemu still
+# calls healthy -- `info status` says `VM status: running` and `info cpus` lists
+# every vcpu with a live thread id -- attached to a window that never paints
+# again, with the process burning a core or two forever. There is no exit code 4
+# and nothing is paused, which is exactly how it is told apart from the vcpu
+# defect above. Measured on win11, `-smp 8`, at Setup's own reboot.
+#
+# The OVMF log is what names it, which is the fourth time that -debugcon has
+# paid for itself. A wedged boot stops ~67 lines in, at:
+#
+#   PlatformAddHobCB: HighMemory [0x100000000, 0x280000000)
+#   ASSERT .../OvmfPkg/Library/PlatformInitLib/MemDetect.c(1181):
+#       (MtrrSettings.MtrrDefType & 0x00000400) == 0
+#
+# 0x400 is FE, the fixed-range MTRR enable bit, and PlatformQemuInitializeRam
+# asserts it is clear before it programs MTRRs of its own. It is clear on a cold
+# start and set once Windows has run -- and **WHPX does not reset the MTRR MSRs
+# on a guest-initiated system reset**, so IA32_MTRR_DEF_TYPE comes back into the
+# firmware still carrying what the guest left in it. The firmware this build
+# ships is a DEBUG build, which is why there is a debugcon log at all and also
+# why ASSERT is CpuDeadLoop() rather than a warning: the spin is the assert.
+#
+# So the shape is cold boot fine, first reboot dead, every reset after it dead
+# in the same place. One log carried three boots and read 1-2370 (Setup ran),
+# 2371-2438 (ASSERT) and 2439-2506 (ASSERT) -- the second and third are 67 lines
+# each, which is how far PEI gets before the check.
+#
+# The vcpu count is not the variable here, so `-c 1` does not dodge this one and
+# the two defects want different answers. There is no qemu flag for it either:
+# the stale state is a guest MSR and no `-machine` option resets it. What clears
+# it is a new qemu process, so the workaround is the domain's own lifecycle --
+# `quit` over the monitor, then `domain start` again, once per reboot Setup
+# wants -- or `domain start VM -c 1`, which dodges the other defect in the same
+# breath. Setup resumes where it left off; nothing is lost but the uptime. The
+# durable fix is a RELEASE build of edk2-x86_64-code.fd, which has no ASSERT
+# compiled into it and carries on past a stale MTRR default type. That is a
+# firmware swap rather than a qemu upgrade, and it is not what this driver
+# ships, so `domain create` says the workaround out loud instead.
+
 $script:DomainCpu = 'Skylake-Client'
 
 function Get-DomainUsage {
@@ -98,7 +140,7 @@ function Get-DomainUsage {
         'usage: virutil domain create VM ISO [OPTIONS]'
         '       virutil domain delete VM'
         '       virutil domain list'
-        '       virutil domain start    VM [-G]'
+        '       virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]'
         '       virutil domain shutdown VM'
         '       virutil domain addr     VM'
         '       virutil domain port     VM [SPEC] [-c PORT]'
@@ -113,8 +155,9 @@ function Get-DomainUsage {
         "  -c, --vcpus N     virtual CPUs (default: half the host's, max 8)"
         '                    install Windows with -c 1: on this qemu build a'
         "                    guest with more than one vcpu dies at its own"
-        '                    reboot, which is halfway through Setup. See the'
-        '                    header of modules/domain.ps1.'
+        '                    reboot, which is halfway through Setup. Put it'
+        '                    back afterwards with: domain start VM -c N.'
+        '                    See the header of modules/domain.ps1.'
         '  -o, --osinfo ID   accepted and ignored: there is no libosinfo here'
         '  -v, --virtio ISO  virtio-win ISO to attach as a second cdrom, or'
         '                    "none" (default: found beside ISO)'
@@ -124,7 +167,15 @@ function Get-DomainUsage {
         "The disk is always $($script:VirutilsImageDir)\VM.qcow2;"
         'VIRUTILS_IMAGE_DIR moves it.'
         ''
-        'start options:'
+        'start options (-s, -m and -c change the domain and then start it;'
+        'each is a persistent edit to the launcher, refused while it runs):'
+        '  -s, --size GiB    grow the disk image (qemu-img will not shrink it,'
+        '                    and the guest must grow its own partition after)'
+        '  -m, --memory MiB  guest RAM'
+        '  -c, --vcpus N     virtual CPUs. -c 1 is the way through a Windows'
+        "                    install here: on this qemu build a guest with more"
+        '                    than one vcpu dies at its own reboot. Put it back'
+        '                    up once Setup is done.'
         '  -G, --no-gui      not honoured here: qemu under WHPX has no headless'
         '                    console to detach from, and -display none would'
         '                    leave the guest with no way in at all'
@@ -234,6 +285,7 @@ function Get-DomainDisk     { param([string]$Vm) Join-Path $script:VirutilsImage
 function Get-DomainNvram    { param([string]$Vm) Join-Path $script:VirutilsImageDir "${Vm}_VARS.fd" }
 function Get-DomainLauncher { param([string]$Vm) Join-Path $script:VirutilsImageDir "$Vm.cmd" }
 function Get-DomainOvmfLog  { param([string]$Vm) Join-Path $script:VirutilsImageDir "$Vm-ovmf.log" }
+function Get-DomainQemuLog  { param([string]$Vm) Join-Path $script:VirutilsImageDir "$Vm-qemu.log" }
 
 function Test-Domain {
     param([string]$Vm)
@@ -378,8 +430,9 @@ function Show-DomainList {
 
 function Start-Domain {
     param([string[]]$Arguments)
-    $vm = $null
-    foreach ($a in $Arguments) {
+    $vm = $null; $size = 0; $memory = 0; $vcpus = 0
+    for ($i = 0; $i -lt $Arguments.Count; $i++) {
+        $a = $Arguments[$i]
         if ($a -in @('-G', '--no-gui')) {
             Warn @(
                 '-G is not honoured on this host: qemu under WHPX has no'
@@ -388,23 +441,78 @@ function Start-Domain {
             )
             continue
         }
-        if ($a.StartsWith('-')) {
-            Die @(
-                "virutil domain start: $a is not a flag this driver has."
-                '-s, -m and -c rewrite a libvirt domain config, and there is no'
-                'domain config here -- the launcher is the domain. Edit'
-                "$($script:VirutilsImageDir)\VM.cmd, or recreate it."
-            )
+        elseif ($a -in @('-s', '--size'))   { $i++; $size   = [int](Get-FlagValue $Arguments $i $a) }
+        elseif ($a -in @('-m', '--memory')) { $i++; $memory = [int](Get-FlagValue $Arguments $i $a) }
+        elseif ($a -in @('-c', '--vcpus'))  { $i++; $vcpus  = [int](Get-FlagValue $Arguments $i $a) }
+        elseif ($a.StartsWith('-')) {
+            Die "virutil domain start: $a is not a flag this driver has."
         }
-        if ($null -eq $vm) { $vm = $a } else { Usage (Get-DomainUsage) 1 }
+        elseif ($null -eq $vm) { $vm = $a }
+        else { Usage (Get-DomainUsage) 1 }
     }
     Assert-Domain $vm
 
     if (Test-DomainRunning $vm) { Die "$vm is already running" }
 
-    Start-Process -FilePath $env:ComSpec `
-        -ArgumentList '/c', (Get-DomainLauncher $vm) -WindowStyle Hidden | Out-Null
+    # -s, -m and -c change the domain and then start it, which is what they do
+    # on the other driver too. The shape is the same in both places: a
+    # persistent edit to the definition, refused while the guest is up.
+    #
+    # This used to be refused outright here, on the grounds that the three
+    # "rewrite a libvirt domain config, and there is no domain config here."
+    # The premise was wrong. There is one -- the launcher is the domain, this
+    # file says so everywhere else, and `port` has always edited it in place.
+    # The bash driver's -c is `virsh setvcpus --config`, which is a persistent
+    # edit to a definition on disk; rewriting -smp in the launcher is the same
+    # act on the same kind of object. Refusing it did not protect anything, it
+    # just moved the edit into a text editor and told the user to do it by
+    # hand, which is strictly worse on the host where the reboot defects make
+    # `-c 1` a thing you need routinely. -s is not even libvirt's: both drivers
+    # end at `qemu-img resize` on the same image.
+    #
+    # The running check above is the guard the bash driver states explicitly,
+    # and it is already there for its own reasons, so it is not repeated.
+    if ($vcpus) {
+        if ($vcpus -lt 1) { Die "--vcpus wants a whole number, got '$vcpus'" }
+        Set-LauncherVcpus $vm $vcpus
+        Say "vcpus:  $vcpus (1 socket x $vcpus cores x 1 thread)"
+    }
+    if ($memory) {
+        if ($memory -lt 1) { Die "--memory wants MiB, got '$memory'" }
+        Set-LauncherMemory $vm $memory
+        Say "memory: $memory MiB"
+    }
+    if ($size) {
+        if ($size -lt 1) { Die "--size wants a whole number of GiB, got '$size'" }
+        $disk = Get-DomainDisk $vm
+        if (-not (Test-Path -LiteralPath $disk)) { Die "no disk image for $vm at $disk" }
+        # No --shrink, as on the other driver: qemu-img refuses to shrink
+        # without it, and that refusal is the check rather than an obstacle.
+        & (Get-QemuTools).Img resize -- $disk "${size}G" | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Die @(
+                "could not resize $disk to $size GiB"
+                "(qemu-img refuses to shrink an image; $size GiB may be smaller"
+                'than it is now. The guest also has to grow its own partition'
+                'afterwards -- the image is bigger, the filesystem is not.)'
+            )
+        }
+        Say "disk:   $size GiB"
+    }
+
+    Start-DomainProcess $vm
     Say "$vm started"
+}
+
+# The launcher is the domain, so running one is the only way to start a guest
+# and this is the only place that does it. -WindowStyle Hidden is for cmd's own
+# window: the launcher's `start /b` returns immediately and cmd exits with it,
+# so this is a flash at most, but a flash per start is still a flash. qemu
+# itself has no window to hide -- that is the GUI build's whole point.
+function Start-DomainProcess {
+    param([string]$Vm)
+    Start-Process -FilePath $env:ComSpec `
+        -ArgumentList '/c', (Get-DomainLauncher $Vm) -WindowStyle Hidden | Out-Null
 }
 
 function Stop-Domain {
@@ -556,6 +664,47 @@ function Add-LauncherForward {
     Set-Content -LiteralPath $path -Value $new -Encoding ASCII -NoNewline
 }
 
+# -c and -m are one substitution each in the launcher, and the launcher is the
+# domain, so writing them here is the same act `virsh setvcpus --config` is on
+# the other driver: it changes the definition, persistently, and the next start
+# uses it. Both refuse to guess -- a launcher that does not match the shape
+# these expect is an edited launcher, and rewriting it blind is how a hand edit
+# gets silently undone.
+function Set-LauncherVcpus {
+    param([string]$Vm, [int]$Vcpus)
+    $path = Get-DomainLauncher $Vm
+    $text = Get-Content -LiteralPath $path -Raw
+
+    # Topology and count in one write, as the bash driver does it for the same
+    # reason: they have to multiply out. threads=1 always -- see the header.
+    $new = [regex]::Replace($text, '-smp\s+"?\d+,sockets=1,cores=\d+,threads=1"?',
+                            "-smp `"$Vcpus,sockets=1,cores=$Vcpus,threads=1`"", 1)
+    if ($new -eq $text) { Die "could not find -smp in $path to change" }
+
+    # num-queues follows the vcpu count. Left behind it is not fatal -- virtio
+    # copes -- but it is a queue per vcpu by design, and a launcher that says 8
+    # queues for 1 vcpu is a launcher that lies about the machine.
+    #
+    # ${1} rather than $1: the replacement is a group reference butted straight
+    # against a digit, and .NET reads "$1" + "1" as group 11, which does not
+    # exist -- so the whole num-queues= disappears. Braces end the group name.
+    $new = [regex]::Replace($new, '(virtio-blk-pci,drive=hd0,num-queues=)\d+',
+                            "`${1}$Vcpus", 1)
+
+    Set-Content -LiteralPath $path -Value $new -Encoding ASCII -NoNewline
+}
+
+function Set-LauncherMemory {
+    param([string]$Vm, [int]$Memory)
+    $path = Get-DomainLauncher $Vm
+    $text = Get-Content -LiteralPath $path -Raw
+    # -m, anchored to its own line: a bare -m would also match the -m inside a
+    # file path or a device argument.
+    $new = [regex]::Replace($text, '(?m)^(\s*)-m\s+\d+', "`$1-m $Memory", 1)
+    if ($new -eq $text) { Die "could not find -m in $path to change" }
+    Set-Content -LiteralPath $path -Value $new -Encoding ASCII -NoNewline
+}
+
 function Remove-LauncherForward {
     param([string]$Vm, [int]$HostPort)
     $path = Get-DomainLauncher $Vm
@@ -582,7 +731,7 @@ function Remove-Domain {
     # "$Vm*" in a shared image directory would take win11-backup.qcow2 with
     # win11, and delete never asks.
     foreach ($f in @((Get-DomainDisk $vm), (Get-DomainNvram $vm), (Get-DomainLauncher $vm),
-                     (Get-DomainOvmfLog $vm))) {
+                     (Get-DomainOvmfLog $vm), (Get-DomainQemuLog $vm))) {
         if (Remove-VirutilsFile $f) { Say "removed $f" }
     }
 }
@@ -687,20 +836,45 @@ function New-Domain {
         -Iso $iso -Virtio $virtio -Memory $memory -Vcpus $vcpus `
         -Ports $ports -MonitorPort $monitorPort -AgentPort $agentPort
 
-    Write-DomainLauncher $launcher $qemu.System $qemuArgs $vm
+    Write-DomainLauncher $launcher $qemu.Display $qemuArgs $vm
     Say ('{0,-10}{1}' -f 'launcher:', $launcher)
     Say ('{0,-10}{1}' -f 'monitor:',  "127.0.0.1:$monitorPort")
     Say ('{0,-10}{1}' -f 'agent:',    "127.0.0.1:$agentPort")
 
     if ($noStart) { return }
 
-    Start-Process -FilePath $qemu.System -ArgumentList $qemuArgs | Out-Null
+    # The launcher, not $qemuArgs again. These were the same command line
+    # twice and they had already drifted: this one went through Start-Process
+    # directly, so it got a console window the launcher's `start /b` does not
+    # give, and no stderr log. One way in means create and start cannot differ.
+    Start-DomainProcess $vm
     Send-BootPrompt $vm
 
     Say @(
         ''
         'Windows Setup should be on screen. Boot it again later with:'
         "  virutil domain start $vm"
+        ''
+        "Setup reboots itself twice, and on this host it does not come back:"
+        'the firmware wedges on any guest-initiated reboot, leaving a window'
+        'that never paints again while qemu still reports the domain running.'
+        'That is expected here and costs the install nothing but its uptime.'
+        ''
+        'domain shutdown cannot clear it -- that is ACPI, and a guest stuck in'
+        'its firmware has nothing left to answer with. Send quit to the monitor'
+        'instead, then start the domain again, and Setup resumes where it was:'
+        "  127.0.0.1:$monitorPort -> quit"
+        "  virutil domain start $vm -c 1"
+        'The -c 1 is the other defect: at more than one vcpu the guest dies at'
+        'its own reboot instead. One vcpu is the only setting that survives a'
+        "reboot here, so it is the one to install on. Put it back after OOBE:"
+        "  virutil domain start $vm -c $vcpus"
+        ''
+        'To tell this apart from the vcpu crash the -c usage warns about: this'
+        'one leaves the domain running rather than paused, and the last line of'
+        "  $(Get-DomainOvmfLog $vm)"
+        'reads ASSERT ... MemDetect.c(1181). See the header of'
+        'modules/domain.ps1 for both.'
     )
     if ($virtio) {
         Say @(
@@ -758,12 +932,33 @@ function Get-QemuTools {
         Die 'this qemu has no whpx accelerator'
     }
 
+    # Two binaries, and which one is used depends on whether anything is
+    # reading. qemu ships qemu-system-x86_64.exe built for the console
+    # subsystem and qemu-system-x86_64w.exe built for the GUI subsystem --
+    # byte-for-byte the same emulator, differing only in the PE subsystem
+    # field (3 against 2). The console one allocates a console window on
+    # launch and fills it with the CPUID warnings this host's Skylake-Client
+    # model earns -- rtm, hle and arat, once per vcpu -- so a domain started
+    # from the launcher comes up with a black wall of text beside its display.
+    # -WindowStyle Hidden does not suppress it, because the window belongs to
+    # qemu rather than to the cmd that started it.
+    #
+    # So the launcher runs the GUI build and there is no console at all. The
+    # cost is that the GUI build's *stdout* goes nowhere a pipe can reach it:
+    # `& $systemw -accel help` captures an empty string, measured here, which
+    # is why the accelerator probe above stays on the console binary. stderr
+    # still writes to a handle it is given, so the launcher redirects it to a
+    # file and nothing is lost -- see Write-DomainLauncher.
+    $systemw = Join-Path $dir 'qemu-system-x86_64w.exe'
+    if (-not (Test-Path $systemw)) { $systemw = $system }
+
     $code = Join-Path $dir 'share\edk2-x86_64-code.fd'
     $vars = Join-Path $dir 'share\edk2-i386-vars.fd'
     if (-not (Test-Path $code) -or -not (Test-Path $vars)) {
         Die "no OVMF firmware under $dir\share -- Windows 11 will not install without UEFI"
     }
-    return @{ Dir = $dir; System = $system; Img = (Join-Path $dir 'qemu-img.exe')
+    return @{ Dir = $dir; System = $system; Display = $systemw
+              Img = (Join-Path $dir 'qemu-img.exe')
               Code = $code; VarsTemplate = $vars }
 }
 
@@ -886,13 +1081,39 @@ function Write-DomainLauncher {
     }
     $quoted = $pairs -join " ^`r`n    "
 
+    # start /b, and both halves of that are load-bearing.
+    #
+    # /b runs the child without a new window. Plain `start` gives it one, and
+    # on the GUI build there is nothing to put in it; on the console build it
+    # is the CPUID wall. Either way the domain does not want it.
+    #
+    # The redirect is why it is /b rather than no `start` at all. Measured
+    # here, three ways:
+    #
+    #   start "" qemu ... 2> log     log is created and stays empty
+    #   qemu ... 2> log              log is written; cmd blocks until qemu exits
+    #   start /b "" qemu ... 2> log  log is written; cmd returns at once
+    #
+    # Plain `start` hands the child a fresh set of handles and the redirect
+    # never reaches it. /b lets the child inherit, so the file gets the
+    # warnings -- and it still returns immediately, which the launcher needs:
+    # `domain start` runs this through cmd and expects it back.
+    #
+    # What is in that file is the point. qemu's stderr is where `failed to get
+    # xsave state` appears, and the header of this file calls that line the
+    # thing to grep for. Taking the console away without keeping the stream
+    # would trade a diagnosable defect for a black window, twice over.
+    $log = Get-DomainQemuLog $Vm
+
     $text = @"
 @echo off
 rem virutil domain: $Vm -- regenerate with: virutil domain create $Vm <iso>
 rem This file is the domain. virutil reads the monitor port and the port
 rem forwards back out of it; edit it by hand and virutil follows the edit.
-start "" "$Qemu" ^
-    $quoted
+rem qemu's own warnings go to $Vm-qemu.log; the firmware's go to $Vm-ovmf.log.
+start /b "" "$Qemu" ^
+    $quoted ^
+    2> "$log"
 "@
     Set-Content -LiteralPath $Path -Value $text -Encoding ASCII
 }

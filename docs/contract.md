@@ -468,6 +468,16 @@ way and then failed. The fix is upstream and dated after the newest published
 Windows build of qemu, so until there is a build to move to, `domain create`'s
 usage says to install with `-c 1`. It costs an install its uptime, not its disk.
 
+A guest-initiated reboot on that host has a second way to die, and clearing the
+first one only exposes it: the firmware itself wedges, with OVMF asserting on a
+stale MTRR default type (`MemDetect.c(1181)`) because WHPX does not reset the
+MTRR MSRs across a guest reset. The domain is left *running* rather than paused,
+spinning a core in `CpuDeadLoop` behind a window that never paints, which is how
+the two are told apart. A new qemu process clears it; the vcpu count does not
+affect it. Neither is contract -- both are one host, one qemu build and one
+DEBUG firmware -- but between them they are why an install there is done at
+`-c 1` and restarted at each of Setup's own reboots.
+
 ### Where the grammar bends, and why
 
 Five places, each because the host cannot mean what the other one means.
@@ -506,13 +516,18 @@ thing neither driver may do, because it reports a change that was not made.
   disk at the snapshot, where the bash driver's `--running` hands back a
   running one: there is no memory image to resume into, and booting a guest
   nobody asked to boot is not a substitute.
-- **`domain start -s/-m/-c` is refused on a Windows host, not ignored**, which
-  is the third possibility above rather than an exception to the rule. Those
-  three rewrite a libvirt domain config, and there is no domain config there --
-  the launcher is the domain, and the honest answer is "edit it, or recreate
-  the domain". `domain start -G` is accepted, warned about and not honoured:
-  qemu under WHPX has no headless console to detach from, and `-display none`
-  would leave the guest with no way in at all.
+- **`domain start -G` is accepted, warned about and not honoured**: qemu under
+  WHPX has no headless console to detach from, and `-display none` would leave
+  the guest with no way in at all. `-s`, `-m` and `-c` used to be listed here
+  as refused, on the grounds that they "rewrite a libvirt domain config, and
+  there is no domain config there". That was wrong, and they are honoured now.
+  There is a domain config there -- the launcher is the domain, which is this
+  document's own phrase, and `domain port` has always edited it in place. The
+  bash driver's `-c` is `virsh setvcpus --config`: a persistent edit to a
+  definition on disk, which is exactly what rewriting `-smp` in the launcher
+  is. `-s` was never libvirt's at all -- both drivers end at `qemu-img resize`
+  on the same image. Both require the domain shut off, on both hosts, for the
+  same reason. This is the rare case of the grammar bending back straight.
 
 The same rule covers the environment. `VIRUTILS_OSINFO`, `VIRUTILS_NETWORK` and
 `VIRUTILS_FIRMWARE` are read by the Windows driver and acted on by none of it,

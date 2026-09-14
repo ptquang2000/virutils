@@ -1,4 +1,4 @@
-<#
+﻿<#
   PowerShell completion for virutil -- mirrors the dispatch in
   modules\parser.ps1, the way completions\_virutil mirrors modules/parser.
 
@@ -227,6 +227,12 @@ $completer = {
             Add-Match '-N' 'create it without starting it';            Add-Match '--no-start' 'create it without starting it'
         }
         elseif ($module -eq 'domain' -and $verb -eq 'start') {
+            Add-Match '-s' 'grow the disk image, then start (needs it shut off)'
+            Add-Match '--size' 'grow the disk image, then start (needs it shut off)'
+            Add-Match '-m' 'set guest RAM in MiB, then start'
+            Add-Match '--memory' 'set guest RAM in MiB, then start'
+            Add-Match '-c' 'set virtual CPUs, then start -- -c 1 to get through a Windows install'
+            Add-Match '--vcpus' 'set virtual CPUs, then start -- -c 1 to get through a Windows install'
             Add-Match '-G' 'accepted and not honoured: WHPX has no headless console'
             Add-Match '--no-gui' 'accepted and not honoured: WHPX has no headless console'
         }
