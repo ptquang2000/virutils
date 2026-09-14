@@ -76,6 +76,14 @@ Invariants that are contract, not implementation:
   A trailing slash means a directory, as with rsync.
 - `pull` wildcards match with the *guest's* own matching: case-insensitive on
   Windows, case-sensitive on Linux.
+- **On a Windows host, `push` and `pull` reach a Windows guest only**, and say
+  so by name when asked for any other kind. That is a gap in the port rather
+  than in the grammar -- the Linux-guest side is payload selection against
+  payloads that already exist -- and section 7 says what is still unmeasured
+  about it. The same host also prompts once per transfer for Administrator and
+  mints a throwaway local account, because the share comes from its own SMB
+  server; the grammar, the guest-side behaviour and the exit codes are
+  unchanged by that.
 - `domain delete` never prompts and removes disks, backing chain, snapshot
   overlays and memory files, mount points and port forwards; files another
   domain uses are kept.
@@ -114,14 +122,29 @@ directory.
 
 Every driver knows the whole layout and relocates it from the same variables,
 but a driver only creates the directories it actually writes to. The Windows
-driver currently writes to `images` alone: `conf`, `staging`, `tmp` and `mnt`
-belong to `sync`, `push` and `pull`, which are not ported there yet, and `ports`
-holds the relay state and logs of a mechanism it does not have -- under
-user-mode NAT a forward is a `hostfwd` on the qemu command line, so it lives in
-the launcher with every other qemu argument and needs no state of its own.
-`cache` follows `ui`. **An empty directory is not a promise**: what section 3
-fixes is where a thing goes when there is one, not that every driver puts
+driver writes to `images` and to `tmp`: `conf` and `staging` belong to `sync`,
+which is not ported there yet, `mnt` is for host mount points it never makes,
+and `ports` holds the relay state and logs of a mechanism it does not have --
+under user-mode NAT a forward is a `hostfwd` on the qemu command line, so it
+lives in the launcher with every other qemu argument and needs no state of its
+own. `cache` follows `ui`. **An empty directory is not a promise**: what section
+3 fixes is where a thing goes when there is one, not that every driver puts
 something in each.
+
+`tmp` stopped being an empty promise on the Windows host when `push` and `pull`
+landed there. Each transfer gets `<root>/tmp/<token>/`, holding its staging
+tree, the status file the elevated helper answers through, and that helper
+itself; all three go at teardown. It is deliberately not the system temp
+directory: under elevation `%TEMP%` resolves to an 8.3 short path that an
+ordinary recursive remove refuses to delete through.
+
+**A transfer's staging tree is under `tmp`, not under `staging`**, and the
+distinction is what each row means rather than an inconsistency. `staging` holds
+`sync`'s *incremental* trees, which outlive a run and are what make the next one
+cheap; a transfer's staged copy exists for one transfer and is deleted with the
+share and the account it was published for. Putting it under `staging` would put
+something disposable in the one directory whose contents are meant to survive.
+So `staging` stays `sync`'s and is still empty on a Windows host.
 
 ## 4. Environment
 
@@ -163,8 +186,19 @@ match on:
 | 94 | SRC matched nothing in the guest (pull) |
 | 95 | robocopy failed, exit >= 8 (pull) |
 | 97 | PsExec is not present in the guest (ui) |
+| 98 | the elevation prompt was declined (Windows host, push/pull) |
+| 99 | the host could not publish the share (Windows host, push/pull) |
 
 Otherwise the guest's own exit code passes through (`exec`).
+
+90 through 95 are the guest's, and are the same on both hosts. 98 and 99 are
+the Windows host's alone: a transfer there publishes a share on the host's own
+SMB server, which needs Administrator, and neither failure has any counterpart
+on a Linux host. They are two codes rather than one because declining the
+prompt is an answer rather than a fault -- a script wrapping `virutil push` has
+to be able to tell "I clicked No" from "SMB is broken". 99 covers the rest of
+the host setup (the share, the account, the filesystem ACL) with the specifics
+in the diagnosis text.
 
 ## 6. Shared payloads
 
@@ -182,12 +216,30 @@ payloads/pull.ps1       Windows guest  robocopy matches of a pattern out
 payloads/pull.sh        Linux guest    rsync matches of a pattern out
 payloads/sync.ps1       Windows guest  robocopy the whole share onto C:\
 payloads/sync.sh        Linux guest    rsync the whole export onto /
+payloads/mount.ps1      Windows guest  authenticate to a credentialled share
+payloads/unmount.ps1    Windows guest  let go of it again
 ```
 
-Nine files rather than the five this section first guessed at, because push
+Nine of them rather than the five this section first guessed at, because push
 needs two shapes on each side: robocopy cannot rename onto a new name, so a
 single file goes through Copy-Item, and the rsync side is split to match rather
-than to differ.
+than to differ. The last two came later and are a different kind of thing.
+
+**The mount pair is keyed on the host, and it is the only pair that is.** Every
+other payload is keyed on the guest, because what a guest can run is the guest's
+business. These two exist because only one *host* has to authenticate: a Linux
+host serves an anonymous share and sends neither of them, and a Windows host
+cannot serve an anonymous one at all (section 7), so it sends them as their own
+agent calls around the copier payload. `mount.ps1` drops the guest's existing
+sessions to the host before mounting -- see the `1219` measurement in section 7
+-- and maps no drive letter, so the copier payloads keep addressing the bare UNC
+they are written and documented around.
+
+Adding a credential hole to the three Windows payloads instead was rejected: a
+hole left unfilled is refused by both renderers, so the bash driver would have
+to carry forever a hole it can never fill. Both drivers render all eleven and
+diff them against the one golden file, so this pair is held to the same identity
+as everything else even though only one driver ever sends it.
 
 ### The placeholder grammar
 
@@ -215,7 +267,7 @@ This is the only code the two implementations share, and it is the most
 carefully bisected code in the repo -- robocopy's exit code is a bitmap, not an
 error level; robocopy always takes a source *directory*, so a file is named as
 a filter on its parent. Keep it in one place. `tests/payloads.sh` and
-`tests/payloads.ps1` render all nine under both drivers and diff the result
+`tests/payloads.ps1` render all eleven under both drivers and diff the result
 against one golden file, which is what makes "byte-identical" a fact rather than
 an intention.
 
@@ -223,18 +275,19 @@ an intention.
 
 Not every module ports. What the Windows driver ships today is:
 
-`domain`, `exec` and `usb`. `sync`, `push` and `pull` are the intended surface
-and are blocked rather than unwritten; `ui` is bash-only, and `snapshot` is
-bash-only now as well. All of them are below. A module that works beats two
-half-ported.
+`domain`, `exec`, `push`, `pull` and `usb`. `sync` is the remaining intended
+surface; `ui` is bash-only, and `snapshot` is bash-only now as well. All of them
+are below. A module that works beats two half-ported.
 
 **Where it actually is:** `domain` and `exec` are ported, and the guest agent
 channel they both stand on is in place. `usb` is on both drivers. `snapshot` was
 ported and has been taken back out -- the question this section used to leave
 open was measured, the answer was no, and the answer took the command with it,
-below. `sync`, `push` and `pull` are not ported, and they are blocked on one
-unanswered question rather than on effort -- see "The transfer layer" below.
-`ui` is bash-only.
+below. `push` and `pull` are ported, against a **Windows guest**: the question
+they were blocked on was measured and decided, and what was decided is recorded
+below. `sync` is not ported, and neither is a Linux guest from a Windows host;
+both are later passes on the transport that now exists rather than new
+questions. `ui` is bash-only.
 
 ### `snapshot`: ported, measured, and taken back out
 
@@ -336,7 +389,8 @@ the reason. What it must not do is fall through to "unknown module": the command
 is in the grammar section 2 publishes, and it was on this driver one commit ago,
 so whoever types it has been told twice that it exists. `$script:ELSEWHERE` in
 `modules/parser.ps1` is where that reason lives, and it is the right home for
-`sync`, `push`, `pull` and `ui` too.
+`sync` and `ui` too. `push` and `pull` were on that list and have left it: they
+are in `$MODULES` now.
 
 The bash driver is untouched. Its `snapshot` is external overlays plus a memspec
 through libvirt, it captures memory for a running domain, and none of this
@@ -440,16 +494,65 @@ point than the bash side, and the ACL is doing the work the bind address does
 there -- which is a reason to prefer a named grantee over `Everyone` that has
 nothing to do with authentication.
 
-What remains open is the decision, not the facts. The invoking user's own
-credential in the payload was deliberately **not** measured: the throwaway
-account proves the mechanism, and running it would put a real password on a
-virtio channel and into a guest's command history to learn nothing new. The
-Linux-guest side of the same share -- whether `mount -t cifs` will take an
-anonymous mount a Windows client refuses -- is unmeasured, and it matters,
-because the guest axis is where the two would differ.
+The invoking user's own credential in the payload was deliberately **not**
+measured: the throwaway account proves the mechanism, and running it would put a
+real password on a virtio channel and into a guest's command history to learn
+nothing new. The Linux-guest side of the same share -- whether `mount -t cifs`
+will take an anonymous mount a Windows client refuses -- is unmeasured, and it
+matters, because the guest axis is where the two would differ. It is the one
+fact a Linux guest from a Windows host still waits on.
 
-The prototype that took these measurements is on the `prototype/xfer-windows-auth`
-branch, with the teardown and stray-reporting that makes each number checkable.
+**Decided, on those measurements: a throwaway local account, minted per
+transfer.** `modules/xfer.ps1` is what that became, and these are the parts of
+it that are contract rather than implementation:
+
+- The account is `vxp-<token>`, inside Windows' 20-character cap on a local
+  account name, with a 24-character alphanumeric password from a cryptographic
+  RNG. Alphanumeric because a value spelled like a placeholder is refused by
+  both renderers (section 6), and because the guest hands it to `net use`.
+- It is in **no group**, is granted the network logon right and denied the
+  interactive and remote-interactive ones, and is removed at teardown. The
+  argument for preferring a throwaway over a real credential is that it cannot
+  be used for anything else; restricting its rights is what makes that true
+  rather than merely likely. The password does cross the virtio channel -- that
+  is inherent to the guest running `net use` -- and the point is that this
+  credential is worthless.
+- The `vxp-` prefix is what makes "mine to reap" decidable **without a state
+  file**. Strays are swept on the next run, and the sweep skips any candidate
+  whose owning process is still alive, which each transfer's status file records.
+  Concurrent transfers are independent and are not refused.
+- **Only the share management elevates.** The run stays in the console the
+  developer typed in -- keeping the guest's stdout, the diagnoses and the exit
+  code where they belong -- and a short-lived elevated helper mints the account,
+  publishes the share, fixes the filesystem ACL and takes all three away again.
+  One prompt per transfer. The helper keys its teardown on waiting for the
+  *parent's* process to exit, which is the nearest thing this host has to the
+  `trap ... EXIT` the bash transport relies on: teardown fires on Ctrl-C, on an
+  exception, and on the run being killed while the agent hangs.
+- The two halves cannot use a pipe, and the reason is measured rather than
+  assumed: `Start-Process -Verb RunAs -RedirectStandardOutput` is a parameter-set
+  error, because the verb requires ShellExecute and ShellExecute forbids
+  redirection. The parent passes the token, the account and the password down as
+  arguments and the helper answers upward through a status file.
+- **Every transfer stages**, into `<root>/tmp/<token>/`, and the staged copy is
+  what the share points at. This diverges from the bash driver, which serves a
+  directory source in place, and the divergence is deliberate: serving in place
+  would mean editing the filesystem ACL of the developer's real tree and -- since
+  a share here cannot be bound to an interface -- offering that tree on every
+  network the host is attached to. `pull` seeds its staging tree from the
+  destination first, so the guest still sees what the host already holds and
+  still sends only what differs.
+- **Nothing is created and nothing is prompted for until the transfer is known
+  to be possible.** Domain running, agent answering and source readable are all
+  settled first. Being asked to approve Administrator and *then* told the guest
+  is not running is the worst available ordering.
+- The weakening against the Linux host stands and is not solved: the ACL is
+  doing the work `smbd`'s bind address does there.
+
+The prototype that took these measurements was on the
+`prototype/xfer-windows-auth` branch, with the teardown and stray-reporting that
+made each number checkable. Its own header said to delete it once the findings
+were folded in. They are, and it is.
 
 **`usb` is one grammar over two mechanisms, and the WSL case is not a command
 at all.** There used to be a bash `usb` module that drove `usbipd.exe` on the
@@ -516,15 +619,21 @@ drivers:
 | | |
 |---|---|
 | `tests/conformance.sh` | the runner. Every `--help` exits 0, every usage error exits 1, in both drivers; drives the two below. |
-| `tests/payloads.sh`, `tests/payloads.ps1` | render all nine payloads under each driver and diff both against `tests/golden/payloads.txt`. This is what makes section 6's "byte-identical" checkable. |
+| `tests/payloads.sh`, `tests/payloads.ps1` | render all eleven payloads under each driver and diff both against `tests/golden/payloads.txt`. This is what makes section 6's "byte-identical" checkable. |
 | `tests/domain.ps1` | the launcher round trip: monitor port, agent channel and port forwards written, read back, edited and read again. |
+| `tests/xfer.ps1` | `push` and `pull` on a Windows host with both seams substituted -- the guest agent and the share publisher -- so the guest path rules, credential generation, the free-space refusal, the sweep's liveness decision, the rendered payload and the teardown all run with no VM and no Administrator. |
+| `tests/transfer.ps1` | the guest tier: the transfer minimum below, plus the property that a completed transfer and a killed one both leave no account, no share and no staged tree. |
 
-The PowerShell half skips itself, loudly, on a host with no `pwsh`.
+The PowerShell half skips itself, loudly, on a host with no `pwsh`, and
+`tests/transfer.ps1` skips itself the same way when no guest is up. When a guest
+*is* up it is the only interactive test in the suite: a transfer on a Windows
+host prompts for Administrator once, and suppressing that would mean installing
+a service.
 
-**Still missing, and named so it is not mistaken for covered:** everything that
-needs a running guest with an agent in it -- the `push`/`pull` round trip, the
-second `push` moving nothing, `exec` propagating an exit code, and `domain
-create` leaving exactly the files section 3 names.
+**Still missing, and named so it is not mistaken for covered:** `exec`
+propagating a guest exit code against a real guest, and `domain create` leaving
+exactly the files section 3 names. The `push`/`pull` round trip and the second
+`push` moving nothing were on this list and are now in `tests/transfer.ps1`.
 
 ## 9. Host-specific behaviour that is *not* contract
 
