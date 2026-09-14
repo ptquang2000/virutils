@@ -1,0 +1,496 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>PROTOTYPE -- virutil transfer auth on a Windows host</title>
+<style>
+  :root {
+    --ink: #16181d; --dim: #6b7280; --line: #e3e5ea; --bg: #fbfbfc;
+    --panel: #fff; --accent: #1d4ed8; --bad: #b42318; --warn: #8a5a00;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 40px 24px 80px; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 -apple-system, "Segoe UI", system-ui, sans-serif;
+  }
+  main { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 23px; margin: 0 0 4px; letter-spacing: -.01em; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .07em;
+       color: var(--dim); margin: 38px 0 12px; font-weight: 600; }
+  p  { margin: 0 0 12px; }
+  .lede { color: var(--dim); max-width: 68ch; }
+  .stamp { display: inline-block; font: 600 11px/1 var(--mono); letter-spacing: .08em;
+           color: var(--bad); border: 1px solid var(--bad); padding: 5px 7px;
+           border-radius: 3px; margin-bottom: 14px; }
+  .panel { background: var(--panel); border: 1px solid var(--line);
+           border-radius: 8px; padding: 18px 20px; }
+  .q { border-left: 3px solid var(--accent); background: #fff; padding: 14px 18px;
+       border-radius: 0 8px 8px 0; border-top: 1px solid var(--line);
+       border-right: 1px solid var(--line); border-bottom: 1px solid var(--line);
+       max-width: 72ch; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; }
+  button {
+    font: inherit; font-size: 14px; padding: 8px 13px; border-radius: 6px;
+    border: 1px solid var(--line); background: #fff; color: var(--ink);
+    cursor: pointer; text-align: left;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .36; cursor: not-allowed; }
+  button.danger:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); }
+  button.step { display: block; width: 100%; margin-bottom: 6px; }
+  button.step.done { opacity: .45; text-decoration: line-through; }
+  .setting { display: flex; gap: 18px; flex-wrap: wrap; align-items: baseline; }
+  .setting label { font-size: 13px; color: var(--dim); display: block; margin-bottom: 4px; }
+  select { font: inherit; font-size: 14px; padding: 7px 9px; border-radius: 6px;
+           border: 1px solid var(--line); background: #fff; }
+  dl { display: grid; grid-template-columns: 210px 1fr; gap: 7px 18px; margin: 0; }
+  dt { color: var(--dim); font-size: 13px; }
+  dd { margin: 0; font-family: var(--mono); font-size: 13px; word-break: break-word; }
+  dd.none { color: var(--dim); font-family: inherit; font-style: italic; }
+  dd.leak { color: var(--bad); }
+  .phase { font: 600 13px/1 var(--mono); background: #eef2ff; color: var(--accent);
+           padding: 5px 8px; border-radius: 4px; display: inline-block; }
+  .phase.bad { background: #fdeceb; color: var(--bad); }
+  .phase.ok  { background: #e9f6ec; color: #196c2e; }
+  .note { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line);
+          font-size: 14px; }
+  .note.bad { color: var(--bad); }
+  .tabs { display: flex; gap: 4px; flex-wrap: wrap; border-bottom: 1px solid var(--line);
+          margin-bottom: 16px; }
+  .tabs button { border: none; border-bottom: 2px solid transparent; border-radius: 0;
+                 background: none; padding: 9px 12px; color: var(--dim); font-size: 14px; }
+  .tabs button[aria-selected=true] { color: var(--accent); border-bottom-color: var(--accent);
+                                     font-weight: 600; }
+  .scenario p { font-size: 14px; color: var(--dim); max-width: 68ch; }
+  ol.log { font-family: var(--mono); font-size: 12.5px; margin: 0; padding-left: 22px;
+           color: var(--dim); max-height: 210px; overflow-y: auto; }
+  ol.log li { margin-bottom: 3px; }
+  ol.log li:last-child { color: var(--ink); }
+  footer { margin-top: 44px; color: var(--dim); font-size: 13px; max-width: 72ch; }
+  code { font-family: var(--mono); font-size: .92em; background: #f1f2f5;
+         padding: 1px 4px; border-radius: 3px; }
+</style>
+
+<main>
+  <span class="stamp">PROTOTYPE &mdash; THROWAWAY</span>
+  <h1>Authenticating a virutil transfer on a Windows host</h1>
+  <p class="lede">Not shipping code. A model of one <code>push</code> so the
+     three candidate answers in <code>docs/contract.md</code> &sect;7 can be
+     driven by hand and watched where they hurt.</p>
+
+  <div class="q">
+    <p><strong>The question.</strong> On a Linux host the share is anonymous
+    (<code>map to guest = Bad User</code>) and the guest fetches with no
+    credential. Windows has no equivalent that is on by default. Three ways out
+    were written down and none picked. This drives the whole lifecycle of a
+    transfer &mdash; stage, credential, publish, fetch, tear down &mdash; under
+    each, and lets you end it badly (Ctrl-C, host reboot, a second transfer) to
+    see what each one leaves behind on the host.</p>
+    <p style="margin:0"><strong>Watch for:</strong> what survives an abort, what
+    survives a reboot, and which option needs Administrator for which step.</p>
+  </div>
+
+  <h2>The setup</h2>
+  <div class="panel setting" id="settings"></div>
+
+  <h2>What is true right now</h2>
+  <div class="panel" id="state"></div>
+
+  <h2>Free play &mdash; press anything, in any order</h2>
+  <div class="row" id="actions"></div>
+
+  <h2>Guided walkthroughs</h2>
+  <div class="tabs" id="tabs"></div>
+  <div class="panel scenario" id="scenario"></div>
+
+  <h2>What happened</h2>
+  <div class="panel"><ol class="log" id="log"></ol></div>
+
+  <footer>
+    <p><strong>One claim here is not measured.</strong> That a Windows guest's
+    SMB <em>client</em> refuses an insecure guest logon is taken from documented
+    Windows defaults since 10&nbsp;1709, exactly as &sect;7 says &mdash; it has
+    not been checked against a real guest on this host. Scenario 3 is the one
+    that turns on it. Verify it before this model decides anything.</p>
+  </footer>
+</main>
+
+<script>
+/* ---------------------------------------------------------------------------
+ * The model. Pure: no DOM in here, nothing reaches in from a handler.
+ * A transfer is a phase plus the residue it has put on the host so far.
+ * This is the bit that lifts into modules/xfer.ps1 if it survives contact.
+ * ------------------------------------------------------------------------ */
+
+const AUTH = {
+  mint:    "A throwaway local account, per transfer",
+  invoker: "The invoking user's own credential, in the payload",
+  anon:    "Re-enable anonymous guest logons, host and guest",
+};
+
+const initial = (opts = {}) => ({
+  auth:     opts.auth    || "mint",
+  guestOs:  opts.guestOs || "windows",
+  elevated: opts.elevated === undefined ? true : opts.elevated,
+  phase:    "idle",
+  transfers: 0,
+  residue:  { accounts: [], shares: [], stages: [], policyOff: false },
+  secretOnWire: false,
+  shareScope: null,
+  rebooted: false,
+  failure:  null,
+  log:      [],
+});
+
+const token = () => Math.random().toString(36).slice(2, 8);
+
+// Which actions are legal in which phase. Half the question is here.
+const LEGAL = {
+  check:      ["idle"],
+  stage:      ["checked"],
+  credential: ["staged"],
+  publish:    ["credentialed"],
+  fetch:      ["published"],
+  teardown:   ["staged", "credentialed", "published", "fetched", "failed"],
+  abort:      ["checked", "staged", "credentialed", "published", "fetched", "failed"],
+  second:     ["published", "fetched"],
+  reboot:     ["idle", "checked", "staged", "credentialed", "published",
+               "fetched", "failed", "aborted", "done"],
+  reset:      ["idle", "checked", "staged", "credentialed", "published",
+               "fetched", "failed", "aborted", "done"],
+};
+
+const legal = (s, a) => LEGAL[a].includes(s.phase);
+
+function step(state, action) {
+  if (action === "reset") return initial(state);
+  if (!legal(state, action)) return state;
+
+  const s = structuredClone(state);
+  const say = m => s.log.push(m);
+  const die = m => { s.phase = "failed"; s.failure = m; say("x " + m); return s; };
+
+  switch (action) {
+
+    case "check":
+      s.phase = "checked";
+      say("domain is running and qemu-ga answers -- the copy can be driven");
+      return s;
+
+    case "stage": {
+      const p = "%USERPROFILE%\\.virutils\\staging\\t" + token();
+      s.residue.stages.push(p);
+      s.phase = "staged";
+      say("payload tree written to " + p);
+      return s;
+    }
+
+    case "credential":
+      if (s.auth === "mint") {
+        if (!s.elevated)
+          return die("New-LocalUser needs Administrator; this shell is not elevated");
+        const u = "virutil-x" + token();
+        s.residue.accounts.push(u);
+        say("created local account " + u + " (password held in memory only)");
+      } else if (s.auth === "invoker") {
+        s.secretOnWire = true;
+        say("will hand the invoking user's own password to the guest in the payload");
+      } else {
+        if (!s.elevated)
+          return die("enabling the Guest account and anonymous LanmanServer access " +
+                     "needs Administrator; this shell is not elevated");
+        s.residue.policyOff = true;
+        say("enabled the host Guest account; insecure guest logons now permitted");
+        if (s.guestOs === "windows")
+          say("! the guest's own client must be relaxed too -- " +
+              "AllowInsecureGuestAuth, set inside the guest");
+      }
+      s.phase = "credentialed";
+      return s;
+
+    case "publish": {
+      // New-SmbShare is Administrator-only whatever the auth answer is.
+      if (!s.elevated)
+        return die("New-SmbShare needs Administrator; this shell is not elevated. " +
+                   "True of all three answers -- the share, not the credential, " +
+                   "is what needs the privilege");
+      const name = "vx" + token();
+      s.residue.shares.push(name);
+      // The bash side binds smbd to the single address that reaches the guest.
+      // New-SmbShare has no bind address at all.
+      s.shareScope = "every interface this host has -- a share cannot be scoped " +
+                     "to one NIC; only its ACL narrows it";
+      s.transfers += 1;
+      say("published \\\\10.0.2.2\\" + name +
+          (s.auth === "mint"
+            ? " ACLed to " + s.residue.accounts.at(-1) + " alone"
+            : s.auth === "invoker"
+              ? " ACLed to the invoking user"
+              : " open to Everyone, including anonymous"));
+      s.phase = "published";
+      return s;
+    }
+
+    case "fetch":
+      if (s.auth === "anon" && s.guestOs === "windows")
+        return die("the guest's SMB client refused the share: insecure guest logons " +
+                   "are blocked by default since Windows 10 1709. UNVERIFIED -- " +
+                   "this is the claim to measure first");
+      if (s.auth === "anon" && s.guestOs === "linux")
+        say("mount -t cifs -o guest succeeded -- the Linux client will do an " +
+            "anonymous mount the Windows one refuses");
+      if (s.auth === "invoker")
+        say("! the payload carrying that password went over the agent channel and " +
+            "is now in the guest's own command history");
+      say(s.guestOs === "windows"
+        ? "robocopy fetched what differed; the guest kept running throughout"
+        : "rsync over the cifs mount fetched what differed");
+      s.phase = "fetched";
+      return s;
+
+    case "teardown":
+      s.residue.shares.forEach(n => say("removed share " + n));
+      s.residue.accounts.forEach(u => say("deleted account " + u));
+      s.residue.stages.forEach(p => say("cleared " + p));
+      s.residue.shares = []; s.residue.accounts = []; s.residue.stages = [];
+      s.secretOnWire = false;
+      s.shareScope = null;
+      if (s.residue.policyOff)
+        say("! the host's guest-logon protection stays off -- virutil turned a " +
+            "machine-wide setting off and cannot know it may turn it back on");
+      s.phase = "done";
+      return s;
+
+    case "abort":
+      say("^C -- virutil died here. Nothing below was undone.");
+      s.phase = "aborted";
+      return s;
+
+    case "second": {
+      const u = s.auth === "mint" ? "virutil-x" + token() : null;
+      if (u) s.residue.accounts.push(u);
+      const n = "vx" + token();
+      s.residue.shares.push(n);
+      s.residue.stages.push("%USERPROFILE%\\.virutils\\staging\\t" + token());
+      s.transfers += 1;
+      say("a second transfer started against another domain: share " + n +
+          (u ? ", account " + u : "") + " -- random names, so no collision");
+      return s;
+    }
+
+    case "reboot":
+      s.rebooted = true;
+      say("host rebooted.");
+      if (s.residue.shares.length)
+        say("! the shares came back: New-SmbShare is persistent");
+      if (s.residue.accounts.length)
+        say("! the accounts are still there: a local account outlives a reboot");
+      if (s.residue.stages.length)
+        say("! the staging trees are still there, by contract -- staging is " +
+            "deliberately not %TEMP%");
+      if (s.residue.policyOff)
+        say("! guest logons are still permitted");
+      if (!s.residue.shares.length && !s.residue.accounts.length &&
+          !s.residue.stages.length && !s.residue.policyOff)
+        say("nothing was left to survive it");
+      return s;
+  }
+  return s;
+}
+
+/* --- scenarios: ordered (label, action) steps over the same model --------- */
+
+const SCENARIOS = [
+  { name: "The happy path",
+    setup: { auth: "mint", guestOs: "windows", elevated: true },
+    blurb: "Mint an account, publish, fetch, tear down. Watch the host end the " +
+           "run exactly as clean as it started. This is the option the contract " +
+           "calls 'account churn on the host for every push' -- decide here " +
+           "whether that churn is actually a cost.",
+    steps: [["Check the guest is up", "check"], ["Stage the payload", "stage"],
+            ["Mint the account", "credential"], ["Publish the share", "publish"],
+            ["Tell the guest to fetch", "fetch"], ["Tear down", "teardown"]] },
+
+  { name: "Ctrl-C halfway",
+    setup: { auth: "mint", guestOs: "windows", elevated: true },
+    blurb: "The same run, killed after the share goes up. Look at what is left on " +
+           "the host, then reboot and look again. An account and a share that " +
+           "nothing will ever come back for is the failure mode this option has " +
+           "to answer for -- and modules/xfer's EXIT trap has no counterpart here " +
+           "yet.",
+    steps: [["Check the guest is up", "check"], ["Stage the payload", "stage"],
+            ["Mint the account", "credential"], ["Publish the share", "publish"],
+            ["Kill virutil (^C)", "abort"], ["Reboot the host", "reboot"]] },
+
+  { name: "No credential at all",
+    setup: { auth: "anon", guestOs: "windows", elevated: true },
+    blurb: "The straight port of what the Linux host does: serve it open and let " +
+           "the guest walk in. It gets all the way to the fetch before anything " +
+           "objects, and the thing that objects is inside the guest, where virutil " +
+           "would have to reach in and relax a security setting to fix it. THIS IS " +
+           "THE UNVERIFIED STEP -- measure it for real.",
+    steps: [["Check the guest is up", "check"], ["Stage the payload", "stage"],
+            ["Turn guest logons back on", "credential"],
+            ["Publish the share", "publish"], ["Tell the guest to fetch", "fetch"],
+            ["Tear down", "teardown"]] },
+
+  { name: "A Linux guest is a different question",
+    setup: { auth: "anon", guestOs: "linux", elevated: true },
+    blurb: "Same open share, Linux guest. The cifs client mounts anonymously " +
+           "without complaint. So 'no credential' is not one answer that fails -- " +
+           "it is an answer that works on one guest axis and not the other, and " +
+           "the contract's guest-axis split would have to carry the difference.",
+    steps: [["Check the guest is up", "check"], ["Stage the payload", "stage"],
+            ["Turn guest logons back on", "credential"],
+            ["Publish the share", "publish"], ["Tell the guest to fetch", "fetch"],
+            ["Tear down", "teardown"]] },
+
+  { name: "Not an Administrator",
+    setup: { auth: "mint", guestOs: "windows", elevated: false },
+    blurb: "Run it as an ordinary user. Note where it dies -- then switch the auth " +
+           "mode above and run it again. Every answer dies at the same place, " +
+           "because publishing a share is Administrator-only whatever the " +
+           "credential is. Which means the auth question does not decide whether " +
+           "push needs elevation. That is already settled.",
+    steps: [["Check the guest is up", "check"], ["Stage the payload", "stage"],
+            ["Mint the account", "credential"], ["Publish the share", "publish"]] },
+
+  { name: "Two at once",
+    setup: { auth: "mint", guestOs: "windows", elevated: true },
+    blurb: "A push to one domain while another is still running. On the Linux host " +
+           "this is the hard case -- smbd owns port 445 exclusively. Here the SMB " +
+           "server is already up and serving whatever else the host serves, so two " +
+           "transfers coexist. Read the share-scope field while you do it: that is " +
+           "what replaces the bash side's bind-address argument, and it is weaker.",
+    steps: [["Check the guest is up", "check"], ["Stage the payload", "stage"],
+            ["Mint the account", "credential"], ["Publish the share", "publish"],
+            ["Start a second transfer", "second"],
+            ["Tell the guest to fetch", "fetch"], ["Tear down", "teardown"]] },
+];
+
+/* ---------------------------------------------------------------------------
+ * The page. Throwaway shell over the module above.
+ * ------------------------------------------------------------------------ */
+
+let S = initial();
+let tab = 0, stepAt = 0;
+
+const ACTIONS = [
+  ["Check the guest is up", "check"], ["Stage the payload", "stage"],
+  ["Mint / arrange the credential", "credential"], ["Publish the share", "publish"],
+  ["Tell the guest to fetch", "fetch"], ["Tear down", "teardown"],
+  ["Kill virutil (^C)", "abort", "danger"],
+  ["Start a second transfer", "second", "danger"],
+  ["Reboot the host", "reboot", "danger"], ["Start over", "reset"],
+];
+
+const PHASE_WORDS = {
+  idle: "nothing started", checked: "guest confirmed up", staged: "payload staged",
+  credentialed: "credential arranged", published: "share is live",
+  fetched: "guest has the files", done: "finished and cleaned up",
+  failed: "failed", aborted: "killed mid-transfer",
+};
+
+function dispatch(a) { S = step(S, a); render(); }
+
+function render() {
+  const sel = (id, val, o) =>
+    '<div><label for="' + id + '">' + o.label + '</label><select id="' + id + '">' +
+    o.items.map(function (it) {
+      return '<option value="' + it[0] + '"' + (it[0] === val ? " selected" : "") +
+             '>' + it[1] + '</option>';
+    }).join("") + '</select></div>';
+
+  settings.innerHTML =
+    sel("auth", S.auth, { label: "Which answer are we trying?",
+                          items: Object.entries(AUTH) }) +
+    sel("guestOs", S.guestOs, { label: "What is in the guest?", items:
+      [["windows", "A Windows guest (robocopy)"],
+       ["linux", "A Linux guest (rsync over cifs)"]] }) +
+    sel("elevated", String(S.elevated), { label: "Who is running virutil?", items:
+      [["true", "An Administrator"], ["false", "An ordinary user"]] });
+
+  auth.onchange     = e => { S = initial({ ...S, auth: e.target.value }); render(); };
+  guestOs.onchange  = e => { S = initial({ ...S, guestOs: e.target.value }); render(); };
+  elevated.onchange = e => { S = initial({ ...S, elevated: e.target.value === "true" }); render(); };
+
+  const list = (arr, cls) => arr.length
+    ? '<dd class="' + cls + '">' + arr.join("<br>") + "</dd>"
+    : '<dd class="none">nothing</dd>';
+  const cls = S.phase === "done" ? "ok"
+            : ["failed", "aborted"].includes(S.phase) ? "bad" : "";
+
+  state.innerHTML = "<dl>" +
+    "<dt>Where the transfer is</dt><dd><span class=\"phase " + cls + "\">" +
+      PHASE_WORDS[S.phase] + "</span></dd>" +
+    "<dt>Answer being tried</dt><dd style=\"font-family:inherit\">" + AUTH[S.auth] + "</dd>" +
+    "<dt>Accounts on the host</dt>" + list(S.residue.accounts, "leak") +
+    "<dt>Shares published</dt>" + list(S.residue.shares, "leak") +
+    "<dt>Staging trees on disk</dt>" + list(S.residue.stages, "leak") +
+    "<dt>Who the share is offered to</dt>" + (S.shareScope
+      ? '<dd class="leak" style="font-family:inherit">' + S.shareScope + "</dd>"
+      : '<dd class="none">no share up</dd>') +
+    "<dt>Host guest-logon protection</dt>" + (S.residue.policyOff
+      ? '<dd class="leak" style="font-family:inherit">turned off by virutil, still off</dd>'
+      : '<dd class="none">untouched</dd>') +
+    "<dt>A real password in a payload</dt>" + (S.secretOnWire
+      ? '<dd class="leak" style="font-family:inherit">yes -- sent over the agent channel</dd>'
+      : '<dd class="none">no</dd>') +
+    "<dt>Transfers started</dt><dd>" + S.transfers + "</dd>" +
+  "</dl>" +
+  (S.failure ? '<p class="note bad">' + S.failure + "</p>" : "") +
+  (S.phase === "aborted" && (S.residue.shares.length || S.residue.accounts.length)
+    ? '<p class="note bad">Left behind and not coming back: ' +
+      S.residue.shares.length + " share(s), " + S.residue.accounts.length +
+      " account(s), " + S.residue.stages.length + " staging tree(s).</p>" : "") +
+  (S.rebooted && (S.residue.shares.length || S.residue.accounts.length)
+    ? '<p class="note bad">And a reboot did not take any of it with it.</p>' : "");
+
+  actions.innerHTML = ACTIONS.map(function (a) {
+    return '<button data-a="' + a[1] + '" class="' + (a[2] || "") + '"' +
+           (legal(S, a[1]) ? "" : " disabled") + ">" + a[0] + "</button>";
+  }).join("");
+  actions.querySelectorAll("button").forEach(b => b.onclick = () => dispatch(b.dataset.a));
+
+  tabs.innerHTML = SCENARIOS.map(function (s, i) {
+    return '<button role="tab" aria-selected="' + (i === tab) + '" data-i="' + i +
+           '">' + s.name + "</button>";
+  }).join("");
+  tabs.querySelectorAll("button").forEach(b => b.onclick = () => {
+    tab = +b.dataset.i; startScenario();
+  });
+
+  const sc = SCENARIOS[tab];
+  scenario.innerHTML = "<p>" + sc.blurb + "</p>" + sc.steps.map(function (st, i) {
+    return '<button class="step ' + (i < stepAt ? "done" : "") + '" data-i="' + i +
+           '"' + (i === stepAt ? "" : " disabled") + ">" + (i + 1) + ". " + st[0] +
+           "</button>";
+  }).join("") + (stepAt >= sc.steps.length
+    ? '<p class="note">Walkthrough finished. The free-play buttons above still ' +
+      "work, or pick another tab.</p>" : "");
+  scenario.querySelectorAll("button.step").forEach(b => b.onclick = () => {
+    dispatchScenarioStep(+b.dataset.i);
+  });
+
+  log.innerHTML = S.log.map(function (l) {
+    const bad = l.startsWith("x "), warn = l.startsWith("! ");
+    const style = bad ? ' style="color:var(--bad)"'
+                : warn ? ' style="color:var(--warn)"' : "";
+    return "<li" + style + ">" + l.replace(/^[x!] /, "") + "</li>";
+  }).join("");
+  log.scrollTop = log.scrollHeight;
+}
+
+function startScenario() {
+  S = initial(SCENARIOS[tab].setup);
+  stepAt = 0;
+  render();
+}
+
+function dispatchScenarioStep(i) {
+  S = step(S, SCENARIOS[tab].steps[i][1]);
+  stepAt = i + 1;
+  render();
+}
+
+startScenario();
+</script>
