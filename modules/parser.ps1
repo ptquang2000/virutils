@@ -104,10 +104,17 @@ function Get-TopUsage {
 # tree spells this `shift`; PowerShell has no such thing, and the slice that
 # stands in for it (`$a[$n..($a.Count-1)]`) counts backwards from the end when
 # the array is already exhausted, quietly handing back the whole thing reversed.
+#
+# Both returns are comma-wrapped, because `return` unrolls an array on the way
+# out: `@()` would arrive as $null and a one-element slice as a bare string.
+# Either one costs the caller `.Count`, which under StrictMode is not a $null
+# that falls through but a PropertyNotFound that ends the run. Callers that hand
+# $rest straight to a [string[]] parameter never saw this -- the binder coerced
+# the scalar back -- so it stayed hidden until a caller read .Count itself.
 function Get-RestArgs {
     param([string[]]$Arguments, [int]$From = 1)
-    if (-not $Arguments -or $From -ge $Arguments.Count) { return @() }
-    return $Arguments[$From..($Arguments.Count - 1)]
+    if (-not $Arguments -or $From -ge $Arguments.Count) { return ,@() }
+    return ,@($Arguments[$From..($Arguments.Count - 1)])
 }
 
 function Invoke-Dispatch {

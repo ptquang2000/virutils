@@ -87,6 +87,20 @@ try {
     Check 'rest of an empty array'        ''   ((Get-RestArgs @() 1) -join ',')
     Check 'rest from index 2'             'c'  ((Get-RestArgs @('a','b','c') 2) -join ',')
 
+    # Every case above joins its result, and a join flattens a scalar and a
+    # one-element array alike -- so none of them can see the shape. `return`
+    # unrolls an array on the way out, which handed the caller $null for the
+    # empty case and a bare string for the one-element case. Reading .Count is
+    # the assertion that tells the two apart: under StrictMode it is what the
+    # caller does and what throws. `virutil exec cmd VM WORD` is exactly the
+    # one-element case, and it died on this for every single invocation.
+    Check 'the empty rest is an array, not $null' 0 `
+        ((Get-RestArgs @('a') 1).Count)
+    Check 'a one-element rest is an array, not a string' 1 `
+        ((Get-RestArgs @('a','b') 1).Count)
+    Check 'and its element survives' 'b' `
+        ((Get-RestArgs @('a','b') 1)[0])
+
     [Console]::Out.WriteLine('')
     [Console]::Out.WriteLine("$($script:Pass) passed, $($script:Fail) failed")
 } finally {
