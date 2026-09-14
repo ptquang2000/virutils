@@ -92,6 +92,36 @@ try {
     # rewrite that lost it would leave a domain nothing could shut down.
     Check 'the monitor survives an edit' 44444 (Get-DomainMonitorPort $vm)
 
+    # --- setting a value it already has -------------------------------------
+    #
+    # `domain start VM -c 1` is the documented way through a Windows install --
+    # once per reboot the firmware wedges at -- so every start after the first
+    # asks for the count the launcher already carries. Rewriting to the same
+    # bytes is success, not a launcher that failed to match: the version that
+    # compared the result instead of the pattern died with "could not find -smp"
+    # and left the domain unstarted, which is the whole install stuck.
+    $lp = Get-DomainLauncher $vm
+    Set-LauncherVcpus $vm 1
+    $once = Get-Content -LiteralPath $lp -Raw
+    Check 'vcpus are written'            $true ($once -match '-smp "1,sockets=1,cores=1,threads=1"')
+    Check 'and num-queues follows'       $true ($once -match 'num-queues=1,')
+    Set-LauncherVcpus $vm 1
+    Check 'and setting 1 again is a no-op' $once (Get-Content -LiteralPath $lp -Raw)
+
+    Set-LauncherMemory $vm 8192
+    Check 'memory is written'            $true ((Get-Content -LiteralPath $lp -Raw) -match '(?m)^\s*-m 8192\b')
+    Set-LauncherMemory $vm 8192
+    Check 'and setting it again is a no-op' $true ((Get-Content -LiteralPath $lp -Raw) -match '(?m)^\s*-m 8192\b')
+
+    # The other half of the contract still holds: a launcher that does not
+    # carry the shape these expect is an edited launcher, and is refused rather
+    # than rewritten blind.
+    $edited = Join-Path $script:VirutilsImageDir 'edited.cmd'
+    Set-Content -LiteralPath $edited -Value "rem no smp here`r`n" -Encoding ASCII
+    $refused = $false
+    try { Set-LauncherVcpus 'edited' 2 } catch { $refused = $true }
+    Check 'a launcher with no -smp is refused' $true $refused
+
     # --- deleting through an 8.3 short path ---------------------------------
     #
     # Remove-Item cannot do it, -LiteralPath notwithstanding, which broke

@@ -677,9 +677,20 @@ function Set-LauncherVcpus {
 
     # Topology and count in one write, as the bash driver does it for the same
     # reason: they have to multiply out. threads=1 always -- see the header.
-    $new = [regex]::Replace($text, '-smp\s+"?\d+,sockets=1,cores=\d+,threads=1"?',
+    #
+    # Whether the pattern matched is asked of the pattern, never of the result.
+    # `-c N` on a launcher that already says N rewrites it to the same bytes,
+    # and a `$new -eq $text` test reads an unchanged file as a pattern that did
+    # not match. That is not an edge case here, it is the install path: the
+    # header's own workaround for the firmware wedge is `domain start VM -c 1`
+    # once per reboot Setup wants, so the *second* such start and every one
+    # after it is a no-op rewrite. It died with "could not find -smp" on a file
+    # whose -smp was right there in the shape expected, and -- because the
+    # rewrite happens before the start -- the domain never started at all.
+    $smp = '-smp\s+"?\d+,sockets=1,cores=\d+,threads=1"?'
+    if ($text -notmatch $smp) { Die "could not find -smp in $path to change" }
+    $new = [regex]::Replace($text, $smp,
                             "-smp `"$Vcpus,sockets=1,cores=$Vcpus,threads=1`"", 1)
-    if ($new -eq $text) { Die "could not find -smp in $path to change" }
 
     # num-queues follows the vcpu count. Left behind it is not fatal -- virtio
     # copes -- but it is a queue per vcpu by design, and a launcher that says 8
@@ -699,9 +710,12 @@ function Set-LauncherMemory {
     $path = Get-DomainLauncher $Vm
     $text = Get-Content -LiteralPath $path -Raw
     # -m, anchored to its own line: a bare -m would also match the -m inside a
-    # file path or a device argument.
-    $new = [regex]::Replace($text, '(?m)^(\s*)-m\s+\d+', "`$1-m $Memory", 1)
-    if ($new -eq $text) { Die "could not find -m in $path to change" }
+    # file path or a device argument. Matched before it is replaced, for the
+    # reason written out in Set-LauncherVcpus above: `-m 8192` on a domain
+    # already at 8192 is a rewrite to the same bytes, not a missing -m.
+    $mem = '(?m)^(\s*)-m\s+\d+'
+    if ($text -notmatch $mem) { Die "could not find -m in $path to change" }
+    $new = [regex]::Replace($text, $mem, "`$1-m $Memory", 1)
     Set-Content -LiteralPath $path -Value $new -Encoding ASCII -NoNewline
 }
 
