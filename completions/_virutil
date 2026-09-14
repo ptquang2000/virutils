@@ -4,8 +4,9 @@
 #
 # This completes the *bash* driver, so it offers every module in $MODULES:
 # domain, snapshot, sync, pull, push, exec, ui, usb. The Windows driver carries
-# domain, exec and usb only, and its completer says so; usb is on both, spelled
-# the same way on each.
+# domain, snapshot, exec and usb, and its completer says so; usb and snapshot
+# are on both, spelled the same way on each -- though a snapshot there is
+# disk-only and needs the domain shut off (docs/contract.md section 9).
 
 _virutil() {
   # One tag per group in `virutil help`, so zstyle group-name can render them

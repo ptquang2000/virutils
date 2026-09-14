@@ -10,14 +10,20 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # What this driver answers to. Shorter than the bash tree's list on purpose:
-# `snapshot`, `sync`, `push`, `pull` and `ui` are not ported yet, and a module
-# that works beats two half-ported (contract section 7). A name absent here is
-# refused by name rather than dispatched to a function that does not exist.
+# `sync`, `push`, `pull` and `ui` are not ported yet, and a module that works
+# beats two half-ported (contract section 7). A name absent here is refused by
+# name rather than dispatched to a function that does not exist.
 #
 # `usb` is on both drivers, by two mechanisms: device_add over the QEMU monitor
 # here, a libvirt <hostdev> there. What is on neither is the WSL case, where
 # the device is on the far side of the kernel boundary -- see contract 7.
-$script:MODULES = @('domain', 'exec', 'usb')
+#
+# `snapshot` is on both too, and is the newest of them. It is disk-only on this
+# host and needs the domain shut off, because WHPX blocks qemu's VM-state save
+# outright -- measured, and written up in the header of modules/snapshot.ps1.
+# That is a contract difference (section 9), stated wherever the command is,
+# rather than a silently smaller command.
+$script:MODULES = @('domain', 'exec', 'snapshot', 'usb')
 
 # --- saying things ----------------------------------------------------------
 #
@@ -73,6 +79,7 @@ function Get-TopUsage {
         ''
         'domains'
         '  domain     the domain lifecycle: create, delete, list, start, shutdown, addr, port'
+        '  snapshot   qcow2 internal snapshots: create, list, revert, delete'
         ''
         'guest'
         '  exec       run commands inside a guest via the QEMU guest agent'
@@ -82,8 +89,9 @@ function Get-TopUsage {
         ''
         'This is the Windows-host driver: raw QEMU under WHPX, no libvirt. It'
         'shares a contract with the bash driver rather than any source; see'
-        'docs/contract.md. snapshot, sync, push, pull and ui are in the'
-        'bash tree only so far.'
+        'docs/contract.md. sync, push, pull and ui are in the bash tree only'
+        'so far, and snapshot is disk-only here: WHPX blocks saving a running'
+        "guest's memory, so a snapshot needs the domain shut off."
         ''
         "Run 'virutil <module>' for a module's own usage."
     )

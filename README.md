@@ -164,7 +164,7 @@ host-side machinery in `modules/xfer` and `modules/guest`, which is
 | Module | Purpose | Usage |
 | --- | --- | --- |
 | `domain` | The domain lifecycle: create one from an install ISO with a KVM-tuned profile, delete one along with its disks, and the everyday operations in between. | `virutil domain {create\|delete\|list\|start\|shutdown\|addr\|port} [VM] [ISO] [OPTIONS]` |
-| `snapshot` | External snapshots (disk and memory) for libvirt domains. | `virutil snapshot {create\|list\|revert\|delete} VM [SNAP]` |
+| `snapshot` | External snapshots (disk and memory) for libvirt domains. On the Windows driver the same four verbs are qcow2 internal snapshots, disk-only and with the domain shut off — WHPX blocks saving a running guest's memory. | `virutil snapshot {create\|list\|revert\|delete} VM [SNAP]` |
 
 ### transfer
 
