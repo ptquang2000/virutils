@@ -14,8 +14,12 @@
 #
 # The rest of section 8 -- a push/pull round trip, a second push moving nothing,
 # exec propagating a guest exit code, domain create leaving exactly the files
-# section 3 names -- needs a running guest with an agent in it and is not run
-# here. That is a gap and is written down as one.
+# section 3 names -- needs a running guest with an agent in it. The first two of
+# those now exist, in tests/transfer.ps1, which is driven from here and **skips
+# loudly when there is no guest** rather than failing. It is the one test in the
+# suite that is interactive when it does run: a transfer on a Windows host
+# publishes a share on the host's own SMB server, so it prompts for
+# Administrator once per transfer. The other two are still a gap.
 #
 #   tests/conformance.sh            both drivers, or whichever is runnable here
 #
@@ -135,8 +139,12 @@ else
     #               qemu-ga sends no exitcode at all.
     #   usb.ps1     an attach is a line in that same launcher, inserted
     #               into the middle of it rather than appended.
+    #   xfer.ps1    push and pull with both of their seams substituted -- the
+    #               guest agent and the share publisher -- so the guest path
+    #               rules, the staging copy, the rendered payload and the
+    #               teardown are exercised with no VM and no Administrator.
     printf '\n-- PowerShell unit tests --\n'
-    for t in domain exec usb; do
+    for t in domain exec usb xfer; do
         if out="$("$PWSH" -NoProfile -File "$ROOT/tests/$t.ps1" 2>&1)"; then
             printf '%s\n' "$out" | sed 's/^/  /'
             ok "tests/$t.ps1"
@@ -157,6 +165,29 @@ else
     else
         bad 'PowerShell renderer agrees with the golden file, byte for byte' \
             "$(head -20 /tmp/vp.ps.diff /tmp/vp.ps.err)"
+    fi
+
+    # The guest tier. Section 8's transfer minimum -- push then pull round-trips
+    # a tree byte for byte, and a second push of an unchanged tree moves nothing
+    # -- plus the two properties nothing below a guest can reach: that a
+    # transfer which ends and a transfer which is killed both leave no account,
+    # no share and no staged tree on this host.
+    #
+    # It skips itself when no guest is up, so this costs nothing on a machine
+    # with no VM running. When one *is* up it is the only interactive test in
+    # the suite: a transfer on a Windows host publishes a share on the host's
+    # own SMB server, which prompts for Administrator once per transfer.
+    printf '\n-- PowerShell guest tier --\n'
+    if out="$("$PWSH" -NoProfile -File "$ROOT/tests/transfer.ps1" 2>&1)"; then
+        printf '%s\n' "$out" | sed 's/^/  /'
+        if printf '%s' "$out" | grep -q '^skip     no guest'; then
+            skip 'tests/transfer.ps1 -- no guest to test against'
+        else
+            ok 'tests/transfer.ps1'
+        fi
+    else
+        printf '%s\n' "$out" | sed 's/^/  /'
+        bad 'tests/transfer.ps1'
     fi
 fi
 
