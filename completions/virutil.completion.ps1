@@ -8,8 +8,8 @@
 
   install.ps1 adds that line for you.
 
-  This completes the *Windows* driver, so it offers domain, exec and usb and
-  nothing else. sync, push, pull, ui and snapshot are in the bash tree only,
+  This completes the *Windows* driver, so it offers domain, exec, push, pull
+  and usb and nothing else. sync, ui and snapshot are in the bash tree only,
   and offering a name this driver would reject is worse than offering
   nothing -- $MODULES in modules\parser.ps1 is the list to keep this in step
   with. usb is on both drivers, spelled the same way on each.
@@ -169,6 +169,8 @@ $completer = {
     $modules = [ordered]@{
         domain   = 'the domain lifecycle: create, delete, list, start, shutdown, addr, port'
         exec     = 'run commands inside a guest via the QEMU guest agent'
+        push     = 'copy a file or directory from this host into a guest'
+        pull     = 'copy files out of a guest onto this host'
         usb      = 'pass a host USB device through to a guest'
         help     = 'the module list'
     }
@@ -314,7 +316,13 @@ $completer = {
         }
         1 {
             $hint = "$module has no verb starting with '$wordToComplete'"
-            if ($module -eq 'domain') { foreach ($k in $domainVerbs.Keys) { Add-Match $k $domainVerbs[$k] } }
+            # push and pull have no verb: VM is the first word after the
+            # module, so this position wants a domain rather than a subcommand.
+            if ($module -in @('push', 'pull')) {
+                $hint = $noDomain
+                foreach ($d in $domains) { Add-Match $d 'domain' }
+            }
+            elseif ($module -eq 'domain') { foreach ($k in $domainVerbs.Keys) { Add-Match $k $domainVerbs[$k] } }
             elseif ($module -eq 'exec') { foreach ($k in $execVerbs.Keys) { Add-Match $k $execVerbs[$k] } }
             elseif ($module -eq 'usb') { foreach ($k in $usbVerbs.Keys) { Add-Match $k $usbVerbs[$k] } }
         }
@@ -348,6 +356,15 @@ $completer = {
                 $hint = $noDomain
                 foreach ($d in $domains) { Add-Match $d 'domain' }
             }
+            # `push VM SRC` is a path on this host, and is the one word here
+            # that wants the file fallback, so it is the one that leaves $hint
+            # null. `pull VM SRC` is a path inside the guest, which nothing on
+            # this side can enumerate -- but saying so is still an answer, and
+            # a completer that says nothing gets PowerShell's file list for a
+            # word that is not a host path at all.
+            elseif ($module -eq 'pull') {
+                $hint = 'a path inside the guest, relative to C:\ -- wildcards allowed'
+            }
         }
         3 {
             # `domain create VM ISO` is the one word here that wants the file
@@ -370,6 +387,12 @@ $completer = {
             elseif ($module -eq 'usb' -and $verb -eq 'detach') {
                 $hint = "$($positional[2]) passes through no USB devices"
                 foreach ($u in Get-DomainUsbIds $positional[2]) { Add-Match $u 'attached' }
+            }
+            # The mirror of the pair above: `push VM SRC DST` is the guest
+            # path, and `pull VM SRC DST` is the host directory that takes the
+            # file fallback.
+            elseif ($module -eq 'push') {
+                $hint = 'a path inside the guest, relative to C:\ -- a trailing \ means a directory'
             }
         }
     }

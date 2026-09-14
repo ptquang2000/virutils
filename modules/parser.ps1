@@ -9,10 +9,16 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# What this driver answers to. Shorter than the bash tree's list on purpose:
-# `sync`, `push`, `pull` and `ui` are not ported yet, and a module that works
-# beats two half-ported (contract section 7). A name absent here is refused by
-# name rather than dispatched to a function that does not exist.
+# What this driver answers to. Still shorter than the bash tree's list: `sync`
+# and `ui` are not ported, and a module that works beats two half-ported
+# (contract section 7). A name absent here is refused by name rather than
+# dispatched to a function that does not exist.
+#
+# `push` and `pull` are here now. They were blocked rather than unwritten, on
+# one question -- how a share on a Windows host authenticates a guest that
+# refuses anonymous SMB -- which was measured against a real guest and answered
+# with a throwaway local account per transfer. modules/xfer.ps1 carries the
+# transport; `sync` drops in beside them later with nothing rearranged.
 #
 # `usb` is on both drivers, by two mechanisms: device_add over the QEMU monitor
 # here, a libvirt <hostdev> there. What is on neither is the WSL case, where
@@ -24,7 +30,7 @@ $ErrorActionPreference = 'Stop'
 # way it was -- is exactly the half this host cannot take. The measurements are
 # kept in docs/contract.md section 7, as the reason for the removal rather than
 # as a footnote to a command that still exists.
-$script:MODULES = @('domain', 'exec', 'usb')
+$script:MODULES = @('domain', 'exec', 'pull', 'push', 'usb')
 
 # Names the bash driver answers to that this one does not, and why. A name here
 # is refused with its own reason instead of "unknown module", because each is in
@@ -32,8 +38,8 @@ $script:MODULES = @('domain', 'exec', 'usb')
 # grammar and typed one has been told the command exists, and "unknown module"
 # leaves them to work out alone which driver they are standing on.
 #
-# `sync`, `push`, `pull` and `ui` belong here too and are not listed yet; they
-# have never been on this driver, so they have never stopped working.
+# `sync` and `ui` belong here too and are not listed yet; they have never been
+# on this driver, so they have never stopped working.
 $script:ELSEWHERE = [ordered]@{
     snapshot = @(
         'virutil snapshot is a Linux-host command; this driver does not have it.'
@@ -98,6 +104,10 @@ function Get-TopUsage {
         'domains'
         '  domain     the domain lifecycle: create, delete, list, start, shutdown, addr, port'
         ''
+        'transfer'
+        '  push       copy a file or directory from this host into a guest'
+        '  pull       copy files out of a guest onto this host'
+        ''
         'guest'
         '  exec       run commands inside a guest via the QEMU guest agent'
         ''
@@ -106,9 +116,13 @@ function Get-TopUsage {
         ''
         'This is the Windows-host driver: raw QEMU under WHPX, no libvirt. It'
         'shares a contract with the bash driver rather than any source; see'
-        'docs/contract.md. sync, push, pull, ui and snapshot are in the bash'
-        'tree only: WHPX blocks saving a running guest memory image, and that'
-        'is what took snapshot out of this one.'
+        'docs/contract.md. sync, ui and snapshot are in the bash tree only:'
+        'WHPX blocks saving a running guest memory image, and that is what'
+        'took snapshot out of this one.'
+        ''
+        "push and pull publish a share on this machine's own SMB server, so"
+        'they prompt once for Administrator and mint a throwaway local'
+        'account for the length of the transfer. See README.md.'
         ''
         "Run 'virutil <module>' for a module's own usage."
     )
