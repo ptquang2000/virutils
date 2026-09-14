@@ -1,4 +1,4 @@
-﻿# domain -- the domain lifecycle, on a Windows host running QEMU natively.
+# domain -- the domain lifecycle, on a Windows host running QEMU natively.
 #
 # There is no libvirt here, so there is no domain to define. `create` writes the
 # disk, the UEFI nvram and a per-VM `.cmd` launcher holding every qemu argument,
@@ -181,9 +181,9 @@ function Get-DomainUsage {
         '                    leave the guest with no way in at all'
         ''
         'delete takes no options. It never asks, and it removes the disk, the'
-        "nvram and the launcher. There is no backing chain to walk: a snapshot"
-        'here lives inside the disk image, so the disk takes its snapshots with'
-        'it.'
+        'nvram and the launcher. There is no backing chain to walk and nothing'
+        'a snapshot left behind: this driver has no snapshot command at all'
+        '(docs/contract.md section 7), so the disk is the whole of it.'
         ''
         '  -h, --help        this message'
         ''

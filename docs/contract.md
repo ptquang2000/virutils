@@ -36,10 +36,10 @@ virutil domain shutdown VM
 virutil domain addr     VM
 virutil domain port     VM [PORT | HOSTPORT:GUESTPORT] [-c PORT]
 
-virutil snapshot create VM [SNAP]        # default snap-<timestamp>
-virutil snapshot list   VM
-virutil snapshot revert VM SNAP
-virutil snapshot delete VM SNAP
+virutil snapshot create VM [SNAP]        # Linux host only; default snap-<timestamp>
+virutil snapshot list   VM               # Linux host only
+virutil snapshot revert VM SNAP          # Linux host only
+virutil snapshot delete VM SNAP          # Linux host only
 
 virutil sync VM [-c NAME|PATH]
 virutil push VM SRC DST
@@ -62,8 +62,10 @@ is a `usbipd` recipe in the README rather than a command. See section 7.
 starting) exist on the Windows driver only, and are marked as such above. They
 are in this section rather than buried in section 9 because a reader working out
 what a command line means should not have to find them somewhere else -- but a
-script using them is a script for one host. Everything else above is both
-drivers'. Section 9 says what each flag *does* where the two cannot agree.
+script using them is a script for one host. `snapshot` is marked the same way
+for the same reason, the other way round: it was on both drivers and was taken
+out of the Windows one (section 7). Everything else above is both drivers'.
+Section 9 says what each flag *does* where the two cannot agree.
 
 Invariants that are contract, not implementation:
 
@@ -78,13 +80,12 @@ Invariants that are contract, not implementation:
   overlays and memory files, mount points and port forwards; files another
   domain uses are kept.
 - `snapshot delete` takes SNAP's descendants with it and commits no disk data.
-- **A snapshot captures memory only where the host can save it.** On a Linux
-  host a running domain snapshots memory too and a shut-off one is disk-only;
-  on a Windows host every snapshot is disk-only and `create`, `revert` and
-  `delete` require the domain **shut off**. That is not a half-port: WHPX
-  installs a migration blocker, so `savevm` refuses before it reaches any disk
-  (measured -- section 9 quotes it). A driver that cannot capture memory says
-  so at `create` rather than at `revert`.
+- **`snapshot` is a Linux-host command.** There a running domain snapshots
+  memory too and a shut-off one is disk-only. It is not on the Windows driver
+  at all: WHPX installs a migration blocker, so `savevm` refuses before it
+  reaches any disk (measured -- section 7 quotes it), and a snapshot that can
+  only ever be a disk is not worth the name. `virutil snapshot` on a Windows
+  host is refused by name with that reason, never silently.
 - `exec` runs as SYSTEM (Windows) / root (Linux) and the guest's exit code
   becomes virutil's.
 - The disk is always `<image dir>/VM.qcow2`.
@@ -103,9 +104,9 @@ One root, everything under it, one variable relocates the lot.
 | `<root>/tmp` | transfer payload scratch |
 | `<root>/cache` | third-party tools fetched once (PsExec) |
 
-A snapshot has no files of its own on a Windows host: qcow2 internal snapshots
-live inside `VM.qcow2`, so the overlays and memory files in the `images` row are
-the Linux host's alone.
+The overlays and memory files in the `images` row are the Linux host's alone:
+`snapshot` is a Linux-host command (section 7), so a Windows host's `images`
+holds disks, nvram, launchers and logs and nothing any snapshot left behind.
 
 Root is `~/.virutils` on Linux and `%USERPROFILE%\.virutils` on Windows. The
 staging tree must survive a reboot -- this is why it is not an XDG/`%TEMP%`
@@ -222,24 +223,34 @@ an intention.
 
 Not every module ports. What the Windows driver ships today is:
 
-`domain`, `snapshot`, `exec` and `usb`. `sync`, `push` and `pull` are the
-intended surface and are blocked rather than unwritten; `ui` is bash-only. Both
-are below. A module that works beats two half-ported.
+`domain`, `exec` and `usb`. `sync`, `push` and `pull` are the intended surface
+and are blocked rather than unwritten; `ui` is bash-only, and `snapshot` is
+bash-only now as well. All of them are below. A module that works beats two
+half-ported.
 
 **Where it actually is:** `domain` and `exec` are ported, and the guest agent
-channel they both stand on is in place. `usb` is on both drivers. `snapshot` is
-now on both as well, disk-only on the Windows host -- the question this section
-used to leave open has been measured and answered, below. `sync`, `push` and
-`pull` are not ported, and they are blocked on one unanswered question rather
-than on effort -- see "The transfer layer" below. `ui` is bash-only.
+channel they both stand on is in place. `usb` is on both drivers. `snapshot` was
+ported and has been taken back out -- the question this section used to leave
+open was measured, the answer was no, and the answer took the command with it,
+below. `sync`, `push` and `pull` are not ported, and they are blocked on one
+unanswered question rather than on effort -- see "The transfer layer" below.
+`ui` is bash-only.
 
-### `snapshot`: ported, disk-only, and why that is not a half-port
+### `snapshot`: ported, measured, and taken back out
 
-This section used to read "not yet, and the criterion for changing that". The
-criterion was: *port it when the memory half has an answer that has been tested
-against a running guest -- or when section 2 is changed to say that snapshots
-are disk-only on a Windows host, which is a contract change and needs to be made
-deliberately.* Both halves of that have now happened, and in that order.
+This section has said three things in turn. First "not yet, and here is the
+criterion for changing that". Then "ported, disk-only, and that is not a
+half-port". Now: **the command is gone from the Windows driver**, and what
+follows is the evidence that took it out rather than an account of something
+that still ships.
+
+The order matters, because every measurement below was made while the command
+existed and not one of them has been retracted. The disk half worked. What
+changed is the judgement of whether a snapshot that is only a disk half earns
+the name on this host, and the answer is no -- the thing a snapshot is reached
+for, putting a running guest back the way it was, is exactly the half WHPX will
+not give. A command that cannot do the thing it is named for is better absent,
+and said to be absent, than present and explaining itself at every call.
 
 **The memory half has an answer, and the answer is no.** It is not a matter of
 choosing between `migrate "exec:..."` and `savevm`: WHPX installs a migration
@@ -299,40 +310,45 @@ There is no third state in which a snapshot becomes possible.
 virutil's to enforce.** On a Linux host qemu takes an OFD lock and `qemu-img`
 refuses a locked image; the Windows file backend has no equivalent. Measured:
 `qemu-img snapshot -c` against the disk of a *running* domain returned exit 0
-and wrote the snapshot into the live image. So `modules/snapshot.ps1` opens the
-disk exclusively before every write and refuses if anything holds it -- which
-also covers the case the monitor cannot see, a live qemu whose monitor never
-came up and which `Test-DomainRunning` therefore reports as shut off.
+and wrote the snapshot into the live image. While the command existed, the
+module opened the disk exclusively before every write and refused if anything
+held it. **That fact outlives the command:** two qemus on one qcow2 is silent
+corruption here rather than an error, and anything written in future that
+touches a disk image has to carry the check the snapshot module carried.
 
-**So section 2 was changed, deliberately, to say snapshots are disk-only on a
-Windows host.** What makes that acceptable where "ship only the disk half" was
-not is that nothing about it is silent. The old objection was that `snapshot
-create` on a running domain would quietly mean something different on the two
-hosts and be found out at `revert`. Here a running domain is *refused* by name,
-with the reason, which is the third honest possibility in section 9 -- and the
-refusal is the same one qemu-img needs anyway, since the disk a running qemu
-holds open must not be written underneath it.
+**And then it was taken out.** The disk half worked, and was measured working
+against a real Windows 11 guest: `create` refused a running domain by name,
+`list` answered over the monitor while the domain ran, and the shut-off round
+trip of create/list/revert/delete was clean. The removal retracts none of that.
+It answers a different question -- what is a disk-only snapshot actually *for*?
 
-The mechanism is qcow2 internal snapshots (`qemu-img snapshot -c/-l/-a/-d`)
-rather than libvirt's overlay-per-disk:
+On a Linux host the question does not arise, because the memory half is there
+when the domain runs and the disk half stands alone honestly when it does not.
+Here there is only ever the disk half, and what it serves is already served: a
+domain about to be changed can be copied while it is shut off, and a domain that
+must come back exactly as it was is precisely what WHPX refuses. What was left
+was a command whose usage text spent more words on what it could not do than on
+what it could.
 
-| | bash driver | Windows driver |
-| --- | --- | --- |
-| create | `snapshot-create-as`, external overlay + memspec | `qemu-img snapshot -c` |
-| list | `snapshot-list --tree` | `qemu-img snapshot -l`, or `info snapshots` when running |
-| revert | `snapshot-revert --running` | `qemu-img snapshot -a`, domain left shut off |
-| delete | `snapshot-delete --metadata` + a file sweep | `qemu-img snapshot -d` |
-| lives in | overlay and memory files beside the disk | inside `VM.qcow2` |
-| shape | a tree; a record has a parent | a flat list; qcow2 records no parent |
+So section 2's four `snapshot` verbs are **Linux-host commands**, annotated
+there as such, and `virutil snapshot` on a Windows host is refused by name with
+the reason. What it must not do is fall through to "unknown module": the command
+is in the grammar section 2 publishes, and it was on this driver one commit ago,
+so whoever types it has been told twice that it exists. `$script:ELSEWHERE` in
+`modules/parser.ps1` is where that reason lives, and it is the right home for
+`sync`, `push`, `pull` and `ui` too.
 
-Two of the bash module's invariants are satisfied vacuously rather than
-implemented, and that is worth knowing before reading the two files side by
-side. "delete takes SNAP's descendants with it" has no descendants to take --
-internal snapshots have no parent recorded. And the entire in-use analysis that
-is most of `modules/snapshot` -- the sweep, the backing-chain walk, the refusal
-to unlink a file the guest still reads -- answers a question that only exists
-where a snapshot is a *file*. Here it is a region of the disk image, so
-`domain delete` takes the snapshots with the disk and there is nothing to leak.
+The bash driver is untouched. Its `snapshot` is external overlays plus a memspec
+through libvirt, it captures memory for a running domain, and none of this
+reaches it.
+
+**What the removal deleted,** for a reader comparing the two trees:
+`modules/snapshot.ps1` -- qcow2 internal snapshots, `qemu-img snapshot -c/-l/-a/-d`,
+one image, no overlay or memory files of its own -- and `tests/snapshot.ps1`.
+The bash module's in-use analysis (the sweep, the backing-chain walk, the
+refusal to unlink a file the guest still reads) never had a counterpart here,
+because an internal snapshot is a region of a disk image rather than a file.
+That asymmetry is now moot rather than vacuously satisfied.
 
 `ui` (PsExec) ports: it is Windows-*guest*-only, but host-portable -- it
 delivers over the same transport as `push`, which means smbd on a Linux host
@@ -439,7 +455,6 @@ drivers:
 | `tests/conformance.sh` | the runner. Every `--help` exits 0, every usage error exits 1, in both drivers; drives the two below. |
 | `tests/payloads.sh`, `tests/payloads.ps1` | render all nine payloads under each driver and diff both against `tests/golden/payloads.txt`. This is what makes section 6's "byte-identical" checkable. |
 | `tests/domain.ps1` | the launcher round trip: monitor port, agent channel and port forwards written, read back, edited and read again. |
-| `tests/snapshot.ps1` | the snapshot round trip against a real qcow2: create, list, revert, delete, the refusals, and that nothing is written outside the image. Skips itself where there is no qemu. |
 
 The PowerShell half skips itself, loudly, on a host with no `pwsh`.
 
@@ -504,18 +519,14 @@ thing neither driver may do, because it reports a change that was not made.
   into the guest, so create has to be able to make one. `-N` creates the domain
   without starting it. Neither exists on the Linux driver, and a script using
   them is a script for one host.
-- **`snapshot` is disk-only on a Windows host, and its three writing verbs are
-  refused while the domain runs.** Refused rather than ignored, for the same
-  reason `domain start -s` is: a `create` that accepted a running domain and
-  captured no memory would report a snapshot that was not taken, and the bill
-  arrives at `revert`. WHPX blocks saving VM state at all (section 7 quotes the
-  refusal), so there is nothing to honour; `qemu-img` additionally must not
-  write a disk the running qemu holds open. `list` is a question rather than a
-  write and works either way -- over the monitor when the domain is running,
-  off the image when it is not. `revert` leaves the domain shut off with its
-  disk at the snapshot, where the bash driver's `--running` hands back a
-  running one: there is no memory image to resume into, and booting a guest
-  nobody asked to boot is not a substitute.
+- **`snapshot` is not on the Windows driver at all, and is refused by name.**
+  It was there, disk-only, and was removed; section 7 carries the measurements
+  and the reasoning. This is the fourth possibility alongside honour, refuse and
+  accept-and-say-so: *not offer the command*. What makes it honest is the
+  refusal -- `virutil snapshot` on a Windows host exits 1 saying it is a
+  Linux-host command and why, rather than "unknown module", because the verbs
+  are published in section 2 and were on this driver until recently. A name that
+  used to work must not come back as a typo.
 - **`domain start -G` is accepted, warned about and not honoured**: qemu under
   WHPX has no headless console to detach from, and `-display none` would leave
   the guest with no way in at all. `-s`, `-m` and `-c` used to be listed here

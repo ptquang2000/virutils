@@ -113,6 +113,17 @@ else
     exits 1 'virutil.ps1 domain bogus'   "$PWSH" -NoProfile -File "$ROOT/virutil.ps1" domain bogus
     exits 1 'virutil.ps1 exec bogus VM'  "$PWSH" -NoProfile -File "$ROOT/virutil.ps1" exec bogus VM
 
+    # snapshot was on this driver and was dropped (contract section 7). The
+    # point of how it was dropped is that it is refused *by name, with the
+    # reason*, rather than falling through to "unknown module" -- so what is
+    # tested here is the reason, not only the exit code.
+    if out="$("$PWSH" -NoProfile -File "$ROOT/virutil.ps1" snapshot create vm 2>&1)"; then
+        bad 'virutil.ps1 snapshot is refused' 'it exited 0'
+    elif printf '%s' "$out" | grep -q 'Linux-host command'; then
+        ok 'virutil.ps1 snapshot is refused by name, with the reason'
+    else
+        bad 'virutil.ps1 snapshot is refused by name, with the reason' "$out"
+    fi
     # Each of these needs a scratch VIRUTILS_DIR of its own and has to take it
     # away again, so they run as their own scripts rather than inline.
     #
@@ -125,11 +136,7 @@ else
     #   usb.ps1     an attach is a line in that same launcher, inserted
     #               into the middle of it rather than appended.
     printf '\n-- PowerShell unit tests --\n'
-    #   snapshot.ps1 the snapshot round trip against a real qcow2: what
-    #               `qemu-img snapshot -l` prints is the only record
-    #               there is, so reading it back is the contract. It
-    #               skips itself where there is no qemu.
-    for t in domain exec usb snapshot; do
+    for t in domain exec usb; do
         if out="$("$PWSH" -NoProfile -File "$ROOT/tests/$t.ps1" 2>&1)"; then
             printf '%s\n' "$out" | sed 's/^/  /'
             ok "tests/$t.ps1"

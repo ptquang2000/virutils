@@ -18,12 +18,30 @@ $ErrorActionPreference = 'Stop'
 # here, a libvirt <hostdev> there. What is on neither is the WSL case, where
 # the device is on the far side of the kernel boundary -- see contract 7.
 #
-# `snapshot` is on both too, and is the newest of them. It is disk-only on this
-# host and needs the domain shut off, because WHPX blocks qemu's VM-state save
-# outright -- measured, and written up in the header of modules/snapshot.ps1.
-# That is a contract difference (section 9), stated wherever the command is,
-# rather than a silently smaller command.
-$script:MODULES = @('domain', 'exec', 'snapshot', 'usb')
+# `snapshot` was here and is gone. It shipped disk-only, because WHPX blocks
+# qemu's VM-state save outright, and disk-only turned out not to be worth a
+# command: the thing a snapshot is reached for -- put a running guest back the
+# way it was -- is exactly the half this host cannot take. The measurements are
+# kept in docs/contract.md section 7, as the reason for the removal rather than
+# as a footnote to a command that still exists.
+$script:MODULES = @('domain', 'exec', 'usb')
+
+# Names the bash driver answers to that this one does not, and why. A name here
+# is refused with its own reason instead of "unknown module", because each is in
+# the grammar docs/contract.md section 2 publishes: someone who read that
+# grammar and typed one has been told the command exists, and "unknown module"
+# leaves them to work out alone which driver they are standing on.
+#
+# `sync`, `push`, `pull` and `ui` belong here too and are not listed yet; they
+# have never been on this driver, so they have never stopped working.
+$script:ELSEWHERE = [ordered]@{
+    snapshot = @(
+        'virutil snapshot is a Linux-host command; this driver does not have it.'
+        'It was here, disk-only, and was dropped. WHPX blocks saving a running'
+        "guest's memory, so the half a snapshot is usually wanted for cannot be"
+        'taken on this host at all -- see docs/contract.md section 7.'
+    )
+}
 
 # --- saying things ----------------------------------------------------------
 #
@@ -79,7 +97,6 @@ function Get-TopUsage {
         ''
         'domains'
         '  domain     the domain lifecycle: create, delete, list, start, shutdown, addr, port'
-        '  snapshot   qcow2 internal snapshots: create, list, revert, delete'
         ''
         'guest'
         '  exec       run commands inside a guest via the QEMU guest agent'
@@ -89,9 +106,9 @@ function Get-TopUsage {
         ''
         'This is the Windows-host driver: raw QEMU under WHPX, no libvirt. It'
         'shares a contract with the bash driver rather than any source; see'
-        'docs/contract.md. sync, push, pull and ui are in the bash tree only'
-        'so far, and snapshot is disk-only here: WHPX blocks saving a running'
-        "guest's memory, so a snapshot needs the domain shut off."
+        'docs/contract.md. sync, push, pull, ui and snapshot are in the bash'
+        'tree only: WHPX blocks saving a running guest memory image, and that'
+        'is what took snapshot out of this one.'
         ''
         "Run 'virutil <module>' for a module's own usage."
     )
@@ -124,6 +141,8 @@ function Invoke-Dispatch {
 
     $module = $Arguments[0]
     if ($module -in @('help', '-h', '--help')) { Usage (Get-TopUsage) 0 }
+
+    if ($script:ELSEWHERE.Contains($module)) { Die $script:ELSEWHERE[$module] }
 
     if ($module -notin $script:MODULES) {
         Die "virutil: unknown module: $module (see: virutil help)"

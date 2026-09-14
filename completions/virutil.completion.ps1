@@ -8,11 +8,11 @@
 
   install.ps1 adds that line for you.
 
-  This completes the *Windows* driver, so it offers domain, snapshot, exec
-  and usb and nothing else. sync, push, pull and ui are in the bash tree
-  only, and offering a name this driver would reject is worse than offering
+  This completes the *Windows* driver, so it offers domain, exec and usb and
+  nothing else. sync, push, pull, ui and snapshot are in the bash tree only,
+  and offering a name this driver would reject is worse than offering
   nothing -- $MODULES in modules\parser.ps1 is the list to keep this in step
-  with. usb and snapshot are on both drivers, spelled the same way on each.
+  with. usb is on both drivers, spelled the same way on each.
 
   Everything lives inside the scriptblock rather than in functions beside it:
   a completer dot-sourced into a profile should leave nothing behind in the
@@ -168,7 +168,6 @@ $completer = {
 
     $modules = [ordered]@{
         domain   = 'the domain lifecycle: create, delete, list, start, shutdown, addr, port'
-        snapshot = 'qcow2 internal snapshots: create, list, revert, delete'
         exec     = 'run commands inside a guest via the QEMU guest agent'
         usb      = 'pass a host USB device through to a guest'
         help     = 'the module list'
@@ -184,16 +183,6 @@ $completer = {
         port     = 'list, open or close a host->guest port forward'
     }
 
-    # Disk-only, and every verb but `list` wants the domain shut off: WHPX
-    # blocks saving a running guest's memory. The tooltips say so, because a
-    # snapshot that quietly held no memory is the thing docs/contract.md spent
-    # longest refusing to ship.
-    $snapshotVerbs = [ordered]@{
-        create = 'snapshot the disk (default name snap-<timestamp>; needs the domain shut off)'
-        list   = 'the snapshots inside the domain disk'
-        revert = 'put the disk back to a snapshot (needs the domain shut off)'
-        delete = 'remove a snapshot from the disk (needs the domain shut off)'
-    }
 
     $usbVerbs = [ordered]@{
         list   = 'the host USB devices, as VENDOR:PRODUCT'
@@ -326,7 +315,6 @@ $completer = {
         1 {
             $hint = "$module has no verb starting with '$wordToComplete'"
             if ($module -eq 'domain') { foreach ($k in $domainVerbs.Keys) { Add-Match $k $domainVerbs[$k] } }
-            elseif ($module -eq 'snapshot') { foreach ($k in $snapshotVerbs.Keys) { Add-Match $k $snapshotVerbs[$k] } }
             elseif ($module -eq 'exec') { foreach ($k in $execVerbs.Keys) { Add-Match $k $execVerbs[$k] } }
             elseif ($module -eq 'usb') { foreach ($k in $usbVerbs.Keys) { Add-Match $k $usbVerbs[$k] } }
         }
@@ -352,7 +340,7 @@ $completer = {
                 $hint = $noDomain
                 foreach ($d in $domains) { Add-Match $d 'domain' }
             }
-            elseif ($module -in @('exec', 'snapshot')) {
+            elseif ($module -eq 'exec') {
                 $hint = $noDomain
                 foreach ($d in $domains) { Add-Match $d 'domain' }
             }
@@ -378,16 +366,6 @@ $completer = {
             elseif ($module -eq 'usb' -and $verb -eq 'attach') {
                 $hint = 'no USB devices on this host'
                 foreach ($u in Get-UsbIds) { Add-Match $u.Text $u.Tip }
-            }
-            # `snapshot revert VM SNAP` completes nothing on purpose, where
-            # the zsh completion offers the names. Reading them means running
-            # qemu-img against the domain's disk -- a subprocess per keypress,
-            # and one that must not touch the image of a running domain, which
-            # in turn needs a monitor connection to rule out. That is far more
-            # than a Tab should cost; the names are one `virutil snapshot list`
-            # away, and saying so beats listing the working directory.
-            elseif ($module -eq 'snapshot' -and $verb -in @('revert', 'delete')) {
-                $hint = "the snapshot name -- see: virutil snapshot list $($positional[2])"
             }
             elseif ($module -eq 'usb' -and $verb -eq 'detach') {
                 $hint = "$($positional[2]) passes through no USB devices"
