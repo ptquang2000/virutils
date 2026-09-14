@@ -198,9 +198,28 @@ function Open-GuestAgent {
 # and no deadline checked around it is ever reached. The pipe is opened
 # Asynchronous for exactly this. A read left outstanding when the wait expires
 # is cancelled by the Dispose that every timeout path here leads to.
+# A monotonic millisecond count that exists on both PowerShells.
+#
+# This was [Environment]::TickCount64, which is .NET Core only: the .NET
+# Framework that Windows PowerShell 5.1 runs on has no such property, and
+# reading a property that is not there throws under the
+# $ErrorActionPreference = 'Stop' that virutil.ps1 sets. Every caller below sits
+# inside Open-GuestAgent's catch, which turns any throw into a silent $null --
+# so on 5.1 the channel never opened and the failure was reported as "$Vm's
+# QEMU guest agent is not answering", pointing at a qemu-ga that was running
+# the whole time. Measured: virutil under pwsh 7 worked and the same command
+# under 5.1 did not, against the same guest, seconds apart.
+#
+# A Stopwatch rather than [Environment]::TickCount, which is a 32-bit count
+# that wraps about every 49.7 days -- PowerShell widens it to Int64 before the
+# subtraction, so the wrap would not cancel out and a deadline computed across
+# one would come out enormous.
+$script:GuestAgentClock = [Diagnostics.Stopwatch]::StartNew()
+function Get-GuestAgentTick { return $script:GuestAgentClock.ElapsedMilliseconds }
+
 function Read-GuestAgentByte {
     param($Pipe, [long]$Deadline)
-    $remaining = $Deadline - [Environment]::TickCount64
+    $remaining = $Deadline - (Get-GuestAgentTick)
     if ($remaining -le 0) { return $null }
     $buf = New-Object byte[] 1
     $task = $Pipe.ReadAsync($buf, 0, 1)
@@ -212,7 +231,7 @@ function Read-GuestAgentByte {
 # Everything up to and including the 0xFF that answers a sync, discarded.
 function Wait-GuestAgentDelimiter {
     param($Pipe, [int]$TimeoutMs)
-    $deadline = [Environment]::TickCount64 + $TimeoutMs
+    $deadline = (Get-GuestAgentTick) + $TimeoutMs
     while ($true) {
         $b = Read-GuestAgentByte $Pipe $deadline
         if ($null -eq $b) { return $false }
@@ -225,7 +244,7 @@ function Wait-GuestAgentDelimiter {
 # for bytes that are not coming or swallow the start of the next reply.
 function Read-GuestAgentLine {
     param($Pipe, [int]$TimeoutMs)
-    $deadline = [Environment]::TickCount64 + $TimeoutMs
+    $deadline = (Get-GuestAgentTick) + $TimeoutMs
     $out = New-Object System.IO.MemoryStream
     while ($true) {
         $b = Read-GuestAgentByte $Pipe $deadline
