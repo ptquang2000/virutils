@@ -16,6 +16,7 @@ step and no dependencies beyond the utilities it calls.
    - [guest](#guest)
    - [hardware](#hardware)
 - [How files move](#how-files-move)
+   - [On a Windows host](#on-a-windows-host)
    - [Which guest is on the other side](#which-guest-is-on-the-other-side)
    - [Delivering](#delivering)
    - [What used to read through a snapshot](#what-used-to-read-through-a-snapshot)
@@ -248,6 +249,53 @@ side skipping whatever the other end already holds.
 | Host needs | `smbd` + root for 445 (Windows guest), or `rsync` and no root at all (Linux guest) |
 | Fixed cost per run | an agent round trip |
 | Moves on a re-run | only what changed |
+
+### On a Windows host
+
+Everything above describes the transport, and the transport is the same on both
+hosts: the host serves a tree, the guest fetches it with `robocopy`, and only
+what changed crosses. Three things about the *host* half differ on Windows and
+will surprise someone arriving from the Linux host.
+
+**The share comes from your own SMB server.** There is no private `smbd` to
+stand up, because there is nowhere to stand it up: port 445 is what SMB means to
+a Windows client, no ephemeral-port trick can move it, and on a Windows host the
+operating system already holds it. So `virutil push` publishes a share with
+`New-SmbShare` on the machine's own server and retires it again when the
+transfer ends.
+
+**It prompts for Administrator, once per transfer.** Publishing a share needs
+it, and so does removing one. Only the share management is elevated — the run
+itself stays in the console you typed in, so the guest's output, the diagnoses
+and the exit code all land where you are looking. Declining the prompt is its
+own exit code (98), so a script can tell "I clicked No" from "SMB is broken"
+(99).
+
+**A throwaway local account is minted and dropped per transfer.** Windows has no
+anonymous share: a modern Windows guest refuses an insecure guest logon, and
+this host's own `Guest` account is disabled, so the share has to have a named
+grantee. Each transfer creates `vxp-<token>` with a random password, grants it
+on the share and on the staged files and nothing else, and deletes it at
+teardown. The account is in no group and may not log on interactively; the
+password goes to the guest over the agent channel, and the whole point of it
+being a throwaway is that a credential worth stealing never does.
+
+Two consequences worth knowing:
+
+- **Your source tree is never shared.** Every transfer copies into
+  `%USERPROFILE%\.virutils\tmp\<token>\` first and shares that copy, which is
+  deleted with the account and the share. The Linux host serves a directory
+  where it lies; this one does not, because a share here cannot be scoped to one
+  network interface, so what is exposed should be a copy virutil owns. `pull`
+  seeds its staging tree from the destination first, so it still moves only what
+  changed.
+- **Teardown survives a crash.** The elevated helper waits on the run's own
+  process, so Ctrl-C, an unhandled error and a kill all still take the share and
+  the account away. Anything an earlier bad day did leave behind is swept up by
+  the next transfer, which never touches a transfer that is still running.
+
+A Linux guest from a Windows host is not supported yet; `push` and `pull` say so
+by name rather than failing partway.
 
 ### Which guest is on the other side
 
