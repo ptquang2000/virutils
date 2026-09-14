@@ -354,7 +354,7 @@ That asymmetry is now moot rather than vacuously satisfied.
 delivers over the same transport as `push`, which means smbd on a Linux host
 and `New-SmbShare` on a Windows one.
 
-### The transfer layer, and what is not settled about it
+### The transfer layer, and what is measured about it
 
 `sync`, `push` and `pull` all deliver the same way: **the host serves a tree and
 the guest fetches it.** That direction is not an implementation detail and must
@@ -368,25 +368,88 @@ privileged-port dance) and a Linux guest can `mount -t cifs` and rsync against
 the mount. The guest-side split survives untouched; only what the guest mounts
 changes. That deletes the whole samba and rsyncd half of `modules/xfer`.
 
-**The open question is authentication, and it has no answer yet.** The bash
+**Authentication was the open question, and it has been measured.** The bash
 driver's smbd is configured `map to guest = Bad User` with `guest ok = yes`, so
 the guest fetches with no credential at all. Windows' own SMB server has no
-equivalent that is on by default: the `Guest` account is disabled, and since
-Windows 10 1709 the SMB *client* refuses insecure guest logons as well -- so a
-Windows guest would decline the share even if the host offered it. Every way
-out costs something:
+equivalent that is on by default, and this section used to say so from
+documented defaults while asking for a measurement against a real guest. The
+measurement was taken -- Windows 11 24H2 guest, build 10.0.26100, qemu's slirp,
+host serving with `New-SmbShare` -- and it moved more than it confirmed.
 
-- a throwaway local account per transfer, created and deleted around it. Needs
-  Administrator and puts account churn on the host for every push.
-- the invoking user's own credential, handed to the guest in the payload. Puts
-  a real password into a script sent over a virtio channel; not acceptable.
-- re-enabling guest logons on both sides. Turns off a protection the host has
-  for reasons that have nothing to do with virutil.
+**The anonymous share is refused twice over, and the two refusals are
+independent.** A stock guest ships `EnableInsecureGuestLogons: False` and
+`RequireSecuritySignature: True`, so its client declines before the host is
+consulted -- the claim this section made from documentation, now a fact about a
+real guest. Relaxing *both* of those inside the guest gets past the client and
+straight into the host's own refusal:
 
-This is written down rather than guessed at because picking wrong here is a
-security decision, not a plumbing one. **Verify the client-side refusal against
-the actual guest before designing around it** -- it is stated here from
-documented Windows defaults, not from a measurement on this host.
+```
+System error 1331 has occurred.
+This user can't sign in because this account is currently disabled.
+```
+
+That is the host's `Guest` account. So the straight port of the Linux-host
+design does not cost one protection, it costs two, on two machines, and neither
+one alone is enough to make it work.
+
+**The throwaway account works, and costs more than this section used to say.**
+It was costed at "account churn on the host for every push". Measured, it is
+account churn *plus an ACL edit*: granting the account read on the share and
+nothing else produces a successful logon followed by
+
+```
+ERROR 5 (0x00000005) Getting File System Type of Source \\10.0.2.2\<share>
+Access is denied.
+```
+
+because the staged tree is under `%USERPROFILE%` and an account minted seconds
+ago has no NTFS rights inside another user's profile. The share ACL and the
+filesystem ACL are two gates and the tighter one wins. With both granted, a
+marker file crosses and is read back in the guest by content.
+
+**Elevation is not a differentiator, and that is settled for all three.**
+`New-SmbShare` requires Administrator whichever credential answer wins, so the
+auth question does not decide whether `push` needs elevation. It does.
+
+**One credential per (client, server) pair, and this is the constraint that was
+missing.** Windows permits a client exactly one identity toward a given server,
+whatever the share:
+
+```
+System error 1219 has occurred.
+Multiple connections to a server or shared resource by the same user, using
+more than one user name, are not allowed.
+```
+
+Measured by accident and worth more than anything measured on purpose: a run
+that died between its `net use` and its cleanup left the guest holding a session
+under an account the teardown had already deleted, and the *next* run's
+candidates both failed at the logon -- neither because the answer was wrong. Any
+design minting a per-transfer identity inherits this, so a transfer that ends
+badly wedges the next one, and a guest that merely has a drive mapped to the
+host for its own reasons breaks transfers outright. Dropping the guest's
+sessions to the host is therefore a precondition of a transfer and not tidying
+after one.
+
+**And a share cannot be scoped to an interface.** `xfer_smb_serve` binds smbd to
+the single address that reaches the guest, never the wildcard, precisely so the
+payload is not offered to every network the host is on. `New-SmbShare` takes no
+bind address at all: the share is offered everywhere the host's SMB server
+listens and only its ACL narrows it. Whatever is built here is weaker on this
+point than the bash side, and the ACL is doing the work the bind address does
+there -- which is a reason to prefer a named grantee over `Everyone` that has
+nothing to do with authentication.
+
+What remains open is the decision, not the facts. The invoking user's own
+credential in the payload was deliberately **not** measured: the throwaway
+account proves the mechanism, and running it would put a real password on a
+virtio channel and into a guest's command history to learn nothing new. The
+Linux-guest side of the same share -- whether `mount -t cifs` will take an
+anonymous mount a Windows client refuses -- is unmeasured, and it matters,
+because the guest axis is where the two would differ.
+
+The prototype that took these measurements is on the `prototype/xfer-windows-auth`
+branch, with the teardown and stray-reporting that makes each number checkable.
 
 **`usb` is one grammar over two mechanisms, and the WSL case is not a command
 at all.** There used to be a bash `usb` module that drove `usbipd.exe` on the
