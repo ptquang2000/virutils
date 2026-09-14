@@ -267,6 +267,29 @@ Error: Device 'pflash1' is writable but does not support snapshots
 still stops at the accelerator. So the memory half is closed for as long as the
 Windows driver runs guests under WHPX, and no plumbing in virutil opens it.
 
+**Re-measured against a real guest, and confirmed from upstream.** The first
+measurement was taken against a probe domain whose guest was the OVMF shell,
+which invites the fair objection that an empty guest is a degenerate case and
+proves nothing about a real one. It is not, and it does. The same refusal comes
+back in the same words from a Windows 11 guest installing from its own media,
+running and paused alike. `savevm` is not the only door tried: `migrate -d
+file:...` writes no file and is refused identically, and `info migrate` then
+reports
+
+```
+Outgoing migration blocked:
+  State blocked due to missing dirty memory tracking support,And some
+  system register/state save-restore
+```
+
+which is the blocker saying in its own words that it guards every route out of
+guest RAM rather than `savevm` alone. The wording is upstream's: it was written
+in patch 33 of the WHPX x86 series for qemu 11.1 -- the series that *added*
+XSAVE support and kept the blocker anyway, because dirty memory tracking is
+still missing. So "no memory snapshot under WHPX" is qemu's own position on its
+own accelerator, not an inference drawn from one host, and the thing to watch
+for a change is dirty memory tracking landing in `whpx-all.c`.
+
 **Shut off means shut off, not paused.** The blocker is not a property of the
 run state: `savevm` on a guest stopped with the monitor's `stop` is refused in
 exactly the same words, and qemu goes on holding its image open while paused.
@@ -434,6 +457,16 @@ than host-passthrough, `threads=1` rather than an SMT topology,
 `cache=writeback` rather than `cache=none,io=io_uring`, `-vga std` rather than
 virtio. No kvm (WHPX instead, so no hyperv enlightenments), no swtpm, no
 libvirt network.
+
+One entry in that header is a defect rather than a setting, and it changes what
+an install has to be *told* rather than what either driver promises. On the qemu
+build the Windows driver runs, a guest with more than one vcpu dies at its own
+reboot -- `failed to get xsave state` once per vcpu, then `WHPX: Unexpected VP
+exit code 4`, leaving the domain paused with vcpus that cannot be restarted. It
+fires at Setup's own reboot, so it looks like an install that got most of the
+way and then failed. The fix is upstream and dated after the newest published
+Windows build of qemu, so until there is a build to move to, `domain create`'s
+usage says to install with `-c 1`. It costs an install its uptime, not its disk.
 
 ### Where the grammar bends, and why
 

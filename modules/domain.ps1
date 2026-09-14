@@ -31,6 +31,66 @@
 #   -vga std, not virtio. Windows Setup has no virtio-gpu driver, and under WHPX
 #   virtio-vga never brought the display up at all.
 
+# A fifth fact about this host is not a setting but a defect, and it is the one
+# that decides what an install has to be told: **on this qemu build a guest
+# with more than one vcpu dies at its own reboot.** Measured twice against a
+# Windows 11 guest installing from the tiny 24H2 media, `-smp 4`, with nothing
+# connected to the monitor but a screendump:
+#
+#   qemu: failed to get xsave state: No error        (once per vcpu)
+#   qemu: WHPX: Unexpected VP exit code 4
+#
+# and the domain is left paused with its vcpus dead. `cont` does not revive it:
+# it stops again the instant they run. Exit code 4 is
+# WHvRunVpExitReasonUnrecoverableException -- not InvalidVpRegisterValue, which
+# is 5 and the easier mis-read. It fires at a *guest-initiated reboot*: Windows
+# Setup's reboot after it copies files, and again in OOBE. That is why an
+# install appears to get most of the way and then die, and why the first guess
+# is always the wrong one -- pausing looks like the obvious suspect and is not.
+# Neither crash had anything touching the monitor.
+#
+# The cause is upstream and this build predates the patch. whpx_get_xsave_state
+# does not handle WHV_E_INSUFFICIENT_BUFFER, which is what Hyper-V returns when
+# its XSAVES image carries supervisor state, and it reports strerror(errno)
+# where it means the HRESULT -- which is why the message ends "No error" with
+# errno never set. That trailing "No error" is the signature of the unfixed
+# path, so it is the thing to grep for. qemu here is v11.1.0-12130-ge470268ff4,
+# the 2026-08-11 weilnetz build and the newest Windows build published; the
+# patch is dated 2026-08-20. There is nothing to update to yet. When there is,
+# re-measure this whole block rather than trusting it.
+#
+# Workarounds, in the order they were tried:
+#
+#   | vcpus | machine                | result                                   |
+#   |-------|------------------------|------------------------------------------|
+#   |   4   | q35 (default irqchip)  | dies at every guest reboot, 2 of 2       |
+#   |   4   | q35,kernel-irqchip=off | no crash -- the Windows loader wedges    |
+#   |       |                        | instead, spinning 3 cores, never painting|
+#   |   1   | q35 (default irqchip)  | boots through Setup's reboots into OOBE  |
+#
+# So the vcpu count is the variable. `kernel-irqchip=off` is the other
+# workaround the upstream issue reports and it is not usable here: it trades
+# the crash for a hang, which is worse, because a hang has no error to read.
+#
+# The default stays half the host's cpus, which on any host with more than two
+# cores puts a new domain in the failing configuration. That is deliberate. The
+# crash costs an install its uptime and not its disk -- the qcow2 survived every
+# one of these, and restarting the domain continued Setup where it left off --
+# and pinning every domain to one vcpu to spare a Windows install its reboots
+# would be the worse trade on a host whose whole reason for WHPX is speed. So
+# the usage says it instead: install with `-c 1`, and edit the launcher
+# afterwards, which is the supported way to change a domain anyway.
+#
+# One consequence of all this that bites elsewhere: a guest that dies this way
+# has to be killed, and a killed qemu leaves the qcow2's lazy refcounts dirty.
+# The next open rebuilds them and says so at length --
+#
+#   Rebuilding refcount structure
+#   ERROR cluster 6 refcount=0 reference=1      (thousands of these)
+#
+# -- which is qcow2 working as designed, not corruption, and not worth chasing.
+# Prefer the monitor's `quit` to killing the process and it does not arise.
+
 $script:DomainCpu = 'Skylake-Client'
 
 function Get-DomainUsage {
@@ -51,6 +111,10 @@ function Get-DomainUsage {
         '  -s, --size GiB    disk size (default 64)'
         "  -m, --memory MiB  guest RAM (default: half the host's)"
         "  -c, --vcpus N     virtual CPUs (default: half the host's, max 8)"
+        '                    install Windows with -c 1: on this qemu build a'
+        "                    guest with more than one vcpu dies at its own"
+        '                    reboot, which is halfway through Setup. See the'
+        '                    header of modules/domain.ps1.'
         '  -o, --osinfo ID   accepted and ignored: there is no libosinfo here'
         '  -v, --virtio ISO  virtio-win ISO to attach as a second cdrom, or'
         '                    "none" (default: found beside ISO)'
@@ -66,8 +130,9 @@ function Get-DomainUsage {
         '                    leave the guest with no way in at all'
         ''
         'delete takes no options. It never asks, and it removes the disk, the'
-        "nvram and the launcher. There is no backing chain to walk: snapshot"
-        'is not ported to this driver yet.'
+        "nvram and the launcher. There is no backing chain to walk: a snapshot"
+        'here lives inside the disk image, so the disk takes its snapshots with'
+        'it.'
         ''
         '  -h, --help        this message'
         ''

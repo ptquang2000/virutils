@@ -24,6 +24,18 @@
 # other route to a guest's RAM is closed while the domain runs under WHPX, and
 # no amount of plumbing here opens it.
 #
+# Both halves of that have since been re-measured against a real guest rather
+# than the bare OVMF probe the first numbers came from -- a Windows 11 guest
+# installing from its own media, running and paused alike -- and they came back
+# in the same words. `migrate` was tried as well, since "savevm is blocked" and
+# "the guest's RAM is unreachable" are different claims: `migrate -d file:...`
+# writes no file, and `info migrate` answers `Outgoing migration blocked:` with
+# the same reason, which is the blocker naming itself. The wording is upstream's
+# own -- it was written in patch 33 of the WHPX x86 series for qemu 11.1, the
+# series that added XSAVE support and kept the blocker anyway because dirty
+# memory tracking is still missing -- so the thing to watch, if this is ever to
+# change, is dirty memory tracking landing in whpx-all.c.
+#
 # What is left is the disk half, and section 2 of the contract has been changed
 # deliberately to say so: **on a Windows host a snapshot is disk-only, and
 # create, revert and delete need the domain shut off.** Not silently -- the one
