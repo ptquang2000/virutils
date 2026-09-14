@@ -54,12 +54,19 @@ function Get-ExecUsage {
 # Invoke-GuestExec VM PATH ARGV -- wait for completion, print the guest's stdout
 # and stderr, and leave its exit code in $script:VirutilExit. Honours -Detach
 # and -InputB64.
+#
+# -Capture hands the guest's stdout back as a string instead of printing it, and
+# is what the transports run under: a payload's stdout is the one line push and
+# pull parse ("copied total ms", "files dirs ms"), not something a person is
+# meant to read. stderr still goes to the console, because that half *is* for
+# the person -- the bash driver gets the same split for free from `$(...)`.
 function Invoke-GuestExec {
     param(
         [Parameter(Mandatory)][string]$Vm,
         [Parameter(Mandatory)][string]$Path,
         [string[]]$Argv = @(),
         [switch]$Detach,
+        [switch]$Capture,
         [string]$InputB64 = ''
     )
 
@@ -87,8 +94,12 @@ function Invoke-GuestExec {
 
     # \r stripped so Windows output pipes cleanly into unix tools, and trailing
     # whitespace trimmed off each line, exactly as the bash driver does.
+    $captured = ''
     $out = Get-AgentStream $st 'out-data'
-    if ($out) { [Console]::Out.Write((Format-GuestStream $out)) }
+    if ($out) {
+        if ($Capture) { $captured = (Format-GuestStream $out).TrimEnd("`n") }
+        else          { [Console]::Out.Write((Format-GuestStream $out)) }
+    }
 
     $err = Get-AgentStream $st 'err-data'
     if ($err) {
@@ -113,6 +124,8 @@ function Invoke-GuestExec {
     } else {
         $script:VirutilExit = 0
     }
+
+    if ($Capture) { return $captured }
 }
 
 function Get-AgentStream {
@@ -153,7 +166,7 @@ function ConvertFrom-Clixml {
 # Shared with the transports, exactly as the bash exec_ps_text is.
 function Invoke-GuestPsText {
     param([Parameter(Mandatory)][string]$Vm, [Parameter(Mandatory)][string]$Script,
-          [switch]$Detach, [string]$InputB64 = '')
+          [switch]$Detach, [switch]$Capture, [string]$InputB64 = '')
 
     # The catch writes to the console handle, not powershell's error stream,
     # which would be serialised as CLIXML; the explicit exit 1 restores the code
@@ -180,7 +193,7 @@ function Invoke-GuestPsText {
 
     Invoke-GuestExec $Vm 'powershell.exe' `
         @('-NoProfile', '-NonInteractive', '-OutputFormat', 'Text', '-EncodedCommand', $enc) `
-        -Detach:$Detach -InputB64 $InputB64
+        -Detach:$Detach -Capture:$Capture -InputB64 $InputB64
 }
 
 # Invoke-GuestShText VM SCRIPT -- run SCRIPT in the guest's /bin/sh.
