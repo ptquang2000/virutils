@@ -11,8 +11,11 @@
   here rather than in a guest.
 
   The values are the literals the bash harness's push/pull/sync functions
-  compute for those same inputs, because push and pull are not ported to this
-  driver yet. What is under test is the renderer, which is.
+  compute for those same inputs. They are written out here rather than obtained
+  by calling this driver's own push, pull and sync -- which do exist now -- so
+  that both harnesses are held to one set of inputs chosen once. What is under
+  test is the renderer, and a renderer fed its own driver's values could agree
+  with itself while disagreeing with the other.
 #>
 
 $ErrorActionPreference = 'Stop'

@@ -84,14 +84,20 @@ Invariants that are contract, not implementation:
   A trailing slash means a directory, as with rsync.
 - `pull` wildcards match with the *guest's* own matching: case-insensitive on
   Windows, case-sensitive on Linux.
-- **On a Windows host, `push` and `pull` reach a Windows guest only**, and say
-  so by name when asked for any other kind. That is a gap in the port rather
-  than in the grammar -- the Linux-guest side is payload selection against
-  payloads that already exist -- and section 7 says what is still unmeasured
-  about it. The same host also prompts once per transfer for Administrator and
-  mints a throwaway local account, because the share comes from its own SMB
-  server; the grammar, the guest-side behaviour and the exit codes are
-  unchanged by that.
+- **On a Windows host, `push`, `pull` and `sync` reach a Windows guest only**,
+  and say so by name when asked for any other kind -- `sync` by refusing
+  `@guest=linux` out of the config, before it fetches anything. That is a gap in
+  the port rather than in the grammar -- the Linux-guest side is payload
+  selection against payloads that already exist -- and section 7 says what is
+  still unmeasured about it. The same host also prompts once per transfer for
+  Administrator and mints a throwaway local account, because the share comes
+  from its own SMB server; the grammar, the guest-side behaviour and the exit
+  codes are unchanged by that.
+- **`sync`'s `>pre-ui` and `>post-ui` run rules are a Linux-host feature**, for
+  the same reason `ui` is (section 7): they launch through PsExec, which is what
+  `virutil ui` is. The Windows driver refuses a config carrying one by name and
+  up front, alongside `@guest`, rather than at the point the rule would have
+  run. Every other directive in a config means the same thing on both hosts.
 - `domain delete` never prompts and removes disks, backing chain, snapshot
   overlays and memory files, mount points and port forwards; files another
   domain uses are kept.
@@ -130,9 +136,12 @@ directory.
 
 Every driver knows the whole layout and relocates it from the same variables,
 but a driver only creates the directories it actually writes to. The Windows
-driver writes to `images` and to `tmp`: `conf` and `staging` belong to `sync`,
-which is not ported there yet, `mnt` is for host mount points it never makes,
-and `ports` holds the relay state and logs of a mechanism it does not have --
+driver writes to `images`, `tmp` and `staging`, and reads `conf`: the last two
+arrived with `sync`, which is ported there now. (`conf` is read on both hosts
+and written by neither -- a config is the user's file, and a missing one is
+reported at the path it was looked for rather than created.) `mnt` is for host
+mount points it never makes, and `ports` holds the relay state and logs of a
+mechanism it does not have --
 under user-mode NAT a forward is a `hostfwd` on the qemu command line, so it
 lives in the launcher with every other qemu argument and needs no state of its
 own. `cache` follows `ui`. **An empty directory is not a promise**: what section
@@ -152,7 +161,23 @@ distinction is what each row means rather than an inconsistency. `staging` holds
 cheap; a transfer's staged copy exists for one transfer and is deleted with the
 share and the account it was published for. Putting it under `staging` would put
 something disposable in the one directory whose contents are meant to survive.
-So `staging` stays `sync`'s and is still empty on a Windows host.
+So `staging` stays `sync`'s, on both hosts.
+
+`sync` on a Windows host makes that distinction visible rather than blurring it,
+because one run uses both rows: `staging` holds the incremental tree the fetch
+refreshes, and `tmp/<token>/share` holds the *delivery* tree the map rules build
+for that one run and the share is published over. The second is built straight
+into the transfer's own staging directory rather than assembled elsewhere and
+copied in, which is the whole of what `sync` added to the transport there -- see
+`Invoke-XferTransfer` in `modules/win/xfer.ps1`.
+
+**One directory, not two, for named configs on a Windows host.** The bash driver
+falls back from `<root>/conf` to `~/.config/virutils` so an install predating
+`VIRUTILS_CONF_DIR` keeps working. There is no such install on a Windows host --
+`sync` has never run there before now, and `%USERPROFILE%\.config\virutils` is a
+path nothing has ever written -- so that fallback would be a compatibility
+promise to nobody. "Looked up here first" is therefore also "looked up here
+only" on that host. A path spelled out with `-c` is unaffected on either.
 
 ## 4. Environment
 
@@ -190,12 +215,12 @@ match on:
 |---|---|
 | 90 | the guest has no rsync |
 | 92 | mkdir failed in the guest (push) |
-| 93 | robocopy failed, exit >= 8 (push) |
+| 93 | robocopy failed, exit >= 8 (push, sync) |
 | 94 | SRC matched nothing in the guest (pull) |
 | 95 | robocopy failed, exit >= 8 (pull) |
 | 97 | PsExec is not present in the guest (ui) |
-| 98 | the elevation prompt was declined (Windows host, push/pull) |
-| 99 | the host could not publish the share (Windows host, push/pull) |
+| 98 | the elevation prompt was declined (Windows host, push/pull/sync) |
+| 99 | the host could not publish the share (Windows host, push/pull/sync) |
 
 Otherwise the guest's own exit code passes through (`exec`).
 
@@ -207,6 +232,11 @@ prompt is an answer rather than a fault -- a script wrapping `virutil push` has
 to be able to tell "I clicked No" from "SMB is broken". 99 covers the rest of
 the host setup (the share, the account, the filesystem ACL) with the specifics
 in the diagnosis text.
+
+93 is shared by `push` and `sync` rather than given one each, and that is
+deliberate: it is the *guest's* code, raised by the robocopy line their payloads
+have in common, and splitting it would mean the guest knowing which host command
+sent it -- which it does not and should not.
 
 ## 6. Shared payloads
 
@@ -285,7 +315,7 @@ an intention.
 
 Not every module ports. What the Windows driver ships today is:
 
-`domain`, `exec`, `push`, `pull` and `usb`. `sync` is the remaining intended
+`domain`, `exec`, `push`, `pull`, `sync` and `usb`. That is the whole intended
 surface; `ui` is bash-only, and `snapshot` is bash-only now as well. All of them
 are below. A module that works beats two half-ported.
 
@@ -293,11 +323,48 @@ are below. A module that works beats two half-ported.
 channel they both stand on is in place. `usb` is on both drivers. `snapshot` was
 ported and has been taken back out -- the question this section used to leave
 open was measured, the answer was no, and the answer took the command with it,
-below. `push` and `pull` are ported, against a **Windows guest**: the question
-they were blocked on was measured and decided, and what was decided is recorded
-below. `sync` is not ported, and neither is a Linux guest from a Windows host;
-both are later passes on the transport that now exists rather than new
-questions. `ui` is bash-only.
+below. `push`, `pull` and `sync` are ported, against a **Windows guest**: the
+question `push` and `pull` were blocked on was measured and decided, and what was
+decided is recorded below. What remains unported is a Linux guest from a Windows
+host, which is a later pass on the transport that now exists rather than a new
+question. `ui` is bash-only.
+
+### `sync`: ported, on the transport `push` and `pull` built
+
+`sync` was the last module this section listed as intended and unwritten, and it
+was unwritten for one reason: it is the transfer layer plus a config parser, and
+the transfer layer did not exist on this host. Once it did, the port was that
+parser and nothing else -- the guest half is `payloads/win/sync.ps1`, which both
+drivers already shared byte for byte, sent over the same share `push` publishes.
+
+**What it added to the transport is one thing.** `Invoke-XferTransfer` took a
+path to copy into the transfer's staging directory; it now takes either that or
+a builder to fill the directory itself. `sync` needs the second because its
+delivery tree is *built* -- the map rules write it one rule at a time in a layout
+that mirrors the guest's root -- and staging it the old way would have meant
+assembling that tree somewhere else and then copying the whole of it in. For a
+build tree that second copy is the expensive half of the run. Neither form is
+optional: a transfer that staged nothing would publish an empty share and report
+a successful delivery of no files, which is the one failure here that looks like
+a success.
+
+**The host half is robocopy, not rsync.** Both the fetch and the map are
+host-to-host, so the copier is the host's own. The one place that is visible in
+a config is the excludes: rsync's `--exclude=PAT` matches a name at any depth,
+file or directory alike, and robocopy splits that across `/XF` and `/XD`, so
+every pattern is given to both. What does not survive the mapping is an anchored
+pattern -- rsync reads a leading or embedded `/` as a position in the tree, and
+`/XF` matches on the name alone.
+
+**Two things in a config are refused by name, and both are refused before the
+fetch.** `@guest=linux`, because this host reaches a Windows guest only, and
+`>pre-ui`/`>post-ui`, because they are `ui`. The bash module refuses its own
+equivalent at the rule, which is the only place it can: there the obstacle is
+the guest, and the guest is not known until the config names it. Here both
+obstacles are properties of the *host*, known before the config is opened -- so
+there is no reason to spend a fetch, an elevation prompt and a delivery first,
+and a `>post-ui` rule refused after the files had landed would leave a guest
+half-configured by a run that then failed.
 
 ### `snapshot`: ported, measured, and taken back out
 
@@ -399,8 +466,8 @@ the reason. What it must not do is fall through to "unknown module": the command
 is in the grammar section 2 publishes, and it was on this driver one commit ago,
 so whoever types it has been told twice that it exists. `$script:ELSEWHERE` in
 `modules/win/parser.ps1` is where that reason lives, and it is the right home for
-`sync` and `ui` too. `push` and `pull` were on that list and have left it: they
-are in `$MODULES` now.
+`ui` too. `push`, `pull` and `sync` were on that list and have left it: they are
+in `$MODULES` now.
 
 The bash driver is untouched. Its `snapshot` is external overlays plus a memspec
 through libvirt, it captures memory for a running domain, and none of this
@@ -633,6 +700,7 @@ drivers:
 | `tests/linux/payloads.sh`, `tests/win/payloads.ps1` | render all eleven payloads under each driver and diff both against `tests/golden/payloads.txt`. This is what makes section 6's "byte-identical" checkable. |
 | `tests/win/domain.ps1` | the launcher round trip: monitor port, agent channel and port forwards written, read back, edited and read again. |
 | `tests/win/xfer.ps1` | `push` and `pull` on a Windows host with both seams substituted -- the guest agent and the share publisher -- so the guest path rules, credential generation, the free-space refusal, the sweep's liveness decision, the rendered payload and the teardown all run with no VM and no Administrator. |
+| `tests/win/sync.ps1` | `sync` on a Windows host, over the same two seams, with a real staging tree and a real delivery tree built on the host: what each config directive parses to, that the two a Windows host cannot honour are refused **before anything is fetched**, the layout the map rules build, the payload the guest would have been sent, and that a failed delivery tears down as completely as a successful one. |
 | `tests/win/transfer.ps1` | the guest tier: the transfer minimum below, plus the property that a completed transfer and a killed one both leave no account, no share and no staged tree. |
 
 The PowerShell half skips itself, loudly, on a host with no `pwsh`, and
@@ -642,9 +710,16 @@ host prompts for Administrator once, and suppressing that would mean installing
 a service.
 
 **Still missing, and named so it is not mistaken for covered:** `exec`
-propagating a guest exit code against a real guest, and `domain create` leaving
-exactly the files section 3 names. The `push`/`pull` round trip and the second
-`push` moving nothing were on this list and are now in `tests/win/transfer.ps1`.
+propagating a guest exit code against a real guest, `domain create` leaving
+exactly the files section 3 names, and `sync` against a real guest -- the whole
+of `tests/win/sync.ps1` stops at the agent boundary, so what a guest does with
+the delivery is asserted nowhere on this host. The `push`/`pull` round trip and
+the second `push` moving nothing were on this list and are now in
+`tests/win/transfer.ps1`.
+
+The config parse is the one part of `sync` that is worth testing twice over
+rather than once against a guest: the config file is contract, both drivers read
+it, and neither reads the other's parser.
 
 ## 9. Host-specific behaviour that is *not* contract
 

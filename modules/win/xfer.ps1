@@ -197,9 +197,10 @@ function Get-XferSize {
 
 # --- staging ----------------------------------------------------------------
 #
-# **Every transfer stages.** The source is copied into the transfer's own
-# scratch directory, that copy is what the share points at, and it is deleted at
-# teardown.
+# **Every transfer stages.** The bytes are put into the transfer's own scratch
+# directory, that directory is what the share points at, and it is deleted at
+# teardown. push and pull put them there by copying a path; sync builds its
+# delivery tree there a map rule at a time. See Invoke-XferTransfer.
 #
 # This diverges from the bash driver, which serves a directory source in place
 # and stages only a single file, and the divergence is deliberate. Serving in
@@ -809,23 +810,54 @@ function Assert-XferReady {
 # modules/win/parser.ps1.
 #
 # BODY is called with the session and the staging directory, and whatever it
-# returns is what this returns. STAGEFROM is mandatory because every transfer
-# stages -- pull's staging tree is seeded from its destination rather than left
-# empty, so there is no shape of transfer that skips this.
+# returns is what this returns.
+#
+# **Every transfer stages, and says where the staged bytes come from.** There
+# are two ways to say it and exactly one has to be given:
+#
+#   -StageFrom PATH    copy PATH into the staging directory. push's source and
+#                      pull's destination seed, and the reason pull's is not
+#                      left empty is above.
+#   -StageWith BLOCK   call BLOCK with the staging directory and let it put the
+#                      bytes there itself, with -StageNeed saying how many to
+#                      check for first.
+#
+# The second exists for sync, whose delivery tree is *built* rather than copied:
+# its map rules already write one file at a time into a layout that mirrors the
+# guest's root, so that layout can be written straight into the directory the
+# share will point at. Making sync build somewhere else and hand the result over
+# as -StageFrom would keep this signature and cost a second full local copy of
+# the delivery -- which for a build tree is the expensive half of the run.
+#
+# Neither and both are refused rather than defaulted. A transfer that staged
+# nothing would publish an empty share and report a successful delivery of no
+# files, which is the one failure here that looks like a success.
 function Invoke-XferTransfer {
     param(
         [Parameter(Mandatory)][string]$Vm,
-        [Parameter(Mandatory)][string]$StageFrom,
+        [string]$StageFrom,
+        [scriptblock]$StageWith,
+        [long]$StageNeed = 0,
         [switch]$Write,
         [Parameter(Mandatory)][scriptblock]$Body
     )
+
+    if ($StageFrom -and $StageWith) {
+        Die 'internal: a transfer stages from a path or with a builder, not both'
+    }
+    if (-not $StageFrom -and -not $StageWith) {
+        Die 'internal: a transfer needs -StageFrom or -StageWith'
+    }
 
     $token   = New-XferToken
     $scratch = Get-XferScratch $token
     $stage   = Join-Path $scratch 'share'
 
     # Before the copy begins, because staging is where the bytes get committed.
-    Assert-XferRoom (Get-XferSize $StageFrom) `
+    # A builder is priced by its caller, which is the only side that knows what
+    # it is about to write.
+    $need = if ($StageFrom) { Get-XferSize $StageFrom } else { $StageNeed }
+    Assert-XferRoom $need `
                     (Get-XferFreeSpace $script:VirutilsTmpDir) `
                     $script:VirutilsTmpDir
 
@@ -834,7 +866,12 @@ function Invoke-XferTransfer {
     New-VirutilsDir $stage | Out-Null
 
     try {
-        Copy-XferStage $StageFrom $stage
+        # Before the share is published, either way: an elevation prompt that
+        # arrives and is then followed by "nothing matched" is the worst
+        # available ordering, and a builder is the one staging step that can
+        # decide there is nothing to send.
+        if ($StageFrom) { Copy-XferStage $StageFrom $stage }
+        else            { & $StageWith $stage | Out-Null }
 
         $session = Publish-XferShare $token $stage -Write:$Write
         try {

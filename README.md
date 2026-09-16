@@ -37,7 +37,9 @@ step and no dependencies beyond the utilities it calls.
       - [Map rules](#map-rules)
       - [Excludes](#excludes)
       - [Cleanup rules](#cleanup-rules)
+      - [Run rules](#run-rules)
    - [Example](#example)
+   - [On a Windows host](#sync-on-a-windows-host)
    - [How the delivery works](#how-the-delivery-works)
       - [On a Linux guest](#on-a-linux-guest)
    - [Notes](#notes)
@@ -171,7 +173,7 @@ host-side machinery in `modules/linux/xfer` and `modules/linux/guest`, which is
 
 | Module | Purpose | Usage |
 | --- | --- | --- |
-| `sync` | Fetch a project's build output from a Windows host and push it into a guest's `C:` drive. | `virutil sync VM [-c NAME\|PATH]` |
+| `sync` | Fetch a project's build output out of a build tree and deliver it into a **running** guest's `C:` drive, config-driven. | `virutil sync VM [-c NAME\|PATH]` |
 | `pull` | Copy a file or directory out of a **running** guest. | `virutil pull VM SRC DST` |
 | `push` | Copy a file or directory from the host into a guest's `C:` drive. | `virutil push VM SRC DST` |
 
@@ -262,7 +264,7 @@ stand up, because there is nowhere to stand it up: port 445 is what SMB means to
 a Windows client, no ephemeral-port trick can move it, and on a Windows host the
 operating system already holds it. So `virutil push` publishes a share with
 `New-SmbShare` on the machine's own server and retires it again when the
-transfer ends.
+transfer ends. `pull` and `sync` use the same publisher.
 
 **It prompts for Administrator, once per transfer.** Publishing a share needs
 it, and so does removing one. Only the share management is elevated — the run
@@ -294,8 +296,11 @@ Two consequences worth knowing:
   the account away. Anything an earlier bad day did leave behind is swept up by
   the next transfer, which never touches a transfer that is still running.
 
-A Linux guest from a Windows host is not supported yet; `push` and `pull` say so
-by name rather than failing partway.
+A Linux guest from a Windows host is not supported yet; `push`, `pull` and
+`sync` say so by name rather than failing partway — `sync` by refusing
+`@guest=linux` out of the config, before it fetches anything. See
+[`sync` on a Windows host](#sync-on-a-windows-host) for the rest of what differs
+there.
 
 ### Which guest is on the other side
 
@@ -584,7 +589,7 @@ normally arranged to mirror what will land in the guest, so the map rules stay
 trivial.
 
 **Push** runs the map rules into a delivery tree on the host — the
-same rsync, the same excludes and destinations, into a scratch directory —
+same copier, the same excludes and destinations, into a scratch directory —
 exports that tree read-only on the address the guest reaches
 this host at, and has the guest copy it onto its own root: an SMB share and
 `robocopy` onto `C:` for a Windows guest, an `rsync` daemon and `rsync` onto `/`
@@ -595,6 +600,8 @@ before it fetches, any directories listed for cleanup are emptied in the guest
 afterwards, `>post` rules run last, and the share and the tree are torn down
 however the run ends. Nothing is mounted and nothing is shut down.
 
+The rest of this paragraph is the Linux host's; see
+[On a Windows host](#sync-on-a-windows-host) for what that one does instead.
 Run it as yourself, **not** under `sudo`. It refuses to start when invoked under
 `sudo`, because `$HOME` — and therefore config discovery — resolves to root's
 home on any host whose sudoers sets `always_set_home`. Only the commands that
@@ -641,6 +648,9 @@ config.
 
 A missing config is a fatal error naming the exact path that was looked for.
 Nothing is generated for you, and nothing else is touched first.
+
+On a Windows host the root is `%USERPROFILE%\.virutils\` and there is no
+legacy location; see [On a Windows host](#sync-on-a-windows-host).
 
 ### Configuration
 
@@ -713,6 +723,11 @@ Ordinary `rsync` exclude patterns, applied to both halves of the pipeline, so
 build leftovers stay out of the staging tree *and* out of the guest. Repeat the
 directive as often as convenient; the lists are concatenated.
 
+A Windows host copies with `robocopy` and maps each pattern onto its `/XF` and
+`/XD`, which is exact for a name like `*.pdb` or `CMakeFiles` and does not carry
+an *anchored* pattern across — see
+[On a Windows host](#sync-on-a-windows-host).
+
 #### Cleanup rules
 
 ```
@@ -777,10 +792,15 @@ returns as soon as the process starts, and the process runs as SYSTEM on that
 desktop (add `-u`/`-p` to the command if it must be the logged-in user).
 
 The command is a command line, not a bare exe, so quote a path that contains
-spaces exactly as you would at a prompt. These rules are Windows-only — a
-`@guest=linux` config that carries one is refused — and they need PsExec staged
-in the guest first (`virutil ui setup VM`); a config that runs before that fails
-with the same "run `virutil ui setup`" message `virutil ui run` gives.
+spaces exactly as you would at a prompt. These rules are Windows-*guest*-only —
+a `@guest=linux` config that carries one is refused — and they need PsExec
+staged in the guest first (`virutil ui setup VM`); a config that runs before
+that fails with the same "run `virutil ui setup`" message `virutil ui run`
+gives.
+
+They are also a Linux-*host* feature: `virutil ui` is not on the Windows driver,
+so a Windows host refuses a config carrying one, by name and before it fetches
+anything. `>pre` and `>post` are unaffected.
 
 ### Example
 
@@ -864,6 +884,53 @@ not happen would deliver a half-installed guest and report success — and
 strict on purpose: if the service will not start after the delivery, that is
 worth hearing about.
 
+<a id="sync-on-a-windows-host"></a>
+
+### On a Windows host
+
+Everything above is the config, and the config is the same file on both hosts:
+the fetch rules, the map rules, the excludes, the cleanup rules and the `>pre`
+and `>post` commands all mean what they mean regardless of which driver reads
+them. Five things about the *host* half differ on Windows.
+
+**It publishes a share the way `push` does**, which means it prompts once for
+Administrator per run and mints a throwaway local account for the length of it —
+see [On a Windows host](#on-a-windows-host) above, which describes the whole
+transport. Declining the prompt is exit 98; a share that could not be published
+is 99.
+
+**A Windows guest only.** A config saying `@guest=linux` is refused by name,
+before anything is fetched. That is the same limit `push` and `pull` have on
+this host, not a limit of `sync`.
+
+**`>pre-ui` and `>post-ui` are refused**, also before anything is fetched. They
+launch on the guest's interactive desktop through PsExec, which is `virutil ui`,
+which is a Linux-host command. A config carrying one names every such rule in
+the refusal, so it is obvious which lines to drop or rewrite as ordinary `>pre`
+and `>post` rules.
+
+Both refusals come before the fetch on purpose. An elevation prompt, a
+multi-gigabyte copy and then a refusal would be the worst available ordering,
+and a `>post-ui` rule refused *after* the files had landed would leave the guest
+half-configured by a run that then reported failure.
+
+**Configs are looked up in `%USERPROFILE%\.virutils\conf\` and nowhere else.**
+The bash driver also falls back to `~/.config/virutils` so an install predating
+`VIRUTILS_CONF_DIR` keeps working; there is no such install on a Windows host,
+so there is nothing for a fallback to be compatible with. `-c` also treats a
+backslash or a leading drive letter as "this is a path", not just a forward
+slash — `-c C:\work\my.conf` is a path, `-c win11` is a name.
+
+**Both host-side copies use `robocopy`**, not `rsync`. The fetch and the map are
+host-to-host, so the copier is the host's own. This is invisible except in the
+excludes: `rsync --exclude=PAT` matches a *name* at any depth, file or directory
+alike, and `robocopy` splits that across `/XF` (files) and `/XD` (directories),
+so every pattern is handed to both. A pattern like `*.pdb` or `CMakeFiles`
+therefore behaves identically on the two hosts. What does not carry across is an
+**anchored** pattern — `rsync` reads a leading or embedded `/` as a position in
+the tree, and `/XF` matches on the name alone, so write excludes as names if the
+config has to work on both.
+
 ### How the delivery works
 
 The second half of the run is a delivery the running guest pulls for itself. The
@@ -886,7 +953,8 @@ The map rules build their `C:`-shaped tree in a scratch directory under
 `~/.virutils/tmp/`; the host exports that directory as a
 read-only, anonymous SMB share on the one address the guest reaches it at; and
 the guest is told, through the guest agent, to `robocopy` the whole share onto
-`C:\`. Because the delivery tree's layout already *is* the layout the rules asked
+`C:\`. (A Windows host publishes the same tree from its own SMB server, which
+cannot be anonymous — see [On a Windows host](#sync-on-a-windows-host).) Because the delivery tree's layout already *is* the layout the rules asked
 for, that is one command and one round trip, whatever the rules said.
 
 Two things follow, and between them they are the reason it exists:

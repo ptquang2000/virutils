@@ -98,9 +98,10 @@ printf '\n-- virutil.ps1 (PowerShell driver) --\n'
 if [[ -z "$PWSH" ]]; then
     skip 'no pwsh or powershell on PATH -- the Windows driver was not exercised'
 else
-    # Shorter than the bash list on purpose: sync, push, pull and ui are not
-    # ported. The list is read out of the driver itself rather than
-    # repeated here, so a module added there is tested here without an edit.
+    # Shorter than the bash list on purpose: ui is not ported, and snapshot was
+    # ported and taken back out. The list is read out of the driver itself
+    # rather than repeated here, so a module added there is tested here without
+    # an edit -- which is how `sync` arrived in it.
     mapfile -t PS_MODULES < <("$PWSH" -NoProfile -Command \
         ". '$WROOT/modules/win/parser.ps1'; \$MODULES" 2>/dev/null | tr -d '\r')
 
@@ -147,8 +148,13 @@ else
     #               guest agent and the share publisher -- so the guest path
     #               rules, the staging copy, the rendered payload and the
     #               teardown are exercised with no VM and no Administrator.
+    #   sync.ps1    sync over those same two seams: what each config directive
+    #               parses to -- the config file is contract and both drivers
+    #               read it -- that the two a Windows host cannot honour are
+    #               refused before anything is fetched, and the delivery tree
+    #               the map rules build.
     printf '\n-- PowerShell unit tests --\n'
-    for t in domain exec usb xfer; do
+    for t in domain exec usb xfer sync; do
         if out="$("$PWSH" -NoProfile -File "$ROOT/tests/win/$t.ps1" 2>&1)"; then
             printf '%s\n' "$out" | sed 's/^/  /'
             ok "tests/win/$t.ps1"

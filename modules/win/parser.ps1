@@ -9,16 +9,24 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# What this driver answers to. Still shorter than the bash tree's list: `sync`
-# and `ui` are not ported, and a module that works beats two half-ported
-# (contract section 7). A name absent here is refused by name rather than
-# dispatched to a function that does not exist.
+# What this driver answers to. Still shorter than the bash tree's list: `ui` is
+# not ported, and a module that works beats two half-ported (contract section
+# 7). A name absent here is refused by name rather than dispatched to a function
+# that does not exist.
 #
-# `push` and `pull` are here now. They were blocked rather than unwritten, on
+# `push` and `pull` arrived first. They were blocked rather than unwritten, on
 # one question -- how a share on a Windows host authenticates a guest that
 # refuses anonymous SMB -- which was measured against a real guest and answered
 # with a throwaway local account per transfer. modules/win/xfer.ps1 carries the
-# transport; `sync` drops in beside them later with nothing rearranged.
+# transport.
+#
+# `sync` is here now, and it did drop in beside them with nothing rearranged:
+# its whole guest half is that transport plus the payload both drivers already
+# shared. What it added to xfer is one way of filling a staging directory --
+# sync builds its delivery tree there rather than copying one in. It delivers to
+# a **Windows guest** only, and refuses `@guest=linux` and the `>pre-ui` /
+# `>post-ui` run rules by name, up front: the first is the limit push and pull
+# already have here, and the second is `ui`, below.
 #
 # `usb` is on both drivers, by two mechanisms: device_add over the QEMU monitor
 # here, a libvirt <hostdev> there. What is on neither is the WSL case, where
@@ -30,7 +38,7 @@ $ErrorActionPreference = 'Stop'
 # way it was -- is exactly the half this host cannot take. The measurements are
 # kept in docs/contract.md section 7, as the reason for the removal rather than
 # as a footnote to a command that still exists.
-$script:MODULES = @('domain', 'exec', 'pull', 'push', 'usb')
+$script:MODULES = @('domain', 'exec', 'pull', 'push', 'sync', 'usb')
 
 # Names the bash driver answers to that this one does not, and why. A name here
 # is refused with its own reason instead of "unknown module", because each is in
@@ -38,8 +46,9 @@ $script:MODULES = @('domain', 'exec', 'pull', 'push', 'usb')
 # grammar and typed one has been told the command exists, and "unknown module"
 # leaves them to work out alone which driver they are standing on.
 #
-# `sync` and `ui` belong here too and are not listed yet; they have never been
-# on this driver, so they have never stopped working.
+# `ui` belongs here too and is not listed yet; it has never been on this driver,
+# so it has never stopped working. `sync` was in this paragraph and has left it:
+# it is in $MODULES now.
 $script:ELSEWHERE = [ordered]@{
     snapshot = @(
         'virutil snapshot is a Linux-host command; this driver does not have it.'
@@ -107,6 +116,7 @@ function Get-TopUsage {
         'transfer'
         '  push       copy a file or directory from this host into a guest'
         '  pull       copy files out of a guest onto this host'
+        "  sync       deliver a project's build output into a running guest"
         ''
         'guest'
         '  exec       run commands inside a guest via the QEMU guest agent'
@@ -116,13 +126,14 @@ function Get-TopUsage {
         ''
         'This is the Windows-host driver: raw QEMU under WHPX, no libvirt. It'
         'shares a contract with the bash driver rather than any source; see'
-        'docs/contract.md. sync, ui and snapshot are in the bash tree only:'
-        'WHPX blocks saving a running guest memory image, and that is what'
-        'took snapshot out of this one.'
+        'docs/contract.md. ui and snapshot are in the bash tree only: WHPX'
+        'blocks saving a running guest memory image, and that is what took'
+        'snapshot out of this one.'
         ''
-        "push and pull publish a share on this machine's own SMB server, so"
-        'they prompt once for Administrator and mint a throwaway local'
-        'account for the length of the transfer. See README.md.'
+        "push, pull and sync publish a share on this machine's own SMB server,"
+        'so they prompt once for Administrator and mint a throwaway local'
+        'account for the length of the transfer. They deliver to a Windows'
+        'guest only. See README.md.'
         ''
         "Run 'virutil <module>' for a module's own usage."
     )

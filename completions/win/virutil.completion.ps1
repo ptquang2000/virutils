@@ -9,8 +9,8 @@
 
   install.ps1 adds that line for you.
 
-  This completes the *Windows* driver, so it offers domain, exec, push, pull
-  and usb and nothing else. sync, ui and snapshot are in the bash tree only,
+  This completes the *Windows* driver, so it offers domain, exec, push, pull,
+  sync and usb and nothing else. ui and snapshot are in the bash tree only,
   and offering a name this driver would reject is worse than offering
   nothing -- $MODULES in modules\win\parser.ps1 is the list to keep this in step
   with. usb is on both drivers, spelled the same way on each.
@@ -51,7 +51,7 @@ $completer = {
     # Get-FlagValues' problem, and that one does look at the verb.
     $valueFlags = @(
         '-s', '--size', '-m', '--memory', '-c', '--vcpus', '-o', '--osinfo',
-        '-v', '--virtio', '-p', '--port', '--close'
+        '-v', '--virtio', '-p', '--port', '--close', '--config'
     )
 
     # Flags do not consume a slot, so the positional index counts only the
@@ -84,6 +84,7 @@ $completer = {
     $root     = Get-Root 'DIR'       (Join-Path $env:USERPROFILE '.virutils')
     $imageDir = Get-Root 'IMAGE_DIR' (Join-Path $root 'images')
     $portDir  = Get-Root 'PORT_DIR'  (Join-Path $root 'ports')
+    $confDir  = Get-Root 'CONF_DIR'  (Join-Path $root 'conf')
 
     # A domain is a launcher in the image dir -- the same thing `domain list`
     # counts. Its running state is deliberately not shown: telling it needs a
@@ -119,6 +120,19 @@ $completer = {
         $text = Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue
         [regex]::Matches([string]$text, '-device\s+"?usb-host,vendorid=0x([0-9a-fA-F]{4}),productid=0x([0-9a-fA-F]{4})') |
             ForEach-Object { ('{0}:{1}' -f $_.Groups[1].Value, $_.Groups[2].Value).ToLowerInvariant() }
+    }
+
+    # The sync configs, by the name `-c` wants rather than by filename: the
+    # driver appends '.conf' to a bare name, so offering `myproj.conf` would
+    # complete to a name it then reads as `myproj.conf.conf`. Only this
+    # directory, because Resolve-SyncConfig in modules\win\sync.ps1 looks in
+    # only this one -- the bash driver's legacy ~/.config/virutils fallback has
+    # no meaning on a Windows host.
+    function Get-Configs {
+        if (-not (Test-Path -LiteralPath $confDir)) { return @() }
+        Get-ChildItem -LiteralPath $confDir -Filter '*.conf' -ErrorAction SilentlyContinue |
+            Sort-Object Name |
+            ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_.Name) }
     }
 
     # The host ports this domain currently forwards; the guest side is the
@@ -172,6 +186,7 @@ $completer = {
         exec     = 'run commands inside a guest via the QEMU guest agent'
         push     = 'copy a file or directory from this host into a guest'
         pull     = 'copy files out of a guest onto this host'
+        sync     = "deliver a project's build output into a running guest"
         usb      = 'pass a host USB device through to a guest'
         help     = 'the module list'
     }
@@ -232,6 +247,10 @@ $completer = {
             Add-Match '-c' 'close the forward on host PORT'
             Add-Match '--close' 'close the forward on host PORT'
         }
+        elseif ($module -eq 'sync') {
+            Add-Match '-c' 'config to use (default sync.conf)'
+            Add-Match '--config' 'config to use (default sync.conf)'
+        }
         elseif ($module -eq 'exec' -and $verb -in @('cmd', 'ps', 'sh')) {
             Add-Match '-d' 'fire and forget: print the guest pid and exit 0'
             Add-Match '--detach' 'fire and forget: print the guest pid and exit 0'
@@ -266,6 +285,7 @@ $completer = {
         # leaves $hint null.
         $hint = if ($prev -in @('-v', '--virtio')) { $null }
                 elseif ($module -eq 'domain' -and $verb -eq 'port') { "$($positional[2]) has no forwards open" }
+                elseif ($module -eq 'sync') { "no config in $confDir starts with '$wordToComplete'" }
                 else { "$prev takes a value, and it is not a path" }
         switch ($prev) {
             { $_ -in @('-s', '--size') } {
@@ -274,11 +294,15 @@ $completer = {
             { $_ -in @('-m', '--memory') } {
                 foreach ($n in 2048, 4096, 8192, 12288, 16384, 24576, 32768) { Add-Match "$n" 'MiB' }
             }
-            { $_ -in @('-c', '--vcpus', '--close') } {
-                # -c is --vcpus under create and --close under port, and the
-                # two answer with entirely different things.
+            { $_ -in @('-c', '--vcpus', '--close', '--config') } {
+                # -c is --vcpus under create, --close under port and --config
+                # under sync, and the three answer with entirely different
+                # things. The module decides, which is why this one branch
+                # cannot be split by flag name the way the others are.
                 if ($module -eq 'domain' -and $verb -eq 'port') {
                     foreach ($p in Get-Ports $positional[2]) { Add-Match $p.Text $p.Tip }
+                } elseif ($module -eq 'sync') {
+                    foreach ($c in Get-Configs) { Add-Match $c 'sync config' }
                 } else {
                     foreach ($n in 1, 2, 4, 6, 8, 12, 16) { Add-Match "$n" 'vcpus' }
                 }
@@ -317,9 +341,10 @@ $completer = {
         }
         1 {
             $hint = "$module has no verb starting with '$wordToComplete'"
-            # push and pull have no verb: VM is the first word after the
-            # module, so this position wants a domain rather than a subcommand.
-            if ($module -in @('push', 'pull')) {
+            # push, pull and sync have no verb: VM is the first word after
+            # the module, so this position wants a domain rather than a
+            # subcommand.
+            if ($module -in @('push', 'pull', 'sync')) {
                 $hint = $noDomain
                 foreach ($d in $domains) { Add-Match $d 'domain' }
             }
@@ -365,6 +390,11 @@ $completer = {
             # word that is not a host path at all.
             elseif ($module -eq 'pull') {
                 $hint = 'a path inside the guest, relative to C:\ -- wildcards allowed'
+            }
+            # `sync VM` takes nothing else positional: the config is the whole
+            # rest of the interface, and it arrives through -c.
+            elseif ($module -eq 'sync') {
+                $hint = 'sync takes only a domain; everything else is in the config (-c)'
             }
         }
         3 {
