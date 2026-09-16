@@ -14,10 +14,10 @@
   A change to the contract is a change to both drivers or it is a bug.
 
   The shape here mirrors the bash driver deliberately: that one sources
-  modules/parser (which declares the module list and the shared helpers) and
-  then every other module, and dispatches to <name>_main. This dot-sources
-  modules/*.ps1 and dispatches to <Name>-Main. Keeping them alike is what gives
-  a change in one tree an obvious address in the other.
+  modules/linux/parser (which declares the module list and the shared helpers)
+  and then every other module, and dispatches to <name>_main. This dot-sources
+  modules/win/*.ps1 and dispatches to <Name>-Main. Keeping them alike is what
+  gives a change in one tree an obvious address in the other.
 
     virutil help    the module list
 #>
@@ -37,7 +37,9 @@ if ($item.LinkType -eq 'SymbolicLink' -and $item.Target) {
     $target = @($item.Target)[0]
     $here = Split-Path -Parent ([IO.Path]::GetFullPath($target))
 }
-$moduleDir = Join-Path $here 'modules'
+# modules/ is split by host: this driver's files are modules\win, and the bash
+# driver's are modules/linux, which are virutil's to load, not ours.
+$moduleDir = Join-Path $here 'modules\win'
 
 # The exit code a module leaves behind. `exec` sets it to the guest's own, which
 # the contract says becomes ours; everything else leaves it at 0 and fails by
@@ -79,7 +81,7 @@ try {
     # The guest agent channel is one per qemu process rather than one per
     # command -- qemu's chardev does not go back to listening once a client has
     # come and gone -- so the run holds it open and closes it here, once,
-    # however the run ends. See Get-GuestAgentChannel in modules/guest.ps1.
+    # however the run ends. See Get-GuestAgentChannel in modules/win/guest.ps1.
     Close-GuestAgentChannels
 }
 

@@ -5,6 +5,13 @@ OS, never the host's, so `virutil` (bash, Linux host) and `virutil.ps1`
 (PowerShell, Windows host) send byte-identical text to a guest of a given kind.
 Keeping them here as data is rule 2 of the fork: see `docs/contract.md` §6.
 
+`linux/` and `win/` here are therefore the *guest's* halves, not the host's --
+the opposite of `modules/linux` and `modules/win`, which are one driver each.
+Both drivers read both halves, and a caller names a payload by its bare
+filename: the renderer settles the half from the extension, which is what
+already settles the quoting. See `payload_render` in `modules/linux/payload` and
+`Invoke-Payload` in `modules/win/payload.ps1`.
+
 `mount.ps1` and `unmount.ps1` are the one exception, and §6 names them as such:
 they are keyed on the **host**, because only one host has to authenticate the
 share it is serving. A Linux host serves an anonymous share and sends neither of
@@ -51,21 +58,21 @@ and `@` means nothing at all to `sh`.
 
 | file | sent to | what it does |
 |---|---|---|
-| `probe.sh` | Linux guest | refuse early and legibly when the guest has no rsync |
-| `push-dir.ps1` | Windows guest | robocopy a served tree into a directory |
-| `push-file.ps1` | Windows guest | Copy-Item one served file onto a path |
-| `push-dir.sh` | Linux guest | rsync a served tree into a directory |
-| `push-file.sh` | Linux guest | rsync one served file onto a path |
-| `pull.ps1` | Windows guest | robocopy matches of a pattern out to the share |
-| `pull.sh` | Linux guest | rsync matches of a pattern out to the daemon |
-| `sync.ps1` | Windows guest | robocopy the whole share onto `C:\` |
-| `sync.sh` | Linux guest | rsync the whole export onto `/` |
-| `mount.ps1` | Windows guest | authenticate to a credentialled share (**Windows host only**) |
-| `unmount.ps1` | Windows guest | let go of it again (**Windows host only**) |
+| `linux/probe.sh` | Linux guest | refuse early and legibly when the guest has no rsync |
+| `win/push-dir.ps1` | Windows guest | robocopy a served tree into a directory |
+| `win/push-file.ps1` | Windows guest | Copy-Item one served file onto a path |
+| `linux/push-dir.sh` | Linux guest | rsync a served tree into a directory |
+| `linux/push-file.sh` | Linux guest | rsync one served file onto a path |
+| `win/pull.ps1` | Windows guest | robocopy matches of a pattern out to the share |
+| `linux/pull.sh` | Linux guest | rsync matches of a pattern out to the daemon |
+| `win/sync.ps1` | Windows guest | robocopy the whole share onto `C:\` |
+| `linux/sync.sh` | Linux guest | rsync the whole export onto `/` |
+| `win/mount.ps1` | Windows guest | authenticate to a credentialled share (**Windows host only**) |
+| `win/unmount.ps1` | Windows guest | let go of it again (**Windows host only**) |
 
 Each prints one space-separated line on stdout, which its caller parses; the
 shapes are documented at the head of each file.
 
-`tests/payloads.sh` and `tests/payloads.ps1` render every one of them with fixed
-inputs and diff the result against `tests/golden/payloads.txt`. A change to a
-payload is a change to that golden file, deliberately.
+`tests/linux/payloads.sh` and `tests/win/payloads.ps1` render every one of them
+with fixed inputs and diff the result against `tests/golden/payloads.txt`. A
+change to a payload is a change to that golden file, deliberately.

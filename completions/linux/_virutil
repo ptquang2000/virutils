@@ -1,0 +1,381 @@
+#compdef virutil
+# zsh completion for virutil -- mirrors the dispatch in modules/linux/parser,
+# the way completions/win/virutil.completion.ps1 mirrors modules/win/parser.ps1.
+#
+# This completes the *bash* driver, so it offers every module in $MODULES:
+# domain, snapshot, sync, pull, push, exec, ui, usb. The Windows driver carries
+# domain, snapshot, exec and usb, and its completer says so; usb and snapshot
+# are on both, spelled the same way on each -- though a snapshot there is
+# disk-only and needs the domain shut off (docs/contract.md section 9).
+
+_virutil() {
+  # One tag per group in `virutil help`, so zstyle group-name can render them
+  # as separate blocks.
+  local -a domains transfer guest hardware other
+  domains=(
+    'domain:the domain lifecycle: create, delete, list, start, shutdown, addr, port'
+    'snapshot:external snapshots (disk and memory) for libvirt domains'
+  )
+  transfer=(
+    'sync:fetch build output from the Windows host and push into a guest'
+    'pull:copy a file or directory out of a guest'
+    'push:copy a file or directory from the host into a guest'
+  )
+  guest=(
+    'exec:run commands inside a guest via the QEMU guest agent'
+    'ui:deliver PsExec into a Windows guest, then launch on its desktop'
+  )
+  hardware=(
+    'usb:pass a host USB device through to a guest'
+  )
+  other=(
+    'help:this message'
+  )
+
+  if (( CURRENT == 2 )); then
+    _describe -t domains  'domain module'   domains
+    _describe -t transfer 'transfer module' transfer
+    _describe -t guest    'guest module'    guest
+    _describe -t hardware 'hardware module' hardware
+    _describe -t other    'other'           other
+    return
+  fi
+
+  case $words[2] in
+    domain)   _virutil_domain ;;
+    snapshot) _virutil_snapshot ;;
+    sync)     _virutil_sync ;;
+    pull)     _virutil_pull ;;
+    push)     _virutil_push ;;
+    exec)     _virutil_exec ;;
+    ui)       _virutil_ui ;;
+    usb)      _virutil_usb ;;
+  esac
+}
+
+_virutil_domains() {
+  local -a doms
+  if command -v virsh >/dev/null 2>&1; then
+    doms=(${(f)"$(virsh -c qemu:///system list --all 2>/dev/null |
+      awk 'NR>2 && NF { name = $2; $1 = ""; $2 = ""
+                        sub(/^ +/, ""); sub(/ +$/, "")
+                        print name ":" $0 }')"})
+  fi
+  _describe -t domain 'domain' doms
+}
+
+# The host ports this domain currently forwards, read from the same state dir
+# the module writes; the guest side becomes the description.
+_virutil_domain_ports() {
+  local root=${VIRUTILS_DIR:-$HOME/.virutils}
+  local dir=${VIRUTILS_PORT_DIR:-$root/ports}
+  local -a ports
+  local f
+  for f in $dir/tcp-*(N); do
+    ports+=("${f:t:s/tcp-/}:-> $(<$f)")
+  done
+  _describe -t port 'forward' ports
+}
+
+_virutil_osinfo() {
+  local -a ids
+  if command -v osinfo-query >/dev/null 2>&1; then
+    ids=(${(f)"$(osinfo-query --fields=short-id os 2>/dev/null | awk 'NR>2 {print $1}')"})
+  fi
+  _describe -t osinfo 'osinfo id' ids
+}
+
+# -h/--help is on every module (docs/contract.md section 2), so every completer
+# below answers a leading '-' with it before anything positional.
+_virutil_help_flag() {
+  _values 'option' '-h[this message]' '--help[this message]'
+}
+
+_virutil_exec() {
+  local -a cmds=(
+    'ping:check the guest agent is responding'
+    'cmd:run a command via cmd.exe /c (Windows)'
+    'ps:run a script via powershell (Windows)'
+    'sh:run a script via /bin/sh -c (Linux)'
+  )
+  case $CURRENT in
+    3) [[ $words[CURRENT] == -* ]] && { _virutil_help_flag; return }
+       _describe -t command 'command' cmds ;;
+    4) _virutil_domains ;;
+    *)
+      case $words[3] in
+        cmd|ps|sh)
+          # Flags sit between VM and the command, and everything after the
+          # command is the guest's to read -- so they are offered once.
+          (( CURRENT == 5 )) && _values 'option' \
+            '-d[fire and forget, print guest pid]' \
+            '--detach[fire and forget, print guest pid]' \
+            '--[end of flags]' \
+            '-[read command from stdin]'
+          ;;
+      esac
+      ;;
+  esac
+}
+
+# setup warms the host cache and delivers PsExec into a guest; run launches an
+# app on the interactive desktop. run's APP is a guest path, so it completes to
+# nothing -- offering host files there would be offering the wrong filesystem.
+_virutil_ui() {
+  local -a cmds=(
+    'setup:cache PsExec on the host and deliver it into the guest'
+    'run:launch an app on the guest interactive desktop (PsExec -i)'
+  )
+  if [[ $words[CURRENT] == -* ]]; then
+    case $words[3] in
+      setup) _values 'option' \
+               '(-f --force)'{-f,--force}'[re-download even if the host cache holds it]' \
+               '-h[this message]' '--help[this message]' ;;
+      *)     _virutil_help_flag ;;
+    esac
+    return
+  fi
+  case $CURRENT in
+    3) _describe -t command 'command' cmds ;;
+    4) _virutil_domains ;;    # setup's VM is optional: with none it warms the cache
+  esac
+}
+
+_virutil_sync() {
+  local state line
+  _arguments \
+    '(-c --config)'{-c,--config}'[config NAME or PATH]:config:->config' \
+    '(-h --help)'{-h,--help}'[print usage and exit]' \
+    '2:domain:->domain'   # 1 is the module word itself; _arguments skips words[1]
+  case $state in
+    domain) _virutil_domains ;;
+    config)
+      if [[ $PREFIX == */* ]]; then
+        _files
+      else
+        local -a confs
+        local root=${VIRUTILS_DIR:-$HOME/.virutils}
+        local dirs=($root/conf $HOME/.config/virutils)
+        local d
+        for d in $dirs; do
+          confs+=(${~d}/*.conf(N:t:r))
+        done
+        _describe -t config 'config' confs
+      fi
+      ;;
+  esac
+}
+
+# pull and push take the same shape -- VM SRC DST. Only the side each path lives
+# on differs, so only the operands complete differently.
+_virutil_pull() {
+  if [[ $words[CURRENT] == -* ]]; then
+    _virutil_help_flag
+    return
+  fi
+  case $CURRENT in
+    3) _virutil_domains ;;
+    4) ;;                             # the guest-side source: nothing to complete
+    5) _files -/ ;;
+  esac
+}
+
+# Sizes are free-form numbers, so the best a completion can do is offer sensible
+# round values and let anything else be typed over them.
+_virutil_size() {
+  _values -w 'GiB' 32 64 128 256 512
+}
+
+_virutil_memory() {
+  _values -w 'MiB' 2048 4096 8192 12288 16384 24576 32768
+}
+
+_virutil_vcpus() {
+  local -a n
+  n=(1 2 4 6 8 12 16)
+  _values -w 'vcpus' $n
+}
+
+_virutil_push() {
+  if [[ $words[CURRENT] == -* ]]; then
+    _virutil_help_flag
+    return
+  fi
+  case $CURRENT in
+    3) _virutil_domains ;;
+    4) _files ;;
+    5) ;;                             # the guest-side destination: nothing to complete
+  esac
+}
+
+_virutil_usb() {
+  local -a cmds=(
+    'list:the host USB devices, as VENDOR:PRODUCT'
+    'show:what a domain passes through, live and persistent'
+    'attach:pass a host device through to a domain'
+    'detach:take one back from a domain'
+  )
+  if [[ $words[CURRENT] == -* ]]; then
+    _virutil_help_flag
+    return
+  fi
+  case $CURRENT in
+    3) _describe -t command 'command' cmds ;;
+    *)
+      case $words[3] in
+        show|attach|detach)
+          (( CURRENT == 4 )) && { _virutil_domains; return; }
+          # attach names a device on the host; detach names one the domain
+          # already has, which is a much shorter and more useful list.
+          (( CURRENT == 5 )) || return
+          case $words[3] in
+            attach) _virutil_usb_host_ids ;;
+            detach) _virutil_usb_domain_ids ${words[4]} ;;
+          esac
+          ;;
+      esac
+      ;;
+  esac
+}
+
+# The same sysfs walk modules/linux/usb does, and for the same reason: no
+# usbutils.
+_virutil_usb_host_ids() {
+  local -a ids
+  local d
+  for d in /sys/bus/usb/devices/[0-9]*-[0-9]*(/N); do
+    [[ -r $d/idVendor ]] || continue
+    # _describe splits a spec on the first unescaped colon, and the value
+    # here has one of its own, so the id's colon is escaped and the one before
+    # the description is not.
+    ids+=("${(L)$(<$d/idVendor)}\:${(L)$(<$d/idProduct)}:$(<$d/product 2>/dev/null)")
+  done
+  _describe -t device 'device' ids
+}
+
+# Read back out of the domain's persistent config, which is where an attach
+# leaves it -- libvirt writes <vendor> before <product>, so successive ids pair.
+_virutil_usb_domain_ids() {
+  local -a ids
+  ids=(${(f)"$(virsh -c qemu:///system dumpxml --inactive $1 2>/dev/null |
+    sed -n "s/.*<\(vendor\|product\) id='0x\([0-9a-f]*\)'.*/\2/p" |
+    paste -d: - -)"})
+  _describe -t device 'attached' ids
+}
+
+_virutil_snapshot() {
+  if [[ $words[CURRENT] == -* ]]; then
+    _virutil_help_flag
+    return
+  fi
+  local -a cmds=(
+    'create:create an external snapshot (default name snap-<timestamp>; disk-only when shut off)'
+    'list:list snapshots as a tree'
+    'revert:revert to a snapshot and leave the VM running'
+    'delete:delete a snapshot and its children'
+  )
+  case $CURRENT in
+    3) _describe -t command 'command' cmds ;;
+    4) _virutil_domains ;;
+    *)
+      case $words[3] in
+        revert|delete)
+          local -a snaps
+          snaps=(${(f)"$(virsh -c qemu:///system snapshot-list --domain ${words[4]} 2>/dev/null | awk 'NR>2 && $1 !~ /^-/ {print $1}')"})
+          _describe -t snapshot 'snapshot' snaps
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_virutil_domain() {
+  if [[ $words[CURRENT] == -* && $CURRENT == 3 ]]; then
+    _virutil_help_flag
+    return
+  fi
+  local -a cmds=(
+    'create:define a domain and boot the installer'
+    'delete:undefine a domain and delete its disks'
+    'list:list all domains and their state'
+    'start:power on a domain and open its console'
+    'shutdown:request a graceful shutdown (ACPI)'
+    'addr:show guest interface addresses'
+    'port:forward a host port into a running guest'
+  )
+  case $words[3] in
+    shutdown|addr)
+      (( CURRENT == 4 )) && _virutil_domains
+      ;;
+    port)
+      case $CURRENT in
+        4) _virutil_domains ;;
+        5) ;;                       # PORT or HOSTPORT:GUESTPORT: free-form
+        *)
+           # -c takes a host port, and the open forwards are the only ones worth
+           # offering
+           case $words[CURRENT-1] in
+             -c|--close) _virutil_domain_ports $words[4]; return ;;
+           esac
+           _values 'option' \
+             '(-c --close)'{-c,--close}'[close the forward on host PORT]' \
+             '-h[this message]' '--help[this message]'
+           ;;
+      esac
+      ;;
+    list) ;;                        # takes no arguments, beyond -h
+    start)
+      case $CURRENT in
+        3) _describe -t command 'command' cmds ;;
+        4) _virutil_domains ;;
+        *)
+           case $words[CURRENT-1] in
+             -s|--size)   _virutil_size;   return ;;
+             -m|--memory) _virutil_memory; return ;;
+             -c|--vcpus)  _virutil_vcpus;  return ;;
+           esac
+           _values 'option' \
+             '(-s --size)'{-s,--size}'[grow the disk image, GiB]' \
+             '(-m --memory)'{-m,--memory}'[guest RAM, MiB]' \
+             '(-c --vcpus)'{-c,--vcpus}'[virtual CPUs]' \
+             '(-G --no-gui)'{-G,--no-gui}'[start it without opening the console]' \
+             '-h[this message]' '--help[this message]'
+           ;;
+      esac
+      ;;
+    create)
+      case $CURRENT in
+        3) _describe -t command 'command' cmds ;;
+        4) ;;                       # the new domain's name: nothing to complete
+        5) _files -g '*.iso' ;;
+        *)
+           # the value-taking flags read the next word, so complete for the flag
+           # behind us before offering another flag
+           case $words[CURRENT-1] in
+             -o|--osinfo) _virutil_osinfo;      return ;;
+             -v|--virtio) _files -g '*.iso';    return ;;
+             -s|--size)   _virutil_size;   return ;;
+             -m|--memory) _virutil_memory; return ;;
+             -c|--vcpus)  _virutil_vcpus;  return ;;
+           esac
+           _values 'option' \
+             '(-s --size)'{-s,--size}'[disk size, GiB]' \
+             '(-m --memory)'{-m,--memory}'[guest RAM, MiB]' \
+             '(-c --vcpus)'{-c,--vcpus}'[virtual CPUs]' \
+             '(-o --osinfo)'{-o,--osinfo}'[libosinfo id; detected from the ISO by default]' \
+             '(-v --virtio)'{-v,--virtio}'[virtio-win ISO to attach, or none]' \
+             '-h[this message]' '--help[this message]'
+           ;;
+      esac
+      ;;
+    delete)
+      # takes a domain and nothing else
+      case $CURRENT in
+        4) _virutil_domains ;;
+      esac
+      ;;
+    *) (( CURRENT == 3 )) && _describe -t command 'command' cmds ;;
+  esac
+}
+
+_virutil "$@"

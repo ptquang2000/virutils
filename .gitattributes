@@ -6,8 +6,8 @@
 # PowerShell one with Get-Content, which takes it off. On a clone with
 # core.autocrlf=true they would therefore send *different bytes* into the same
 # guest, which is precisely what section 6 of docs/contract.md promises cannot
-# happen. tests/payloads.{sh,ps1} would catch it, but only on a host that runs
-# both halves.
+# happen. tests/linux/payloads.sh and tests/win/payloads.ps1 would catch it, but
+# only on a host that runs both halves.
 payloads/** text eol=lf
 
 # Same reasoning, one step removed: the golden file is the comparison both
@@ -18,5 +18,5 @@ tests/golden/** text eol=lf
 # of a line is a syntax error there rather than whitespace.
 virutil          text eol=lf
 install.sh       text eol=lf
-modules/*        text eol=lf
-tests/*.sh       text eol=lf
+modules/linux/*  text eol=lf
+tests/linux/*.sh text eol=lf

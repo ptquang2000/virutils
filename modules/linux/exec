@@ -1,0 +1,278 @@
+# exec -- run commands inside a guest via the QEMU guest agent.
+#
+#   virutil exec ping VM                 check that the guest agent is responding
+#   virutil exec cmd  VM [-d] CMD...     run CMD via cmd.exe /c        (Windows)
+#   virutil exec ps   VM [-d] SCRIPT...  run SCRIPT via powershell     (Windows)
+#   virutil exec sh   VM [-d] SCRIPT...  run SCRIPT via /bin/sh -c     (Linux)
+#
+# Which of the three a guest answers to is the guest's business, not the agent's:
+# guest-exec carries a path and an argv either way, so the only thing that
+# differs is what is on the other side to receive it. Nothing here probes for it
+# -- the caller knows which guest it is addressing, and sync learns it from
+# @guest in its config.
+#
+# Commands run as SYSTEM on Windows and as root on Linux -- qemu-ga is a service
+# in both cases -- and the guest exit code becomes ours. Flags sit between
+# the VM name and the command; parsing stops at the first non-flag, and `--`
+# forces the end of flags so a command may start with `-`.
+#
+# stdin is overloaded, disambiguated by whether `-` sits in the command slot:
+#   virutil exec ps VM -           the script is read from stdin
+#   echo x | virutil exec ps VM C  stdin becomes the guest process's stdin,
+#                                  buffered whole and EOF'd immediately, so it
+#                                  cannot answer an interactive prompt
+
+# Windows caps a command line at 32767 chars; cmd.exe caps itself far lower.
+# Enforced host-side: overflowing them fails in the guest as an
+# unrelated-looking spawn error.
+CMDLINE_MAX=32767
+CMD_EXE_MAX=8191
+
+# Linux has no command-line limit to speak of, but it does cap a single argv
+# entry at MAX_ARG_STRLEN -- 32 pages, which is 128KB on every architecture
+# virutil runs on. A sh script is passed as one such entry, so this is the
+# ceiling that matters, and it is enforced host-side for the same reason the
+# Windows ones are: over it, execve fails in the guest as E2BIG, which surfaces
+# as an unrelated-looking spawn error rather than as "your script is too long".
+SH_ARG_MAX=131072
+
+DETACH=0
+INPUT_B64=
+
+exec_usage() {
+    printf '%s\n' \
+        "usage: virutil exec {ping|cmd|ps|sh} VM [FLAGS] [ARGS]" \
+        "" \
+        "  cmd, ps        a Windows guest; sh a Linux one." \
+        "" \
+        "  -d, --detach   fire and forget: print the guest pid and exit 0." \
+        "                 No output and no exit code, but the command survives" \
+        "                 the channel dropping -- the only way to run a reboot" \
+        "                 or a long installer." \
+        "  --             end of flags" \
+        "  -              read the command from stdin" \
+        "  -h, --help     this message" >&2
+    exit "${1:-1}"
+}
+
+# agent JSON -> stdout; dies on an agent-level error rather than feeding jq garbage
+agent() {
+    local reply
+    reply=$("${VIRSH_Q[@]}" qemu-agent-command "$VM" "$1" 2>&1) || true
+    case "$reply" in
+        *'"error"'*|error:*) echo "$reply" >&2; exit 1 ;;
+    esac
+    echo "$reply"
+}
+
+# flags -> DETACH, remainder -> E_REST
+parse_flags() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --detach|-d) DETACH=1; shift ;;
+            --)          shift; break ;;
+            -)           break ;;
+            -*)          echo "virutil exec: unknown flag: $1 (use -- to end flags)" >&2; exit 1 ;;
+            *)           break ;;
+        esac
+    done
+    E_REST=("$@")
+}
+
+# command text -> TEXT, host stdin -> INPUT_B64
+resolve_text() {
+    [ $# -gt 0 ] || return 1
+    if [ $# -eq 1 ] && [ "$1" = "-" ]; then
+        TEXT=$(cat)
+    else
+        TEXT="$*"
+        [ -t 0 ] || INPUT_B64=$(base64 -w0)
+    fi
+}
+
+# powershell serialises its error stream as CLIXML whenever stderr is
+# redirected; only errors outside the ps wrapper's reach get here. Passes the
+# raw text through when python3 is missing rather than depending on it.
+declixml() {
+    command -v python3 >/dev/null 2>&1 || { cat; return; }
+    python3 -c '
+import re, sys, xml.etree.ElementTree as ET
+d = sys.stdin.read()
+if not d.startswith("#< CLIXML"):
+    sys.stdout.write(d); sys.exit()
+try:
+    root = ET.fromstring(d.split("\n", 1)[1])
+except ET.ParseError:
+    sys.stdout.write(d); sys.exit()
+t = "".join(e.text or "" for e in root.iter() if e.tag.rpartition("}")[2] == "S")
+sys.stdout.write(re.sub(r"_x([0-9A-Fa-f]{4})_", lambda m: chr(int(m.group(1), 16)), t))
+'
+}
+
+# gexec PATH ARGS_JSON -- wait for completion, print out/err, return guest exit
+# code; honours DETACH and INPUT_B64
+gexec() {
+    local pid st out err errtext ec ms args
+    args=$(jq -nc --arg p "$1" --argjson a "$2" \
+        --argjson cap "$([ "$DETACH" = 1 ] && echo false || echo true)" \
+        --arg i "$INPUT_B64" \
+        '{execute:"guest-exec",arguments:
+            ({path:$p,arg:$a,"capture-output":$cap}
+             + (if $i == "" then {} else {"input-data":$i} end))}')
+    pid=$(agent "$args" | jq -r '.return.pid')
+
+    if [ "$DETACH" = 1 ]; then
+        echo "$pid"
+        return 0
+    fi
+
+    # backoff: a one-liner returns at once, an installer runs for minutes
+    ms=50
+    while :; do
+        st=$(agent "$(jq -nc --argjson pid "$pid" \
+            '{execute:"guest-exec-status",arguments:{pid:$pid}}')")
+        [ "$(jq -r '.return.exited' <<<"$st")" = true ] && break
+        sleep "$(printf '%d.%03d' $((ms / 1000)) $((ms % 1000)))"
+        ms=$(( ms * 3 / 2 < 1000 ? ms * 3 / 2 : 1000 ))
+    done
+
+    # \r stripped so windows output pipes cleanly into unix tools
+    out=$(jq -r '.return["out-data"] // empty' <<<"$st")
+    err=$(jq -r '.return["err-data"] // empty' <<<"$st")
+    if [ -n "$out" ]; then base64 -d <<<"$out" | tr -d '\r' | sed 's/[[:space:]]*$//'; fi
+    if [ -n "$err" ]; then
+        errtext=$(base64 -d <<<"$err")
+        case "$errtext" in
+            '#< CLIXML'*) printf '%s\n' "$errtext" | declixml | tr -d '\r' | sed 's/[[:space:]]*$//' >&2 ;;
+            *)            printf '%s\n' "$errtext" | tr -d '\r' | sed 's/[[:space:]]*$//' >&2 ;;
+        esac
+    fi
+
+    ec=$(jq -r '.return.exitcode // 0' <<<"$st")
+    return "$ec"
+}
+
+# exec_ps_text SCRIPT -- run SCRIPT in $VM's powershell, return its exit code.
+# Shared with the transports in modules/linux/xfer.
+exec_ps_text() {
+    local SCRIPT ENC
+    # The catch writes to the console handle, not powershell's error stream,
+    # which would be serialised as CLIXML; the explicit exit 1 restores the code
+    # an uncaught terminating error would have returned.
+    SCRIPT=$(printf '%s\n%s\n%s\n%s\n%s\n' \
+        '$ProgressPreference="SilentlyContinue";' \
+        'try { $Host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size(4096, 2000) } catch {}' \
+        'try {' \
+        "$1" \
+        '} catch { [Console]::Error.WriteLine(($_ | Out-String)); exit 1 }')
+
+    # UTF-16LE base64 sidesteps every quoting layer between here and the guest
+    ENC=$(printf '%s' "$SCRIPT" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)
+    # + the powershell.exe flags that precede it on the command line
+    if [ $(( ${#ENC} + 128 )) -gt "$CMDLINE_MAX" ]; then
+        echo "virutil: script encodes to ${#ENC} chars, over Windows's $CMDLINE_MAX" \
+             "command-line limit (~12000 chars of source); shorten it, or stage" \
+             "a .ps1 in the guest and run that" >&2
+        exit 1
+    fi
+
+    gexec powershell.exe "$(jq -nc --arg e "$ENC" \
+        '["-NoProfile","-NonInteractive","-OutputFormat","Text","-EncodedCommand",$e]')"
+}
+
+# sh_quote STR -- STR as a single-quoted /bin/sh word. The sh counterpart of
+# push_ps_quote, and the same one rule: inside single quotes every character is
+# literal except the quote itself, which is closed, escaped and reopened.
+sh_quote() {
+    local s="$1"
+    s=${s//\'/\'\\\'\'}
+    printf "'%s'" "$s"
+}
+
+# exec_sh_text SCRIPT -- run SCRIPT in $VM's /bin/sh, return its exit code.
+# Shared with the transports in modules/linux/xfer, exactly as exec_ps_text is.
+#
+# No base64 layer, and this is the one place the Linux side is *simpler* rather
+# than merely different. The Windows encoding exists because qemu-ga there has
+# to flatten argv into a single CreateProcess command line, which re-quotes as
+# it goes -- that is what mangles an embedded quote through cmd.exe. On Linux
+# qemu-ga execve's the argv array it was handed, so the script arrives as one
+# argument byte for byte, whatever is in it.
+#
+# set -e to match $ErrorActionPreference = "Stop" on the other side: a run rule
+# exists to make the copy land correctly, so the first failing statement in one
+# has to end it rather than let the rest carry on against a guest that is not in
+# the state the rule was meant to put it in.
+exec_sh_text() {
+    local SCRIPT
+    SCRIPT="set -e
+$1"
+
+    # + "-c" and the argv overhead around it
+    if [ $(( ${#SCRIPT} + 64 )) -gt "$SH_ARG_MAX" ]; then
+        echo "virutil: script is ${#SCRIPT} chars, over Linux's $SH_ARG_MAX" \
+             "single-argument limit; shorten it, or stage a script in the" \
+             "guest and run that" >&2
+        exit 1
+    fi
+
+    gexec /bin/sh "$(jq -nc --arg c "$SCRIPT" '["-c",$c]')"
+}
+
+exec_main() {
+    local CMD VM
+    CMD="${1:-}"
+    # An asked-for help exits 0 and a usage error exits 1, on every module in
+    # both drivers. That is contract, so it is settled before anything else is
+    # read -- and this module used to get it wrong, exiting 1 either way.
+    case "$CMD" in
+        -h|--help) exec_usage 0 ;;
+    esac
+    [ -n "$CMD" ] || exec_usage
+    VM="${2:-}"
+    [ -n "$VM" ] || exec_usage
+    shift 2
+
+    case "$CMD" in
+    ping)
+        agent '{"execute":"guest-ping"}' >/dev/null
+        echo "$VM: agent up"
+        ;;
+    cmd)
+        parse_flags "$@"
+        set -- ${E_REST[@]+"${E_REST[@]}"}
+        resolve_text "$@" || { echo "usage: virutil exec cmd VM [-d] CMD..." >&2; exit 1; }
+
+        # qemu-ga backslash-escapes embedded quotes and cmd.exe has never
+        # understood \" as an escape, so the command arrives mangled with a zero
+        # exit code. ps encodes to base64 and is immune.
+        case "$TEXT" in
+            *'"'*) echo "virutil exec: cmd cannot carry embedded quotes through cmd.exe; use ps" >&2
+                   exit 1 ;;
+        esac
+        # + the "cmd.exe /c " prefix and the quotes qemu-ga wraps the arg in
+        if [ $(( ${#TEXT} + 16 )) -gt "$CMD_EXE_MAX" ]; then
+            echo "virutil exec: command is ${#TEXT} chars, over cmd.exe's $CMD_EXE_MAX limit;" \
+                 "shorten it, or stage a .cmd file in the guest and run that" >&2
+            exit 1
+        fi
+
+        gexec cmd.exe "$(jq -nc --arg c "$TEXT" '["/c",$c]')"
+        ;;
+    ps)
+        parse_flags "$@"
+        set -- ${E_REST[@]+"${E_REST[@]}"}
+        resolve_text "$@" || { echo "usage: virutil exec ps VM [-d] SCRIPT..." >&2; exit 1; }
+        exec_ps_text "$TEXT"
+        ;;
+    sh)
+        parse_flags "$@"
+        set -- ${E_REST[@]+"${E_REST[@]}"}
+        resolve_text "$@" || { echo "usage: virutil exec sh VM [-d] SCRIPT..." >&2; exit 1; }
+        exec_sh_text "$TEXT"
+        ;;
+    *)
+        exec_usage
+        ;;
+    esac
+}

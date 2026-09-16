@@ -8,7 +8,7 @@
 
   virutil.ps1 resolves its module and payload directories from its own path,
   following a symlink rather than going around one, so this links the driver
-  instead of copying it. A copy would look for modules\ beside the copy and
+  instead of copying it. A copy would look for modules\win beside the copy and
   find nothing.
 
   Windows will not create a symlink without administrator rights or Developer
@@ -21,7 +21,7 @@
   PowerShell has no fpath to drop a completer into, so the profile is the only
   place a registration can happen. The line goes in a marked block so that
   installing twice changes nothing and uninstalling takes back exactly what
-  was added. completions\_virutil stays zsh-only and is not touched here.
+  was added. completions\linux\_virutil stays zsh-only and is not touched here.
 
     .\install.ps1                    link into ~\.local\bin, register completion
     .\install.ps1 -NoCompletions     skip the $PROFILE edit
@@ -65,7 +65,7 @@ if (-not $Bin) { $Bin = Join-Path $HOME '.local\bin' }
 
 $src  = Join-Path $here 'virutil.ps1'
 $dest = Join-Path $Bin  'virutil.ps1'
-$comp = Join-Path $here 'completions\virutil.completion.ps1'
+$comp = Join-Path $here 'completions\win\virutil.completion.ps1'
 
 # The profile block, fenced so uninstall can find both ends of what it wrote.
 $compBegin = '# >>> virutil completion >>>'
@@ -78,9 +78,9 @@ $shimMark = '# installed by virutil install.ps1 -- do not edit'
 # --- dependencies -----------------------------------------------------------
 #
 # The bash driver leans on a dozen host programs; this one leans on qemu and
-# nothing else. The search path below is Get-QemuTools in modules\domain.ps1,
-# and the two must agree -- a check that passes where the driver then dies is
-# worse than no check.
+# nothing else. The search path below is Get-QemuTools in
+# modules\win\domain.ps1, and the two must agree -- a check that passes where
+# the driver then dies is worse than no check.
 
 function Test-Deps {
     $missing = 0

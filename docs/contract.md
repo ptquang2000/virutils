@@ -5,6 +5,14 @@ virutil ships as two programs: `virutil`, a bash driver for a Linux host
 QEMU under WHPX). They share no source. This file is what they do share -- the
 observable surface a user and a script may rely on, identically, on either host.
 
+The fork is the directory layout too: `modules/linux`, `tests/linux` and
+`completions/linux` are the bash driver's and `modules/win`, `tests/win` and
+`completions/win` are the PowerShell driver's, each driver loading only its own
+half. The exceptions are the two things that are *shared* rather than forked --
+`payloads/`, which is split on the guest's OS instead (section 6), and
+`tests/golden/`, which is one file precisely because both drivers must render
+it.
+
 A change to anything below is a change to both implementations or it is a bug.
 Anything *not* below is each implementation's own business: how it talks to the
 hypervisor, how it serves a payload, what it shells out to.
@@ -151,12 +159,12 @@ So `staging` stays `sync`'s and is still empty on a Windows host.
 **The prefix is `VIRUTILS_`, plural, for every variable either driver reads.**
 
 This was open, and it was a real bug rather than a matter of taste:
-`modules/paths` spelled the roots `VIRUTILS_*`, `modules/domain` read
+`modules/linux/paths` spelled the roots `VIRUTILS_*`, `modules/linux/domain` read
 `VIRUTIL_IMAGE_DIR` (singular) *in preference to it*, and the first draft of the
 PowerShell driver followed the singular -- so one config pointed the two drivers
 at two different directories. Settled: plural everywhere, and the singular is
 still read, second, with a one-line deprecation note. Both drivers do this, in
-`modules/paths` and `modules/paths.ps1`, and neither will stop reading the old
+`modules/linux/paths` and `modules/win/paths.ps1`, and neither will stop reading the old
 spelling.
 
 | variable | meaning |
@@ -204,20 +212,22 @@ in the diagnosis text.
 
 The scripts virutil sends *into* a guest are keyed on the guest OS, so they are
 byte-identical under both drivers. They live in `payloads/` as data that each
-implementation reads and interpolates -- not as code in either language:
+implementation reads and interpolates -- not as code in either language, and
+split into `payloads/linux` and `payloads/win` on the **guest's** OS rather
+than the host's, so both drivers read both halves:
 
 ```
-payloads/probe.sh       Linux guest    refuse early when the guest has no rsync
-payloads/push-dir.ps1   Windows guest  robocopy a served tree into a directory
-payloads/push-file.ps1  Windows guest  Copy-Item one served file onto a path
-payloads/push-dir.sh    Linux guest    rsync a served tree into a directory
-payloads/push-file.sh   Linux guest    rsync one served file onto a path
-payloads/pull.ps1       Windows guest  robocopy matches of a pattern out
-payloads/pull.sh        Linux guest    rsync matches of a pattern out
-payloads/sync.ps1       Windows guest  robocopy the whole share onto C:\
-payloads/sync.sh        Linux guest    rsync the whole export onto /
-payloads/mount.ps1      Windows guest  authenticate to a credentialled share
-payloads/unmount.ps1    Windows guest  let go of it again
+payloads/linux/probe.sh      Linux guest    refuse early when the guest has no rsync
+payloads/win/push-dir.ps1    Windows guest  robocopy a served tree into a directory
+payloads/win/push-file.ps1   Windows guest  Copy-Item one served file onto a path
+payloads/linux/push-dir.sh   Linux guest    rsync a served tree into a directory
+payloads/linux/push-file.sh  Linux guest    rsync one served file onto a path
+payloads/win/pull.ps1        Windows guest  robocopy matches of a pattern out
+payloads/linux/pull.sh       Linux guest    rsync matches of a pattern out
+payloads/win/sync.ps1        Windows guest  robocopy the whole share onto C:\
+payloads/linux/sync.sh       Linux guest    rsync the whole export onto /
+payloads/win/mount.ps1       Windows guest  authenticate to a credentialled share
+payloads/win/unmount.ps1     Windows guest  let go of it again
 ```
 
 Nine of them rather than the five this section first guessed at, because push
@@ -266,8 +276,8 @@ Rules both drivers keep:
 This is the only code the two implementations share, and it is the most
 carefully bisected code in the repo -- robocopy's exit code is a bitmap, not an
 error level; robocopy always takes a source *directory*, so a file is named as
-a filter on its parent. Keep it in one place. `tests/payloads.sh` and
-`tests/payloads.ps1` render all eleven under both drivers and diff the result
+a filter on its parent. Keep it in one place. `tests/linux/payloads.sh` and
+`tests/win/payloads.ps1` render all eleven under both drivers and diff the result
 against one golden file, which is what makes "byte-identical" a fact rather than
 an intention.
 
@@ -309,7 +319,7 @@ and said to be absent, than present and explaining itself at every call.
 choosing between `migrate "exec:..."` and `savevm`: WHPX installs a migration
 blocker, and every route to a guest's RAM goes through the code that blocker
 guards. Measured on a Windows host, qemu 11.1.0, against a guest booted on
-exactly the command line `modules/domain.ps1` writes:
+exactly the command line `modules/win/domain.ps1` writes:
 
 ```
 (qemu) savevm t1
@@ -388,7 +398,7 @@ there as such, and `virutil snapshot` on a Windows host is refused by name with
 the reason. What it must not do is fall through to "unknown module": the command
 is in the grammar section 2 publishes, and it was on this driver one commit ago,
 so whoever types it has been told twice that it exists. `$script:ELSEWHERE` in
-`modules/parser.ps1` is where that reason lives, and it is the right home for
+`modules/win/parser.ps1` is where that reason lives, and it is the right home for
 `sync` and `ui` too. `push` and `pull` were on that list and have left it: they
 are in `$MODULES` now.
 
@@ -397,8 +407,9 @@ through libvirt, it captures memory for a running domain, and none of this
 reaches it.
 
 **What the removal deleted,** for a reader comparing the two trees:
-`modules/snapshot.ps1` -- qcow2 internal snapshots, `qemu-img snapshot -c/-l/-a/-d`,
-one image, no overlay or memory files of its own -- and `tests/snapshot.ps1`.
+`modules/win/snapshot.ps1` -- qcow2 internal snapshots, `qemu-img snapshot
+-c/-l/-a/-d`, one image, no overlay or memory files of its own -- and
+`tests/win/snapshot.ps1`.
 The bash module's in-use analysis (the sweep, the backing-chain walk, the
 refusal to unlink a file the guest still reads) never had a counterpart here,
 because an internal snapshot is a region of a disk image rather than a file.
@@ -420,7 +431,7 @@ The plan for the Windows host is to collapse both guest OSes onto SMB, since
 Windows *is* an SMB server natively (`New-SmbShare`, no smbd to install, no
 privileged-port dance) and a Linux guest can `mount -t cifs` and rsync against
 the mount. The guest-side split survives untouched; only what the guest mounts
-changes. That deletes the whole samba and rsyncd half of `modules/xfer`.
+changes. That deletes the whole samba and rsyncd half of `modules/linux/xfer`.
 
 **Authentication was the open question, and it has been measured.** The bash
 driver's smbd is configured `map to guest = Bad User` with `guest ok = yes`, so
@@ -503,7 +514,7 @@ matters, because the guest axis is where the two would differ. It is the one
 fact a Linux guest from a Windows host still waits on.
 
 **Decided, on those measurements: a throwaway local account, minted per
-transfer.** `modules/xfer.ps1` is what that became, and these are the parts of
+transfer.** `modules/win/xfer.ps1` is what that became, and these are the parts of
 it that are contract rather than implementation:
 
 - The account is `vxp-<token>`, inside Windows' 20-character cap on a local
@@ -613,19 +624,19 @@ then `pull` round-trips a tree byte-for-byte; a second `push` of an unchanged
 tree moves nothing; `exec` propagates a non-zero guest exit code; `domain
 create` leaves exactly the files section 3 says it does.
 
-`tests/conformance.sh` runs the part of that which needs no guest, against both
+`tests/linux/conformance.sh` runs the part of that which needs no guest, against both
 drivers:
 
 | | |
 |---|---|
-| `tests/conformance.sh` | the runner. Every `--help` exits 0, every usage error exits 1, in both drivers; drives the two below. |
-| `tests/payloads.sh`, `tests/payloads.ps1` | render all eleven payloads under each driver and diff both against `tests/golden/payloads.txt`. This is what makes section 6's "byte-identical" checkable. |
-| `tests/domain.ps1` | the launcher round trip: monitor port, agent channel and port forwards written, read back, edited and read again. |
-| `tests/xfer.ps1` | `push` and `pull` on a Windows host with both seams substituted -- the guest agent and the share publisher -- so the guest path rules, credential generation, the free-space refusal, the sweep's liveness decision, the rendered payload and the teardown all run with no VM and no Administrator. |
-| `tests/transfer.ps1` | the guest tier: the transfer minimum below, plus the property that a completed transfer and a killed one both leave no account, no share and no staged tree. |
+| `tests/linux/conformance.sh` | the runner. Every `--help` exits 0, every usage error exits 1, in both drivers; drives the two below. |
+| `tests/linux/payloads.sh`, `tests/win/payloads.ps1` | render all eleven payloads under each driver and diff both against `tests/golden/payloads.txt`. This is what makes section 6's "byte-identical" checkable. |
+| `tests/win/domain.ps1` | the launcher round trip: monitor port, agent channel and port forwards written, read back, edited and read again. |
+| `tests/win/xfer.ps1` | `push` and `pull` on a Windows host with both seams substituted -- the guest agent and the share publisher -- so the guest path rules, credential generation, the free-space refusal, the sweep's liveness decision, the rendered payload and the teardown all run with no VM and no Administrator. |
+| `tests/win/transfer.ps1` | the guest tier: the transfer minimum below, plus the property that a completed transfer and a killed one both leave no account, no share and no staged tree. |
 
 The PowerShell half skips itself, loudly, on a host with no `pwsh`, and
-`tests/transfer.ps1` skips itself the same way when no guest is up. When a guest
+`tests/win/transfer.ps1` skips itself the same way when no guest is up. When a guest
 *is* up it is the only interactive test in the suite: a transfer on a Windows
 host prompts for Administrator once, and suppressing that would mean installing
 a service.
@@ -633,12 +644,12 @@ a service.
 **Still missing, and named so it is not mistaken for covered:** `exec`
 propagating a guest exit code against a real guest, and `domain create` leaving
 exactly the files section 3 names. The `push`/`pull` round trip and the second
-`push` moving nothing were on this list and are now in `tests/transfer.ps1`.
+`push` moving nothing were on this list and are now in `tests/win/transfer.ps1`.
 
 ## 9. Host-specific behaviour that is *not* contract
 
 Documented so nobody "fixes" one driver to match the other. The header of
-`modules/domain.ps1` records how each was bisected on the Windows host, and is
+`modules/win/domain.ps1` records how each was bisected on the Windows host, and is
 the place to read before changing one: `-cpu Skylake-Client` rather
 than host-passthrough, `threads=1` rather than an SMT topology,
 `cache=writeback` rather than `cache=none,io=io_uring`, `-vga std` rather than

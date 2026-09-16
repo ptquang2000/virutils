@@ -157,7 +157,7 @@ the warning simply never fires.
 
 The seven modules fall into four groups, which is also the order
 `virutil help` prints them in. The three transfer modules additionally share the
-host-side machinery in `modules/xfer` and `modules/guest`, which is
+host-side machinery in `modules/linux/xfer` and `modules/linux/guest`, which is
 [how the bytes move](#how-files-move).
 
 ### domains
@@ -192,7 +192,7 @@ way.
 | --- | --- | --- |
 | `usb` | Pass a physical host USB device through to a guest, hot-plugged: a libvirt `<hostdev>` here, `device_add` over the QEMU monitor on the Windows driver. | `virutil usb {list\|show\|attach\|detach} [VM] [VENDOR:PRODUCT]` |
 
-`virutil` alone, or `virutil help`, prints the module list. `modules/parser`
+`virutil` alone, or `virutil help`, prints the module list. `modules/linux/parser`
 handles the top-level dispatch plus the helpers every module shares; each
 module file declares its own subcommands. Only `sync` is driven by a config
 file; the rest take everything on the command line. The remainder of this
@@ -1432,7 +1432,7 @@ profile once, or prefix a single `create` with them.
 
 The same names spelled with the singular `VIRUTIL_` prefix are still read,
 second, and print one deprecation line when they are. They used to disagree:
-`VIRUTIL_IMAGE_DIR` was preferred over `VIRUTILS_IMAGE_DIR` in `modules/domain`
+`VIRUTIL_IMAGE_DIR` was preferred over `VIRUTILS_IMAGE_DIR` in `modules/linux/domain`
 and nowhere else, so one config could point two things at two directories.
 
 ```
@@ -1559,7 +1559,7 @@ Thin wrappers over `virsh list --all`, `virsh shutdown` and
 connection URI (`qemu:///system`, so they match what every other module talks
 to), and they live here so the whole lifecycle is one module rather than a
 separate junk drawer. `shutdown` is the graceful ACPI request — for the
-guest-agent path that `sync` and `push` use, see `modules/guest`.
+guest-agent path that `sync` and `push` use, see `modules/linux/guest`.
 
 Note that `addr` is `virsh domifaddr`; the shorter name is deliberate, since the
 `dom` prefix is redundant under a module already called `domain`.

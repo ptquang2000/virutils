@@ -144,7 +144,7 @@ unlink_ours() {
 
 install_links() {
     link "$HERE/virutil" "$BIN/virutil"
-    (( DO_COMPLETIONS )) && link "$HERE/completions/_virutil" "$COMP_DIR/_virutil"
+    (( DO_COMPLETIONS )) && link "$HERE/completions/linux/_virutil" "$COMP_DIR/_virutil"
 
     case ":$PATH:" in
         *":$BIN:"*) ;;
@@ -158,7 +158,7 @@ install_links() {
 
 uninstall_links() {
     unlink_ours "$BIN/virutil" "$HERE/virutil"
-    unlink_ours "$COMP_DIR/_virutil" "$HERE/completions/_virutil"
+    unlink_ours "$COMP_DIR/_virutil" "$HERE/completions/linux/_virutil"
 }
 
 case "$ACTION" in

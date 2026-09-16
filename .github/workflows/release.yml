@@ -44,20 +44,20 @@ jobs:
         run: |
           sudo apt-get install -y --no-install-recommends zsh shellcheck >/dev/null
           bash -n virutil install.sh
-          for m in modules/*; do bash -n "$m"; done
-          zsh -n completions/_virutil
+          for m in modules/linux/*; do bash -n "$m"; done
+          zsh -n completions/linux/_virutil
           # Files are named explicitly: the modules are sourced fragments with no
           # shebang, and the completion is zsh, which shellcheck cannot parse at
           # all. Errors only -- the warning level is all false positives here
           # (comma-separated virt-install arguments, cross-module variables).
-          shellcheck -s bash -S error -e SC1090,SC1091 virutil install.sh modules/*
+          shellcheck -s bash -S error -e SC1090,SC1091 virutil install.sh modules/linux/*
 
       - name: Build tarball
         id: build
         run: |
           name='${{ steps.version.outputs.name }}'
           mkdir -p "dist/$name"
-          cp -r virutil install.sh modules completions README.md LICENSE "dist/$name/"
+          cp -r virutil install.sh modules payloads completions README.md LICENSE "dist/$name/"
           tar -C dist -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
           tar -tzf "$name.tar.gz"

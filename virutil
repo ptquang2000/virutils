@@ -14,24 +14,25 @@ export LC_ALL=C
 
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
+# modules/ is split by host: this driver's files are modules/linux/, and the
+# Windows driver's are modules/win/, which are virutil.ps1's to load, not ours.
+MODULE_DIR="$HERE/modules/linux"
+
 # parser bootstraps: it declares MODULES and the helpers every other module
 # calls, so it is the one file named here. The rest are discovered -- the shared
 # libraries (everything parser does not list) before the command modules, since
 # they set the roots a command module reads as it loads.
-source "$HERE/modules/parser"
+source "$MODULE_DIR/parser"
 
-for module in "$HERE"/modules/*; do
+for module in "$MODULE_DIR"/*; do
     name="${module##*/}"
-    # modules/ holds both drivers. This one's files have no extension; the
-    # Windows driver's are *.ps1 and are virutil.ps1's to load, not ours.
-    [[ "$name" == *.* ]] && continue
     [[ "$name" == parser ]] && continue
     for m in "${MODULES[@]}"; do [[ "$name" == "$m" ]] && continue 2; done
     source "$module"
 done
 
 for module in "${MODULES[@]}"; do
-    source "$HERE/modules/$module"
+    source "$MODULE_DIR/$module"
 done
 
 parse_dispatch "$@"
