@@ -122,6 +122,57 @@ try {
     try { Set-LauncherVcpus 'edited' 2 } catch { $refused = $true }
     Check 'a launcher with no -smp is refused' $true $refused
 
+    # --- ports that stopped being bindable ----------------------------------
+    #
+    # The two loopback ports are frozen into the launcher at create time, and on
+    # this host they can stop being bindable with nobody touching the file:
+    # Hyper-V reserves a fresh set of ranges at every boot. qemu then dies on
+    # its own command line and the domain is "shut off" a moment after it was
+    # started. `domain start` re-picks them first; this is that.
+    #
+    # An in-use port stands in for a reserved one. The two fail differently at
+    # the socket -- WSAEADDRINUSE against WSAEACCES -- and Test-LoopbackPortFree
+    # exists precisely because both mean the same thing here, so binding one is
+    # a faithful stand-in and needs no hypervisor to arrange.
+    Check 'the band is below the ephemeral range' $true ($script:DomainPortBandEnd -lt 49152)
+
+    $held = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+    $held.Start()
+    $heldPort = ([Net.IPEndPoint]$held.LocalEndpoint).Port
+    try {
+        Check 'a held port is not free' $false (Test-LoopbackPortFree $heldPort)
+
+        $rv = 'repairvm'
+        $rargs = Get-DomainQemuArgs -Vm $rv `
+            -Qemu @{ Code = 'C:\q\share\edk2-x86_64-code.fd' } `
+            -Disk (Get-DomainDisk $rv) -Nvram (Get-DomainNvram $rv) `
+            -Iso 'C:\iso\win.iso' -Virtio '' -Memory 4096 -Vcpus 2 `
+            -Ports @('13389:3389') -MonitorPort $heldPort -AgentPort 44445
+        Write-DomainLauncher (Get-DomainLauncher $rv) 'C:\q\qemu-system-x86_64.exe' $rargs $rv
+
+        Repair-DomainPorts $rv
+        $moved = Get-DomainMonitorPort $rv
+        Check 'the unbindable monitor port moved'   $true ($moved -ne $heldPort)
+        Check 'and it moved into the band'          $true ($moved -ge $script:DomainPortBandStart -and $moved -le $script:DomainPortBandEnd)
+        Check 'and it is one qemu can have'         $true (Test-LoopbackPortFree $moved)
+        # The agent port was fine, so it is left where it was: repair moves what
+        # is broken and nothing else.
+        Check 'the bindable agent port stayed'      44445 (Get-GuestAgentPort $rv)
+        # ...and so do the forwards, which are the user's and qemu's to complain
+        # about.
+        # @(): one forward comes back as the hashtable itself, not a list.
+        $rfwd = @(Get-DomainForwards $rv)
+        Check 'the forwards are untouched'          13389 $rfwd[0].Host
+
+        # Nothing to do twice: a second pass over a healthy launcher leaves the
+        # bytes alone, or every start would hand the domain new ports.
+        $before = Get-Content -LiteralPath (Get-DomainLauncher $rv) -Raw
+        Repair-DomainPorts $rv
+        Check 'a healthy launcher is left alone' $before (Get-Content -LiteralPath (Get-DomainLauncher $rv) -Raw)
+    } finally {
+        $held.Stop()
+    }
+
     # --- deleting through an 8.3 short path ---------------------------------
     #
     # Remove-Item cannot do it, -LiteralPath notwithstanding, which broke

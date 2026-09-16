@@ -135,6 +135,33 @@
 
 $script:DomainCpu = 'Skylake-Client'
 
+# The band `domain create` allocates the monitor and guest agent ports from,
+# and it is deliberately *below* the ephemeral range rather than inside it.
+#
+# These two ports are written into the launcher once and read back out of it
+# forever, so a port that stops being bindable is a domain that stops starting.
+# The first draft asked the OS for port 0 and took what it was given, which is
+# the ephemeral range -- 49152 upward here -- and that is exactly the range
+# Hyper-V carves reservations out of. WHPX brings the hypervisor platform up,
+# the platform reserves a fresh set of 100-port blocks **at every boot**, and a
+# port that was free the day the domain was created lands inside one of them
+# later. Measured here, on a win11 created with -monitor 50429 / qga0 50430:
+#
+#   netsh int ipv4 show excludedportrange protocol=tcp   ->  50412  50511
+#   bind 127.0.0.1:50429  ->  WSAEACCES (forbidden by its access permissions)
+#   qemu ... win11-qemu.log  ->  "Failed to bind socket: Input/output error"
+#
+# qemu dies on that line, before OVMF, so the domain is shut off a moment after
+# `domain start` launched it. Nothing had touched the launcher; the reservations
+# moved under it.
+#
+# 24000-24999 is below the default dynamic range start (49152), so the reboot
+# lottery cannot reach it. That is not a guarantee on its own -- the excluded
+# list holds a few low ports too, and other software binds where it likes -- so
+# the band only narrows the field and the bind test is what settles it.
+$script:DomainPortBandStart = 24000
+$script:DomainPortBandEnd   = 24999
+
 function Get-DomainUsage {
     @(
         'usage: virutil domain create VM ISO [OPTIONS]'
@@ -500,8 +527,50 @@ function Start-Domain {
         Say "disk:   $size GiB"
     }
 
+    Repair-DomainPorts $vm
     Start-DomainProcess $vm
+    Wait-DomainStart $vm
     Say "$vm started"
+}
+
+# Did it come up? `domain start` used to say "started" the moment cmd returned,
+# which is a statement about the launcher rather than about the guest: the
+# launcher's `start /b` returns at once by design, so the line printed just as
+# happily for a qemu that had already died on its own command line. The session
+# that found this read
+#
+#   domain start win11   ->  win11 started
+#   domain list          ->  win11   shut off
+#
+# twice in a row, with the reason sitting in $Vm-qemu.log the whole time.
+#
+# The monitor is the thing to wait on, because it is what every other command
+# here reaches the domain through -- and it is the same question
+# Test-DomainRunning answers for `list`, so "started" now means exactly what
+# `list` means by "running". qemu binds it while it is still reading its command
+# line, well before the firmware paints anything, so this waits on the process
+# living rather than on the guest booting.
+function Wait-DomainStart {
+    param([string]$Vm, [int]$TimeoutMs = 15000)
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt $TimeoutMs) {
+        if (Test-DomainRunning $Vm) { return }
+        Start-Sleep -Milliseconds 250
+    }
+
+    # qemu said why on its way out, and the launcher redirects stderr to a file
+    # precisely so that this is quotable rather than lost with the window.
+    $log  = Get-DomainQemuLog $Vm
+    $tail = @()
+    if (Test-Path -LiteralPath $log) {
+        $tail = @(Get-Content -LiteralPath $log -Tail 10 | Where-Object { $_.Trim() })
+    }
+    $why = if ($tail) { @('qemu said:') + $tail + @("(all of it in $log)") }
+           else { @("qemu wrote nothing to $log.") }
+    Die (@(
+        "$Vm did not start: nothing answered its QEMU monitor within"
+        "$([int]($TimeoutMs / 1000))s, so the qemu process is not there."
+    ) + $why)
 }
 
 # The launcher is the domain, so running one is the only way to start a guest
@@ -717,6 +786,62 @@ function Set-LauncherMemory {
     if ($text -notmatch $mem) { Die "could not find -m in $path to change" }
     $new = [regex]::Replace($text, $mem, "`$1-m $Memory", 1)
     Set-Content -LiteralPath $path -Value $new -Encoding ASCII -NoNewline
+}
+
+# The monitor and guest agent ports, re-picked in place when the host has taken
+# them back. The launcher is the domain, so this is the same kind of persistent
+# edit as -c and -m above and it is written the same way.
+#
+# It runs on the way into every start rather than on the way out of a failure,
+# because the failure is silent where it happens: qemu writes one line to
+# $Vm-qemu.log and exits, the window never appears, and `domain list` then reads
+# an unbindable monitor as "shut off" -- which is true, and says nothing about
+# why. Two ports are cheap to check first.
+#
+# Only the ports move. The forwards are the user's -- `domain port` put them
+# there and something on the host is expected to be dialling them -- so a
+# forward that cannot bind is qemu's to complain about and is left alone.
+function Repair-DomainPorts {
+    param([string]$Vm)
+    $path = Get-DomainLauncher $Vm
+    $text = Get-Content -LiteralPath $path -Raw
+    $new  = $text
+    $kept = @()
+
+    # The same two patterns Get-DomainMonitorPort and Get-GuestAgentPort read
+    # back with, group 1 being everything up to the number so the replacement
+    # rewrites the number alone.
+    $slots = @(
+        @{ What = 'monitor'; Pattern = '(-monitor\s+"?tcp:127\.0\.0\.1:)(\d+)' }
+        @{ What = 'guest agent'
+           Pattern = '(-chardev\s+"?socket,id=qga0,host=127\.0\.0\.1,port=)(\d+)' }
+    )
+    foreach ($slot in $slots) {
+        $m = [regex]::Match($new, $slot.Pattern)
+        # A launcher with no monitor or no agent chardev is a separate
+        # complaint, and the two readers above make it in their own words at
+        # the point it actually costs something. Nothing to re-pick here.
+        if (-not $m.Success) { continue }
+
+        $port = [int]$m.Groups[2].Value
+        if ($port -notin $kept -and (Test-LoopbackPortFree $port)) {
+            $kept += $port
+            continue
+        }
+        $fresh = Get-FreeLoopbackPort -Exclude $kept
+        $kept += $fresh
+        $new = [regex]::Replace($new, $slot.Pattern, "`${1}$fresh", 1)
+        Warn @(
+            "$Vm's $($slot.What) port $port cannot be bound on this host any"
+            'more -- Hyper-V reserves a fresh set of port ranges at every boot,'
+            'and this one is inside one of them now. qemu would have died on it'
+            "at startup. Moved to $fresh in $path."
+        )
+    }
+
+    if ($new -ne $text) {
+        Set-Content -LiteralPath $path -Value $new -Encoding ASCII -NoNewline
+    }
 }
 
 function Remove-LauncherForward {
@@ -976,23 +1101,50 @@ function Get-QemuTools {
               Code = $code; VarsTemplate = $vars }
 }
 
-# A free loopback port. Bound and released rather than scanned: asking the OS
-# for port 0 is the only way to be told a port that is actually free, and the
-# race between releasing it and qemu binding it is one transfer wide and fails
-# loudly if it is lost.
+# A free loopback port, taken from $script:DomainPortBandStart..End rather than
+# from whatever the OS answers port 0 with -- see the band's own comment at the
+# head of this file for why the ephemeral range is the wrong place to keep a
+# port that gets written down.
 #
-# Exclude is the ports already handed out in this same breath -- the OS is free
-# to answer port 0 with the number it just released, so two calls in a row can
-# name the same port and the second chardev would then fail to bind.
+# Exclude is the ports already handed out in this same breath: the bind test is
+# a bind and a release, so a port is free again the instant it is chosen and two
+# calls in a row would otherwise name the same one.
 function Get-FreeLoopbackPort {
     param([int[]]$Exclude = @())
-    foreach ($i in 1..20) {
-        $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
-        $l.Start()
-        try { $p = ([Net.IPEndPoint]$l.LocalEndpoint).Port } finally { $l.Stop() }
-        if ($p -notin $Exclude) { return $p }
+    $span   = $script:DomainPortBandEnd - $script:DomainPortBandStart + 1
+    # A random start rather than always the foot of the band, so two domains
+    # created on the same host do not queue up on the same few numbers.
+    $offset = Get-Random -Minimum 0 -Maximum $span
+    foreach ($i in 0..($span - 1)) {
+        $p = $script:DomainPortBandStart + (($offset + $i) % $span)
+        if ($p -in $Exclude) { continue }
+        if (Test-LoopbackPortFree $p) { return $p }
     }
-    Die 'could not find a free loopback port'
+    Die @(
+        "no loopback port free between $script:DomainPortBandStart and"
+        "$script:DomainPortBandEnd -- the band virutil allocates the QEMU"
+        'monitor and guest agent ports from. Move it in modules/win/domain.ps1'
+        'if something else on this host owns that range.'
+    )
+}
+
+# Can qemu bind this port? Asked by binding it, because the two ways it can fail
+# do not look alike anywhere else: a port in use answers WSAEADDRINUSE and a
+# port the OS has reserved -- Hyper-V's doing, and the whole reason the band
+# exists -- answers WSAEACCES, which no listener scan and no `netstat` would
+# show, since nothing is listening on it. Both are "qemu cannot have it", which
+# is the only question here.
+function Test-LoopbackPortFree {
+    param([int]$Port)
+    $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, $Port)
+    try {
+        $l.Start()
+        return $true
+    } catch {
+        return $false
+    } finally {
+        try { $l.Stop() } catch { }
+    }
 }
 
 function Get-DomainQemuArgs {
