@@ -1844,7 +1844,11 @@ Host, to deliver into or read from a running **Linux** guest (`sync` with
 Host, for `virutil domain`:
 
 - `virt-install` and `virt-xml` (`virt-manager`'s CLIs), and `libosinfo` —
-   `osinfo-detect` is what reads the install ISO's os id
+   `osinfo-detect` is what reads the install ISO's os id. Debian and Ubuntu
+   ship that binary in `libosinfo-bin`, a separate package from the
+   library; without it every guest falls back to `VIRUTILS_OSINFO`, and
+   `domain create` says so rather than quietly building a Windows 11
+   machine around a Linux ISO
 - `/dev/kvm` — under WSL2 that means nested virtualisation enabled
 - OVMF/edk2 firmware, unless `VIRUTILS_FIRMWARE=bios` — the loader and its
    nvram template are libvirt's to choose, out of the descriptors the package

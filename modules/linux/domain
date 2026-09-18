@@ -190,7 +190,13 @@ domain_readable_by_qemu() {
 #   Media is an installer for OS 'Microsoft Windows 11 (win11)'
 domain_detect_osinfo() {
     local out short=""
-    command -v osinfo-detect >/dev/null || { printf '%s' "$VIRUTILS_OSINFO"; return; }
+    if ! command -v osinfo-detect >/dev/null; then
+        warn "osinfo-detect is not installed (Debian and Ubuntu keep it in" \
+             "libosinfo-bin), so the guest is built as $VIRUTILS_OSINFO." \
+             "Pass -o ID to say what the ISO actually is."
+        printf '%s' "$VIRUTILS_OSINFO"
+        return
+    fi
 
     if out="$(osinfo-detect -f env -t media -- "$1" 2>/dev/null)" && [[ "$out" == *OSINFO_* ]]; then
         short="$(awk -F= '/^OSINFO_MEDIA_OS_SHORT_ID=/ {gsub(/"/, "", $2); print $2; exit}' \
@@ -198,6 +204,11 @@ domain_detect_osinfo() {
     else
         out="$(osinfo-detect -t media -- "$1" 2>/dev/null || true)"
         short="$(sed -n "1s/.*for OS '.*(\([^)]*\))'.*/\1/p" <<<"$out")"
+    fi
+
+    if [[ -z "$short" ]]; then
+        warn "osinfo-detect does not recognise $1, so the guest is built as" \
+             "$VIRUTILS_OSINFO. Pass -o ID to say what the ISO actually is."
     fi
     printf '%s' "${short:-$VIRUTILS_OSINFO}"
 }
