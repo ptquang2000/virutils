@@ -93,8 +93,11 @@ paths_qemu_warn() {
     local p qemu_user missing=() dir up
     command -v stat >/dev/null || return 0
 
+    # The || true is load-bearing: qemu.conf is 0600 root on Debian and Ubuntu,
+    # so awk exits 2 there, and pipefail would end the run over a check whose
+    # whole output is a warning.
     qemu_user="$(awk -F'"' '/^[[:space:]]*user[[:space:]]*=/ {print $2}' \
-                 /etc/libvirt/qemu.conf 2>/dev/null | tail -1)"
+                 /etc/libvirt/qemu.conf 2>/dev/null | tail -1 || true)"
     qemu_user="${qemu_user:-libvirt-qemu}"
     [[ "$qemu_user" == root ]] && return 0
 
