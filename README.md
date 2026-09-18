@@ -1846,7 +1846,10 @@ Host, for `virutil domain`:
 - `virt-install` and `virt-xml` (`virt-manager`'s CLIs), and `libosinfo` —
    `osinfo-detect` is what reads the install ISO's os id
 - `/dev/kvm` — under WSL2 that means nested virtualisation enabled
-- OVMF/edk2 firmware, unless `VIRUTILS_FIRMWARE=bios`
+- OVMF/edk2 firmware, unless `VIRUTILS_FIRMWARE=bios` — the loader and its
+   nvram template are libvirt's to choose, out of the descriptors the package
+   drops in `/usr/share/qemu/firmware`, so what a distro names its `.fd` files
+   is libvirt's problem and not virutil's
 - `swtpm`, optional: without it the guest gets no TPM 2.0 device, which a
    **stock** Windows 11 ISO refuses to install without. Debloated images have the
    check removed.

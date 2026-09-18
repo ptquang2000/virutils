@@ -2,14 +2,8 @@
 
 DOMAIN_IMAGE_DIR="$VIRUTILS_IMAGE_DIR"
 
-DOMAIN_OVMF=(
-    /usr/share/OVMF/x64/OVMF_CODE.4m.fd:/usr/share/OVMF/x64/OVMF_VARS.4m.fd
-    /usr/share/OVMF/OVMF_CODE.4m.fd:/usr/share/OVMF/OVMF_VARS.4m.fd
-    /usr/share/OVMF/OVMF_CODE.fd:/usr/share/OVMF/OVMF_VARS.fd
-    /usr/share/edk2/ovmf/OVMF_CODE.fd:/usr/share/edk2/ovmf/OVMF_VARS.fd
-    /usr/share/edk2-ovmf/x64/OVMF_CODE.fd:/usr/share/edk2-ovmf/x64/OVMF_VARS.fd
-    /usr/share/qemu/ovmf-x86_64-code.bin:/usr/share/qemu/ovmf-x86_64-vars.bin
-)
+# where the ovmf/edk2-ovmf packages describe the UEFI builds they installed
+DOMAIN_FIRMWARE_DESC=/usr/share/qemu/firmware
 
 domain_usage() {
     printf '%s\n' \
@@ -309,16 +303,14 @@ domain_create() {
     if (( BIOS )); then
         ARGS+=(--boot cdrom,hd)
     else
-        local pair code vars
-        for pair in "${DOMAIN_OVMF[@]}"; do
-            [[ -f "${pair%%:*}" && -f "${pair##*:}" ]] || continue
-            code="${pair%%:*}"; vars="${pair##*:}"
-            break
-        done
-        [[ -n "${code:-}" ]] || die \
-            "no OVMF firmware found -- install edk2-ovmf (or set VIRUTILS_FIRMWARE=bios)." \
+        # libvirt resolves the loader and nvram template itself, from the
+        # firmware descriptors the distro's ovmf/edk2-ovmf package installs --
+        # so this works whatever that distro names the .fd files.
+        compgen -G "$DOMAIN_FIRMWARE_DESC/*.json" >/dev/null || die \
+            "no UEFI firmware descriptors in $DOMAIN_FIRMWARE_DESC --" \
+            "install ovmf/edk2-ovmf (or set VIRUTILS_FIRMWARE=bios)." \
             "Windows 11 will not install without UEFI."
-        ARGS+=(--boot "loader=$code,loader.readonly=yes,loader.type=pflash,loader.secure=no,nvram.template=$vars,cdrom,hd")
+        ARGS+=(--boot "firmware=efi,firmware.feature0.name=secure-boot,firmware.feature0.enabled=no,cdrom,hd")
     fi
 
     if [[ "$OSINFO" == win* ]] && command -v swtpm >/dev/null; then
