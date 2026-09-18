@@ -227,7 +227,7 @@ $completer = {
         if ($module -eq 'domain' -and $verb -eq 'create') {
             Add-Match '-s' 'disk size in GiB (default 64)';           Add-Match '--size' 'disk size in GiB (default 64)'
             Add-Match '-m' "guest RAM in MiB (default: half the host's)"; Add-Match '--memory' "guest RAM in MiB (default: half the host's)"
-            Add-Match '-c' "virtual CPUs (default: half the host's, max 8)"; Add-Match '--vcpus' "virtual CPUs (default: half the host's, max 8)"
+            Add-Match '-c' 'refused under create: a new domain gets 1 vcpu (set it with start -c N)'; Add-Match '--vcpus' 'refused under create: a new domain gets 1 vcpu (set it with start -c N)'
             Add-Match '-o' 'accepted and ignored: no libosinfo here';  Add-Match '--osinfo' 'accepted and ignored: no libosinfo here'
             Add-Match '-v' 'virtio-win ISO, or "none"';               Add-Match '--virtio' 'virtio-win ISO, or "none"'
             Add-Match '-p' 'a port forward, repeatable (default 13389:3389)'; Add-Match '--port' 'a port forward, repeatable'
@@ -303,6 +303,10 @@ $completer = {
                     foreach ($p in Get-Ports $positional[2]) { Add-Match $p.Text $p.Tip }
                 } elseif ($module -eq 'sync') {
                     foreach ($c in Get-Configs) { Add-Match $c 'sync config' }
+                } elseif ($module -eq 'domain' -and $verb -eq 'create') {
+                    # create refuses -c outright, so offering counts here would
+                    # complete a command line into an error. Nothing is the
+                    # honest answer; the flag's own tip says where -c lives.
                 } else {
                     foreach ($n in 1, 2, 4, 6, 8, 12, 16) { Add-Match "$n" 'vcpus' }
                 }

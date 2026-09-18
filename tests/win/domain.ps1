@@ -122,6 +122,23 @@ try {
     try { Set-LauncherVcpus 'edited' 2 } catch { $refused = $true }
     Check 'a launcher with no -smp is refused' $true $refused
 
+    # --- create has no vcpu count -------------------------------------------
+    #
+    # `-c` is published in contract section 2 and was honoured here until
+    # recently, so the refusal has to name the flag rather than fall through to
+    # "unknown flag". It also has to fire before create touches the ISO, or a
+    # command line that is wrong in two ways reports the wrong one first.
+    $said = ''
+    try { New-Domain @('win11', 'C:\nonexistent.iso', '-c', '4') } catch { $said = ($_.Exception.Message) }
+    Check 'create refuses -c'                $true ($said -match '-c is not accepted here')
+    Check 'and not as an unknown flag'       $false ($said -match 'unknown flag')
+    Check 'and before the ISO is looked at'  $false ($said -match 'install ISO not found')
+    Check 'and it says where the count goes' $true ($said -match 'domain start win11 -c N')
+
+    $said = ''
+    try { New-Domain @('win11', 'C:\nonexistent.iso', '--vcpus', '4') } catch { $said = ($_.Exception.Message) }
+    Check 'the long spelling too'            $true ($said -match '--vcpus is not accepted here')
+
     # --- ports that stopped being bindable ----------------------------------
     #
     # The two loopback ports are frozen into the launcher at create time, and on

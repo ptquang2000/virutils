@@ -37,6 +37,8 @@ every module, exit 0 for an asked-for help and 1 for a usage error.
 ```
 virutil domain create   VM ISO [-s GiB] [-m MiB] [-c N] [-o ID] [-v ISO|none]
                                [-p SPEC] [-N]            # Windows host only
+                               # -c N: Linux host only; a Windows host creates
+                               #       at 1 vcpu and refuses it (section 9)
 virutil domain delete   VM
 virutil domain list
 virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]
@@ -738,8 +740,12 @@ reboot -- `failed to get xsave state` once per vcpu, then `WHPX: Unexpected VP
 exit code 4`, leaving the domain paused with vcpus that cannot be restarted. It
 fires at Setup's own reboot, so it looks like an install that got most of the
 way and then failed. The fix is upstream and dated after the newest published
-Windows build of qemu, so until there is a build to move to, `domain create`'s
-usage says to install with `-c 1`. It costs an install its uptime, not its disk.
+Windows build of qemu, so until there is a build to move to, **`domain create`
+on the Windows host writes one vcpu and refuses `-c`** -- what create makes is a
+domain with an install in front of it, and an install is the one thing here that
+cannot survive more than one. The count belongs to a guest that has finished
+installing, so it is set with `domain start VM -c N` after OOBE. It costs an
+install its uptime, not its disk.
 
 A guest-initiated reboot on that host has a second way to die, and clearing the
 first one only exposes it: the firmware itself wedges, with OVMF asserting on a
@@ -753,7 +759,7 @@ DEBUG firmware -- but between them they are why an install there is done at
 
 ### Where the grammar bends, and why
 
-Five places, each because the host cannot mean what the other one means.
+Six places, each because the host cannot mean what the other one means.
 
 A flag or command in section 2 always *parses* under both drivers -- neither
 will tell you it has never heard of `-o`. What it then does is what varies, and
@@ -772,6 +778,15 @@ thing neither driver may do, because it reports a change that was not made.
   libosinfo, and nothing on that host consults an os id. It stays in the grammar
   so a command line written for one driver parses under the other, and it says
   so when used.
+- **`domain create -c N` is refused on a Windows host.** A domain is created
+  with one vcpu there and there is nothing to choose: section 7's defect kills a
+  guest with more than one at its own reboot, which is what Windows Setup does
+  twice. This is refuse-and-say-why rather than accept-and-ignore, because a
+  count that was asked for and not honoured is exactly the silent acceptance the
+  rule above forbids -- and it is refused *by name*, not as an unknown flag,
+  since it is published here and was honoured on that driver until recently. The
+  flag is not gone from the driver: `domain start VM -c N` honours it, on both
+  hosts, and that is where a finished guest gets its cpus.
 - **`domain create -p SPEC` and `-N` are Windows-only additions.** `-p` names a
   port forward, repeatable; without a libvirt network a forward is the only way
   into the guest, so create has to be able to make one. `-N` creates the domain

@@ -72,15 +72,27 @@
 # workaround the upstream issue reports and it is not usable here: it trades
 # the crash for a hang, which is worse, because a hang has no error to read.
 #
-# The default stays half the host's cpus, which on any host with more than two
-# cores puts a new domain in the failing configuration. That is deliberate. The
-# crash costs an install its uptime and not its disk -- the qcow2 survived every
-# one of these, and restarting the domain continued Setup where it left off --
-# and pinning every domain to one vcpu to spare a Windows install its reboots
-# would be the worse trade on a host whose whole reason for WHPX is speed. So
-# the usage says it instead: install with `-c 1`, and put the count back with
-# `domain start VM -c N` once Setup is done. That flag writes the launcher,
-# which is the supported way to change a domain and is no longer a hand edit.
+# **`domain create` takes no vcpu count and always writes one.** This paragraph
+# used to say the opposite -- that the default stayed half the host's cpus, that
+# putting a new domain in the failing configuration was deliberate, and that the
+# usage saying "install with `-c 1`" was enough. It was not. What create makes
+# is a domain with an install in front of it, and the install is the one thing
+# on this host that cannot survive more than one vcpu; a default that every
+# first boot has to be talked out of is a trap with a footnote, not a default.
+# The count is a property of a domain that has finished installing, so it is set
+# where that is known: `domain start VM -c N` after OOBE, which writes the
+# launcher and is the supported way to change a domain.
+#
+# So `-c` is refused under create, by name and with the reason, rather than
+# dropped from the grammar -- contract section 9's rule, and the same reasoning
+# that refuses `snapshot`: the flag is published in section 2 and was honoured
+# here one commit ago, so it must not come back as "unknown flag".
+#
+# None of this is a claim that one vcpu is the right machine. The crash costs an
+# install its uptime and not its disk -- the qcow2 survived every one of these,
+# and restarting the domain continued Setup where it left off -- and a host
+# whose whole reason for WHPX is speed should not run a finished guest on one
+# core. Create installs; start decides the machine.
 #
 # One consequence of all this that bites elsewhere: a guest that dies this way
 # has to be killed, and a killed qemu leaves the qcow2's lazy refcounts dirty.
@@ -179,11 +191,12 @@ function Get-DomainUsage {
         'create options:'
         '  -s, --size GiB    disk size (default 64)'
         "  -m, --memory MiB  guest RAM (default: half the host's)"
-        "  -c, --vcpus N     virtual CPUs (default: half the host's, max 8)"
-        '                    install Windows with -c 1: on this qemu build a'
+        '  -c, --vcpus N     refused here: a domain is created with 1 vcpu and'
+        '                    there is nothing to choose. On this qemu build a'
         "                    guest with more than one vcpu dies at its own"
-        '                    reboot, which is halfway through Setup. Put it'
-        '                    back afterwards with: domain start VM -c N.'
+        '                    reboot, which is halfway through Setup, so an'
+        '                    install is done at 1. Set the real count once OOBE'
+        '                    is done: domain start VM -c N.'
         '                    See the header of modules/win/domain.ps1.'
         '  -o, --osinfo ID   accepted and ignored: there is no libosinfo here'
         '  -v, --virtio ISO  virtio-win ISO to attach as a second cdrom, or'
@@ -199,10 +212,12 @@ function Get-DomainUsage {
         '  -s, --size GiB    grow the disk image (qemu-img will not shrink it,'
         '                    and the guest must grow its own partition after)'
         '  -m, --memory MiB  guest RAM'
-        '  -c, --vcpus N     virtual CPUs. -c 1 is the way through a Windows'
-        "                    install here: on this qemu build a guest with more"
-        '                    than one vcpu dies at its own reboot. Put it back'
-        '                    up once Setup is done.'
+        '  -c, --vcpus N     virtual CPUs. This is where a domain gets its real'
+        '                    count: create writes 1 and refuses -c, because on'
+        "                    this qemu build a guest with more than one vcpu"
+        '                    dies at its own reboot and an install reboots'
+        '                    twice. Raise it once OOBE is done, and put it back'
+        '                    to 1 if a guest has to survive a reboot again.'
         '  -G, --no-gui      not honoured here: qemu under WHPX has no headless'
         '                    console to detach from, and -display none would'
         '                    leave the guest with no way in at all'
@@ -881,7 +896,10 @@ function New-Domain {
     param([string[]]$Arguments)
 
     $vm = $null; $iso = $null
-    $size = 64; $memory = 0; $vcpus = 0; $virtio = $null
+    # $vcpus is not a variable here, and is named only because everything
+    # downstream of create takes a count. A created domain gets one vcpu; see
+    # the header for why create has no say in it.
+    $size = 64; $memory = 0; $vcpus = 1; $virtio = $null
     $ports = @(); $noStart = $false
 
     # if/elseif rather than `switch -Regex`: a PowerShell switch runs *every*
@@ -894,7 +912,23 @@ function New-Domain {
         if     ($a -in @('-h', '--help'))     { Usage (Get-DomainUsage) 0 }
         elseif ($a -in @('-s', '--size'))     { $i++; $size   = [int](Get-FlagValue $Arguments $i $a) }
         elseif ($a -in @('-m', '--memory'))   { $i++; $memory = [int](Get-FlagValue $Arguments $i $a) }
-        elseif ($a -in @('-c', '--vcpus'))    { $i++; $vcpus  = [int](Get-FlagValue $Arguments $i $a) }
+        elseif ($a -in @('-c', '--vcpus')) {
+            # Refused by name rather than left to the catch-all below: it is in
+            # the grammar docs/contract.md section 2 publishes and it was
+            # honoured here until recently, so "unknown flag" would read as a
+            # typo to someone who had been told twice that it works.
+            $i++
+            [void](Get-FlagValue $Arguments $i $a)
+            Die @(
+                "virutil domain create: $a is not accepted here."
+                'A domain is created with 1 vcpu and there is nothing to choose:'
+                'on this qemu build a guest with more than one vcpu dies at its'
+                'own reboot, which is what Windows Setup does twice.'
+                "  virutil domain start $(if ($vm) { $vm } else { 'VM' }) -c N   # once OOBE is done"
+                'See docs/contract.md section 9 and the header of'
+                'modules/win/domain.ps1.'
+            )
+        }
         elseif ($a -in @('-v', '--virtio'))   { $i++; $virtio = Get-FlagValue $Arguments $i $a }
         elseif ($a -in @('-p', '--port'))     { $i++; $ports += Get-FlagValue $Arguments $i $a }
         elseif ($a -in @('-N', '--no-start')) { $noStart = $true }
@@ -935,10 +969,9 @@ function New-Domain {
         $totalMiB = [int]((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1MB)
         $memory = [Math]::Max(2048, [int]($totalMiB / 2 / 512) * 512)
     }
-    if (-not $vcpus) {
-        $lp = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
-        $vcpus = [Math]::Min(8, [Math]::Max(2, [int]($lp / 2)))
-    }
+    # No vcpu probe to match the memory one above. Half the host's logical
+    # processors was what create used to pick, and it picked the one
+    # configuration a Windows install cannot get through.
 
     # virtio-win: found beside the ISO unless named, or refused with 'none'.
     if (-not $virtio) { $virtio = $script:VirutilsVirtio }
@@ -957,7 +990,7 @@ function New-Domain {
     New-VirutilsDir $script:VirutilsImageDir | Out-Null
 
     Say ('{0,-10}{1}' -f 'domain:',   "$vm (whpx, $($script:DomainCpu))")
-    Say ('{0,-10}{1}' -f 'cpu:',      "$vcpus vcpus (1 socket x $vcpus cores x 1 thread)")
+    Say ('{0,-10}{1}' -f 'cpu:',      "$vcpus vcpu (1 socket x $vcpus core x 1 thread) -- raise it after OOBE")
     Say ('{0,-10}{1}' -f 'memory:',   "$memory MiB")
     Say ('{0,-10}{1}' -f 'disk:',     "$disk ($size GiB)")
     Say ('{0,-10}{1}' -f 'iso:',      $iso)
@@ -1003,14 +1036,17 @@ function New-Domain {
         'its firmware has nothing left to answer with. Send quit to the monitor'
         'instead, then start the domain again, and Setup resumes where it was:'
         "  127.0.0.1:$monitorPort -> quit"
-        "  virutil domain start $vm -c 1"
-        'The -c 1 is the other defect: at more than one vcpu the guest dies at'
-        'its own reboot instead. One vcpu is the only setting that survives a'
-        "reboot here, so it is the one to install on. Put it back after OOBE:"
-        "  virutil domain start $vm -c $vcpus"
+        "  virutil domain start $vm"
         ''
-        'To tell this apart from the vcpu crash the -c usage warns about: this'
-        'one leaves the domain running rather than paused, and the last line of'
+        'No -c on that restart: this domain already has the one vcpu an install'
+        'survives here, which is why create does not offer a count. Give it the'
+        'cpus it should actually run on once OOBE is done -- shut off first, and'
+        'the flag writes the launcher:'
+        "  virutil domain start $vm -c N"
+        ''
+        'To tell the firmware wedge apart from the vcpu crash that count avoids:'
+        'the wedge leaves the domain running rather than paused, and the last'
+        'line of'
         "  $(Get-DomainOvmfLog $vm)"
         'reads ASSERT ... MemDetect.c(1181). See the header of'
         'modules/win/domain.ps1 for both.'

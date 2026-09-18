@@ -1416,7 +1416,7 @@ The flags are what you vary per domain. Everything else is a property of the
 | --- | --- | --- |
 | `-s`, `--size GiB` | `64` | Disk size. |
 | `-m`, `--memory MiB` | half the host's | Guest RAM, rounded down to 512 MiB, floor 2048. |
-| `-c`, `--vcpus N` | half the host's, max 8 | Virtual CPUs. |
+| `-c`, `--vcpus N` | half the host's, max 8 | Virtual CPUs. **Linux host only** — a Windows host creates the domain at 1 vcpu and refuses this flag, because a guest with more than one dies at its own reboot there and that is what Setup does twice. Set the count afterwards with `domain start VM -c N`. |
 | `-o`, `--osinfo ID` | **detected from the ISO** | libosinfo id; see `osinfo-query os`. |
 | `-v`, `--virtio ISO` | `virtio-win*.iso` beside the install ISO | Driver ISO to attach as a second cdrom. `none` attaches none. |
 
