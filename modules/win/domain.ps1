@@ -499,6 +499,36 @@ function Test-DomainRunning {
     }
 }
 
+# Get-DomainProcess VM -- the qemu process running that domain, or $null.
+#
+# The monitor is still what "running" means everywhere else (Test-DomainRunning
+# above, and `list`), because it is what every command reaches a domain
+# through. This answers a narrower question, and only Wait-DomainStart asks it:
+# is there a process, whether or not it has bound the monitor yet? The gap
+# between those two is a domain that is starting, and reporting that gap as a
+# death is the bug this exists to stop.
+#
+# Matched on the launcher's own `-name VM`, via the command line, since every
+# domain on the host runs the same executable. -Filter rather than Where-Object
+# on the far side: Win32_Process enumerates every process otherwise.
+function Get-DomainProcess {
+    param([string]$Vm)
+    try {
+        $procs = @(Get-CimInstance Win32_Process `
+            -Filter "Name='qemu-system-x86_64w.exe' OR Name='qemu-system-x86_64.exe'" `
+            -ErrorAction Stop)
+    } catch {
+        # No CIM is not a domain verdict, so say nothing rather than "gone".
+        return $null
+    }
+    foreach ($p in $procs) {
+        if ($p.CommandLine -and $p.CommandLine -match "-name\s+$([regex]::Escape($Vm))(\s|$)") {
+            return $p
+        }
+    }
+    return $null
+}
+
 # --- list -------------------------------------------------------------------
 
 function Show-DomainList {
@@ -620,15 +650,25 @@ function Start-Domain {
 # line, well before the firmware paints anything, so this waits on the process
 # living rather than on the guest booting.
 function Wait-DomainStart {
-    param([string]$Vm, [int]$TimeoutMs = 15000)
+    param([string]$Vm, [int]$TimeoutMs = 60000)
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while ($sw.ElapsedMilliseconds -lt $TimeoutMs) {
         if (Test-DomainRunning $Vm) { return }
+        # A process that is no longer there cannot go on to bind anything, so
+        # stop early rather than serving out the whole timeout. Only once it is
+        # gone: a live process that has not bound yet is still starting.
+        if ($sw.ElapsedMilliseconds -gt 3000 -and -not (Get-DomainProcess $Vm)) { break }
         Start-Sleep -Milliseconds 250
     }
 
-    # qemu said why on its way out, and the launcher redirects stderr to a file
-    # precisely so that this is quotable rather than lost with the window.
+    # Ask before telling. This used to wait 15s and then report "so the qemu
+    # process is not there" -- an inference from silence, not an observation,
+    # and wrong exactly when it mattered: `domain start VM -c 2` printed it
+    # while qemu was running and had already written its log. Two vcpus bind
+    # the monitor later than one, so the old deadline expired mid-start and the
+    # message turned that into a death. The timeout is longer now, and what the
+    # message claims is limited to what was actually looked at.
+    $proc = Get-DomainProcess $Vm
     $log  = Get-DomainQemuLog $Vm
     $tail = @()
     if (Test-Path -LiteralPath $log) {
@@ -636,9 +676,23 @@ function Wait-DomainStart {
     }
     $why = if ($tail) { @('qemu said:') + $tail + @("(all of it in $log)") }
            else { @("qemu wrote nothing to $log.") }
+
+    if ($proc) {
+        Die (@(
+            "$Vm did not answer its QEMU monitor within"
+            "$([int]($TimeoutMs / 1000))s, but qemu (pid $($proc.ProcessId)) is running."
+            'The domain may still be coming up; nothing has been killed. Try'
+            "  virutil domain list"
+            'again in a moment, and if it stays this way the monitor port in'
+            "  $(Get-DomainLauncher $Vm)"
+            'is the thing to check -- a port that stopped being bindable is a'
+            'domain that stops answering. See the port-band comment above.'
+        ) + $why)
+    }
+
     Die (@(
         "$Vm did not start: nothing answered its QEMU monitor within"
-        "$([int]($TimeoutMs / 1000))s, so the qemu process is not there."
+        "$([int]($TimeoutMs / 1000))s and no qemu process for it is running."
     ) + $why)
 }
 
