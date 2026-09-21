@@ -1318,10 +1318,40 @@ function Get-DomainQemuArgs {
         '-m', "$Memory"
         '-drive', "if=pflash,format=raw,readonly=on,file=$($Qemu.Code)"
         '-drive', "if=pflash,format=raw,file=$Nvram"
+        # The disk boots first and the install ISO second, which is the other
+        # way round from how this started and is not a preference.
+        #
+        # qemu turns these into fw_cfg's bootorder, and OVMF's
+        # SetBootOrderFromQemu rewrites the firmware's BootOrder from it on
+        # *every* boot -- so whatever is bootindex=0 wins every time, including
+        # after Windows has installed itself and written its own boot entry.
+        # With the CD first that produced a domain that could never finish
+        # installing: Setup copied its files, wrote
+        # \EFI\Microsoft\Boot\bootmgfw.efi to the ESP, and the next start booted
+        # the ISO straight back into Setup's language screen. The firmware log
+        # shows both halves of it --
+        #
+        #   [Bds] Expand HD(1,GPT,...)/\EFI\Microsoft\Boot\bootmgfw.efi -> ...
+        #   SetBootOrderFromQemu: setting BootOrder: success
+        #   [Bds]Booting UEFI QEMU DVD-ROM QM00001
+        #
+        # -- the installed Windows found, and passed over. That made the
+        # restart-after-a-reboot-crash advice this driver prints untrue in the
+        # one case it exists for.
+        #
+        # Disk first costs a fresh create nothing, because an empty disk is not
+        # bootable: BDS expands it to a null device path, says so, and falls
+        # through to the DVD by itself --
+        #
+        #   [Bds]Booting UEFI Misc Device
+        #   [Bds] Expand PciRoot(0x0)/Pci(0x2,0x0) -> <null string>
+        #
+        # -- so the installer still boots on the first start and stops being
+        # preferred the moment there is something on the disk to boot instead.
         '-drive', "file=$Disk,if=none,id=hd0,format=qcow2,cache=writeback,discard=unmap"
-        '-device', "virtio-blk-pci,drive=hd0,num-queues=$Vcpus,bootindex=1"
+        '-device', "virtio-blk-pci,drive=hd0,num-queues=$Vcpus,bootindex=0"
         '-drive', "file=$Iso,if=none,id=cd0,media=cdrom,readonly=on"
-        '-device', 'ide-cd,bus=ide.0,drive=cd0,bootindex=0'
+        '-device', 'ide-cd,bus=ide.0,drive=cd0,bootindex=1'
     )
     if ($Virtio) {
         $qemuArgs += '-drive', "file=$Virtio,if=none,id=cd1,media=cdrom,readonly=on"

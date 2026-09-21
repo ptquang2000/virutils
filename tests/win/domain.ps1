@@ -141,6 +141,24 @@ try {
     Check 'the long spelling too'       $true  ($said -match 'install ISO not found')
     Check 'and is not refused either'   $false ($said -match 'not accepted here')
 
+    # --- the boot order a half-finished install depends on -------------------
+    #
+    # OVMF rewrites BootOrder from qemu's bootindex on every boot, so whatever
+    # is bootindex=0 wins even after Windows has written its own boot entry.
+    # With the CD at 0 a restart booted the installer again instead of the
+    # install, which made the "start it again and Setup resumes" advice untrue.
+    # An empty disk is not bootable, so disk-first still reaches the installer
+    # on a first start.
+    $args = Get-DomainQemuArgs -Vm 'bootorder' -Qemu @{
+            System = 'qemu-system-x86_64w.exe'; Img = 'qemu-img.exe'
+            Code = 'code.fd'; VarsTemplate = 'vars.fd'; Display = 'gtk'
+        } -Disk 'd.qcow2' -Nvram 'n.fd' -Iso 'i.iso' -Virtio $null `
+          -Memory 4096 -Vcpus 2 -Ports @('13389:3389') `
+          -MonitorPort 24000 -AgentPort 24001
+    $line = ($args -join ' ')
+    Check 'the disk boots first'   $true ($line -match 'virtio-blk-pci[^ ]*bootindex=0')
+    Check 'and the install ISO second' $true ($line -match 'ide-cd,bus=ide\.0,drive=cd0,bootindex=1')
+
     # --- ports that stopped being bindable ----------------------------------
     #
     # The two loopback ports are frozen into the launcher at create time, and on
