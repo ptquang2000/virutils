@@ -122,22 +122,24 @@ try {
     try { Set-LauncherVcpus 'edited' 2 } catch { $refused = $true }
     Check 'a launcher with no -smp is refused' $true $refused
 
-    # --- create has no vcpu count -------------------------------------------
+    # --- create takes a vcpu count, and defaults to one an install can use ---
     #
-    # `-c` is published in contract section 2 and was honoured here until
-    # recently, so the refusal has to name the flag rather than fall through to
-    # "unknown flag". It also has to fire before create touches the ISO, or a
-    # command line that is wrong in two ways reports the wrong one first.
+    # This used to assert the opposite -- that create refused `-c` by name --
+    # and the refusal was wrong: Windows 11 Setup will not install on one vcpu,
+    # so a domain created at one could never be installed. `-c` is a plain flag
+    # again and the default is 2. Both spellings still have to reach the ISO
+    # check rather than dying as "unknown flag", which is what proves they were
+    # parsed rather than ignored.
     $said = ''
     try { New-Domain @('win11', 'C:\nonexistent.iso', '-c', '4') } catch { $said = ($_.Exception.Message) }
-    Check 'create refuses -c'                $true ($said -match '-c is not accepted here')
-    Check 'and not as an unknown flag'       $false ($said -match 'unknown flag')
-    Check 'and before the ISO is looked at'  $false ($said -match 'install ISO not found')
-    Check 'and it says where the count goes' $true ($said -match 'domain start win11 -c N')
+    Check 'create accepts -c'           $true  ($said -match 'install ISO not found')
+    Check 'and not as an unknown flag'  $false ($said -match 'unknown flag')
+    Check 'and does not refuse it'      $false ($said -match 'not accepted here')
 
     $said = ''
     try { New-Domain @('win11', 'C:\nonexistent.iso', '--vcpus', '4') } catch { $said = ($_.Exception.Message) }
-    Check 'the long spelling too'            $true ($said -match '--vcpus is not accepted here')
+    Check 'the long spelling too'       $true  ($said -match 'install ISO not found')
+    Check 'and is not refused either'   $false ($said -match 'not accepted here')
 
     # --- ports that stopped being bindable ----------------------------------
     #

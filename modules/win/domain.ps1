@@ -66,27 +66,82 @@
 #   |   4   | q35 (default irqchip)  | dies at every guest reboot, 2 of 2       |
 #   |   4   | q35,kernel-irqchip=off | no crash -- the Windows loader wedges    |
 #   |       |                        | instead, spinning 3 cores, never painting|
+#   |   2   | q35 (default irqchip)  | dies at Setup's first reboot, same       |
+#   |       |                        | signature: two xsave lines then exit 4   |
 #   |   1   | q35 (default irqchip)  | boots through Setup's reboots into OOBE  |
+#
+# The 2-vcpu row was measured after this file was changed to create domains at
+# two, and it settles a question the change had to leave open: two is not a
+# count that dodges the crash, only the smallest count an install can start on.
+# The count is the variable for *surviving a reboot* and not for avoiding one.
+#
+# The 1-vcpu row is older and it does not fit what a fresh install now does --
+# Setup will not start at one vcpu at all (see below), so nothing at that count
+# can reach "Setup's reboots" from a blank disk. Most likely it was measured on
+# a domain whose install had already begun at a higher count and was then
+# dropped to one. Left in place rather than deleted, because what it claims
+# about reboots at one vcpu may well still hold; it is the path to that state
+# that cannot be what the row implies. Re-measure before trusting it.
 #
 # So the vcpu count is the variable. `kernel-irqchip=off` is the other
 # workaround the upstream issue reports and it is not usable here: it trades
 # the crash for a hang, which is worse, because a hang has no error to read.
 #
-# **`domain create` takes no vcpu count and always writes one.** This paragraph
-# used to say the opposite -- that the default stayed half the host's cpus, that
-# putting a new domain in the failing configuration was deliberate, and that the
-# usage saying "install with `-c 1`" was enough. It was not. What create makes
-# is a domain with an install in front of it, and the install is the one thing
-# on this host that cannot survive more than one vcpu; a default that every
-# first boot has to be talked out of is a trap with a footnote, not a default.
-# The count is a property of a domain that has finished installing, so it is set
-# where that is known: `domain start VM -c N` after OOBE, which writes the
-# launcher and is the supported way to change a domain.
+# **`domain create` writes two vcpus, and `-c` is accepted again.** This
+# paragraph has now been wrong twice in opposite directions, so it is worth
+# saying what each version got from where. It first said the default stayed half
+# the host's cpus and that the usage line "install with `-c 1`" was enough. Then
+# it said create always writes one and refuses `-c`, reasoning that the install
+# is the one thing on this host that cannot survive more than one vcpu. That
+# second version fixed a real crash and introduced a worse bug, because it was
+# argued from the reboot defect alone and never checked against the *start* of
+# an install:
 #
-# So `-c` is refused under create, by name and with the reason, rather than
-# dropped from the grammar -- contract section 9's rule, and the same reasoning
-# that refuses `snapshot`: the flag is published in section 2 and was honoured
-# here one commit ago, so it must not come back as "unknown flag".
+#   **Windows 11 Setup will not install on one vcpu at all.** It stops at "This
+#   PC can't run Windows 11" before the disk step ever appears. Setup says so
+#   itself, in X:\Windows\Panther\setupact.log:
+#
+#     HARDWARE CONFIG=Ram in KB: Total phys=4187912 avail phys=3235280 Procs=1
+#         Arch=9 Family=1 Width=64 Speed=3072 MHz
+#     Callback_ValidateHardwareRequirements: Validating Hardware Requirements
+#     Callback_ValidateHardwareRequirements: Will display the HW Requirements UI
+#
+#   Two cores is a published Windows 11 requirement and the core count is *not*
+#   among the checks LabConfig waives. Measured here: all five of
+#   BypassTPMCheck, BypassSecureBootCheck, BypassStorageCheck, BypassRAMCheck
+#   and BypassCPUCheck written into the WinPE hive and read back with `reg
+#   query`, the appraiser re-run -- still refused. The same domain restarted at
+#   `-smp 2`, with no LabConfig at all, walked straight past the screen.
+#
+# So a domain created with one vcpu is a domain that cannot be installed, which
+# is a worse trap than the one the refusal was protecting against: the reboot
+# crash costs an install its uptime, and this costs it its existence.
+#
+# The two facts are both true and they pull opposite ways -- one vcpu cannot
+# start an install, more than one may not survive its reboots -- so create takes
+# the count that lets the install begin and the reboot workaround below covers
+# the rest. Neither is a claim that two is the right machine to *run* on; that
+# is still `domain start VM -c N` once OOBE is done.
+#
+# `-c` is a plain flag under create again. It stays in the grammar either way --
+# contract section 9's rule, the same as `-o` -- but there is now something to
+# choose, so refusing it would be inventing a restriction rather than reporting
+# one. `-c 1` warns instead of failing: it is a fine machine for a guest already
+# on disk and a dead end only in front of an install.
+#
+# Two vcpus do NOT survive Setup's reboot -- measured, and the table above now
+# carries the row. Setup copied its files, blanked the screen to restart, and
+# the domain came back paused with the same signature as `-smp 4`: two `failed
+# to get xsave state: No error` lines, one per vcpu, then `WHPX: Unexpected VP
+# exit code 4`, with the OVMF log never growing because the firmware was never
+# re-entered.
+#
+# That is not a reason to go back to a count that cannot install. It is the
+# reboot workaround's problem to absorb, and it does: `quit` on the monitor,
+# `domain start VM` again, and Setup resumes where it stopped, because the crash
+# costs the install its uptime and not its disk. An install here is therefore a
+# few supervised restarts rather than one unattended run, at any vcpu count that
+# can begin it.
 #
 # None of this is a claim that one vcpu is the right machine. The crash costs an
 # install its uptime and not its disk -- the qcow2 survived every one of these,
@@ -191,12 +246,11 @@ function Get-DomainUsage {
         'create options:'
         '  -s, --size GiB    disk size (default 64)'
         "  -m, --memory MiB  guest RAM (default: half the host's)"
-        '  -c, --vcpus N     refused here: a domain is created with 1 vcpu and'
-        '                    there is nothing to choose. On this qemu build a'
-        "                    guest with more than one vcpu dies at its own"
-        '                    reboot, which is halfway through Setup, so an'
-        '                    install is done at 1. Set the real count once OOBE'
-        '                    is done: domain start VM -c N.'
+        '  -c, --vcpus N     virtual CPUs (default 2). Windows 11 Setup refuses'
+        '                    to install on fewer than 2 and says so before the'
+        '                    disk step, so 1 warns. Give the domain the count it'
+        '                    should run on once OOBE is done:'
+        '                    domain start VM -c N.'
         '                    See the header of modules/win/domain.ps1.'
         '  -o, --osinfo ID   accepted and ignored: there is no libosinfo here'
         '  -v, --virtio ISO  virtio-win ISO to attach as a second cdrom, or'
@@ -212,12 +266,12 @@ function Get-DomainUsage {
         '  -s, --size GiB    grow the disk image (qemu-img will not shrink it,'
         '                    and the guest must grow its own partition after)'
         '  -m, --memory MiB  guest RAM'
-        '  -c, --vcpus N     virtual CPUs. This is where a domain gets its real'
-        '                    count: create writes 1 and refuses -c, because on'
-        "                    this qemu build a guest with more than one vcpu"
-        '                    dies at its own reboot and an install reboots'
-        '                    twice. Raise it once OOBE is done, and put it back'
-        '                    to 1 if a guest has to survive a reboot again.'
+        '  -c, --vcpus N     virtual CPUs. This is where a domain gets the count'
+        '                    it should actually run on: create writes the 2 an'
+        '                    install needs to start, not the count a finished'
+        "                    guest wants. On this qemu build a guest with more"
+        '                    than one vcpu can die at its own reboot, so drop it'
+        '                    to 1 if a guest has to survive reboots unattended.'
         '  -G, --no-gui      not honoured here: qemu under WHPX has no headless'
         '                    console to detach from, and -display none would'
         '                    leave the guest with no way in at all'
@@ -896,10 +950,9 @@ function New-Domain {
     param([string[]]$Arguments)
 
     $vm = $null; $iso = $null
-    # $vcpus is not a variable here, and is named only because everything
-    # downstream of create takes a count. A created domain gets one vcpu; see
-    # the header for why create has no say in it.
-    $size = 64; $memory = 0; $vcpus = 1; $virtio = $null
+    # Two vcpus, because one is a domain Windows 11 Setup will not install on
+    # at all. See the header: create used to write 1 and refuse -c.
+    $size = 64; $memory = 0; $vcpus = 2; $virtio = $null
     $ports = @(); $noStart = $false
 
     # if/elseif rather than `switch -Regex`: a PowerShell switch runs *every*
@@ -912,23 +965,7 @@ function New-Domain {
         if     ($a -in @('-h', '--help'))     { Usage (Get-DomainUsage) 0 }
         elseif ($a -in @('-s', '--size'))     { $i++; $size   = [int](Get-FlagValue $Arguments $i $a) }
         elseif ($a -in @('-m', '--memory'))   { $i++; $memory = [int](Get-FlagValue $Arguments $i $a) }
-        elseif ($a -in @('-c', '--vcpus')) {
-            # Refused by name rather than left to the catch-all below: it is in
-            # the grammar docs/contract.md section 2 publishes and it was
-            # honoured here until recently, so "unknown flag" would read as a
-            # typo to someone who had been told twice that it works.
-            $i++
-            [void](Get-FlagValue $Arguments $i $a)
-            Die @(
-                "virutil domain create: $a is not accepted here."
-                'A domain is created with 1 vcpu and there is nothing to choose:'
-                'on this qemu build a guest with more than one vcpu dies at its'
-                'own reboot, which is what Windows Setup does twice.'
-                "  virutil domain start $(if ($vm) { $vm } else { 'VM' }) -c N   # once OOBE is done"
-                'See docs/contract.md section 9 and the header of'
-                'modules/win/domain.ps1.'
-            )
-        }
+        elseif ($a -in @('-c', '--vcpus')) { $i++; $vcpus = [int](Get-FlagValue $Arguments $i $a) }
         elseif ($a -in @('-v', '--virtio'))   { $i++; $virtio = Get-FlagValue $Arguments $i $a }
         elseif ($a -in @('-p', '--port'))     { $i++; $ports += Get-FlagValue $Arguments $i $a }
         elseif ($a -in @('-N', '--no-start')) { $noStart = $true }
@@ -949,6 +986,22 @@ function New-Domain {
     }
     if (-not $vm -or -not $iso) { Usage (Get-DomainUsage) 1 }
     if ($ports.Count -eq 0) { $ports = @('13389:3389') }
+    if ($vcpus -lt 1) { Die "--vcpus wants a whole number, got '$vcpus'" }
+    # Accepted, then warned about, rather than refused: a single vcpu is a
+    # legitimate machine for a guest that is already installed, and refusing it
+    # here would be the same mistake create made in the other direction. What
+    # it is not is a machine an install can start on.
+    if ($vcpus -lt 2) {
+        Warn @(
+            "-c 1 creates a domain Windows 11 Setup will not install on. It"
+            'stops at "This PC can''t run Windows 11" before the disk step, and'
+            'no LabConfig bypass moves it: the core count is not one of the'
+            'checks those waive. Setup writes the reason to'
+            '  X:\Windows\Panther\setupact.log'
+            'as "Procs=1" followed by Callback_ValidateHardwareRequirements.'
+            'Leave -c off for an install; 1 is fine for a guest already on disk.'
+        )
+    }
 
     Write-IgnoredEnvWarnings
 
@@ -969,9 +1022,13 @@ function New-Domain {
         $totalMiB = [int]((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1MB)
         $memory = [Math]::Max(2048, [int]($totalMiB / 2 / 512) * 512)
     }
-    # No vcpu probe to match the memory one above. Half the host's logical
-    # processors was what create used to pick, and it picked the one
-    # configuration a Windows install cannot get through.
+    # No vcpu probe to match the memory one above, and the reason has changed:
+    # it is not that a bigger count is unsafe, it is that create is not the
+    # place the count is decided. Half the host's logical processors was what
+    # create used to pick, which put every new domain in the configuration the
+    # reboot crash below eats. Two is the floor an install needs rather than a
+    # guess at the machine, and `domain start VM -c N` is where the real count
+    # goes once there is a guest to run it.
 
     # virtio-win: found beside the ISO unless named, or refused with 'none'.
     if (-not $virtio) { $virtio = $script:VirutilsVirtio }
@@ -990,7 +1047,7 @@ function New-Domain {
     New-VirutilsDir $script:VirutilsImageDir | Out-Null
 
     Say ('{0,-10}{1}' -f 'domain:',   "$vm (whpx, $($script:DomainCpu))")
-    Say ('{0,-10}{1}' -f 'cpu:',      "$vcpus vcpu (1 socket x $vcpus core x 1 thread) -- raise it after OOBE")
+    Say ('{0,-10}{1}' -f 'cpu:',      "$vcpus vcpu (1 socket x $vcpus core x 1 thread) -- set the real count after OOBE")
     Say ('{0,-10}{1}' -f 'memory:',   "$memory MiB")
     Say ('{0,-10}{1}' -f 'disk:',     "$disk ($size GiB)")
     Say ('{0,-10}{1}' -f 'iso:',      $iso)
@@ -1038,13 +1095,13 @@ function New-Domain {
         "  127.0.0.1:$monitorPort -> quit"
         "  virutil domain start $vm"
         ''
-        'No -c on that restart: this domain already has the one vcpu an install'
-        'survives here, which is why create does not offer a count. Give it the'
-        'cpus it should actually run on once OOBE is done -- shut off first, and'
-        'the flag writes the launcher:'
+        "No -c on that restart: this domain has the $vcpus vcpus an install needs"
+        'to start at all -- Setup refuses to install on one. Give it the cpus it'
+        'should actually run on once OOBE is done -- shut off first, and the'
+        'flag writes the launcher:'
         "  virutil domain start $vm -c N"
         ''
-        'To tell the firmware wedge apart from the vcpu crash that count avoids:'
+        'To tell the firmware wedge apart from the vcpu crash:'
         'the wedge leaves the domain running rather than paused, and the last'
         'line of'
         "  $(Get-DomainOvmfLog $vm)"

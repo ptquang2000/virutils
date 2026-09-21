@@ -740,12 +740,23 @@ reboot -- `failed to get xsave state` once per vcpu, then `WHPX: Unexpected VP
 exit code 4`, leaving the domain paused with vcpus that cannot be restarted. It
 fires at Setup's own reboot, so it looks like an install that got most of the
 way and then failed. The fix is upstream and dated after the newest published
-Windows build of qemu, so until there is a build to move to, **`domain create`
-on the Windows host writes one vcpu and refuses `-c`** -- what create makes is a
-domain with an install in front of it, and an install is the one thing here that
-cannot survive more than one. The count belongs to a guest that has finished
-installing, so it is set with `domain start VM -c N` after OOBE. It costs an
-install its uptime, not its disk.
+Windows build of qemu, so there is no build to move to yet.
+
+That defect once made `domain create` write one vcpu and refuse `-c`. It no
+longer does, because the count that dodges it is a count no install can begin
+on: **Windows 11 Setup refuses to install on fewer than two cores**, stopping at
+"This PC can't run Windows 11" before the disk step, and the core minimum is not
+among the checks a `LabConfig` bypass waives -- measured with all five Bypass
+values set and read back, the appraiser re-run, still refused, and the same
+domain walking past the screen at `-smp 2` with no bypass at all. Setup names it
+in `X:\Windows\Panther\setupact.log` as `Procs=1` followed by
+`Callback_ValidateHardwareRequirements`. So **`domain create` on the Windows
+host writes two vcpus and accepts `-c`** (warning on `-c 1`, which is a fine
+machine for an installed guest and a dead end in front of an install). The two
+facts pull opposite ways -- one vcpu cannot start an install, more than one may
+not survive its reboots -- and the reboot workaround below is what absorbs the
+second. The crash costs an install its uptime, not its disk. The count a guest
+should actually *run* on is still set with `domain start VM -c N` after OOBE.
 
 A guest-initiated reboot on that host has a second way to die, and clearing the
 first one only exposes it: the firmware itself wedges, with OVMF asserting on a
@@ -754,8 +765,8 @@ MTRR MSRs across a guest reset. The domain is left *running* rather than paused,
 spinning a core in `CpuDeadLoop` behind a window that never paints, which is how
 the two are told apart. A new qemu process clears it; the vcpu count does not
 affect it. Neither is contract -- both are one host, one qemu build and one
-DEBUG firmware -- but between them they are why an install there is done at
-`-c 1` and restarted at each of Setup's own reboots.
+DEBUG firmware -- but between them they are why an install there is restarted at
+each of Setup's own reboots rather than left to run through.
 
 ### Where the grammar bends, and why
 
