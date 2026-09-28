@@ -20,7 +20,7 @@
 # change to xfer, and would have cost a second local copy of the whole delivery
 # -- which for a build tree is the expensive half of the run.
 #
-# Three things differ from the bash driver, and each is a Windows host rather
+# Two things differ from the bash driver, and each is a Windows host rather
 # than a matter of taste:
 #
 #   * **The fetch and the map copy with robocopy**, not rsync. Both halves are
@@ -31,8 +31,10 @@
 #     already refuses a Linux guest for push and pull -- see docs/contract.md
 #     section 7 -- and a config that names one is refused before anything is
 #     fetched rather than minutes later at the delivery.
-#   * **>pre-ui and >post-ui are refused**, likewise up front: they run through
-#     PsExec, which is 'virutil ui', which is bash-only.
+#
+# >pre-ui and >post-ui used to be a third: they run through PsExec, which is
+# 'virutil ui', and this driver did not have it. It does now (modules/win/ui.ps1),
+# and they run exactly as they do there.
 #
 # Everything else -- the parse, the lookup rules, the staging layout, the map
 # semantics, the cleanup rules and what the guest runs -- is the bash module's
@@ -115,9 +117,8 @@ function Get-SyncUsage {
         'the run ends. See README.md, "On a Windows host".'
         ''
         'This driver delivers to a Windows guest only: a config saying'
-        '@guest=linux is refused, as are >pre-ui and >post-ui run rules, which'
-        'need virutil ui. Both are bash-driver features; see docs/contract.md'
-        'section 7.'
+        '@guest=linux is refused; see docs/contract.md section 7. >pre-ui and'
+        ">post-ui run rules need PsExec in the guest first: 'virutil ui setup VM'."
     )
 }
 
@@ -265,10 +266,10 @@ function Set-SyncSetting {
 # keyword from a command that happens to start with one.
 #
 # Each rule is stored tagged with how it runs -- 'sh' in the guest shell as
-# SYSTEM, or 'ui' on the interactive desktop -- so pre/post order survives and
-# the ui rules can be refused as a group rather than one at a time. The bash
-# module carries the same tag through a tab-separated string; a hashtable says
-# the same thing without a separator a command must never contain.
+# SYSTEM, or 'ui' on the interactive desktop -- so pre/post order survives
+# across the two kinds. The bash module carries the same tag through a
+# tab-separated string; a hashtable says the same thing without a separator a
+# command must never contain.
 function Add-SyncRunRule {
     param([string]$Where, [string]$Line)
 
@@ -295,16 +296,16 @@ function Add-SyncRunRule {
     }
 }
 
-# Assert-SyncPortable CONF -- the two things a config can ask for that this
-# driver has no way to do, refused together and before anything is fetched.
+# Assert-SyncPortable CONF -- the one thing a config can ask for that this
+# driver has no way to do, refused before anything is fetched.
 #
-# Up front, rather than where each would be reached, and that is a divergence
-# from the bash module worth naming: it refuses a ui rule at the rule, because
-# there the obstacle is the *guest*, which is not known until the config names
-# it. Here both obstacles are properties of the host and are known before the
-# config is even opened -- so there is no reason to spend a fetch, an elevation
-# prompt and a delivery before saying so, and a >post-ui rule refused after the
-# files landed would leave a guest half-configured by a run that then failed.
+# Up front, rather than where it would be reached: the obstacle is a property
+# of the host, known before the config is even opened, so there is no reason to
+# spend a fetch, an elevation prompt and a delivery before saying so.
+#
+# >pre-ui and >post-ui were refused here too, as a group, while this driver had
+# no `ui`. They are not any more: Invoke-SyncRun hands them to
+# Invoke-UiRunCmdline, as the bash module hands them to ui_run_cmdline.
 function Assert-SyncPortable {
     param([string]$Conf)
 
@@ -316,23 +317,6 @@ function Assert-SyncPortable {
             'docs/contract.md section 7. Nothing was fetched.'
         )
     }
-
-    $ui = @(@(@($script:SyncRunPre) + @($script:SyncRunPost)) |
-            Where-Object { $_.Mode -eq 'ui' } | ForEach-Object { $_.Cmd })
-    if ($ui.Count -eq 0) { return }
-
-    Die (@(
-        "$Conf carries $($ui.Count) >pre-ui/>post-ui run rule(s). Those launch on"
-        "the guest's interactive desktop through PsExec, which is virutil ui, and"
-        'this driver does not have it (docs/contract.md section 7). They are'
-        'refused here rather than at the point they would have run, so the files'
-        'have not moved and the guest is untouched.'
-        ''
-    ) + @($ui | ForEach-Object { "  $_" }) + @(
-        ''
-        'Drop them, or rewrite them as ordinary >pre/>post rules if session 0'
-        'will do.'
-    ))
 }
 
 # --- copying, host-side -----------------------------------------------------
@@ -489,8 +473,9 @@ function Measure-SyncDelivery {
 
 # --- the guest side ---------------------------------------------------------
 
-# Invoke-SyncRun VM WHEN RULES -- run each rule in the guest's powershell, in
-# config order.
+# Invoke-SyncRun VM WHEN RULES -- run each rule in config order: an 'sh' rule
+# in the guest's powershell as SYSTEM, a 'ui' rule on the interactive desktop
+# through PsExec (modules/win/ui.ps1).
 #
 # Fatal on the first failure: a run rule exists to make the copy land correctly
 # ("stop the service", "run the installer"), so carrying on past one that did
@@ -513,10 +498,21 @@ function Invoke-SyncRun {
     }
 
     foreach ($r in $rules) {
-        [Console]::Out.WriteLine("run ($When): $($r.Cmd)")
-        Invoke-GuestPsText $Vm $r.Cmd
+        if ($r.Mode -eq 'ui') {
+            # No guest-OS check here, unlike the bash module's: a config that
+            # reaches this far has already been held to @guest=windows by
+            # Assert-SyncPortable, and the guest to Windows by Assert-XferReady.
+            # A missing PsExec dies inside with its own code and fix (97).
+            [Console]::Out.WriteLine("run ($When/ui): $($r.Cmd)")
+            Invoke-UiRunCmdline $Vm $r.Cmd
+            $label = "$When-ui"
+        } else {
+            [Console]::Out.WriteLine("run ($When): $($r.Cmd)")
+            Invoke-GuestPsText $Vm $r.Cmd
+            $label = $When
+        }
         if ($script:VirutilExit -ne 0) {
-            Die @("$When run rule failed in $Vm`: $($r.Cmd)"
+            Die @("$label run rule failed in $Vm`: $($r.Cmd)"
                   'Its output is above. Nothing after it was run.')
         }
     }

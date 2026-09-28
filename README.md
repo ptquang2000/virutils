@@ -798,9 +798,7 @@ staged in the guest first (`virutil ui setup VM`); a config that runs before
 that fails with the same "run `virutil ui setup`" message `virutil ui run`
 gives.
 
-They are also a Linux-*host* feature: `virutil ui` is not on the Windows driver,
-so a Windows host refuses a config carrying one, by name and before it fetches
-anything. `>pre` and `>post` are unaffected.
+They work the same from a Windows host: `virutil ui` is on both drivers.
 
 ### Example
 
@@ -903,16 +901,13 @@ is 99.
 before anything is fetched. That is the same limit `push` and `pull` have on
 this host, not a limit of `sync`.
 
-**`>pre-ui` and `>post-ui` are refused**, also before anything is fetched. They
-launch on the guest's interactive desktop through PsExec, which is `virutil ui`,
-which is a Linux-host command. A config carrying one names every such rule in
-the refusal, so it is obvious which lines to drop or rewrite as ordinary `>pre`
-and `>post` rules.
+The refusal comes before the fetch on purpose: an elevation prompt, a
+multi-gigabyte copy and then a refusal would be the worst available ordering.
 
-Both refusals come before the fetch on purpose. An elevation prompt, a
-multi-gigabyte copy and then a refusal would be the worst available ordering,
-and a `>post-ui` rule refused *after* the files had landed would leave the guest
-half-configured by a run that then reported failure.
+**`>pre-ui` and `>post-ui` work**, as they do on a Linux host: they launch
+through `virutil ui`, which is on this driver too. Stage PsExec in the guest
+once with `virutil ui setup VM` first — that is itself a `push`, so it prompts
+for Administrator the same way.
 
 **Configs are looked up in `%USERPROFILE%\.virutils\conf\` and nowhere else.**
 The bash driver also falls back to `~/.config/virutils` so an install predating

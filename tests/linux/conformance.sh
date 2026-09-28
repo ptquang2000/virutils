@@ -98,10 +98,10 @@ printf '\n-- virutil.ps1 (PowerShell driver) --\n'
 if [[ -z "$PWSH" ]]; then
     skip 'no pwsh or powershell on PATH -- the Windows driver was not exercised'
 else
-    # Shorter than the bash list on purpose: ui is not ported, and snapshot was
-    # ported and taken back out. The list is read out of the driver itself
-    # rather than repeated here, so a module added there is tested here without
-    # an edit -- which is how `sync` arrived in it.
+    # Shorter than the bash list on purpose: snapshot was ported and taken back
+    # out. The list is read out of the driver itself rather than repeated here,
+    # so a module added there is tested here without an edit -- which is how
+    # `sync` and `ui` arrived in it.
     mapfile -t PS_MODULES < <("$PWSH" -NoProfile -Command \
         ". '$WROOT/modules/win/parser.ps1'; \$MODULES" 2>/dev/null | tr -d '\r')
 

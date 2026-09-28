@@ -95,11 +95,11 @@ Invariants that are contract, not implementation:
   Administrator and mints a throwaway local account, because the share comes
   from its own SMB server; the grammar, the guest-side behaviour and the exit
   codes are unchanged by that.
-- **`sync`'s `>pre-ui` and `>post-ui` run rules are a Linux-host feature**, for
-  the same reason `ui` is (section 7): they launch through PsExec, which is what
-  `virutil ui` is. The Windows driver refuses a config carrying one by name and
-  up front, alongside `@guest`, rather than at the point the rule would have
-  run. Every other directive in a config means the same thing on both hosts.
+- **`sync`'s `>pre-ui` and `>post-ui` run rules are on both hosts**, because
+  they are `virutil ui` and `ui` is on both (section 7). They were refused on
+  the Windows driver while it had no `ui`; they now launch through the same
+  guest script there as here. Every directive in a config means the same thing
+  on both hosts, except that the Windows one still refuses `@guest=linux`.
 - `domain delete` never prompts and removes disks, backing chain, snapshot
   overlays and memory files, mount points and port forwards; files another
   domain uses are kept.
@@ -138,15 +138,15 @@ directory.
 
 Every driver knows the whole layout and relocates it from the same variables,
 but a driver only creates the directories it actually writes to. The Windows
-driver writes to `images`, `tmp` and `staging`, and reads `conf`: the last two
-arrived with `sync`, which is ported there now. (`conf` is read on both hosts
+driver writes to `images`, `tmp`, `staging` and `cache`, and reads `conf`:
+`staging` and `conf` arrived with `sync`, and `cache` with `ui`. (`conf` is read on both hosts
 and written by neither -- a config is the user's file, and a missing one is
 reported at the path it was looked for rather than created.) `mnt` is for host
 mount points it never makes, and `ports` holds the relay state and logs of a
 mechanism it does not have --
 under user-mode NAT a forward is a `hostfwd` on the qemu command line, so it
 lives in the launcher with every other qemu argument and needs no state of its
-own. `cache` follows `ui`. **An empty directory is not a promise**: what section
+own. **An empty directory is not a promise**: what section
 3 fixes is where a thing goes when there is one, not that every driver puts
 something in each.
 
@@ -317,9 +317,9 @@ an intention.
 
 Not every module ports. What the Windows driver ships today is:
 
-`domain`, `exec`, `push`, `pull`, `sync` and `usb`. That is the whole intended
-surface; `ui` is bash-only, and `snapshot` is bash-only now as well. All of them
-are below. A module that works beats two half-ported.
+`domain`, `exec`, `push`, `pull`, `sync`, `ui` and `usb`. That is the whole
+intended surface; `snapshot` is bash-only now. All of them are below. A module
+that works beats two half-ported.
 
 **Where it actually is:** `domain` and `exec` are ported, and the guest agent
 channel they both stand on is in place. `usb` is on both drivers. `snapshot` was
@@ -329,7 +329,7 @@ below. `push`, `pull` and `sync` are ported, against a **Windows guest**: the
 question `push` and `pull` were blocked on was measured and decided, and what was
 decided is recorded below. What remains unported is a Linux guest from a Windows
 host, which is a later pass on the transport that now exists rather than a new
-question. `ui` is bash-only.
+question. `ui` is ported, below.
 
 ### `sync`: ported, on the transport `push` and `pull` built
 
@@ -358,15 +358,12 @@ every pattern is given to both. What does not survive the mapping is an anchored
 pattern -- rsync reads a leading or embedded `/` as a position in the tree, and
 `/XF` matches on the name alone.
 
-**Two things in a config are refused by name, and both are refused before the
-fetch.** `@guest=linux`, because this host reaches a Windows guest only, and
-`>pre-ui`/`>post-ui`, because they are `ui`. The bash module refuses its own
-equivalent at the rule, which is the only place it can: there the obstacle is
-the guest, and the guest is not known until the config names it. Here both
-obstacles are properties of the *host*, known before the config is opened -- so
-there is no reason to spend a fetch, an elevation prompt and a delivery first,
-and a `>post-ui` rule refused after the files had landed would leave a guest
-half-configured by a run that then failed.
+**One thing in a config is refused by name, before the fetch:** `@guest=linux`,
+because this host reaches a Windows guest only. The obstacle is a property of
+the *host*, known before the config is opened, so there is no reason to spend a
+fetch, an elevation prompt and a delivery first. `>pre-ui`/`>post-ui` were
+refused the same way while this driver had no `ui`; they run now, as they do on
+the bash driver.
 
 ### `snapshot`: ported, measured, and taken back out
 
@@ -467,9 +464,9 @@ there as such, and `virutil snapshot` on a Windows host is refused by name with
 the reason. What it must not do is fall through to "unknown module": the command
 is in the grammar section 2 publishes, and it was on this driver one commit ago,
 so whoever types it has been told twice that it exists. `$script:ELSEWHERE` in
-`modules/win/parser.ps1` is where that reason lives, and it is the right home for
-`ui` too. `push`, `pull` and `sync` were on that list and have left it: they are
-in `$MODULES` now.
+`modules/win/parser.ps1` is where that reason lives. `push`, `pull`, `sync` and
+`ui` were on the list of names waiting for it and have left it: they are in
+`$MODULES` now.
 
 The bash driver is untouched. Its `snapshot` is external overlays plus a memspec
 through libvirt, it captures memory for a running domain, and none of this
@@ -484,9 +481,17 @@ refusal to unlink a file the guest still reads) never had a counterpart here,
 because an internal snapshot is a region of a disk image rather than a file.
 That asymmetry is now moot rather than vacuously satisfied.
 
-`ui` (PsExec) ports: it is Windows-*guest*-only, but host-portable -- it
-delivers over the same transport as `push`, which means smbd on a Linux host
-and `New-SmbShare` on a Windows one.
+### `ui`: ported, on `push`
+
+`ui` (PsExec) was always going to port: it is Windows-*guest*-only, but
+host-portable. Its guest half is one powershell script -- resolve the console
+session, start PsExec `-i <session> -d` -- which both drivers send
+statement for statement, and its delivery is `push`, which means smbd on a
+Linux host and `New-SmbShare` on a Windows one. On the Windows host `ui setup
+VM` therefore carries `push`'s cost: one Administrator prompt and a throwaway
+account, once per guest. The host-side download is `Invoke-WebRequest` plus
+.NET's `ZipFile` rather than curl-or-wget and unzip-or-bsdtar; both are on
+every Windows machine, so there is no fallback chain.
 
 ### The transfer layer, and what is measured about it
 

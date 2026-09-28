@@ -10,10 +10,10 @@
   install.ps1 adds that line for you.
 
   This completes the *Windows* driver, so it offers domain, exec, push, pull,
-  sync and usb and nothing else. ui and snapshot are in the bash tree only,
-  and offering a name this driver would reject is worse than offering
-  nothing -- $MODULES in modules\win\parser.ps1 is the list to keep this in step
-  with. usb is on both drivers, spelled the same way on each.
+  sync, ui and usb and nothing else. snapshot is in the bash tree only, and
+  offering a name this driver would reject is worse than offering nothing --
+  $MODULES in modules\win\parser.ps1 is the list to keep this in step with.
+  usb and ui are on both drivers, spelled the same way on each.
 
   Everything lives inside the scriptblock rather than in functions beside it:
   a completer dot-sourced into a profile should leave nothing behind in the
@@ -187,6 +187,7 @@ $completer = {
         push     = 'copy a file or directory from this host into a guest'
         pull     = 'copy files out of a guest onto this host'
         sync     = "deliver a project's build output into a running guest"
+        ui       = 'launch a process on a Windows guest''s interactive desktop (PsExec)'
         usb      = 'pass a host USB device through to a guest'
         help     = 'the module list'
     }
@@ -201,6 +202,11 @@ $completer = {
         port     = 'list, open or close a host->guest port forward'
     }
 
+
+    $uiVerbs = [ordered]@{
+        setup = 'cache PsExec on this host and deliver it into a guest'
+        run   = 'launch a guest program on the interactive desktop'
+    }
 
     $usbVerbs = [ordered]@{
         list   = 'the host USB devices, as VENDOR:PRODUCT'
@@ -246,6 +252,10 @@ $completer = {
         elseif ($module -eq 'domain' -and $verb -eq 'port') {
             Add-Match '-c' 'close the forward on host PORT'
             Add-Match '--close' 'close the forward on host PORT'
+        }
+        elseif ($module -eq 'ui' -and $verb -eq 'setup') {
+            Add-Match '-f' 're-download PsExec even if the host cache holds it'
+            Add-Match '--force' 're-download PsExec even if the host cache holds it'
         }
         elseif ($module -eq 'sync') {
             Add-Match '-c' 'config to use (default sync.conf)'
@@ -354,6 +364,7 @@ $completer = {
             }
             elseif ($module -eq 'domain') { foreach ($k in $domainVerbs.Keys) { Add-Match $k $domainVerbs[$k] } }
             elseif ($module -eq 'exec') { foreach ($k in $execVerbs.Keys) { Add-Match $k $execVerbs[$k] } }
+            elseif ($module -eq 'ui') { foreach ($k in $uiVerbs.Keys) { Add-Match $k $uiVerbs[$k] } }
             elseif ($module -eq 'usb') { foreach ($k in $usbVerbs.Keys) { Add-Match $k $usbVerbs[$k] } }
         }
         2 {
@@ -379,6 +390,10 @@ $completer = {
                 foreach ($d in $domains) { Add-Match $d 'domain' }
             }
             elseif ($module -eq 'exec') {
+                $hint = $noDomain
+                foreach ($d in $domains) { Add-Match $d 'domain' }
+            }
+            elseif ($module -eq 'ui') {
                 $hint = $noDomain
                 foreach ($d in $domains) { Add-Match $d 'domain' }
             }
@@ -428,6 +443,14 @@ $completer = {
             # file fallback.
             elseif ($module -eq 'push') {
                 $hint = 'a path inside the guest, relative to C:\ -- a trailing \ means a directory'
+            }
+            # `ui run VM APP` is a full path inside the guest -- nothing on this
+            # side can enumerate it -- and `ui setup VM` takes nothing more.
+            elseif ($module -eq 'ui' -and $verb -eq 'run') {
+                $hint = 'the program to launch: a full path inside the guest, then its arguments'
+            }
+            elseif ($module -eq 'ui' -and $verb -eq 'setup') {
+                $hint = 'ui setup takes only a domain (and -f)'
             }
         }
     }

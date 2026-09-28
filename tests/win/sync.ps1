@@ -16,9 +16,11 @@
     * the config file is contract, so a config written for the bash driver has
       to parse to the same thing here -- including the directives that are
       refused by name;
-    * the two things this host cannot do -- @guest=linux and the >pre-ui /
-      >post-ui run rules -- are refused **before anything is fetched**, which is
-      a property of ordering and not of the message;
+    * the one thing this host cannot do -- @guest=linux -- is refused
+      **before anything is fetched**, which is a property of ordering and not
+      of the message;
+    * the >pre-ui / >post-ui run rules, once refused here too, go to PsExec
+      through modules/win/ui.ps1 exactly as the bash module sends them;
     * the map rules build a tree whose layout is the guest's own root, which is
       the whole reason the guest side is one robocopy.
 
@@ -40,6 +42,7 @@ $env:VIRUTILS_DIR = Join-Path ([IO.Path]::GetTempPath()) ("virutil-test-" + [Gui
 . (Join-Path $moduleDir 'exec.ps1')
 . (Join-Path $moduleDir 'xfer.ps1')
 . (Join-Path $moduleDir 'sync.ps1')
+. (Join-Path $moduleDir 'ui.ps1')
 
 $script:Pass = 0
 $script:Fail = 0
@@ -64,6 +67,7 @@ function Dies {
 
 $script:Sent     = @()
 $script:GuestRc  = 0
+$script:UiRc     = 0
 $script:GuestOut = '1 1234'
 function Invoke-GuestAgent {
     param([string]$Vm, [string]$Command, $Arguments = $null, [int]$TimeoutMs = 10000)
@@ -82,7 +86,10 @@ function Invoke-GuestAgent {
             # died first, and the test would have asserted the wrong refusal.
             $last  = $script:Sent[$script:Sent.Count - 1]
             $isDelivery = $last -match '\$dst = "C:\\"'
-            $rc  = if ($isDelivery) { $script:GuestRc }  else { 0 }
+            # $UiRc is the same idea for a ui run rule's launch script, so the
+            # missing-PsExec answer can be given to that script and no other.
+            $isUi = $last -match 'PsExec\.exe'
+            $rc  = if ($isDelivery) { $script:GuestRc } elseif ($isUi) { $script:UiRc } else { 0 }
             $out = if ($isDelivery) { $script:GuestOut } else { 'ok' }
             return ([pscustomobject]@{
                 exited = $true
@@ -252,13 +259,32 @@ try {
     Check     '@guest=linux published no share' 0 $script:Published
     CheckTrue '@guest=linux fetched nothing' (-not (Test-Path -LiteralPath $script:VirutilsStagingRoot))
 
+    # --- a ui run rule -------------------------------------------------------
+    #
+    # Refused here once, because this driver had no `ui`. Now it runs, and what
+    # is asserted is what reaches the guest: the rule's command line, verbatim
+    # and single-quoted, after PsExec's own -i <console session> -d.
+
     $uiConf = WriteConf 'ui.conf' ($base + @('>post-ui "C:\Program Files\Example\app.exe" --restored'))
     $script:Published = 0
-    $why = Dies { Capture { Sync-Main @('win11', '-c', $uiConf) } }
-    CheckTrue 'a ui run rule is refused' ($why -match 'interactive desktop')
-    CheckTrue 'the refusal quotes the rule' ($why -match '--restored')
-    CheckTrue 'the refusal says nothing moved' ($why -match 'guest is untouched')
-    Check     'a ui run rule published no share' 0 $script:Published
+    $out = Capture { Sync-Main @('win11', '-c', $uiConf) }
+    CheckTrue 'a ui run rule runs, and says so' ($out -match [regex]::Escape('run (post/ui): "C:\Program Files\Example\app.exe" --restored'))
+    $launch = @($script:Sent | Where-Object { $_ -match 'PsExec\.exe' })
+    Check     'the launch script was sent once' 1 $launch.Count
+    CheckTrue 'it launches on the console session' `
+        ($launch[0] -match [regex]::Escape("'-accepteula -i ' + `$sid + ' -d ' + "))
+    CheckTrue 'it carries the rule as a raw command line' `
+        ($launch[0] -match [regex]::Escape("'`"C:\Program Files\Example\app.exe`" --restored'"))
+    CheckTrue 'and the run still completes' ($out -match 'copy complete -> win11')
+
+    # PsExec not staged yet: the fix is named, with contract section 5's code.
+    $script:UiRc = 97
+    $code = 0
+    try { Capture { Sync-Main @('win11', '-c', $uiConf) } | Out-Null }
+    catch { $why = $_.Exception.Message; $code = [int]$_.Exception.Data['VirutilCode'] }
+    CheckTrue 'a missing PsExec names the fix' ($why -match 'virutil ui setup win11')
+    Check     'and exits 97' 97 $code
+    $script:UiRc = 0
 
     # --- a whole run --------------------------------------------------------
 
