@@ -1,0 +1,473 @@
+# qemu -- the QEMU process a domain is, on a macOS host: where its files live,
+# its launcher, the socket channel every module talks to it over, and its QMP
+# monitor. Shared by domain, snapshot and exec.
+#
+# There is no libvirt here, so there is no domain to define. `domain create`
+# writes the disk, the UEFI nvram and a per-VM launcher script holding every
+# qemu argument, frozen; **the launcher is the domain**, exactly as the .cmd is
+# on the Windows driver. `list` is the launchers in the image directory, `start`
+# runs one, and everything that touches a running domain goes over the two Unix
+# sockets the launcher opens: QMP for qemu itself, and the guest agent's
+# virtio-serial channel for the guest.
+#
+# What was measured on this host before any of it was written -- an M5 Pro,
+# macOS 27, Homebrew qemu 11.1.1, against a guest booted on this file's own
+# arguments -- and is not to be "fixed" toward either other driver:
+#
+#   **hvf saves memory.** savevm, loadvm and QMP's snapshot-save/-load all
+#   work under hvf, with the whole device set below attached: 0.2s to save and
+#   0.1s to load a firmware-only guest. WHPX refuses the same command at the
+#   accelerator (docs/contract.md section 7), which is why `snapshot` left the
+#   Windows driver and is on this one.
+#
+#   **-daemonize is unusable.** qemu forks after Cocoa and hvf have brought the
+#   Objective-C runtime up, and the child aborts the first time anything
+#   touches it -- reliably at the first savevm:
+#
+#     objc: +[NSNumber initialize] may have been in progress in another thread
+#     when fork() was called. We cannot safely call it or ignore it in the
+#     fork() child process. Crashing instead.
+#
+#   So qemu is never daemonized. domain_launch runs the launcher in its own
+#   process group under nohup and lets the subshell that started it exit.
+#
+#   **Unix socket paths are capped at 104 bytes**, and qemu refuses a longer one
+#   at startup ("UNIX socket path ... is too long"). Every socket lives beside
+#   the disk, so a deep VIRUTILS_IMAGE_DIR is refused at create, by name, rather
+#   than failing at the first start.
+#
+#   **tpm-tis-device needs ppi=off under hvf.** With PPI on, qemu dies at
+#   startup with "Error: ret = HV_BAD_ARGUMENT (... hvf-all.c:123)": PPI adds
+#   a RAM region smaller than the 16 KiB page hvf maps in. Windows 11 does not
+#   need PPI, and with it off the TPM's state rides inside a memory snapshot.
+#
+#   **The nvram is qcow2, not raw.** A writable raw pflash drive blocks every
+#   internal snapshot ("Device 'pflash1' is writable but does not support
+#   snapshots"); as qcow2 it snapshots alongside the disk, so a revert puts the
+#   firmware's boot entries back too.
+#
+#   **Stock qemu cannot boot Windows on Arm under hvf.** The installer reads
+#   its boot.wim off the CD and then sits at the firmware logo forever, one
+#   host core busy. Its boot CPU is parked on `b .` at offset 0x200 of the
+#   boot loader's exception vector table -- a synchronous exception it does
+#   not expect -- with X0 still holding the call that raised it, and qemu's own
+#   trace names it:
+#
+#     hvf_unknown_smc unknown SMC! 0x00000000c3000001
+#
+#   Windows issues that OEM SMCCC call by SMC on every boot, whatever the PSCI
+#   conduit. target/arm/hvf/hvf.c answers an unknown SMC with -1 only when the
+#   conduit *is* SMC, and with an undefined-instruction exception otherwise --
+#   and the virt board's conduit under hvf is HVC, because there is no EL2 or
+#   EL3. That has been upstream's behaviour since hvf landed in 2021; UTM's
+#   qemu boots Windows because it patches exactly that line
+#   (windows_workaround_enabled = true). `virtualization=on` would make the
+#   conduit SMC instead, and does get past the SMC, but the firmware then
+#   stalls at EL2 with no further I/O, so it is not a way round. The fix is the
+#   patch: patches/qemu/hvf-smc-windows.patch, built by `install.sh --qemu`
+#   into $VIRUTILS_CACHE_DIR/qemu, which qemu_tools prefers to the qemu on
+#   PATH. With it, Windows Setup is on screen 30s after `domain create`.
+#
+#   **Startup -loadvm cannot restore a snapshot whose memory is in disk0.** It
+#   looks for the memory image on the first snapshot-capable drive, which is
+#   the nvram, finds an empty one there and refuses: "This is a disk-only
+#   snapshot". snapshot-save is told vmstate=disk0, so the memory goes in the
+#   disk, and a shut-off revert starts qemu paused (-S), runs snapshot-load
+#   over QMP and then continues.
+
+# --- the tools ----------------------------------------------------------------
+
+QEMU_SYSTEM="" QEMU_IMG="" QEMU_SHARE="" SWTPM="" QEMU_PATCHED=0
+
+# The qemu `install.sh --qemu` builds for virutil, with the patch stock qemu
+# cannot boot Windows on Arm without (see "unknown SMC" in the header), and the
+# file that build leaves in its prefix naming the patches it carries.
+QEMU_OWN="$VIRUTILS_CACHE_DIR/qemu"
+QEMU_OWN_MARK="$QEMU_OWN/VIRUTIL_PATCHES"
+
+# qemu_tools -- find qemu-system-aarch64, qemu-img, swtpm and the arm64 UEFI
+# firmware, or die naming the one that is missing. virutil's own build first,
+# then PATH. The firmware is found beside the binary rather than at a fixed
+# Homebrew prefix: Intel Homebrew, MacPorts and a source build each put
+# share/qemu somewhere else, and always next to bin/.
+qemu_tools() {
+    [[ -n "$QEMU_SYSTEM" ]] && return 0
+    local bin
+    local accels
+    if [[ -x "$QEMU_OWN/bin/qemu-system-aarch64" ]]; then
+        bin="$QEMU_OWN/bin/qemu-system-aarch64"
+        grep -qx hvf-smc-windows "$QEMU_OWN_MARK" 2>/dev/null && QEMU_PATCHED=1
+    else
+        bin="$(command -v qemu-system-aarch64 || true)"
+    fi
+    [[ -n "$bin" ]] || die "qemu-system-aarch64 not found (brew install qemu)"
+    # Captured, then searched: grep -q in a pipe exits at the first match, qemu
+    # takes a SIGPIPE on its next line, and pipefail reads that as no hvf.
+    accels="$("$bin" -accel help 2>/dev/null || true)"
+    grep -qx hvf <<<"$accels" || die "this qemu has no hvf accelerator: $bin"
+    QEMU_SYSTEM="$bin"
+    QEMU_IMG="$(dirname "$bin")/qemu-img"
+    [[ -x "$QEMU_IMG" ]] || QEMU_IMG="$(command -v qemu-img || true)"
+    [[ -n "$QEMU_IMG" ]] || die "qemu-img not found (brew install qemu)"
+    # Not through readlink -f: Homebrew's bin/ is a farm of symlinks into a
+    # versioned Cellar directory, and a launcher frozen with the Cellar path
+    # stops booting at the next `brew upgrade qemu`. The logical path,
+    # /opt/homebrew/share/qemu, is the one that survives.
+    QEMU_SHARE="$(cd "$(dirname "$bin")/../share/qemu" 2>/dev/null && pwd -L || true)"
+    [[ -f "$QEMU_SHARE/edk2-aarch64-code.fd" && -f "$QEMU_SHARE/edk2-arm-vars.fd" ]] \
+        || die "no arm64 UEFI firmware beside $bin (looked for" \
+               "edk2-aarch64-code.fd and edk2-arm-vars.fd under ${QEMU_SHARE:-share/qemu})"
+    SWTPM="$(command -v swtpm || true)"
+    [[ -n "$SWTPM" ]] || die "swtpm not found (brew install swtpm). Windows 11 will" \
+                             "not install without the TPM 2.0 it provides."
+    command -v jq >/dev/null || die "jq not found (brew install jq)"
+}
+
+# --- where a domain lives -----------------------------------------------------
+#
+# Named one at a time, never globbed on the domain name: a glob of "$VM*" in a
+# shared image directory would take win11-backup.qcow2 with win11, and delete
+# never asks.
+
+domain_disk()     { printf '%s/%s.qcow2'      "$VIRUTILS_IMAGE_DIR" "$1"; }
+domain_nvram()    { printf '%s/%s_VARS.qcow2' "$VIRUTILS_IMAGE_DIR" "$1"; }
+domain_launcher() { printf '%s/%s.sh'         "$VIRUTILS_IMAGE_DIR" "$1"; }
+domain_log()      { printf '%s/%s-qemu.log'   "$VIRUTILS_IMAGE_DIR" "$1"; }
+domain_pidfile()  { printf '%s/%s.pid'        "$VIRUTILS_IMAGE_DIR" "$1"; }
+domain_qmp()      { printf '%s/%s.qmp'        "$VIRUTILS_IMAGE_DIR" "$1"; }
+domain_qga()      { printf '%s/%s.qga'        "$VIRUTILS_IMAGE_DIR" "$1"; }
+domain_tpmdir()   { printf '%s/%s.tpm'        "$VIRUTILS_IMAGE_DIR" "$1"; }
+
+# The first line every launcher carries after its #!. It is how `list` tells a
+# launcher from any other .sh someone left in the image directory.
+DOMAIN_MARK='# virutil domain:'
+
+domain_exists() {
+    local f; f="$(domain_launcher "$1")"
+    [[ -f "$f" ]] && grep -q "^$DOMAIN_MARK" "$f"
+}
+
+# domain_need VM -- the VM argument every command takes, validated.
+domain_need() {
+    [[ -n "${1:-}" ]] || return 1
+    domain_exists "$1" || die "no such domain: $1 (see: virutil domain list)"
+}
+
+# domain_names -- every domain in the image directory, one per line, sorted.
+domain_names() {
+    local f vm
+    [[ -d "$VIRUTILS_IMAGE_DIR" ]] || return 0
+    for f in "$VIRUTILS_IMAGE_DIR"/*.sh; do
+        [[ -f "$f" ]] || continue
+        vm="${f##*/}"; vm="${vm%.sh}"
+        domain_exists "$vm" && printf '%s\n' "$vm"
+    done
+    return 0
+}
+
+# --- is it running? -----------------------------------------------------------
+
+# domain_pid VM -- the pid of the qemu running VM, or nothing (exit 1).
+#
+# The pidfile alone is not an answer: qemu removes it on a clean exit, but a
+# crashed or killed qemu leaves it behind naming a pid the system may already
+# have handed to something else. So the pid has to be alive *and* be a qemu.
+domain_pid() {
+    local pidfile pid comm
+    pidfile="$(domain_pidfile "$1")"
+    [[ -f "$pidfile" ]] || return 1
+    pid="$(tr -dc '0-9' < "$pidfile")"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null || return 1
+    comm="$(ps -p "$pid" -o comm= 2>/dev/null || true)"
+    [[ "$comm" == *qemu-system* ]] || return 1
+    printf '%s' "$pid"
+}
+
+domain_running() { domain_pid "$1" >/dev/null; }
+
+# --- one socket channel -------------------------------------------------------
+#
+# QMP and the guest agent are both newline-delimited JSON over a Unix socket.
+# bash has no Unix sockets of its own, so a channel is `nc -U` as a coprocess,
+# with its two pipes duplicated onto fds this file owns -- bash closes a
+# coproc's own fds the moment the process exits, and a reply already sitting in
+# the pipe would go with them.
+#
+# One channel at a time, held for as long as the caller needs it: bash keeps
+# track of a single coproc, and nothing here needs QMP and the agent at once.
+# chan_open closes the previous channel first.
+
+CHAN_PID="" CHAN_IN="" CHAN_OUT=""
+
+# chan_open SOCKET -- connect; 1 if there is no socket to connect to.
+chan_open() {
+    chan_close
+    [[ -S "$1" ]] || return 1
+    coproc VIRUTIL_CHAN { exec nc -U "$1" 2>/dev/null; }
+    CHAN_PID="$VIRUTIL_CHAN_PID"
+    exec {CHAN_IN}<&"${VIRUTIL_CHAN[0]}" {CHAN_OUT}>&"${VIRUTIL_CHAN[1]}"
+}
+
+# Closing forgets which endpoint the channel was, for both kinds: QMP_VM and
+# AGENT_VM are how qmp_open and agent_open (modules/mac/guest) tell that the
+# channel already open is theirs, and a stale one would hand QMP a qemu-ga
+# socket or the reverse.
+chan_close() {
+    QMP_VM="" AGENT_VM=""
+    [[ -n "$CHAN_PID" ]] || return 0
+    exec {CHAN_OUT}>&- {CHAN_IN}<&-
+    kill "$CHAN_PID" 2>/dev/null || true
+    wait "$CHAN_PID" 2>/dev/null || true
+    CHAN_PID="" CHAN_IN="" CHAN_OUT=""
+}
+
+# chan_send TEXT -- one line out. 1 if the far end is gone.
+#
+# SIGPIPE is ignored for the one write and only for it: a peer that hung up
+# would otherwise kill this shell outright, with no message, mid-command. It is
+# not ignored globally because an ignored signal is inherited across exec, and
+# every `... | head` virutil runs would then spin on EPIPE instead of ending.
+chan_send() {
+    [[ -n "$CHAN_PID" ]] && kill -0 "$CHAN_PID" 2>/dev/null || return 1
+    local rc=0
+    trap '' PIPE
+    printf '%s\n' "$1" >&"$CHAN_OUT" 2>/dev/null || rc=1
+    trap - PIPE
+    return "$rc"
+}
+
+# chan_line SECS -- one line in, into CHAN_LINE. 1 on timeout or a closed peer.
+CHAN_LINE=""
+chan_line() {
+    CHAN_LINE=""
+    IFS= read -r -t "$1" -u "$CHAN_IN" CHAN_LINE
+}
+
+trap 'chan_close' EXIT
+
+# --- QMP ----------------------------------------------------------------------
+#
+# QMP rather than the human monitor the Windows driver speaks. The human
+# monitor echoes every keystroke back with terminal escapes and has no framing
+# to read a reply to; QMP replies are one JSON object per line, matched to the
+# request by id, with events interleaved and skippable. Human-monitor commands
+# that QMP has no counterpart for (hostfwd_add, hostfwd_remove) go through
+# human-monitor-command and come back as a string.
+
+QMP_VM=""
+
+# qmp_open VM -- a negotiated QMP channel to VM, or 1 if nothing answers.
+qmp_open() {
+    [[ "$QMP_VM" == "$1" && -n "$CHAN_PID" ]] && return 0
+    chan_open "$(domain_qmp "$1")" || return 1
+    chan_line 5 && [[ "$CHAN_LINE" == *'"QMP"'* ]] || { chan_close; return 1; }
+    chan_send '{"execute":"qmp_capabilities"}' || { chan_close; return 1; }
+    chan_line 5 && [[ "$CHAN_LINE" == *'"return"'* ]] || { chan_close; return 1; }
+    QMP_VM="$1"
+}
+
+qmp_close() { chan_close; }
+
+# qmp_need VM -- qmp_open, or die saying why there is nothing to talk to.
+qmp_need() {
+    qmp_open "$1" && return 0
+    if domain_running "$1"; then
+        die "$1 is running but its QMP monitor does not answer on" \
+            "  $(domain_qmp "$1")" \
+            "Only one client is served at a time, so another virutil (or" \
+            "anything else holding that socket) may have it. Nothing has been" \
+            "changed."
+    fi
+    die "$1 is not running"
+}
+
+# qmp EXECUTE [ARGUMENTS_JSON] [SECS] -- one command; the reply's "return" as
+# JSON on stdout. Dies on an error reply, naming it.
+#
+# Callers open the channel first (qmp_need) and may then capture a reply with
+# $(qmp ...): the subshell inherits the channel's fds and reads its reply off
+# the same pipe. What it cannot do is open one -- a channel opened in a
+# subshell goes with it. The id is unique per call rather than a counter for
+# the same reason: a counter bumped in a subshell is not bumped here.
+qmp() {
+    local cmd="$1" args="${2:-}" secs="${3:-30}" id req
+    id="virutil-$BASHPID-$RANDOM$RANDOM"
+    if [[ -n "$args" ]]; then
+        req="$(jq -cn --arg c "$cmd" --arg id "$id" --argjson a "$args" \
+               '{execute:$c, arguments:$a, id:$id}')"
+    else
+        req="$(jq -cn --arg c "$cmd" --arg id "$id" '{execute:$c, id:$id}')"
+    fi
+    chan_send "$req" || die "$QMP_VM's QMP monitor hung up before $cmd"
+    while :; do
+        if ! chan_line "$secs"; then
+            # A closed channel and a slow one both end the read; which it was
+            # is the whole diagnosis. "Did not answer within 30s", printed a
+            # second after qemu had died on an assertion, sent the first
+            # reader of it looking for a hang.
+            domain_running "$QMP_VM" || die "$QMP_VM's qemu exited during $cmd. Its log ends:" \
+                "$(tail -n 3 -- "$(domain_log "$QMP_VM")" 2>/dev/null)"
+            die "$QMP_VM's QMP monitor did not answer $cmd within ${secs}s"
+        fi
+        # Events carry no id, and a reply always carries the one it was sent.
+        [[ "$CHAN_LINE" == *"\"$id\""* ]] || continue
+        if [[ "$CHAN_LINE" == *'"error"'* ]]; then
+            die "$QMP_VM refused $cmd: $(jq -r '.error.desc' <<<"$CHAN_LINE")"
+        fi
+        jq -c '.return' <<<"$CHAN_LINE"
+        return 0
+    done
+}
+
+# qmp_hmp COMMAND -- a human-monitor command over QMP; its text on stdout. The
+# human monitor reports a refusal as prose rather than as an error, so a reply
+# that reads like one is turned into one here rather than passed off as output.
+qmp_hmp() {
+    local out
+    out="$(qmp human-monitor-command "$(jq -cn --arg l "$1" '{"command-line":$l}')" \
+           | jq -r '.')"
+    if grep -qiE '^(error|could not|invalid)' <<<"$out"; then
+        die "$QMP_VM refused '$1': $out"
+    fi
+    printf '%s' "$out"
+}
+
+# qmp_job EXECUTE ARGUMENTS_JSON -- run a QMP job to completion. The id is
+# filled in here; the job is dismissed whatever its outcome, so a failed run
+# does not leave a concluded job behind to collide with the next one's id.
+#
+# Polled with query-jobs rather than waited on as a JOB_STATUS_CHANGE event.
+# Waiting on the event is one missed line from waiting forever, and a poll that
+# goes through qmp() dies the moment qemu does, which is the other way a job
+# never concludes.
+#
+# No overall deadline. A memory snapshot writes the guest's whole RAM, which is
+# seconds for a small guest and minutes for a large one on a slow disk, and
+# there is no size at which giving up is the right call.
+qmp_job() {
+    local cmd="$1" args="$2" jid status err
+    jid="virutil-job-$BASHPID-$RANDOM$RANDOM"
+    qmp "$cmd" "$(jq -c --arg j "$jid" '. + {"job-id": $j}' <<<"$args")" >/dev/null
+    while :; do
+        status="$(qmp query-jobs | jq -r --arg j "$jid" '.[] | select(.id == $j) | .status')"
+        [[ "$status" == concluded ]] && break
+        [[ -n "$status" ]] || die "$QMP_VM: the $cmd job is gone without concluding"
+        sleep 0.25
+    done
+    err="$(qmp query-jobs | jq -r --arg j "$jid" '.[] | select(.id == $j) | .error // empty')"
+    qmp job-dismiss "$(jq -cn --arg j "$jid" '{id:$j}')" >/dev/null
+    [[ -z "$err" ]] || die "$QMP_VM: $cmd failed: $err"
+}
+
+# domain_state VM -- running, paused, or shut off. "paused" covers every state
+# in which the vcpus are stopped with qemu alive: a snapshot being written, a
+# start with -S waiting on its snapshot-load, a guest stopped from the monitor.
+domain_state() {
+    local status
+    domain_running "$1" || { printf 'shut off'; return 0; }
+    if qmp_open "$1"; then
+        status="$(qmp query-status '' 5 | jq -r '.status')"
+        qmp_close
+        case "$status" in
+            running) printf 'running' ;;
+            *)       printf 'paused' ;;
+        esac
+        return 0
+    fi
+    # Alive with a monitor that does not answer -- another client holding it.
+    # That is still a running domain, and saying "shut off" would be a lie.
+    printf 'running'
+}
+
+# --- starting one -------------------------------------------------------------
+
+# domain_launch VM [QEMU_ARGS...] -- run the launcher detached and wait until
+# qemu answers on QMP. Extra arguments go to qemu: -display none for -G, -S for
+# a revert that has to load memory before the guest runs.
+#
+# Detached means three things, and each was needed: its own process group (set
+# -m), so a Ctrl-C in this terminal while virutil waits does not reach qemu;
+# nohup, so closing the terminal later does not either; and a subshell that
+# exits, so qemu is reparented to launchd rather than left as this shell's job.
+# Not -daemonize: see the header.
+domain_launch() {
+    local vm="$1"; shift
+    local launcher pid i
+    launcher="$(domain_launcher "$vm")"
+    rm -f -- "$(domain_qmp "$vm")" "$(domain_qga "$vm")"
+    ( set -m; nohup "$launcher" "$@" </dev/null >/dev/null 2>&1 & )
+
+    # Started means "answers QMP", which is what `list` means by running.
+    # qemu binds the socket while it is still reading its command line, long
+    # before the firmware paints, so this waits on qemu and not on the guest.
+    for (( i = 0; i < 300; i++ )); do
+        if qmp_open "$vm"; then
+            return 0
+        fi
+        # Gone, rather than not yet up: the launcher has exited and left no
+        # qemu behind. Only asked after a grace period -- the launcher brings
+        # swtpm up before qemu exists, and that gap is not a death.
+        if (( i > 30 )) && ! domain_running "$vm" \
+           && ! pgrep -f -- "$launcher" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.1
+    done
+
+    # qemu died before connecting to the TPM, so swtpm's --terminate -- which
+    # fires when qemu's control connection closes -- never will. Stop it here,
+    # or every failed start leaves one behind.
+    local swtpm_pid
+    swtpm_pid="$(cat "$(domain_tpmdir "$vm")/swtpm.pid" 2>/dev/null || true)"
+    if [[ -n "$swtpm_pid" ]] && ! domain_running "$vm" \
+       && ps -p "$swtpm_pid" -o command= 2>/dev/null | grep -q swtpm; then
+        kill "$swtpm_pid" 2>/dev/null || true
+    fi
+
+    local log tail
+    local -a why
+    log="$(domain_log "$vm")"
+    tail="$(tail -n 8 -- "$log" 2>/dev/null | grep -v '^$' || true)"
+    if [[ -n "$tail" ]]; then why=("qemu said:" "$tail" "(all of it in $log)")
+    else why=("qemu wrote nothing to $log."); fi
+    if pid="$(domain_pid "$vm")"; then
+        die "$vm did not answer its QMP monitor within 30s, but qemu (pid $pid)" \
+            "is running. Nothing has been killed; try 'virutil domain list' in a" \
+            "moment." "${why[@]}"
+    fi
+    die "$vm did not start: no qemu is running for it." "${why[@]}"
+}
+
+# --- editing the launcher -----------------------------------------------------
+#
+# The launcher is one qemu argument per line, so every edit is one line
+# rewritten in place. Each edit is matched before it is applied, and the match
+# is asked of the pattern, never of whether the file changed: `-c 4` on a
+# domain already at 4 rewrites a line to the same bytes, and that is a no-op,
+# not a missing line (modules/win/domain.ps1 shipped exactly that bug, and it
+# stopped a domain from starting).
+
+# launcher_edit VM ERE SED_SCRIPT WHAT -- apply SED_SCRIPT if ERE matches a
+# line, or die saying WHAT could not be found. Written through a temp file and
+# copied back with cat, so the launcher keeps its inode and its execute bit.
+launcher_edit() {
+    local vm="$1" ere="$2" script="$3" what="$4" f tmp
+    f="$(domain_launcher "$vm")"
+    grep -qE -- "$ere" "$f" || die "could not find $what in $f to change"
+    tmp="$(mktemp "${TMPDIR:-/tmp}/virutil.XXXXXX")"
+    sed -E "$script" "$f" > "$tmp" && cat "$tmp" > "$f"
+    rm -f -- "$tmp"
+}
+
+# launcher_forwards VM -- "HOST GUEST" per line, from the launcher's netdev.
+launcher_forwards() {
+    grep -oE 'hostfwd=tcp:127\.0\.0\.1:[0-9]+-:[0-9]+' "$(domain_launcher "$1")" \
+        | sed -E 's/hostfwd=tcp:127\.0\.0\.1:([0-9]+)-:([0-9]+)/\1 \2/' || true
+}
+
+# sh_quote STR -- STR as one single-quoted /bin/sh word.
+sh_quote() {
+    local s="$1"
+    s=${s//\'/\'\\\'\'}
+    printf "'%s'" "$s"
+}

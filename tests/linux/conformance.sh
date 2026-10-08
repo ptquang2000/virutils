@@ -57,11 +57,18 @@ exits() {
 # Read out of the driver rather than repeated here, exactly as the PowerShell
 # list is below: a module added there is then tested here without an edit, and a
 # list that has to be kept in step by hand is a list that stops being in step.
+#
+# `virutil` loads modules/mac on a Mac and modules/linux everywhere else, so the
+# list is read from whichever tree this host will actually run.
+case "$(uname -s)" in
+    Darwin) BASH_TREE=mac ;;
+    *)      BASH_TREE=linux ;;
+esac
 # shellcheck source=/dev/null
-BASH_MODULES=($(source "$ROOT/modules/linux/parser" >/dev/null 2>&1; printf '%s ' "${MODULES[@]}"))
-(( ${#BASH_MODULES[@]} )) || { bad 'read MODULES out of modules/linux/parser'; }
+BASH_MODULES=($(source "$ROOT/modules/$BASH_TREE/parser" >/dev/null 2>&1; printf '%s ' "${MODULES[@]}"))
+(( ${#BASH_MODULES[@]} )) || { bad "read MODULES out of modules/$BASH_TREE/parser"; }
 
-printf '\n-- virutil (bash driver) --\n'
+printf '\n-- virutil (bash driver, modules/%s) --\n' "$BASH_TREE"
 exits 0 'virutil help'            bash "$ROOT/virutil" help
 exits 0 'virutil --help'          bash "$ROOT/virutil" --help
 exits 1 'virutil (no arguments)'  bash "$ROOT/virutil"
@@ -72,6 +79,32 @@ for m in "${BASH_MODULES[@]}"; do
 done
 exits 1 'virutil domain bogus'    bash "$ROOT/virutil" domain bogus
 exits 1 'virutil exec bogus VM'   bash "$ROOT/virutil" exec bogus VM
+
+# The macOS driver publishes the whole grammar and carries three modules of it.
+# The rest are refused by name with the reason, never as "unknown module" --
+# the same rule the Windows driver's snapshot refusal is tested for below.
+if [[ "$BASH_TREE" == mac ]]; then
+    for m in sync push pull ui usb; do
+        if out="$(bash "$ROOT/virutil" "$m" 2>&1)"; then
+            bad "virutil $m is refused on macOS" 'it exited 0'
+        elif printf '%s' "$out" | grep -q 'is not on the macOS driver'; then
+            ok "virutil $m is refused by name on macOS, with the reason"
+        else
+            bad "virutil $m is refused by name on macOS, with the reason" "$out"
+        fi
+    done
+
+    # domain, port and snapshot against a real hvf domain with no OS in it --
+    # a blank ISO leaves the firmware in its shell, which is all they need.
+    printf '\n-- macOS driver against a firmware-only domain --\n'
+    if out="$(bash "$ROOT/tests/mac/domain.sh" 2>&1)"; then
+        printf '%s\n' "$out" | sed 's/^/  /'
+        ok 'tests/mac/domain.sh'
+    else
+        printf '%s\n' "$out" | sed 's/^/  /'
+        bad 'tests/mac/domain.sh'
+    fi
+fi
 
 printf '\n-- payloads (bash renderer) --\n'
 if diff -u "$GOLDEN" <(bash "$HERE/payloads.sh" 2>&1) > /tmp/vp.bash.diff; then

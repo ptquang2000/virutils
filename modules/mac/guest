@@ -1,0 +1,111 @@
+# guest -- the guest agent channel, and what OS is on the other side. The macOS
+# host's counterpart of modules/linux/guest and modules/win/guest.ps1.
+#
+# The channel is the Windows driver's, carried over a Unix socket instead of a
+# loopback port: no libvirt to do the framing, so this speaks qemu-ga's
+# newline-delimited JSON directly over the virtio-serial chardev every launcher
+# opens --
+#
+#   -chardev socket,id=qga0,path=<VM>.qga,server=on,wait=off
+#   -device  virtio-serial-pci
+#   -device  virtserialport,chardev=qga0,name=org.qemu.guest_agent.0
+#
+# -- through the one socket channel in modules/mac/qemu. It is held for the rest
+# of the run once opened, because exec polls guest-exec-status over it in a
+# loop and the Windows host measured qemu's chardev refusing a client after it
+# had already served one or two.
+
+AGENT_VM=""
+
+# agent_open VM [SECS] -- a connected, synchronised channel to VM's qemu-ga,
+# held for the rest of the run. 1 if the agent does not answer within SECS.
+#
+# The synchronise is not politeness. The channel outlives the virutil that last
+# used it, so a reply nobody read -- an interrupted run, a guest that answered
+# late -- is still in the buffer, and the next command would read it as its
+# own. guest-sync-delimited is the documented fix: a raw 0xFF, which qemu-ga
+# takes as "discard what you were parsing", then a request carrying an id; the
+# answer comes back behind a 0xFF of its own, and everything before that is
+# stale. LC_ALL=C (set in virutil) is what makes $'\xff' one byte rather than a
+# character, both in the write and as read's delimiter.
+agent_open() {
+    local vm="$1" secs="${2:-3}" id
+    [[ "$AGENT_VM" == "$vm" && -n "$CHAN_PID" ]] && return 0
+    chan_open "$(domain_qga "$vm")" || return 1
+    id=$(( (RANDOM << 15 | RANDOM) + 1 ))
+    chan_send $'\xff'"{\"execute\":\"guest-sync-delimited\",\"arguments\":{\"id\":$id}}" \
+        || { chan_close; return 1; }
+    IFS= read -r -d $'\xff' -t "$secs" -u "$CHAN_IN" _ || { chan_close; return 1; }
+    chan_line "$secs" || { chan_close; return 1; }
+    # The id has to match, or this is still an older run's reply and the sync
+    # has not caught up.
+    [[ "$(jq -r '.return // empty' <<<"$CHAN_LINE" 2>/dev/null)" == "$id" ]] \
+        || { chan_close; return 1; }
+    AGENT_VM="$vm"
+}
+
+# agent_need VM -- agent_open, or die saying why nothing can run in the guest.
+agent_need() {
+    agent_open "$1" && return 0
+    domain_running "$1" || die "$1 is not running"
+    die "$1's QEMU guest agent is not answering on" \
+        "  $(domain_qga "$1")" \
+        "The agent is what runs anything inside the guest, so nothing can" \
+        "proceed without it. Check that qemu-ga is running in the guest -- on" \
+        "a Windows guest that is the 'QEMU Guest Agent' service. See" \
+        "README.md, 'A Windows guest on a macOS host'."
+}
+
+# agent JSON [SECS] -- one round trip on the held channel; the whole reply on
+# stdout, as modules/linux/exec's agent() prints virsh's. Dies on an agent-level
+# error rather than handing a caller JSON with no "return" in it.
+#
+# SECS is the wait for this reply, not for the command: guest-exec answers with
+# a pid at once and it is guest-exec-status that is polled, so nothing here
+# waits out a long-running guest process.
+agent() {
+    local secs="${2:-10}" what
+    what="$(jq -r '.execute' <<<"$1")"
+    chan_send "$1" || { chan_close; die "the guest agent channel dropped before $what"; }
+    chan_line "$secs" || { chan_close; die "the guest agent did not answer $what within ${secs}s"; }
+    if [[ "$CHAN_LINE" == *'"error"'* ]]; then
+        printf '%s\n' "$CHAN_LINE" >&2
+        exit 1
+    fi
+    printf '%s\n' "$CHAN_LINE"
+}
+
+# guest_agent_wait VM [SECS] -- true once the agent answers, retrying for up to
+# SECS. guest-sync, not the socket: the socket accepts with nothing listening
+# behind it in the guest.
+guest_agent_wait() {
+    local vm="$1" secs="${2:-0}" i
+    for (( i = 0; ; i++ )); do
+        agent_open "$vm" 1 && return 0
+        (( i >= secs )) && return 1
+        sleep 1
+    done
+}
+
+# --- which OS is on the other side -------------------------------------------
+#
+# Asked of the agent, then the historical default. There is no second source as
+# there is on the bash driver: no domain XML carries a libosinfo id here, the
+# launcher is the domain.
+
+GUEST_OS_DEFAULT=windows
+
+guest_os() {
+    local vm="$1" id=""
+    if agent_open "$vm" 2; then
+        id="$(agent '{"execute":"guest-get-osinfo"}' 2>/dev/null | jq -r '.return.id // empty' || true)"
+    fi
+    case "$id" in
+        mswindows|windows) printf windows ;;
+        "")
+            warn "could not tell what OS $vm runs: its agent does not answer" \
+                 "guest-get-osinfo. Assuming $GUEST_OS_DEFAULT."
+            printf '%s' "$GUEST_OS_DEFAULT" ;;
+        *) printf linux ;;
+    esac
+}

@@ -1,0 +1,66 @@
+# parser -- top-level dispatch plus the helpers every module shares. The macOS
+# host's counterpart of modules/linux/parser: same bash, same helpers, a
+# different module list.
+
+MODULES=(domain snapshot exec)
+
+# The commands in docs/contract.md section 2 that this driver does not have yet,
+# each with the reason. They are refused by name rather than falling through to
+# "unknown module": the grammar publishes them, and whoever types one has been
+# told it exists. The Windows driver keeps the same kind of list for the same
+# reason ($script:ELSEWHERE in modules/win/parser.ps1).
+declare -A ELSEWHERE=(
+    [sync]="needs the transfer layer, which this driver does not have yet"
+    [push]="needs the transfer layer, which this driver does not have yet"
+    [pull]="needs the transfer layer, which this driver does not have yet"
+    [ui]="delivers PsExec with push, and push is not ported yet"
+    [usb]="has no macOS mechanism yet: host USB passthrough under hvf is unmeasured"
+)
+
+die()  { printf '%s\n' "$@" >&2; exit 1; }
+warn() { printf '%s\n' "$@" >&2; }
+say()  { printf '%s\n' "$@" >&2; }
+
+top_usage() {
+    cat >&2 <<'EOF'
+usage: virutil MODULE [ARGS]
+
+This is the macOS driver: raw QEMU under hvf, one launcher script per domain.
+
+domains
+  domain     the domain lifecycle: create, delete, list, start, shutdown, addr, port
+  snapshot   qcow2 snapshots: disk and memory for a running domain, disk-only
+             for a shut-off one
+
+guest
+  exec       run commands inside a guest via the QEMU guest agent
+
+Not on this host yet: sync, push, pull, ui, usb. Each is refused by name,
+with the reason; see docs/contract.md section 7.
+
+Run 'virutil <module>' for a module's own usage. Every module takes -h/--help,
+which exits 0; a usage error exits 1.
+EOF
+    exit "${1:-1}"
+}
+
+# parse_dispatch "$@" -- sets MODULE and REST
+parse_dispatch() {
+    local m
+    MODULE="${1:-}"
+    if [[ -z "$MODULE" ]]; then top_usage 1; fi
+    case "$MODULE" in
+        help|-h|--help) top_usage 0 ;;
+    esac
+    shift
+    for m in "${MODULES[@]}"; do
+        [[ "$MODULE" == "$m" ]] || continue
+        REST=("$@")
+        return 0
+    done
+    if [[ -n "${ELSEWHERE[$MODULE]:-}" ]]; then
+        die "virutil $MODULE is not on the macOS driver: it ${ELSEWHERE[$MODULE]}." \
+            "See docs/contract.md section 7."
+    fi
+    die "virutil: unknown module: $MODULE (see: virutil help)"
+}

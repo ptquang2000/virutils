@@ -1,6 +1,9 @@
 #compdef virutil
 # zsh completion for virutil -- mirrors the dispatch in modules/linux/parser,
 # the way completions/win/virutil.completion.ps1 mirrors modules/win/parser.ps1.
+# On a Mac the same `virutil` loads modules/mac instead, so the module list,
+# the domains and the snapshots below are read the way that driver keeps them:
+# launchers in the image directory rather than libvirt.
 #
 # This completes the *bash* driver, so it offers every module in $MODULES:
 # domain, snapshot, sync, pull, push, exec, ui, usb. The Windows driver carries
@@ -32,6 +35,14 @@ _virutil() {
     'help:this message'
   )
 
+  if [[ $OSTYPE == darwin* ]]; then
+    # modules/mac/parser's MODULES; the rest are refused by name there.
+    domains[2]='snapshot:qcow2 snapshots (disk and memory) for a domain'
+    transfer=()
+    guest=(${guest[1]})
+    hardware=()
+  fi
+
   if (( CURRENT == 2 )); then
     _describe -t domains  'domain module'   domains
     _describe -t transfer 'transfer module' transfer
@@ -55,7 +66,14 @@ _virutil() {
 
 _virutil_domains() {
   local -a doms
-  if command -v virsh >/dev/null 2>&1; then
+  if [[ $OSTYPE == darwin* ]]; then
+    # A domain is a launcher carrying modules/mac/qemu's mark; its state is
+    # not worth a QMP round trip per name here.
+    local root=${VIRUTILS_DIR:-$HOME/.virutils} f
+    for f in ${VIRUTILS_IMAGE_DIR:-$root/images}/*.sh(N); do
+      grep -q '^# virutil domain:' $f 2>/dev/null && doms+=("${f:t:r}")
+    done
+  elif command -v virsh >/dev/null 2>&1; then
     doms=(${(f)"$(virsh -c qemu:///system list --all 2>/dev/null |
       awk 'NR>2 && NF { name = $2; $1 = ""; $2 = ""
                         sub(/^ +/, ""); sub(/ +$/, "")
@@ -71,6 +89,13 @@ _virutil_domain_ports() {
   local dir=${VIRUTILS_PORT_DIR:-$root/ports}
   local -a ports
   local f
+  if [[ $OSTYPE == darwin* ]]; then
+    # A forward is a hostfwd in the launcher there, not a state file.
+    ports=(${(f)"$(virutil domain port $1 2>/dev/null |
+      sed -n 's/^127\.0\.0\.1:\([0-9]*\) -> \(.*\)/\1:-> \2/p')"})
+    _describe -t port 'forward' ports
+    return
+  fi
   for f in $dir/tcp-*(N); do
     ports+=("${f:t:s/tcp-/}:-> $(<$f)")
   done
@@ -281,7 +306,11 @@ _virutil_snapshot() {
       case $words[3] in
         revert|delete)
           local -a snaps
-          snaps=(${(f)"$(virsh -c qemu:///system snapshot-list --domain ${words[4]} 2>/dev/null | awk 'NR>2 && $1 !~ /^-/ {print $1}')"})
+          if [[ $OSTYPE == darwin* ]]; then
+            snaps=(${(f)"$(virutil snapshot list ${words[4]} 2>/dev/null | awk 'NR>2 {print $1}')"})
+          else
+            snaps=(${(f)"$(virsh -c qemu:///system snapshot-list --domain ${words[4]} 2>/dev/null | awk 'NR>2 && $1 !~ /^-/ {print $1}')"})
+          fi
           _describe -t snapshot 'snapshot' snaps
           ;;
       esac

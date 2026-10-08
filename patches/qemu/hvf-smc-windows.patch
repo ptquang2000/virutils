@@ -1,0 +1,18 @@
+--- a/target/arm/hvf/hvf.c
++++ b/target/arm/hvf/hvf.c
+@@ -2502,7 +2502,14 @@
+         break;
+     case EC_AA64_SMC:
+         cpu_synchronize_state(cpu);
+-        if (arm_cpu->psci_conduit == QEMU_PSCI_CONDUIT_SMC) {
++        /*
++         * Windows on Arm issues an OEM SMCCC call (0xc3000001) via SMC at
++         * boot whatever the PSCI conduit, and parks its CPU if that UDEFs.
++         * Answer every SMC as an SMCCC call -- PSCI if it is one, -1 (NOT
++         * SUPPORTED, SMCCC 1.3 s5.2) otherwise -- which is what KVM does and
++         * what UTM's QEMU does (windows_workaround_enabled).
++         */
++        if (true || arm_cpu->psci_conduit == QEMU_PSCI_CONDUIT_SMC) {
+             /* Secure Monitor Call exception, we need to advance $pc */
+             advance_pc = true;
+ 

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# virutil -- drive libvirt/KVM guest operations from a Linux host (incl. WSL).
+# virutil -- drive guest operations from a Linux host (libvirt/KVM, incl. WSL)
+# or a macOS host (raw QEMU under hvf).
 #
 # A driver around a set of sourced modules, each declaring one <name>_main entry
 # point. Only virutil is installed, so the module directory is resolved from the
@@ -7,16 +8,36 @@
 #
 #   virutil help    the module list
 
+# macOS ships bash 3.2 as /bin/bash, and that is what `env bash` finds on a Mac
+# with no Homebrew bash ahead of it on PATH. Every module is written for bash 4+
+# (associative arrays, {fd} redirections, coproc), so hand over to a newer bash
+# before anything else is parsed -- this block is the only part of the driver
+# 3.2 has to read, and it must stay 3.2-clean.
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+    for b in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+        [ -x "$b" ] && exec "$b" "$0" "$@"
+    done
+    echo "virutil: needs bash 4 or newer and this is $BASH_VERSION." \
+         "On macOS: brew install bash" >&2
+    exit 1
+fi
+
 set -euo pipefail
 
-# silences virsh's "setlocale: No such file or directory" on minimal hosts
+# silences virsh's "setlocale: No such file or directory" on minimal hosts, and
+# makes a byte a character: the macOS agent channel reads up to a raw 0xFF.
 export LC_ALL=C
 
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
-# modules/ is split by host: this driver's files are modules/linux/, and the
-# Windows driver's are modules/win/, which are virutil.ps1's to load, not ours.
-MODULE_DIR="$HERE/modules/linux"
+# modules/ is split by host: modules/linux/ is libvirt's, modules/mac/ is raw
+# QEMU under hvf, and modules/win/ is the Windows driver's, which virutil.ps1
+# loads and this file never does. Both bash trees present the same grammar
+# (docs/contract.md); which one runs is a fact about the host, not a flag.
+case "$(uname -s)" in
+    Darwin) MODULE_DIR="$HERE/modules/mac" ;;
+    *)      MODULE_DIR="$HERE/modules/linux" ;;
+esac
 
 # parser bootstraps: it declares MODULES and the helpers every other module
 # calls, so it is the one file named here. The rest are discovered -- the shared
@@ -39,4 +60,4 @@ parse_dispatch "$@"
 
 # parse_dispatch admits nothing outside MODULES, and every module declares
 # <name>_main, so the name is the dispatch.
-"${MODULE}_main" "${REST[@]}"
+"${MODULE}_main" ${REST[@]+"${REST[@]}"}

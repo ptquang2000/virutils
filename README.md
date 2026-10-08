@@ -1,10 +1,12 @@
 # virutil
 
 A small set of shell tools for driving Windows guests under libvirt/KVM from a
-Linux host, including a WSL host talking to the Windows machine it runs on.
-Everything hangs off a single driver, `virutil`, which dispatches to a set of
-sourced modules under `modules/` — each a small function library with no build
-step and no dependencies beyond the utilities it calls.
+Linux host, including a WSL host talking to the Windows machine it runs on —
+and, on a Mac, Windows 11 on Arm under raw QEMU and hvf (see
+[On a macOS host](#on-a-macos-host)). Everything hangs off a single driver,
+`virutil`, which dispatches to a set of sourced modules under `modules/` — each
+a small function library with no build step and no dependencies beyond the
+utilities it calls.
 
 ## Contents
 
@@ -25,6 +27,7 @@ step and no dependencies beyond the utilities it calls.
    - [A shut-off domain gets a disk-only snapshot](#a-shut-off-domain-gets-a-disk-only-snapshot)
 - [Guest prerequisites](#guest-prerequisites)
    - [A Windows guest](#a-windows-guest)
+   - [A Windows guest on a macOS host](#a-windows-guest-on-a-macos-host)
    - [A Linux guest](#a-linux-guest)
 - [virutil sync](#virutil-sync)
    - [Synopsis](#synopsis)
@@ -53,6 +56,7 @@ step and no dependencies beyond the utilities it calls.
    - [start](#start)
    - [list, shutdown, addr](#list-shutdown-addr)
    - [port](#port)
+   - [On a macOS host](#on-a-macos-host)
 - [virutil usb](#virutil-usb)
    - [USB passthrough under WSL, with usbipd](#usb-passthrough-under-wsl-with-usbipd)
 - [Requirements](#requirements)
@@ -94,6 +98,25 @@ fpath+=( "${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions" )
 Installed as part of [the dotfiles](https://github.com/yourname/.dotfiles),
 none of this is needed: `setup.sh` links `virutils/vir*` into `~/.local/bin`
 itself and `.zshrc` puts `virutils/completions` on `fpath` directly.
+
+On a Mac, install the host's half first — the same `virutil` loads
+`modules/mac` there, and `install.sh --check` reports on that tree's
+dependencies instead of libvirt's:
+
+```sh
+brew install bash qemu swtpm jq ninja pkgconf
+./install.sh --qemu
+```
+
+`bash` because macOS's own is 3.2: `virutil` hands itself to Homebrew's bash
+when `/bin/bash` starts it, and says so when there is none.
+
+`--qemu` because **stock qemu cannot boot Windows on Arm under hvf**: Windows
+makes an SMC call at boot that upstream qemu answers with an exception, and the
+installer sits at the firmware logo forever. It builds qemu with the one-line
+fix UTM's qemu carries (`patches/qemu/`) into `~/.virutils/cache/qemu` — a few
+minutes, 360 MB — and the driver uses that build in preference to Homebrew's,
+which stays installed for its libraries.
 
 ## Artifacts and state
 
@@ -167,7 +190,7 @@ host-side machinery in `modules/linux/xfer` and `modules/linux/guest`, which is
 | Module | Purpose | Usage |
 | --- | --- | --- |
 | `domain` | The domain lifecycle: create one from an install ISO with a KVM-tuned profile, delete one along with its disks, and the everyday operations in between. | `virutil domain {create\|delete\|list\|start\|shutdown\|addr\|port} [VM] [ISO] [OPTIONS]` |
-| `snapshot` | External snapshots (disk and memory) for libvirt domains. **Linux host only.** The Windows driver had these four verbs as qcow2 internal snapshots and they were removed: WHPX blocks saving a running guest's memory, so a snapshot there could only ever be a disk. `virutil snapshot` on a Windows host says so and exits 1. | `virutil snapshot {create\|list\|revert\|delete} VM [SNAP]` |
+| `snapshot` | Snapshots, disk and memory for a running domain and disk-only for a shut-off one. **Linux and macOS hosts.** External overlays through libvirt on Linux; qcow2 internal snapshots on macOS, where hvf saves memory. The Windows driver had these four verbs as internal snapshots and they were removed: WHPX blocks saving a running guest's memory, so a snapshot there could only ever be a disk. `virutil snapshot` on a Windows host says so and exits 1. | `virutil snapshot {create\|list\|revert\|delete} VM [SNAP]` |
 
 ### transfer
 
@@ -487,6 +510,63 @@ statically addressed guest, and `virsh shutdown --mode agent` need.
 | **virtio drivers** (`viostor`, `NetKVM`) | `virtio-win` ISO, or `virtio-win-guest-tools.exe` on it | booting at all — the installer cannot see a virtio disk without `viostor` |
 | **QEMU guest agent** (`qemu-ga`) | `virtio-win-guest-tools.exe`, or `guest-agent\qemu-ga-x86_64.msi` on the ISO | `sync`, `push` and `pull`, `virutil exec`, and `virsh shutdown --mode agent` |
 | **SPICE guest agent** (`spice-vdagent`) | [spice-guest-tools](https://www.spice-space.org/download/windows/spice-guest-tools/spice-guest-tools-latest.exe) | the `spice` display and `spicevmc` channel of every `virutil domain create` domain — clipboard sharing and display auto-resize |
+
+### A Windows guest on a macOS host
+
+The guest is **Windows 11 on Arm** — hvf runs the host's own architecture only —
+from <https://www.microsoft.com/software-download/windows11arm64>. Put
+`virtio-win.iso` beside it and `virutil domain create` attaches both, as USB
+CD-ROMs; see [On a macOS host](#on-a-macos-host) for the machine itself.
+
+Setup itself needs nothing from virtio-win: the disk is NVMe and the TPM is
+emulated, and Windows has drivers for both. What it does not have is a driver
+for either virtio device the domain carries — the **network card** and the
+**guest agent's serial channel** — so a fresh guest has no network, and
+`virutil exec` has nothing to talk to, until they are installed from the
+virtio-win CD. Two consequences:
+
+- **OOBE wants a network and there is none.** At the network screen press
+  Shift+F10 and run `OOBE\BYPASSNRO`; the guest reboots into OOBE with an
+  *I don't have internet* option. Where a build no longer ships that script,
+  the registry value it sets does the same:
+
+  ```
+  reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE /v BypassNRO /t REG_DWORD /d 1 /f
+  shutdown /r /t 0
+  ```
+
+- **The agent comes last, and the one-click installer does not apply.**
+  `virtio-win-guest-tools.exe` and `virtio-win-gt-x64.msi` are x64-only: they
+  install amd64 drivers, which an Arm kernel will not load. The drivers go in
+  one at a time from the CD's `w11\ARM64` folders instead, from an elevated
+  prompt in the guest — `D:` being the virtio-win CD, whatever letter it got:
+
+  ```
+  pnputil /add-driver D:\NetKVM\w11\ARM64\*.inf /install
+  pnputil /add-driver D:\vioserial\w11\ARM64\*.inf /install
+  msiexec /i D:\guest-agent\qemu-ga-x86_64.msi /qn
+  ```
+
+  The first is the network card, the second the channel the agent talks over.
+  The third is the agent itself, and it is the x64 build because virtio-win
+  ships no other (0.1.302, checked): the guest runs it under Windows' own x64
+  emulation, over the native ARM64 channel driver. Measured, and it works —
+  `exec` answers in 0.2s, runs as SYSTEM, carries the guest's exit code back,
+  and the agent comes back on its own after a guest reboot:
+
+  ```
+  virutil exec ping VM
+  ```
+
+  One consequence worth knowing before testing anything architecture-sensitive:
+  **what `exec` runs, runs as x64 under emulation**, because its parent is the
+  x64 agent — PowerShell started through it reports `ProcessArchitecture` X64.
+  For x64 user-mode software that is the point; for anything that has to be
+  native ARM64, start it some other way (RDP, or a scheduled task).
+
+  The same `w11\ARM64` folders also carry `viogpudo` (a virtio-gpu display
+  driver) and `vioinput`; the domain uses ramfb and USB input today, so neither
+  is needed.
 
 ### A Linux guest
 
@@ -1670,6 +1750,72 @@ If the forward connects but the guest never answers, check that the service in
 the guest listens on `0.0.0.0` rather than `127.0.0.1`, and that the guest's
 own firewall allows the port — no host-side plumbing works around either.
 
+### On a macOS host
+
+```
+virutil domain create win11arm ~/Downloads/Win11_25H2_English_Arm64.iso
+```
+
+On a Mac, `virutil` loads `modules/mac`: raw QEMU under hvf, no libvirt, and an
+**arm64** guest — hvf accelerates the host's own architecture only, so the
+install ISO has to be Windows 11 on Arm
+(<https://www.microsoft.com/software-download/windows11arm64>). An x64 ISO is
+warned about by name and will not boot.
+
+`create` writes four things beside each other in `~/.virutils/images` and
+starts the domain:
+
+| File | What it is |
+| --- | --- |
+| `VM.qcow2` | the disk, on NVMe — Setup sees it with no *Load driver* step |
+| `VM_VARS.qcow2` | the UEFI nvram, as qcow2 so snapshots cover it |
+| `VM.sh` | **the launcher, which is the domain**: every qemu argument, one per line |
+| `VM.tpm/` | swtpm's state — the TPM 2.0 Windows 11 requires |
+
+and, while the domain runs, `VM.pid`, `VM.qmp` (the QMP monitor) and `VM.qga`
+(the guest agent channel). There is nothing else: `list` is the launchers in
+that directory, `start` runs one, and `-s`/`-m`/`-c` and `port` edit it in
+place. Running `VM.sh` by hand boots the domain in the foreground, which is the
+quickest way to see why one will not start; qemu's own messages are in
+`VM-qemu.log`.
+
+The flags are the Linux host's, plus the Windows host's `-p SPEC` (a port
+forward, repeatable) and `-N` (create without starting). The default forward is
+RDP on host port 13389 — or the next port up that no other domain's launcher
+names and nothing is listening on, so a second domain does not collide with the
+first. `domain port VM` says which it got.
+The defaults are half the host's memory (at least 4096 MiB, Windows 11's
+minimum) and half its cores (at most 8, at least 2). The install ISO and
+`virtio-win*.iso` beside it are attached as USB CD-ROMs, and `create` presses
+Enter at the firmware's "Press any key to boot from CD or DVD" for you.
+
+What differs from the other hosts, and why:
+
+- **The display is a Cocoa window**, at the firmware's fixed resolution. RDP is
+   the better screen once Windows is up — `localhost:13389` from Microsoft's
+   *Windows App*. `start -G` starts the domain with no window at all.
+- **Forwards bind 127.0.0.1 only**, not every interface, so the guest's RDP is
+   not offered to whatever network the Mac is on. `domain addr` prints them;
+   the guest's own 10.0.2.15 is not reachable from the host.
+- **Each domain has its own hardware identity** — SMBIOS UUID and serial, MAC,
+   NVMe serial — made at `create` and kept in the launcher. qemu's defaults make
+   every guest the same machine, and a Windows guest on them was matched to
+   another organisation's Autopilot enrolment during OOBE. Do not edit these
+   lines out of a launcher, and do not copy one launcher to make another.
+- **`shutdown` asks the guest agent first** and falls back to the ACPI power
+   button when the agent does not answer.
+- **Snapshots include memory.** hvf can save a running guest, which WHPX cannot,
+   so `virutil snapshot` is on this host: qcow2 internal snapshots inside
+   `VM.qcow2` and `VM_VARS.qcow2`, memory included when the domain runs. They
+   cost space in the image directory and go with `domain delete`, and a disk
+   that has any cannot be grown with `start -s` until they are deleted.
+- **`sync`, `push`, `pull`, `ui` and `usb` are not here yet**, and each says so
+   by name. Until they are, `exec` is the way into the guest, and RDP's drive
+   redirection is the way to move a file.
+
+See [A Windows guest on a macOS host](#a-windows-guest-on-a-macos-host) for
+what to do inside Setup.
+
 ## virutil usb
 
 Pass a physical USB device from the host through to a guest. Both drivers have
@@ -1855,6 +2001,20 @@ Host, for `virutil domain`:
 - `acl`, optional: an install ISO under a `0700` home directory is unreachable
    by the qemu user, and `virutil domain create` prints the `setfacl` that fixes
    it
+
+Host, on macOS (`modules/mac`) — none of the above, and instead:
+
+- `bash` 4 or newer (`brew install bash`); macOS's `/bin/bash` is 3.2
+- `qemu` with the hvf accelerator, and its `share/qemu/edk2-aarch64-code.fd`
+   and `edk2-arm-vars.fd` beside the binary (`brew install qemu` has all three)
+- for a Windows guest, the patched qemu `./install.sh --qemu` builds, which
+   needs `ninja` and `pkgconf` to build; stock qemu cannot boot Windows on Arm
+- `swtpm` (`brew install swtpm`) — Windows 11 will not install without a TPM
+- `jq` and `nc` (`nc` ships with macOS); `nc -U` is how bash reaches the two
+   Unix sockets a domain opens
+- a `VIRUTILS_IMAGE_DIR` short enough that `VM.tpm/swtpm.sock` inside it stays
+   under 104 bytes, macOS's cap on a Unix socket path; `create` refuses a
+   longer one by name
 
 Guest — see [Guest prerequisites](#guest-prerequisites) for where each of
 these comes from and how to install it:

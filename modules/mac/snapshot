@@ -1,0 +1,221 @@
+# snapshot -- qcow2 internal snapshots on a macOS host: disk and memory for a
+# running domain, disk-only for one that is shut off. The same four verbs and
+# the same two kinds as modules/linux/snapshot; a different mechanism, because
+# there is no libvirt to keep records and overlays.
+#
+# Internal, not external. Every snapshot is a named state inside the domain's
+# own two qcow2s -- the disk and the nvram -- so there are no overlay files, no
+# backing chain and no memory files to account for, and nothing a delete can
+# leave behind. The memory image of a running snapshot goes inside the disk
+# too (snapshot-save's vmstate=disk0), never the nvram: see modules/mac/qemu for
+# why startup -loadvm cannot find it there, and why a shut-off revert goes
+# through -S and snapshot-load instead.
+#
+# qcow2 internal snapshots are flat. A snapshot has no parent and no children:
+# reverting to one and taking another does not branch anything, and deleting
+# one never touches the rest. So the contract's "delete takes SNAP's
+# descendants with it" holds here with nothing to take.
+#
+# The TPM is the one piece of state outside the qcow2s. A running snapshot
+# carries it: swtpm hands its state to qemu and it is written with the guest's
+# memory (measured: TPM state restored on load). A disk-only snapshot cannot,
+# so the swtpm state file is copied beside it, and put back on revert --
+# otherwise a guest whose TPM changed after the snapshot boots against keys it
+# no longer holds, which is what makes BitLocker ask for a recovery key.
+
+snapshot_usage() {
+    printf '%s\n' \
+        "usage: virutil snapshot create VM [SNAP]  (default name snap-<timestamp>)" \
+        "       virutil snapshot list   VM" \
+        "       virutil snapshot revert VM SNAP" \
+        "       virutil snapshot delete VM SNAP" \
+        "" \
+        "A running domain gets a memory snapshot too: the guest is paused while" \
+        "its RAM is written, then carries on. A shut-off one cannot, so its" \
+        "snapshot is disk-only -- the guest boots fresh from the disk state on" \
+        "a revert." \
+        "" \
+        "revert leaves the domain running at SNAP, whatever state it was in." \
+        "A running domain is powered off first, without asking the guest --" \
+        "what it had not saved is what a revert discards -- and SNAP is loaded" \
+        "into a fresh qemu: loading into the live one crashes it." \
+        "" \
+        "Snapshots live inside the domain's qcow2s, so they cost disk space in" \
+        "$VIRUTILS_IMAGE_DIR and go with 'domain delete'. A disk with snapshots" \
+        "cannot be grown with 'domain start -s'." \
+        "" \
+        "  -h, --help  this message" >&2
+    exit "${1:-1}"
+}
+
+# The two block nodes every launcher names, and the only ones a snapshot
+# covers: the install and virtio-win CDs are read-only and are left out.
+SNAP_DEVICES='["disk0","nvram"]'
+
+# snapshot_rows VM -- "NAME<TAB>VMSTATE_BYTES<TAB>DATE_SEC" per snapshot, read
+# from the disk image. -U reads it while qemu has it open: qemu holds a write
+# lock, and a listing is metadata only.
+snapshot_rows() {
+    "$QEMU_IMG" info -U --output=json -- "$(domain_disk "$1")" \
+        | jq -r '.snapshots // [] | .[] | [.name, (."vm-state-size" // 0), ."date-sec"] | @tsv'
+}
+
+snapshot_exists() {
+    snapshot_rows "$1" | cut -f1 | grep -qxF -- "$2"
+}
+
+# snapshot_has_memory VM SNAP
+snapshot_has_memory() {
+    local size
+    size="$(snapshot_rows "$1" | awk -F'\t' -v s="$2" '$1 == s { print $2 }')"
+    [[ -n "$size" ]] && (( size > 0 ))
+}
+
+snapshot_tpm_copy() { printf '%s/snapshot-%s.permall' "$(domain_tpmdir "$1")" "$2"; }
+
+# snapshot_tpm_state VM -- swtpm's state file for VM, or nothing before the
+# guest has ever touched its TPM.
+snapshot_tpm_state() {
+    local f; f="$(domain_tpmdir "$1")/tpm2-00.permall"
+    [[ -f "$f" ]] && printf '%s' "$f"
+}
+
+# snapshot_offline VM SNAP FLAG -- qemu-img snapshot FLAG on both images. Only
+# for a domain that is shut off; a running qemu does all of this over QMP.
+snapshot_offline() {
+    local vm="$1" snap="$2" flag="$3" img
+    for img in "$(domain_disk "$vm")" "$(domain_nvram "$vm")"; do
+        "$QEMU_IMG" snapshot "$flag" "$snap" -- "$img" \
+            || die "qemu-img snapshot $flag $snap failed on $img"
+    done
+}
+
+# snapshot_stop VM -- power a running domain off now and wait for qemu to be
+# gone. quit, not system_powerdown: a revert discards the guest's state anyway,
+# and waiting on a guest to agree to that would be waiting for nothing.
+snapshot_stop() {
+    local vm="$1" i
+    qmp_need "$vm"
+    qmp quit >/dev/null || true
+    qmp_close
+    for (( i = 0; i < 100; i++ )); do
+        domain_running "$vm" || return 0
+        sleep 0.1
+    done
+    die "$vm did not exit after quit; nothing has been reverted."
+}
+
+snapshot_main() {
+    local CMD VM SNAP
+    CMD="${1:-}"
+    [ -n "$CMD" ] || snapshot_usage
+    case "$CMD" in -h|--help) snapshot_usage 0 ;; esac
+    VM="${2:-}"
+    domain_need "$VM" || snapshot_usage
+    qemu_tools
+
+    case "$CMD" in
+    create)
+        SNAP="${3:-snap-$(date +%Y%m%d-%H%M%S)}"
+        [[ "$SNAP" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+            || die "a snapshot name is letters, digits, '.', '_' and '-', got '$SNAP'"
+        ! snapshot_exists "$VM" "$SNAP" \
+            || die "snapshot '$SNAP' already exists on $VM" \
+                   "Pick another name, or: virutil snapshot delete $VM $SNAP"
+
+        if domain_running "$VM"; then
+            qmp_need "$VM"
+            say "saving $VM's memory and disks (the guest is paused while it runs)"
+            qmp_job snapshot-save "$(jq -cn --arg t "$SNAP" --argjson d "$SNAP_DEVICES" \
+                '{tag:$t, vmstate:"disk0", devices:$d}')"
+            qmp_close
+        else
+            say "shut off: disk-only snapshot (no memory image)"
+            snapshot_offline "$VM" "$SNAP" -c
+            local tpm
+            if tpm="$(snapshot_tpm_state "$VM")"; then
+                cp -p -- "$tpm" "$(snapshot_tpm_copy "$VM" "$SNAP")"
+            fi
+        fi
+        echo "created: $SNAP"
+        ;;
+    list)
+        local name size date state
+        printf ' %-30s %-27s %s\n' Name 'Creation Time' State
+        printf '%s\n' '----------------------------------------------------------------------'
+        while IFS=$'\t' read -r name size date; do
+            [[ -n "$name" ]] || continue
+            # virsh's words for the same two kinds: the state the domain was
+            # in, which is what decides what a revert brings back.
+            if (( size > 0 )); then state=running; else state=shutoff; fi
+            printf ' %-30s %-27s %s\n' "$name" "$(date -r "$date" '+%Y-%m-%d %H:%M:%S %z')" "$state"
+        done < <(snapshot_rows "$VM")
+        ;;
+    revert)
+        SNAP="${3:?usage: virutil snapshot revert VM SNAP}"
+        snapshot_exists "$VM" "$SNAP" || die "no such snapshot on $VM: $SNAP"
+
+        if snapshot_has_memory "$VM" "$SNAP"; then
+            # Always into a fresh qemu, never into the running one. Loading
+            # device state into a live process kills it once a real guest has
+            # been running: measured against Windows 11 on Arm, snapshot-load
+            # on the running domain died in 1s on
+            #
+            #   Assertion failed: (!auto_alloc || *pptr == NULL),
+            #   function vmstate_load_next, file vmstate.c, line 265.
+            #
+            # -- the NVMe controller's queue arrays, which its vmstate
+            # allocates on load and so requires to be empty, and which a live
+            # guest has filled. A firmware-only guest has none, which is why
+            # the in-place load passed every test before a real one. A fresh
+            # qemu has them empty, the same as a migration target, and the
+            # same revert from shut off took 2.4s and came back clean. So a
+            # running domain is powered off first, as for a disk-only revert,
+            # and both states go the one way that works.
+            if domain_running "$VM"; then
+                snapshot_stop "$VM"
+            fi
+            # Paused at the first instruction, so nothing the guest does can be
+            # overwritten by the load; see modules/mac/qemu.
+            domain_launch "$VM" -S
+            qmp_need "$VM"
+            qmp_job snapshot-load "$(jq -cn --arg t "$SNAP" --argjson d "$SNAP_DEVICES" \
+                '{tag:$t, vmstate:"disk0", devices:$d}')"
+            qmp cont >/dev/null
+            qmp_close
+        else
+            if domain_running "$VM"; then
+                say "$SNAP is disk-only: powering $VM off to revert it"
+                snapshot_stop "$VM"
+            fi
+            snapshot_offline "$VM" "$SNAP" -a
+            local copy
+            copy="$(snapshot_tpm_copy "$VM" "$SNAP")"
+            [[ -f "$copy" ]] && cp -p -- "$copy" "$(domain_tpmdir "$VM")/tpm2-00.permall"
+            domain_launch "$VM"
+        fi
+        echo "reverted: $SNAP"
+        # A guest reverted here wakes with the clock it had when the snapshot
+        # was taken. The guest's own time sync corrects it; nothing virutil
+        # copies compares timestamps for which side is newer, so the skew
+        # costs a transfer nothing.
+        ;;
+    delete)
+        SNAP="${3:?usage: virutil snapshot delete VM SNAP}"
+        snapshot_exists "$VM" "$SNAP" || die "no such snapshot on $VM: $SNAP"
+        if domain_running "$VM"; then
+            qmp_need "$VM"
+            qmp_job snapshot-delete "$(jq -cn --arg t "$SNAP" --argjson d "$SNAP_DEVICES" \
+                '{tag:$t, devices:$d}')"
+            qmp_close
+        else
+            snapshot_offline "$VM" "$SNAP" -d
+        fi
+        rm -f -- "$(snapshot_tpm_copy "$VM" "$SNAP")"
+        echo "deleted: $SNAP"
+        ;;
+    *)
+        snapshot_usage
+        ;;
+    esac
+}

@@ -1,0 +1,687 @@
+# domain -- the domain lifecycle on a macOS host: raw QEMU under hvf, an arm64
+# guest, one launcher script per domain. modules/mac/qemu says what a domain is
+# here and what was measured before any of this was written; this file builds
+# one, starts it, and edits it.
+#
+# The machine is Windows 11 on Arm, because that is what hvf runs: it
+# accelerates a guest of the host's own architecture and nothing else, so an
+# x64 guest would be TCG emulation at a fraction of the speed. Every device
+# below is one the Windows arm64 installer has an inbox driver for, or is
+# marked as needing virtio-win:
+#
+#   nvme         the disk. Inbox, so Setup sees it without a Load driver step,
+#                and it snapshots (measured: savevm/loadvm with it attached).
+#   usb-bot +    the install ISO and the virtio-win ISO, as USB CD-ROMs. The
+#   scsi-cd      virt machine has no IDE or AHCI, and the arm64 installer has
+#                USB mass storage inbox. A usb-bot with a scsi-cd on it rather
+#                than usb-storage: usb-storage on a -blockdev presents a hard
+#                disk, and firmware boots an ISO from a CD.
+#   ramfb        the display. Windows drives it as the UEFI framebuffer
+#                ("Microsoft Basic Display Adapter"), at the firmware's
+#                resolution. RDP is the better screen once the guest is up.
+#   usb-kbd,     input, on the xHCI controller Windows has inbox.
+#   usb-tablet
+#   tpm-tis-     TPM 2.0 from swtpm, ppi=off (see modules/mac/qemu).
+#   device
+#   virtio-net   the NIC -- needs NetKVM from virtio-win's ARM64 folder.
+#   virtio-      the guest agent channel -- needs vioser from the same place,
+#   serial       and qemu-ga itself.
+#
+# **Every domain gets its own hardware identity**, generated once at create and
+# frozen in the launcher: an SMBIOS UUID and serial, a NIC MAC, an NVMe serial.
+# Left to qemu's defaults -- MAC 52:54:00:12:34:56, no SMBIOS UUID or serial,
+# and the NVMe serial this file used to hard-code -- every domain is the same
+# machine, and so is every other qemu guest anyone ever left on its defaults.
+# Measured on the first Windows install here: OOBE went online, matched that
+# identity against Windows Autopilot, and put up another company's tenant
+# (a car maker's branded work-or-school sign-in) as the way into the guest --
+# somebody had registered a default-identity qemu guest there. libvirt
+# randomises the MAC and UUID per domain for its own reasons; this does it for
+# that one too. Frozen rather than per-boot, because Windows activation and a
+# memory snapshot both expect the machine they were made on.
+
+domain_usage() {
+    printf '%s\n' \
+        "usage: virutil domain create VM ISO [OPTIONS]" \
+        "       virutil domain delete VM" \
+        "       virutil domain list" \
+        "       virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]" \
+        "       virutil domain shutdown VM" \
+        "       virutil domain addr     VM" \
+        "       virutil domain port     VM [SPEC] [-c PORT]" \
+        "" \
+        "port options (SPEC is PORT, or HOSTPORT:GUESTPORT when the two differ;" \
+        "with no SPEC it lists the open forwards for VM):" \
+        "  -c, --close PORT  close the forward on host PORT" \
+        "" \
+        "create options:" \
+        "  -s, --size GiB    disk size (default 64)" \
+        "  -m, --memory MiB  guest RAM (default: half the host's, at least 4096)" \
+        "  -c, --vcpus N     virtual CPUs (default: half the host's, max 8)" \
+        "  -o, --osinfo ID   accepted and ignored: there is no libosinfo here" \
+        "  -v, --virtio ISO  virtio-win ISO to attach as a second cdrom, or" \
+        "                    'none' (default: found beside ISO)" \
+        "  -p, --port SPEC   a port forward, repeatable (default 13389:3389, or" \
+        "                    the next free host port when another domain has it)" \
+        "  -N, --no-start    create it without starting it" \
+        "" \
+        "ISO must be an arm64 install image: hvf runs guests of the host's own" \
+        "architecture only." \
+        "" \
+        "The disk is always $VIRUTILS_IMAGE_DIR/VM.qcow2;" \
+        "VIRUTILS_IMAGE_DIR moves it, and the launcher, nvram and sockets with it." \
+        "" \
+        "start options (-s/-m/-c need the domain shut off; each is written to the" \
+        "launcher, which is the domain):" \
+        "  -s, --size GiB    grow the disk image (never shrinks)" \
+        "  -m, --memory MiB  guest RAM" \
+        "  -c, --vcpus N     virtual CPUs" \
+        "  -G, --no-gui      start it with no window (-display none); reach it" \
+        "                    over RDP or the agent" \
+        "" \
+        "delete takes no options. It never asks, and it removes everything the" \
+        "domain has: the disk (and the snapshots inside it), the nvram, the" \
+        "launcher, the TPM state and the logs." \
+        "" \
+        "  -h, --help        this message" \
+        "" \
+        "create reads these from the environment:" \
+        "  VIRUTILS_DIR           $VIRUTILS_ROOT   root for all state" \
+        "  VIRUTILS_IMAGE_DIR     $VIRUTILS_IMAGE_DIR" \
+        "  VIRUTILS_VIRTIO        (auto)       virtio-win ISO path, or 'none'" \
+        "" \
+        "VIRUTILS_OSINFO, VIRUTILS_NETWORK and VIRUTILS_FIRMWARE are in the" \
+        "contract but have no meaning on this host: there is no libosinfo, no" \
+        "libvirt network, and an arm64 guest has no BIOS. Each is named and" \
+        "ignored when set." \
+        "" \
+        "The same names spelled with the singular VIRUTIL_ prefix are still" \
+        "read, second, and say so once when they are." >&2
+    exit "${1:-1}"
+}
+
+domain_main() {
+    local CMD
+    CMD="${1:-}"
+    case "$CMD" in
+        "")        domain_usage 1 ;;
+        -h|--help) domain_usage 0 ;;
+    esac
+    shift
+
+    case "$CMD" in
+        create)   domain_create   "$@" ;;
+        delete)   domain_delete   "$@" ;;
+        start)    domain_start    "$@" ;;
+        list)     domain_list     "$@" ;;
+        shutdown) domain_shutdown "$@" ;;
+        addr)     domain_addr     "$@" ;;
+        port)     domain_port     "$@" ;;
+        *)        die "virutil domain: unknown command: $CMD (see: virutil domain -h)" ;;
+    esac
+}
+
+# --- create -------------------------------------------------------------------
+
+domain_default_memory() {
+    local mem
+    mem=$(( $(sysctl -n hw.memsize) / 1048576 / 2 ))
+    mem=$(( mem / 512 * 512 ))
+    # 4096 rather than the bash driver's 2048: Windows 11 Setup refuses less,
+    # and a Windows guest is what this driver builds.
+    (( mem < 4096 )) && mem=4096
+    printf '%s' "$mem"
+}
+
+domain_default_vcpus() {
+    local n=$(( $(sysctl -n hw.ncpu) / 2 ))
+    (( n > 8 )) && n=8
+    # Windows 11 Setup refuses fewer than two cores, before the disk step --
+    # measured on the Windows host, see modules/win/domain.ps1.
+    (( n < 2 )) && n=2
+    printf '%s' "$n"
+}
+
+# domain_free_port FROM -- the first host port at or above FROM that no other
+# domain's launcher forwards and nothing on this host is listening on. Both,
+# because a domain that is shut off holds its ports only on paper, and a port
+# held on paper still kills that domain's qemu at its next start ("Could not
+# set up host forwarding rule") the moment two of them run at once.
+domain_free_port() {
+    local h f
+    for (( h = $1; h < $1 + 1000; h++ )); do
+        for f in "$VIRUTILS_IMAGE_DIR"/*.sh; do
+            [[ -f "$f" ]] && grep -q "hostfwd=tcp:127\.0\.0\.1:$h-" "$f" && continue 2
+        done
+        nc -z -G 1 127.0.0.1 "$h" >/dev/null 2>&1 && continue
+        printf '%s' "$h"
+        return 0
+    done
+    die "no free host port between $1 and $(( $1 + 999 )) for the default RDP forward;" \
+        "name one with -p HOSTPORT:3389"
+}
+
+# domain_port_spec SPEC -- "HOST GUEST", or die. SPEC is PORT or HOST:GUEST.
+domain_port_spec() {
+    local h g
+    case "$1" in
+        *:*) h="${1%%:*}"; g="${1#*:}" ;;
+        *)   h="$1"; g="$1" ;;
+    esac
+    [[ "$h" =~ ^[0-9]+$ && "$g" =~ ^[0-9]+$ ]] && (( h >= 1 && h <= 65535 && g >= 1 && g <= 65535 )) \
+        || die "a port forward is PORT or HOSTPORT:GUESTPORT, got '$1'"
+    printf '%s %s' "$h" "$g"
+}
+
+domain_create() {
+    local VM="" ISO="" SIZE=64 MEM="" VCPUS="" VIRTIO="$VIRUTILS_VIRTIO" NOSTART=0
+    local -a PORTS=()
+    local candidate s
+
+    while (( $# )); do
+        case "$1" in
+            -s|--size)     SIZE="${2:?$1 needs a value}";   shift 2 ;;
+            -m|--memory)   MEM="${2:?$1 needs a value}";    shift 2 ;;
+            -c|--vcpus)    VCPUS="${2:?$1 needs a value}";  shift 2 ;;
+            -v|--virtio)   VIRTIO="${2:?$1 needs a value}"; shift 2 ;;
+            -p|--port)     PORTS+=("${2:?$1 needs a value}"); shift 2 ;;
+            -N|--no-start) NOSTART=1; shift ;;
+            -o|--osinfo)
+                : "${2:?$1 needs a value}"
+                warn "-o is accepted and ignored: there is no libosinfo on this" \
+                     "host and nothing here consults an os id. It is in the" \
+                     "grammar so a command line written for one driver parses" \
+                     "under another."
+                shift 2 ;;
+            -h|--help)     domain_usage 0 ;;
+            -*)            die "virutil domain create: unknown option: $1" ;;
+            *)
+                if   [[ -z "$VM"  ]]; then VM="$1"
+                elif [[ -z "$ISO" ]]; then ISO="$1"
+                else die "virutil domain create: unexpected argument: $1"
+                fi
+                shift ;;
+        esac
+    done
+    [[ -n "$VM" && -n "$ISO" ]] || domain_usage
+
+    # The name becomes file names, socket paths and a qemu -name; anything that
+    # would need quoting in one of those is refused here rather than escaped
+    # differently in each.
+    [[ "$VM" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+        || die "a domain name is letters, digits, '.', '_' and '-', got '$VM'"
+    [[ "$SIZE" =~ ^[0-9]+$ ]] || die "--size wants a whole number of GiB, got '$SIZE'"
+    [[ -z "$MEM"   || "$MEM"   =~ ^[0-9]+$ ]] || die "--memory wants MiB, got '$MEM'"
+    [[ -z "$VCPUS" || "$VCPUS" =~ ^[0-9]+$ ]] || die "--vcpus wants a whole number, got '$VCPUS'"
+    # The default is RDP on 13389, or the next port up that is free: a second
+    # domain on the same default would kill the first one's forward, or its
+    # own qemu, depending on which starts second.
+    (( ${#PORTS[@]} )) || PORTS=("$(domain_free_port 13389):3389")
+    for s in "${PORTS[@]}"; do domain_port_spec "$s" >/dev/null; done
+
+    paths_ignored_warn
+    qemu_tools
+    # Not refused: the domain is still a domain, and a Linux guest boots on
+    # stock qemu. But a Windows installer will sit at the firmware logo
+    # forever, which looks like a hang rather than like this.
+    (( QEMU_PATCHED )) || warn "$QEMU_SYSTEM is stock qemu, which cannot boot Windows on Arm" \
+        "under hvf: Windows issues an SMC at boot that stock qemu answers with an" \
+        "exception, and the installer never gets past the firmware logo. Build the" \
+        "patched qemu the driver prefers, then recreate the domain:" \
+        "  $HERE/install.sh --qemu"
+
+    [[ -f "$ISO" ]] || die "install ISO not found: $ISO"
+    ISO="$(realpath -- "$ISO")"
+    # The one check that can be made without opening the image: Microsoft names
+    # its media by architecture. Only a warning, since a renamed file proves
+    # nothing either way -- but an x64 ISO here is an hour lost to a firmware
+    # that cannot boot it, and the name is usually right.
+    shopt -s nocasematch
+    if [[ "${ISO##*/}" =~ (x64|amd64|x86_64) && ! "${ISO##*/}" =~ (arm64|aarch64) ]]; then
+        warn "${ISO##*/} looks like an x64 image. hvf runs arm64 guests only," \
+             "so the firmware will not boot it. Windows 11 on Arm is at" \
+             "  https://www.microsoft.com/software-download/windows11arm64"
+    fi
+    shopt -u nocasematch
+
+    if [[ -z "$VIRTIO" ]]; then
+        for candidate in "$(dirname -- "$ISO")"/virtio-win*.iso; do
+            [[ -f "$candidate" ]] && VIRTIO="$candidate"
+        done
+    fi
+    [[ "$VIRTIO" == none ]] && VIRTIO=""
+    [[ -n "$VIRTIO" && ! -f "$VIRTIO" ]] && die "virtio-win ISO not found: $VIRTIO"
+    [[ -n "$VIRTIO" ]] && VIRTIO="$(realpath -- "$VIRTIO")"
+
+    [[ -n "$MEM"   ]] || MEM="$(domain_default_memory)"
+    [[ -n "$VCPUS" ]] || VCPUS="$(domain_default_vcpus)"
+    (( VCPUS >= 2 )) || warn "-c $VCPUS creates a domain Windows 11 Setup will not" \
+        "install on: it stops at \"This PC can't run Windows 11\" before the disk" \
+        "step. 1 is fine for a guest already installed."
+
+    local DISK NVRAM LAUNCHER sock
+    DISK="$(domain_disk "$VM")"
+    NVRAM="$(domain_nvram "$VM")"
+    LAUNCHER="$(domain_launcher "$VM")"
+    domain_exists "$VM" && die "domain already exists: $VM (see: virutil domain list)"
+    [[ -e "$DISK" ]] && die "disk image already exists: $DISK" \
+                            "  remove it, or set VIRUTILS_IMAGE_DIR elsewhere"
+
+    # qemu splits its option values on commas, and a path holding one would be
+    # read as two options. Refused, rather than doubled into ',,' in some
+    # places and not others.
+    [[ "$VIRUTILS_IMAGE_DIR$ISO$VIRTIO" != *,* ]] \
+        || die "a path virutil hands qemu contains a comma, which qemu reads as" \
+               "an option separator: $VIRUTILS_IMAGE_DIR, $ISO${VIRTIO:+, $VIRTIO}"
+    # 104 bytes, sun_path's size on macOS; see modules/mac/qemu. The TPM socket
+    # is the longest of the three.
+    for sock in "$(domain_qmp "$VM")" "$(domain_qga "$VM")" "$(domain_tpmdir "$VM")/swtpm.sock"; do
+        (( ${#sock} < 104 )) || die "$sock is ${#sock} bytes, and macOS caps a Unix" \
+            "socket path at 103. Every domain's sockets live beside its disk, so" \
+            "set VIRUTILS_IMAGE_DIR to a shorter directory."
+    done
+
+    say "domain:   $VM (hvf, arm64)" \
+        "cpu:      $VCPUS vcpus (1 socket x $VCPUS cores x 1 thread)" \
+        "memory:   $MEM MiB" \
+        "disk:     $DISK ($SIZE GiB)" \
+        "iso:      $ISO"
+    [[ -n "$VIRTIO" ]] && say "virtio:   $VIRTIO"
+
+    mkdir -p "$VIRUTILS_IMAGE_DIR"
+    # cluster_size=1M keeps a 64 GiB image's L2 metadata small enough to stay
+    # cached; preallocation=metadata stops the guest's first write into a region
+    # stalling behind table allocation (APFS is sparse, so it costs no space);
+    # lazy_refcounts trades a `qemu-img check -r all` after an unclean shutdown
+    # for faster writes.
+    "$QEMU_IMG" create -q -f qcow2 \
+        -o cluster_size=1M,preallocation=metadata,lazy_refcounts=on \
+        -- "$DISK" "${SIZE}G" || die "could not create $DISK"
+    # qcow2, not the raw template: a raw writable pflash blocks every snapshot.
+    if ! "$QEMU_IMG" convert -q -O qcow2 -- "$QEMU_SHARE/edk2-arm-vars.fd" "$NVRAM"; then
+        rm -f -- "$DISK"
+        die "could not create $NVRAM -- $DISK removed"
+    fi
+    mkdir -p "$(domain_tpmdir "$VM")"
+
+    domain_write_launcher "$VM" "$ISO" "$VIRTIO" "$VCPUS" "$MEM" \
+        "$(uuidgen | tr 'A-Z' 'a-z')" "${PORTS[@]}"
+    say "launcher: $LAUNCHER" \
+        "monitor:  $(domain_qmp "$VM") (QMP)" \
+        "agent:    $(domain_qga "$VM")"
+
+    (( NOSTART )) && return 0
+
+    domain_launch "$VM"
+    domain_boot_key "$VM"
+
+    local rdp
+    read -r rdp _ <<<"$(domain_port_spec "${PORTS[0]}")"
+    say "" \
+        "Windows Setup should be on screen. Boot it again later with:" \
+        "  virutil domain start $VM"
+    if [[ -n "$VIRTIO" ]]; then
+        say "" \
+            "Setup sees the NVMe disk on its own -- no 'Load driver' step." \
+            "It has no driver for the network card, so there is no network" \
+            "until NetKVM is installed. At the network screen, Shift+F10 and" \
+            "  OOBE\\BYPASSNRO" \
+            "lets you continue offline. Once at the desktop, install from the" \
+            "virtio-win CD with pnputil: NetKVM\\w11\\ARM64 (network) and" \
+            "vioserial\\w11\\ARM64 (the agent's channel), then" \
+            "guest-agent\\qemu-ga-x86_64.msi -- not virtio-win-guest-tools.exe," \
+            "which is x64-only. See README.md, 'A Windows guest on a macOS host'."
+    else
+        say "" \
+            "No virtio-win ISO was attached, so the guest will have no network" \
+            "driver and no agent channel driver. Put virtio-win.iso beside the" \
+            "install ISO, or pass -v, and recreate the domain."
+    fi
+    say "" "RDP once it is up: localhost:$rdp (Windows App, or any RDP client)"
+}
+
+# domain_boot_key VM -- answer the installer's "Press any key to boot from CD
+# or DVD". Without a key the firmware falls through to the UEFI shell, which
+# looks exactly like a hang, and nobody is watching the window this early.
+#
+# Bounded, because the key is Enter and an Enter that lands on Setup's first
+# screen presses Next. On hvf the prompt is up within a few seconds and Setup
+# takes far longer than this to load, so the window between the two is wide.
+domain_boot_key() {
+    local i
+    qmp_open "$1" || return 0
+    for (( i = 0; i < 16; i++ )); do
+        qmp send-key '{"keys":[{"type":"qcode","data":"ret"}]}' >/dev/null
+        sleep 0.5
+    done
+    qmp_close
+}
+
+# domain_write_launcher VM ISO VIRTIO VCPUS MEM UUID PORT... -- the launcher,
+# which is the domain. One qemu argument per line, so every later edit is one
+# line.
+#
+# UUID is the domain's identity and everything else in it is derived from that
+# one value -- the SMBIOS serial, the MAC (in qemu's 52:54:00 prefix), the NVMe
+# serial -- so there is a single source of randomness and the four can be seen
+# to belong together. See the header for why they exist at all.
+domain_write_launcher() {
+    local vm="$1" iso="$2" virtio="$3" vcpus="$4" mem="$5" uuid="$6"; shift 6
+    local f tpm hostfwd="" h g s hex mac serial nvme
+    hex="${uuid//-/}"
+    mac="52:54:00:${hex:0:2}:${hex:2:2}:${hex:4:2}"
+    serial="$(tr 'a-f' 'A-F' <<<"VU${hex:6:12}")"
+    nvme="$(tr 'a-f' 'A-F' <<<"VU${hex:18:14}")"
+    f="$(domain_launcher "$vm")"
+    tpm="$(domain_tpmdir "$vm")"
+    for s in "$@"; do
+        read -r h g <<<"$(domain_port_spec "$s")"
+        # 127.0.0.1, not every interface. The bare `tcp::H-:G` both other
+        # drivers' forwards use binds 0.0.0.0, which offers the guest's RDP to
+        # every network the Mac joins -- a laptop's coffee-shop Wi-Fi included.
+        hostfwd+=",hostfwd=tcp:127.0.0.1:$h-:$g"
+    done
+
+    {
+        printf '%s\n' \
+            '#!/bin/sh' \
+            "$DOMAIN_MARK $vm" \
+            "# Written by 'virutil domain create'. This file is the domain: virutil" \
+            "# reads the port forwards back out of it, and 'domain start -s/-m/-c'" \
+            "# and 'domain port' edit it in place. Edit it by hand and virutil" \
+            "# follows the edit." \
+            "#" \
+            "# Run it to boot the domain in the foreground. Arguments go to qemu after" \
+            "# its own: virutil adds -display none for 'domain start -G', and -S for a" \
+            "# snapshot revert that loads memory before the guest runs." \
+            "#" \
+            "# qemu's own messages go to $vm-qemu.log, swtpm's to $vm.tpm/swtpm.log." \
+            "" \
+            "pidfile=$(sh_quote "$(domain_pidfile "$vm")")" \
+            "log=$(sh_quote "$(domain_log "$vm")")" \
+            "tpm=$(sh_quote "$tpm")" \
+            "" \
+            "# A second qemu on the same qcow2 is corruption, and starting this would" \
+            "# also restart the TPM out from under the running one." \
+            'if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then' \
+            "    echo \"$vm is already running (pid \$(cat \"\$pidfile\"))\" >&2" \
+            '    exit 1' \
+            'fi' \
+            "" \
+            "# The TPM 2.0 Windows 11 requires. --terminate ends swtpm when qemu closes" \
+            "# its control channel, so it lives exactly as long as the domain does." \
+            'mkdir -p "$tpm"' \
+            'if [ -f "$tpm/swtpm.pid" ]; then kill "$(cat "$tpm/swtpm.pid")" 2>/dev/null || true; fi' \
+            'rm -f "$tpm/swtpm.sock"' \
+            "$(sh_quote "$SWTPM") socket --tpm2 --tpmstate dir=\"\$tpm\" \\" \
+            '    --ctrl type=unixio,path="$tpm/swtpm.sock" --terminate \' \
+            '    --daemon --pid file="$tpm/swtpm.pid" --log file="$tpm/swtpm.log"' \
+            'i=0' \
+            'while [ ! -S "$tpm/swtpm.sock" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done' \
+            "" \
+            'printf -- "--- %s start\n" "$(date "+%Y-%m-%d %H:%M:%S")" >> "$log"' \
+            "exec $(sh_quote "$QEMU_SYSTEM") \\" \
+            "    -name $vm \\" \
+            "    -machine virt,gic-version=3,highmem=on,pflash0=firmware,pflash1=nvram \\" \
+            "    -accel hvf \\" \
+            "    -cpu host \\" \
+            "    -smp $vcpus,sockets=1,cores=$vcpus,threads=1 \\" \
+            "    -m $mem \\" \
+            "    -rtc base=localtime \\" \
+            "    -uuid $uuid \\" \
+            "    -smbios type=1,serial=$serial \\" \
+            "    -blockdev node-name=firmware,driver=file,read-only=on,filename=$(sh_quote "$QEMU_SHARE/edk2-aarch64-code.fd") \\" \
+            "    -blockdev node-name=nvram-file,driver=file,filename=$(sh_quote "$(domain_nvram "$vm")") \\" \
+            "    -blockdev node-name=nvram,driver=qcow2,file=nvram-file \\" \
+            "    -blockdev node-name=disk0-file,driver=file,discard=unmap,filename=$(sh_quote "$(domain_disk "$vm")") \\" \
+            "    -blockdev node-name=disk0,driver=qcow2,file=disk0-file,discard=unmap,detect-zeroes=unmap \\" \
+            "    -device nvme,drive=disk0,serial=$nvme,bootindex=0 \\" \
+            "    -device qemu-xhci,id=xhci \\" \
+            "    -blockdev node-name=cd0,driver=file,read-only=on,filename=$(sh_quote "$iso") \\" \
+            "    -device usb-bot,bus=xhci.0,id=cd0bus \\" \
+            "    -device scsi-cd,bus=cd0bus.0,drive=cd0,bootindex=1 \\"
+        if [[ -n "$virtio" ]]; then
+            printf '%s\n' \
+            "    -blockdev node-name=cd1,driver=file,read-only=on,filename=$(sh_quote "$virtio") \\" \
+            "    -device usb-bot,bus=xhci.0,id=cd1bus \\" \
+            "    -device scsi-cd,bus=cd1bus.0,drive=cd1 \\"
+        fi
+        printf '%s\n' \
+            "    -device usb-kbd,bus=xhci.0 \\" \
+            "    -device usb-tablet,bus=xhci.0 \\" \
+            "    -device ramfb \\" \
+            "    -display cocoa \\" \
+            "    -netdev user,id=net0$hostfwd \\" \
+            "    -device virtio-net-pci,netdev=net0,mac=$mac \\" \
+            '    -chardev socket,id=tpm0,path="$tpm/swtpm.sock" \' \
+            "    -tpmdev emulator,id=tpm0,chardev=tpm0 \\" \
+            "    -device tpm-tis-device,tpmdev=tpm0,ppi=off \\" \
+            "    -chardev socket,id=qga0,path=$(sh_quote "$(domain_qga "$vm")"),server=on,wait=off \\" \
+            "    -device virtio-serial-pci \\" \
+            "    -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0 \\" \
+            "    -qmp unix:$(sh_quote "$(domain_qmp "$vm")"),server=on,wait=off \\" \
+            '    -pidfile "$pidfile" \' \
+            '    "$@" 2>> "$log"'
+    } > "$f"
+    chmod +x "$f"
+}
+
+# --- start / shutdown ---------------------------------------------------------
+
+domain_start() {
+    local VM="" SIZE="" MEM="" VCPUS="" GUI=1
+
+    while (( $# )); do
+        case "$1" in
+            -s|--size)   SIZE="${2:?$1 needs a value}";  shift 2 ;;
+            -m|--memory) MEM="${2:?$1 needs a value}";   shift 2 ;;
+            -c|--vcpus)  VCPUS="${2:?$1 needs a value}"; shift 2 ;;
+            -G|--no-gui) GUI=0; shift ;;
+            -h|--help)   domain_usage 0 ;;
+            -*)          die "virutil domain start: unknown option: $1" ;;
+            *)           [[ -z "$VM" ]] || die "unexpected argument: $1"
+                         VM="$1"; shift ;;
+        esac
+    done
+    domain_need "$VM" || domain_usage
+
+    if [[ -n "$SIZE$MEM$VCPUS" ]] && domain_running "$VM"; then
+        die "$VM is running; -s/-m/-c rewrite the launcher and the disk image," \
+            "which only works with it shut off." \
+            "  virutil domain shutdown $VM"
+    fi
+
+    if [[ -n "$VCPUS" ]]; then
+        [[ "$VCPUS" =~ ^[0-9]+$ ]] && (( VCPUS >= 1 )) \
+            || die "--vcpus wants a whole number, got '$VCPUS'"
+        # The whole shape, in the check as in the rewrite: a hand-edited -smp
+        # with another topology must be refused, not matched and left alone.
+        launcher_edit "$VM" '^    -smp [0-9]+,sockets=1,cores=[0-9]+,threads=1 ' \
+            "s/^    -smp [0-9]+,sockets=1,cores=[0-9]+,threads=1 /    -smp $VCPUS,sockets=1,cores=$VCPUS,threads=1 /" \
+            "-smp"
+        say "vcpus:  $VCPUS (1 socket x $VCPUS cores x 1 thread)"
+    fi
+
+    if [[ -n "$MEM" ]]; then
+        [[ "$MEM" =~ ^[0-9]+$ ]] && (( MEM >= 1 )) || die "--memory wants MiB, got '$MEM'"
+        launcher_edit "$VM" '^    -m [0-9]+ ' "s/^    -m [0-9]+ /    -m $MEM /" "-m"
+        say "memory: $MEM MiB"
+    fi
+
+    if [[ -n "$SIZE" ]]; then
+        [[ "$SIZE" =~ ^[0-9]+$ ]] || die "--size wants a whole number of GiB, got '$SIZE'"
+        qemu_tools
+        local img; img="$(domain_disk "$VM")"
+        # No --shrink: qemu-img refuses without it, which is the check we want.
+        "$QEMU_IMG" resize -q -- "$img" "${SIZE}G" \
+            || die "could not resize $img to $SIZE GiB" \
+                   "(qemu-img refuses to shrink an image; $SIZE GiB may be" \
+                   "smaller than it is now, and an image with internal" \
+                   "snapshots cannot be resized at all -- delete them first)"
+        say "disk:   $img ($SIZE GiB)" \
+            "        the guest still has to extend its partition (diskmgmt.msc)"
+    fi
+
+    if domain_running "$VM"; then
+        say "$VM is already running"
+        return 0
+    fi
+
+    local -a extra=()
+    (( GUI )) || extra=(-display none)
+    domain_launch "$VM" ${extra[@]+"${extra[@]}"}
+    say "$VM started"
+}
+
+# Agent first, ACPI second -- what `virsh shutdown` does on the bash driver.
+# The agent's guest-shutdown is Windows' own shutdown with apps forced closed;
+# the ACPI power button is a request a guest may sit on (a locked screen asking
+# whether to close an unsaved document). Neither waits for the guest to finish.
+domain_shutdown() {
+    local VM="${1:-}"
+    case "$VM" in -h|--help) domain_usage 0 ;; esac
+    domain_need "$VM" || die "usage: virutil domain shutdown VM"
+    domain_running "$VM" || die "$VM is not running"
+
+    if agent_open "$VM" 2; then
+        # guest-shutdown sends no reply on success: the agent is on its way
+        # down with the guest. So it is sent and not waited on.
+        chan_send '{"execute":"guest-shutdown","arguments":{"mode":"powerdown"}}' || true
+        chan_close
+        say "$VM is being shut down (guest agent)"
+        return 0
+    fi
+    qmp_need "$VM"
+    qmp system_powerdown >/dev/null
+    qmp_close
+    say "$VM is being shut down (ACPI power button)"
+}
+
+# --- list / addr --------------------------------------------------------------
+
+domain_list() {
+    local vm
+    local -a rows=()
+    while read -r vm; do
+        [[ -n "$vm" ]] && rows+=("$vm")
+    done < <(domain_names)
+    (( ${#rows[@]} )) || return 0
+    # virsh's own shape, so the drivers read alike.
+    printf ' %-24s %s\n' Name State
+    printf '%s\n' '----------------------------------------'
+    for vm in "${rows[@]}"; do
+        printf ' %-24s %s\n' "$vm" "$(domain_state "$vm")"
+    done
+}
+
+# The one command in the grammar with no direct answer under user-mode NAT, and
+# saying so is better than inventing one: the guest is 10.0.2.15 on a network
+# that exists only inside the qemu process. What the host does have is the
+# forwards, so those are printed -- the Windows driver's answer, for the same
+# reason.
+domain_addr() {
+    local VM="${1:-}" h g n=0
+    case "$VM" in -h|--help) domain_usage 0 ;; esac
+    domain_need "$VM" || die "usage: virutil domain addr VM"
+    warn "$VM is on user-mode NAT, so it has no address this host can reach." \
+         "Its own address is 10.0.2.15 on a network that exists only inside the" \
+         "qemu process; the host reaches it at 127.0.0.1 through the forwards" \
+         "below, and the guest reaches the host at 10.0.2.2."
+    while read -r h g; do
+        [[ -n "$h" ]] || continue
+        printf '127.0.0.1:%s -> guest:%s\n' "$h" "$g"
+        n=$(( n + 1 ))
+    done < <(launcher_forwards "$VM")
+    (( n )) || printf 'no forwards\n'
+}
+
+# --- port ---------------------------------------------------------------------
+#
+# A forward is two things kept in step: a live redirection in the running qemu,
+# added or removed over the monitor, and a hostfwd in the launcher's netdev, so
+# it is still there after the next boot. Doing only the first loses it at
+# reboot; doing only the second does not open it now.
+
+domain_port() {
+    local VM="" SPEC="" CLOSE="" h g
+    while (( $# )); do
+        case "$1" in
+            -c|--close) CLOSE="${2:?$1 needs a value}"; shift 2 ;;
+            -h|--help)  domain_usage 0 ;;
+            -*)         die "virutil domain port: unknown flag: $1" ;;
+            *)
+                if   [[ -z "$VM"   ]]; then VM="$1"
+                elif [[ -z "$SPEC" ]]; then SPEC="$1"
+                else domain_usage
+                fi
+                shift ;;
+        esac
+    done
+    domain_need "$VM" || domain_usage
+
+    if [[ -n "$CLOSE" ]]; then
+        [[ "$CLOSE" =~ ^[0-9]+$ ]] || die "--close wants a host port, got '$CLOSE'"
+        launcher_forwards "$VM" | grep -q "^$CLOSE " \
+            || die "$VM has no forward on host port $CLOSE"
+        launcher_edit "$VM" "hostfwd=tcp:127\\.0\\.0\\.1:$CLOSE-:" \
+            "s/,hostfwd=tcp:127\\.0\\.0\\.1:$CLOSE-:[0-9]+//" "the forward on $CLOSE"
+        if domain_running "$VM"; then
+            qmp_need "$VM"
+            qmp_hmp "hostfwd_remove net0 tcp:127.0.0.1:$CLOSE" >/dev/null
+            qmp_close
+        fi
+        say "$VM: closed 127.0.0.1:$CLOSE"
+        return 0
+    fi
+
+    if [[ -z "$SPEC" ]]; then
+        local n=0
+        while read -r h g; do
+            [[ -n "$h" ]] || continue
+            printf '127.0.0.1:%s -> guest:%s\n' "$h" "$g"
+            n=$(( n + 1 ))
+        done < <(launcher_forwards "$VM")
+        (( n )) || printf 'no forwards\n'
+        return 0
+    fi
+
+    read -r h g <<<"$(domain_port_spec "$SPEC")"
+    launcher_forwards "$VM" | grep -q "^$h " \
+        && die "$VM already forwards host port $h (see: virutil domain port $VM)"
+    # Live first: a port something on the host already holds is refused there,
+    # and refusing before the launcher is touched leaves nothing to undo.
+    if domain_running "$VM"; then
+        qmp_need "$VM"
+        qmp_hmp "hostfwd_add net0 tcp:127.0.0.1:$h-:$g" >/dev/null
+        qmp_close
+    fi
+    launcher_edit "$VM" '-netdev user,id=net0' \
+        "s/(-netdev user,id=net0)/\\1,hostfwd=tcp:127.0.0.1:$h-:$g/" "the user-mode netdev"
+    say "$VM: 127.0.0.1:$h -> guest:$g"
+}
+
+# --- delete -------------------------------------------------------------------
+
+domain_delete() {
+    local VM="${1:-}" f
+    case "$VM" in -h|--help) domain_usage 0 ;; esac
+    domain_need "$VM" || die "usage: virutil domain delete VM"
+    domain_running "$VM" \
+        && die "$VM is running. Shut it down first -- 'virutil domain shutdown $VM'" \
+               "-- so the disk is closed before it is removed."
+
+    # Internal snapshots live inside the qcow2s, so the disk and the nvram take
+    # every snapshot with them; the TPM directory holds the state the
+    # disk-only ones saved beside it.
+    for f in "$(domain_disk "$VM")" "$(domain_nvram "$VM")" "$(domain_log "$VM")" \
+             "$(domain_pidfile "$VM")" "$(domain_qmp "$VM")" "$(domain_qga "$VM")"; do
+        [[ -e "$f" || -S "$f" ]] || continue
+        rm -f -- "$f" && say "removed $f"
+    done
+    f="$(domain_tpmdir "$VM")"
+    if [[ -d "$f" ]]; then rm -rf -- "$f" && say "removed $f"; fi
+    # The launcher last: it is what makes the rest a domain, so a delete that
+    # fails partway still lists, and can be run again.
+    f="$(domain_launcher "$VM")"
+    rm -f -- "$f" && say "removed $f"
+}

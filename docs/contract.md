@@ -1,14 +1,19 @@
 # The virutil contract
 
-virutil ships as two programs: `virutil`, a bash driver for a Linux host
-(libvirt/KVM), and `virutil.ps1`, a PowerShell driver for a Windows host (raw
-QEMU under WHPX). They share no source. This file is what they do share -- the
-observable surface a user and a script may rely on, identically, on either host.
+virutil ships as two programs: `virutil`, a bash driver, and `virutil.ps1`, a
+PowerShell driver for a Windows host (raw QEMU under WHPX). The bash driver
+carries two module trees and loads the one `uname` names: `modules/linux` for a
+Linux host (libvirt/KVM) and `modules/mac` for a macOS host (raw QEMU under
+hvf). That is three host implementations, and they share no source. This file
+is what they do share -- the observable surface a user and a script may rely
+on, identically, on any host.
 
 The fork is the directory layout too: `modules/linux`, `tests/linux` and
 `completions/linux` are the bash driver's and `modules/win`, `tests/win` and
 `completions/win` are the PowerShell driver's, each driver loading only its own
-half. The exceptions are the two things that are *shared* rather than forked --
+half. `modules/mac` is the bash driver's second tree; it shares the bash
+driver's entry point, tests and completion, each of which asks `uname` which
+tree it is looking at, and no module source with `modules/linux`. The exceptions are the two things that are *shared* rather than forked --
 `payloads/`, which is split on the guest's OS instead (section 6), and
 `tests/golden/`, which is one file precisely because both drivers must render
 it.
@@ -22,8 +27,9 @@ hypervisor, how it serves a payload, what it shells out to.
 Keep them apart; conflating them is how the fork rots.
 
 - **Host axis.** What the driver runs on. This is the fork. libvirt/virsh,
-  smbd, `ip`/`ss`, `sudo` on one side; qemu-system-x86_64.exe, `New-SmbShare`,
-  `Get-NetIPAddress` on the other.
+  smbd, `ip`/`ss`, `sudo` on a Linux host; qemu-system-x86_64.exe,
+  `New-SmbShare`, `Get-NetIPAddress` on a Windows one; qemu-system-aarch64,
+  swtpm and QMP over Unix sockets on a Mac.
 - **Guest axis.** What is on the other side of the transfer, keyed on the
   guest's OS, *not* the host's. A Windows guest fetches with robocopy over SMB;
   a Linux guest fetches with rsync. This axis is identical in both
@@ -36,8 +42,8 @@ every module, exit 0 for an asked-for help and 1 for a usage error.
 
 ```
 virutil domain create   VM ISO [-s GiB] [-m MiB] [-c N] [-o ID] [-v ISO|none]
-                               [-p SPEC] [-N]            # Windows host only
-                               # -c N: Linux host only; a Windows host creates
+                               [-p SPEC] [-N]            # Windows and macOS hosts
+                               # -c N: Linux and macOS hosts; a Windows host creates
                                #       at 1 vcpu and refuses it (section 9)
 virutil domain delete   VM
 virutil domain list
@@ -46,10 +52,10 @@ virutil domain shutdown VM
 virutil domain addr     VM
 virutil domain port     VM [PORT | HOSTPORT:GUESTPORT] [-c PORT]
 
-virutil snapshot create VM [SNAP]        # Linux host only; default snap-<timestamp>
-virutil snapshot list   VM               # Linux host only
-virutil snapshot revert VM SNAP          # Linux host only
-virutil snapshot delete VM SNAP          # Linux host only
+virutil snapshot create VM [SNAP]        # Linux and macOS hosts; default snap-<timestamp>
+virutil snapshot list   VM               # Linux and macOS hosts
+virutil snapshot revert VM SNAP          # Linux and macOS hosts
+virutil snapshot delete VM SNAP          # Linux and macOS hosts
 
 virutil sync VM [-c NAME|PATH]
 virutil push VM SRC DST
@@ -69,13 +75,16 @@ into Windows and the domain is inside the Linux kernel's view: getting it across
 is a `usbipd` recipe in the README rather than a command. See section 7.
 
 `domain create -p SPEC` (a port forward, repeatable) and `-N` (create without
-starting) exist on the Windows driver only, and are marked as such above. They
+starting) exist on the Windows and macOS drivers, and are marked as such above:
+both run guests on user-mode NAT, where a forward is the only way in. They
 are in this section rather than buried in section 9 because a reader working out
 what a command line means should not have to find them somewhere else -- but a
 script using them is a script for one host. `snapshot` is marked the same way
 for the same reason, the other way round: it was on both drivers and was taken
-out of the Windows one (section 7). Everything else above is both drivers'.
-Section 9 says what each flag *does* where the two cannot agree.
+out of the Windows one (section 7). Everything else above is on the Linux and
+Windows drivers; the macOS driver carries `domain`, `snapshot` and `exec` so far
+and refuses the rest by name (section 7). Section 9 says what each flag *does*
+where the drivers cannot agree.
 
 Invariants that are contract, not implementation:
 
@@ -100,12 +109,18 @@ Invariants that are contract, not implementation:
   the Windows driver while it had no `ui`; they now launch through the same
   guest script there as here. Every directive in a config means the same thing
   on both hosts, except that the Windows one still refuses `@guest=linux`.
+- **On a macOS host, `sync`, `push`, `pull`, `ui` and `usb` are not there yet**,
+  and each is refused by name with the reason rather than as an unknown module
+  (section 7).
 - `domain delete` never prompts and removes disks, backing chain, snapshot
   overlays and memory files, mount points and port forwards; files another
   domain uses are kept.
 - `snapshot delete` takes SNAP's descendants with it and commits no disk data.
-- **`snapshot` is a Linux-host command.** There a running domain snapshots
-  memory too and a shut-off one is disk-only. It is not on the Windows driver
+  On a macOS host a snapshot has no descendants to take: qcow2 internal
+  snapshots are flat (section 7).
+- **`snapshot` is a Linux- and macOS-host command.** On both, a running domain
+  snapshots memory too and a shut-off one is disk-only, and a revert leaves the
+  domain running at the snapshot. It is not on the Windows driver
   at all: WHPX installs a migration blocker, so `savevm` refuses before it
   reaches any disk (measured -- section 7 quotes it), and a snapshot that can
   only ever be a disk is not worth the name. `virutil snapshot` on a Windows
@@ -129,10 +144,17 @@ One root, everything under it, one variable relocates the lot.
 | `<root>/cache` | third-party tools fetched once (PsExec) |
 
 The overlays and memory files in the `images` row are the Linux host's alone:
-`snapshot` is a Linux-host command (section 7), so a Windows host's `images`
-holds disks, nvram, launchers and logs and nothing any snapshot left behind.
+`snapshot` is not on the Windows driver (section 7), so a Windows host's
+`images` holds disks, nvram, launchers and logs and nothing any snapshot left
+behind. A macOS host's snapshots are *internal* -- named states inside the disk
+and nvram qcow2s, memory included -- so its `images` holds, per domain, the
+disk, the nvram (`VM_VARS.qcow2`), the launcher (`VM.sh`), the qemu log, and
+while it runs a pidfile and two Unix sockets (`VM.qmp`, `VM.qga`), plus a
+`VM.tpm/` directory holding swtpm's state and the copies a disk-only snapshot
+keeps of it. Nothing outside that list is ever written there.
 
-Root is `~/.virutils` on Linux and `%USERPROFILE%\.virutils` on Windows. The
+Root is `~/.virutils` on Linux and macOS and `%USERPROFILE%\.virutils` on
+Windows. The
 staging tree must survive a reboot -- this is why it is not an XDG/`%TEMP%`
 directory.
 
@@ -203,9 +225,10 @@ spelling.
 | `VIRUTILS_NETWORK` | guest NIC spec |
 | `VIRUTILS_FIRMWARE` | `uefi` (default) or `bios` |
 
-The last three have no meaning on a Windows host -- there is no libosinfo, no
-libvirt network, and WHPX will not boot Windows 11 without UEFI -- so that
-driver reads them, says they are ignored, and carries on. A variable being in
+The last three have no meaning on a Windows or macOS host -- there is no
+libosinfo, no libvirt network, and neither WHPX booting Windows 11 nor an
+arm64 guest has anything but UEFI -- so those drivers read them, say they are
+ignored when one has actually been set, and carry on. A variable being in
 this table means both drivers must *accept* it, not that both can act on it.
 
 ## 5. Exit codes
@@ -330,6 +353,94 @@ question `push` and `pull` were blocked on was measured and decided, and what wa
 decided is recorded below. What remains unported is a Linux guest from a Windows
 host, which is a later pass on the transport that now exists rather than a new
 question. `ui` is ported, below.
+
+### The macOS host: `domain`, `snapshot` and `exec`
+
+The macOS driver is `modules/mac`, loaded by the same `virutil` as
+`modules/linux` when `uname` says Darwin. It runs an **arm64** guest -- Windows
+11 on Arm -- because hvf accelerates the host's own architecture and nothing
+else; an x64 guest on a Mac is TCG emulation, which is a different product.
+
+Its shape is the Windows driver's, carried over to a Unix host: no libvirt, raw
+QEMU, **the launcher is the domain** (`VM.sh`, one qemu argument per line),
+user-mode NAT with `hostfwd` forwards as the only way in. Where it differs is in
+how a running domain is reached: QMP and the guest agent over two Unix sockets
+beside the disk, through `nc -U`, rather than a human monitor and an agent on
+loopback ports. QMP because its replies are framed and matched by id; Unix
+sockets because there is no port band to allocate and keep bindable, and a
+socket under `~/.virutils` is reachable by its owner only, where a loopback
+port is reachable by every local user.
+
+**Stock qemu cannot boot Windows on Arm here, and the driver builds its own.**
+Measured: the installer reads its `boot.wim` and then sits at the firmware
+logo forever, its boot CPU parked on `b .` in the boot loader's exception
+vector table, and qemu's trace names the cause --
+`hvf_unknown_smc unknown SMC! 0x00000000c3000001`. Windows issues that OEM
+SMCCC call by SMC at every boot; upstream's hvf answers an unknown SMC with -1
+only when the PSCI conduit is SMC, and with an undefined-instruction exception
+otherwise, and under hvf the virt board's conduit is HVC. UTM's qemu boots
+Windows because it patches that one condition. `virtualization=on` makes the
+conduit SMC, but the firmware then stalls at EL2, so it is not a way round.
+So `patches/qemu/` carries the same one-line change, `install.sh --qemu` builds
+a pinned qemu with it into `<root>/cache/qemu` (the cache row of section 3,
+"third-party tools fetched once"), and the driver prefers that build to the
+qemu on PATH -- and `domain create` warns, by name, when it is about to write a
+launcher around stock qemu. With the patch, Windows Setup is on screen 30
+seconds after `domain create`.
+
+**What ships: `domain`, `snapshot` and `exec`.** That is enough to build,
+run, script and roll back a guest. `exec` is `modules/linux/exec` with the
+agent reached over the socket and base64 spelled for BSD; `domain` and
+`snapshot` are new code over QMP and `qemu-img`.
+
+**`snapshot` is on this host because hvf saves memory**, the measurement that
+took it off the Windows driver coming out the other way. Measured on an M5 Pro,
+macOS 27, Homebrew qemu 11.1.1, against a guest booted on exactly the arguments
+`modules/mac/domain` writes: `savevm` and `loadvm` complete (0.2s and 0.1s for
+a firmware-only guest), and so do QMP's `snapshot-save` and `snapshot-load`
+jobs, with the NVMe disk, the USB CD-ROMs, xHCI, ramfb, virtio-net,
+virtio-serial and the swtpm TPM all attached. The snapshots are qcow2
+*internal* ones -- the Windows driver's removed mechanism, now with its memory
+half -- not the Linux driver's external overlays, because there is no libvirt
+to keep records naming overlays. Three things follow, and are contract for this
+host:
+
+- The memory image goes in the disk (`vmstate=disk0`), never in the nvram, and
+  a revert to it always happens in a **fresh** qemu: a running domain is
+  powered off first, then qemu starts paused (`-S`), runs `snapshot-load` and
+  continues. Startup `-loadvm` cannot be used: it looks for the memory on the
+  first snapshot-capable drive, which is the nvram, and refuses with "This is a
+  disk-only snapshot". And loading into the live process cannot be used either,
+  which was learned against a real guest after a firmware-only one had passed:
+  with Windows running, `snapshot-load` in place killed qemu on
+  `Assertion failed: (!auto_alloc || *pptr == NULL), function
+  vmstate_load_next` -- the NVMe controller's queue arrays, which its vmstate
+  allocates on load and so needs empty, and which a live guest has filled. A
+  fresh process has them empty. Measured through that path on Windows 11 on
+  Arm with 8 GiB: create 1.7s while running, revert 2.2s, the guest back with
+  its agent answering and a file written after the snapshot gone.
+- Internal snapshots are flat. None has a parent or children, so "delete takes
+  SNAP's descendants with it" holds with nothing to take, and deleting one
+  never touches another.
+- The TPM's state is outside both qcow2s. A memory snapshot carries it
+  (swtpm hands it to qemu with the guest's RAM); a disk-only one copies swtpm's
+  state file beside it and puts it back on revert, so a guest is never booted
+  against TPM keys from a different moment than its disk.
+
+**What is refused, by name, and why.** `sync`, `push` and `pull` need the
+transfer layer, and the transfer layer on this host is an open question rather
+than a port. The design every other host follows -- the host serves, the guest
+fetches over SMB from 10.0.2.2 -- needs an SMB server the guest's client will
+accept, and a Mac has two candidates, neither measured: macOS's own SMB server
+(File Sharing, which needs Administrator and is offered on every interface, the
+weakness section 7 records for the Windows host), or Samba run as the invoking
+user and reached through a slirp `guestfwd`, which needs no root and is offered
+on no host interface at all -- qemu's own `-nic user,smb=` is that mechanism.
+The second is the likely answer and is what the next pass measures, against the
+two refusals a stock 24H2 client brings (insecure guest logons off, signing
+required). `ui` delivers with `push`, so it waits on the same thing. `usb` is
+unmeasured: whether qemu under hvf can claim a device from macOS's own USB stack
+at all is the first question, and it has not been asked.
 
 ### `sync`: ported, on the transport `push` and `pull` built
 
@@ -706,9 +817,24 @@ drivers:
 | `tests/linux/conformance.sh` | the runner. Every `--help` exits 0, every usage error exits 1, in both drivers; drives the two below. |
 | `tests/linux/payloads.sh`, `tests/win/payloads.ps1` | render all eleven payloads under each driver and diff both against `tests/golden/payloads.txt`. This is what makes section 6's "byte-identical" checkable. |
 | `tests/win/domain.ps1` | the launcher round trip: monitor port, agent channel and port forwards written, read back, edited and read again. |
+| `tests/mac/domain.sh` | the macOS driver against a real hvf domain with no OS: create's files, start, port forwards live and in the launcher, every snapshot verb with the domain running and shut off, the launcher edits, delete. Driven from the runner on a Mac; skips anywhere else. |
 | `tests/win/xfer.ps1` | `push` and `pull` on a Windows host with both seams substituted -- the guest agent and the share publisher -- so the guest path rules, credential generation, the free-space refusal, the sweep's liveness decision, the rendered payload and the teardown all run with no VM and no Administrator. |
 | `tests/win/sync.ps1` | `sync` on a Windows host, over the same two seams, with a real staging tree and a real delivery tree built on the host: what each config directive parses to, that the two a Windows host cannot honour are refused **before anything is fetched**, the layout the map rules build, the payload the guest would have been sent, and that a failed delivery tears down as completely as a successful one. |
 | `tests/win/transfer.ps1` | the guest tier: the transfer minimum below, plus the property that a completed transfer and a killed one both leave no account, no share and no staged tree. |
+
+On a Mac the bash half runs `modules/mac` -- the module list is read from
+whichever tree `uname` selects -- and adds two things of its own: each command
+the macOS driver does not carry is refused by name with the reason, and
+`tests/mac/domain.sh` drives a real hvf domain with no OS in it (a blank ISO
+leaves the firmware in its shell) through create, start, port, every snapshot
+verb in both domain states, the launcher edits and delete -- including
+section 8's "create leaves exactly the files section 3 names". What it cannot
+reach is anything inside a guest. That half was measured by hand against
+Windows 11 on Arm with the x64 qemu-ga, and is not yet a script: `exec`
+propagates the guest's exit code (`exit 7` is virutil's 7), the agent answers
+again after a guest reboot, `shutdown` through the agent powers the domain off
+in 4s, a cold `start` has the agent answering in 12s, and a memory snapshot
+round-trips (above).
 
 The PowerShell half skips itself, loudly, on a host with no `pwsh`, and
 `tests/win/transfer.ps1` skips itself the same way when no guest is up. When a guest
@@ -737,6 +863,34 @@ than host-passthrough, `threads=1` rather than an SMT topology,
 `cache=writeback` rather than `cache=none,io=io_uring`, `-vga std` rather than
 virtio. No kvm (WHPX instead, so no hyperv enlightenments), no swtpm, no
 libvirt network.
+
+The macOS host's equivalents are in the headers of `modules/mac/qemu` (what was
+measured) and `modules/mac/domain` (what each device is for). In brief: `-cpu
+host` under hvf, `virt,gic-version=3`, one thread per core (Apple silicon has
+no SMT); the disk on **NVMe** rather than virtio-blk, because the arm64
+installer has it inbox and it snapshots; the ISOs as **USB CD-ROMs** (`usb-bot`
+plus `scsi-cd`), because the virt machine has no IDE or AHCI; **ramfb** for the
+display; the nvram as **qcow2**, because a raw writable pflash blocks every
+internal snapshot; `tpm-tis-device` with **`ppi=off`**, because PPI's RAM region
+is smaller than the 16 KiB page hvf maps and qemu dies at startup on
+`HV_BAD_ARGUMENT`; qemu **never `-daemonize`d**, because its forked child aborts
+in the Objective-C runtime at the first snapshot; and every forward bound to
+**127.0.0.1**, where the other two drivers' `tcp::H-:G` binds every interface.
+That last one is a choice rather than a measurement, made because a Mac is
+usually a laptop and the guest's RDP should not be offered to whatever network
+it has joined; the other drivers may want it too, but are not changed here.
+
+One more is a measurement, and it is the one most worth carrying to the
+Windows driver: **every macOS domain gets its own hardware identity** -- an
+SMBIOS UUID and serial, a NIC MAC, an NVMe serial -- generated once at create
+and frozen in the launcher. On qemu's defaults every guest is the same machine
+(MAC 52:54:00:12:34:56, no SMBIOS UUID or serial), and so is every other qemu
+guest anyone has left on them. The first Windows install on this host went
+online in OOBE, matched that identity against Windows Autopilot, and offered
+another organisation's tenant as the only way in -- someone had registered a
+default-identity qemu guest there. libvirt randomises the MAC and UUID per
+domain, so the Linux driver has never had this; the Windows driver writes no
+`-uuid`, `-smbios` or `mac=` either, and is likely exposed in the same way.
 
 One entry in that header is a defect rather than a setting, and it changes what
 an install has to be *told* rather than what either driver promises. On the qemu
@@ -828,6 +982,33 @@ thing neither driver may do, because it reports a change that was not made.
   is. `-s` was never libvirt's at all -- both drivers end at `qemu-img resize`
   on the same image. Both require the domain shut off, on both hosts, for the
   same reason. This is the rare case of the grammar bending back straight.
+
+On a macOS host the grammar bends in the same places as on Windows, for the
+same user-mode-NAT reasons, and in two of its own:
+
+- **`domain addr`** prints the forwards and says the guest address is not
+  reachable, as on Windows. **`-o`** is accepted and ignored, as on Windows.
+  **`-p` and `-N`** exist, as on Windows -- but with no `-p`, the default RDP
+  forward is 13389 *or the next free port*, where the Windows driver always
+  writes 13389. Measured the hard way: a second domain on a port the first one
+  holds is a qemu that dies at startup ("Could not set up host forwarding
+  rule"), and before `domain_launch` learned to stop it, a swtpm left running
+  for every such attempt.
+- **`domain create -c N` is honoured.** The reboot defect that shaped the
+  Windows driver's vcpu handling is WHPX's own (`whpx_get_xsave_state`), and
+  it does not happen here: measured, a 4-vcpu Windows 11 on Arm guest went
+  through Setup's own reboots into OOBE inside one qemu process, with nothing
+  in its log. The default is half the host's cores, at most 8, at least the 2
+  Windows 11 Setup insists on.
+- **`domain start -G` is honoured**, unlike on Windows: it starts qemu with
+  `-display none`, and the guest is reached over RDP or the agent. The launcher
+  keeps `-display cocoa`; `-G` is an argument for one start, not an edit.
+- **`domain shutdown` tries the guest agent first** and falls back to the ACPI
+  power button, which is what `virsh shutdown` does on the Linux host -- the
+  Windows driver sends ACPI only.
+- **`snapshot revert` to a disk-only snapshot of a running domain powers it off
+  first**, with `quit` rather than asking the guest, as `virsh snapshot-revert`
+  does: what the guest had not written is exactly what a revert discards.
 
 The same rule covers the environment. `VIRUTILS_OSINFO`, `VIRUTILS_NETWORK` and
 `VIRUTILS_FIRMWARE` are read by the Windows driver and acted on by none of it,
