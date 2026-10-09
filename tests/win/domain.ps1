@@ -210,6 +210,72 @@ try {
         $held.Stop()
     }
 
+    # --- a forward two domains both want -------------------------------------
+    #
+    # create used to write 13389 for every domain made without -p, so of two
+    # such domains only one could run: the second qemu died at startup on
+    # "Could not set up host forwarding rule". create now skips a port another
+    # launcher forwards, and start refuses a forward someone already holds,
+    # naming who and what to type.
+    #
+    # slirp binds a forward on 0.0.0.0, and Windows lets 127.0.0.1 bind beside
+    # that -- which is why the forward test is not the loopback one, and why
+    # the holder here is on Any.
+    $any = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Any, 0)
+    $any.Start()
+    $anyPort = ([Net.IPEndPoint]$any.LocalEndpoint).Port
+    # A listening "monitor" is all Test-DomainRunning asks for.
+    $mon = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+    $mon.Start()
+    $monPort = ([Net.IPEndPoint]$mon.LocalEndpoint).Port
+    # A port nothing holds, for a forward that exists only on paper.
+    $pick = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Any, 0)
+    $pick.Start()
+    $paperPort = ([Net.IPEndPoint]$pick.LocalEndpoint).Port
+    $pick.Stop()
+    try {
+        Check 'a port held on 0.0.0.0 is not a free forward' $false (Test-HostPortFree $anyPort)
+        Check 'though the loopback test would call it free'  $true  (Test-LoopbackPortFree $anyPort)
+
+        foreach ($d in @(
+                @{ Vm = 'paper';  Port = $paperPort; Monitor = 44446 }
+                @{ Vm = 'holder'; Port = $anyPort;   Monitor = $monPort }
+                @{ Vm = 'second'; Port = $anyPort;   Monitor = 44447 })) {
+            $dargs = Get-DomainQemuArgs -Vm $d.Vm `
+                -Qemu @{ Code = 'C:\q\share\edk2-x86_64-code.fd' } `
+                -Disk (Get-DomainDisk $d.Vm) -Nvram (Get-DomainNvram $d.Vm) `
+                -Iso 'C:\iso\win.iso' -Virtio '' -Memory 4096 -Vcpus 2 `
+                -Ports @("$($d.Port):3389") -MonitorPort $d.Monitor -AgentPort 44445
+            Write-DomainLauncher (Get-DomainLauncher $d.Vm) 'C:\q\qemu-system-x86_64.exe' $dargs $d.Vm
+        }
+        Check 'every launcher is a domain' $true ('holder' -in (Get-DomainNames))
+
+        # Held on paper only: bindable now, and still not one to hand out.
+        Check 'a forward on paper is bindable'           $true (Test-HostPortFree $paperPort)
+        Check 'and is still skipped for a new domain'    $true ((Get-FreeForwardPort $paperPort) -ne $paperPort)
+        Check 'a held port is skipped too'               $true ((Get-FreeForwardPort $anyPort) -ne $anyPort)
+
+        $ok = $true
+        try { Assert-DomainForwardsFree 'paper' } catch { $ok = $false }
+        Check 'a domain whose forwards are free may start' $true $ok
+
+        $said = ''
+        try { Assert-DomainForwardsFree 'second' } catch { $said = $_.Exception.Message }
+        Check 'start refuses a forward a running domain holds' $true ($said -match 'holder is running')
+        Check 'and says how to move it'          $true ($said -match "domain port second -c $anyPort\b")
+        Check 'to a port it can have'            $true ($said -match "domain port second (\d+):3389" -and
+                                                        (Test-HostPortFree ([int]$Matches[1])))
+
+        # Nothing running claims it: the port is still held, by someone else.
+        $mon.Stop()
+        $said = ''
+        try { Assert-DomainForwardsFree 'second' } catch { $said = $_.Exception.Message }
+        Check 'a holder that is not a domain is named as such' $true ($said -match 'something else on this host')
+    } finally {
+        $any.Stop()
+        $mon.Stop()
+    }
+
     # --- deleting through an 8.3 short path ---------------------------------
     #
     # Remove-Item cannot do it, -LiteralPath notwithstanding, which broke

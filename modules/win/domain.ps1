@@ -255,7 +255,8 @@ function Get-DomainUsage {
         '  -o, --osinfo ID   accepted and ignored: there is no libosinfo here'
         '  -v, --virtio ISO  virtio-win ISO to attach as a second cdrom, or'
         '                    "none" (default: found beside ISO)'
-        '  -p, --port SPEC   a port forward, repeatable (default 13389:3389)'
+        '  -p, --port SPEC   a port forward, repeatable (default 13389:3389, or'
+        '                    the next free host port when another domain has it)'
         '  -N, --no-start    create it without starting it'
         ''
         "The disk is always $($script:VirutilsImageDir)\VM.qcow2;"
@@ -386,6 +387,14 @@ function Get-DomainQemuLog  { param([string]$Vm) Join-Path $script:VirutilsImage
 function Test-Domain {
     param([string]$Vm)
     return (Test-Path -LiteralPath (Get-DomainLauncher $Vm))
+}
+
+# Every domain on this host, which is every launcher in the image directory.
+function Get-DomainNames {
+    if (-not (Test-Path -LiteralPath $script:VirutilsImageDir)) { return @() }
+    return @(Get-ChildItem -LiteralPath $script:VirutilsImageDir -Filter '*.cmd' |
+             Sort-Object Name |
+             ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_.Name) })
 }
 
 function Assert-Domain {
@@ -536,9 +545,7 @@ function Show-DomainList {
     if (-not (Test-Path -LiteralPath $script:VirutilsImageDir)) { return }
 
     $rows = @()
-    foreach ($f in Get-ChildItem -LiteralPath $script:VirutilsImageDir -Filter '*.cmd' |
-                   Sort-Object Name) {
-        $vm = [IO.Path]::GetFileNameWithoutExtension($f.Name)
+    foreach ($vm in Get-DomainNames) {
         $state = if (Test-DomainRunning $vm) { 'running' } else { 'shut off' }
         $rows += [pscustomobject]@{ Name = $vm; State = $state }
     }
@@ -579,6 +586,8 @@ function Start-Domain {
     Assert-Domain $vm
 
     if (Test-DomainRunning $vm) { Die "$vm is already running" }
+    # Before the edits below, so a start refused here has changed nothing.
+    Assert-DomainForwardsFree $vm
 
     # -s, -m and -c change the domain and then start it, which is what they do
     # on the other driver too. The shape is the same in both places: a
@@ -630,6 +639,42 @@ function Start-Domain {
     Start-DomainProcess $vm
     Wait-DomainStart $vm
     Say "$vm started"
+}
+
+# A forward whose host port something already holds, refused before qemu runs
+# rather than after. qemu's own word for it is one line in $Vm-qemu.log --
+# "Could not set up host forwarding rule" -- and a domain that is shut off a
+# moment after `start` said it launched. That is how two domains created on the
+# old fixed 13389 default read: one of them would start, the other never would,
+# for as long as the first was up.
+#
+# The forwards are the user's (see Repair-DomainPorts), so this does not move
+# one. It says whose port it is and what to type, which is the part qemu's line
+# leaves out.
+function Assert-DomainForwardsFree {
+    param([string]$Vm)
+    foreach ($f in @(Get-DomainForwards $Vm)) {
+        if (Test-HostPortFree $f.Host) { continue }
+
+        $holder = $null
+        foreach ($d in Get-DomainNames) {
+            if ($d -eq $Vm) { continue }
+            if (-not @(Get-DomainForwards $d | Where-Object { $_.Host -eq $f.Host }).Count) { continue }
+            if (Test-DomainRunning $d) { $holder = $d; break }
+        }
+        $who = if ($holder) { "$holder is running with that same forward" }
+               else { 'something else on this host holds it (or Windows has reserved it)' }
+        $next = Get-FreeForwardPort ($f.Host + 1)
+        Die @(
+            "$Vm forwards host port $($f.Host) to its $($f.Guest), and $who,"
+            "so qemu would die at startup: 'Could not set up host forwarding rule'."
+            'Domains run side by side only on different host ports. Move this'
+            "one's, then start it:"
+            "  virutil domain port $Vm -c $($f.Host)"
+            "  virutil domain port $Vm ${next}:$($f.Guest)"
+            "  virutil domain start $Vm"
+        )
+    }
 }
 
 # Did it come up? `domain start` used to say "started" the moment cmd returned,
@@ -923,7 +968,8 @@ function Set-LauncherMemory {
 #
 # Only the ports move. The forwards are the user's -- `domain port` put them
 # there and something on the host is expected to be dialling them -- so a
-# forward that cannot bind is qemu's to complain about and is left alone.
+# forward that cannot bind is left alone, and Assert-DomainForwardsFree refuses
+# the start instead, saying how to move it.
 function Repair-DomainPorts {
     param([string]$Vm)
     $path = Get-DomainLauncher $Vm
@@ -1039,7 +1085,10 @@ function New-Domain {
         $i++
     }
     if (-not $vm -or -not $iso) { Usage (Get-DomainUsage) 1 }
-    if ($ports.Count -eq 0) { $ports = @('13389:3389') }
+    # RDP on 13389, or the next port up that is free. This was a fixed 13389,
+    # so every domain created without -p asked for the same host port, and
+    # whichever started second died on it -- see Assert-DomainForwardsFree.
+    if ($ports.Count -eq 0) { $ports = @("$(Get-FreeForwardPort 13389):3389") }
     if ($vcpus -lt 1) { Die "--vcpus wants a whole number, got '$vcpus'" }
     # Accepted, then warned about, rather than refused: a single vcpu is a
     # legitimate machine for a guest that is already installed, and refusing it
@@ -1123,6 +1172,7 @@ function New-Domain {
     Say ('{0,-10}{1}' -f 'launcher:', $launcher)
     Say ('{0,-10}{1}' -f 'monitor:',  "127.0.0.1:$monitorPort")
     Say ('{0,-10}{1}' -f 'agent:',    "127.0.0.1:$agentPort")
+    Say ('{0,-10}{1}' -f 'forwards:', ($ports -join ', '))
 
     if ($noStart) { return }
 
@@ -1292,6 +1342,49 @@ function Test-LoopbackPortFree {
     } finally {
         try { $l.Stop() } catch { }
     }
+}
+
+# Can slirp bind this as a forward? Not Test-LoopbackPortFree's question, because
+# a forward is not a loopback socket: the launcher writes hostfwd=tcp::H-:G with
+# no host address, and slirp binds that on 0.0.0.0. Measured here, Windows lets
+# 127.0.0.1:H bind beside a 0.0.0.0:H another process holds, so the loopback
+# test alone reads a running domain's RDP forward as free. The reverse holds
+# too -- 0.0.0.0:H binds beside someone's 127.0.0.1:H, which then takes every
+# localhost connection meant for the guest -- so it is free only if both bind.
+function Test-HostPortFree {
+    param([int]$Port)
+    foreach ($addr in @([Net.IPAddress]::Any, [Net.IPAddress]::Loopback)) {
+        $l = New-Object Net.Sockets.TcpListener($addr, $Port)
+        try {
+            $l.Start()
+        } catch {
+            return $false
+        } finally {
+            try { $l.Stop() } catch { }
+        }
+    }
+    return $true
+}
+
+# Get-FreeForwardPort FROM -- the first host port at or above FROM that no
+# domain's launcher forwards and that slirp could bind now. Both, because a
+# domain that is shut off holds its forwards only on paper, and a port held on
+# paper still kills one of the two qemus the moment both run. The mac driver's
+# domain_free_port, for the same reason.
+function Get-FreeForwardPort {
+    param([int]$From)
+    $taken = @(foreach ($d in Get-DomainNames) {
+        Get-DomainForwards $d | ForEach-Object { $_.Host }
+    })
+    for ($p = $From; $p -lt $From + 1000; $p++) {
+        if ($p -in $taken) { continue }
+        if (Test-HostPortFree $p) { return $p }
+    }
+    Die @(
+        "no host port between $From and $($From + 999) is free for a forward:"
+        "each is forwarded by a domain's launcher or held on this host. Name"
+        'one with -p HOSTPORT:GUESTPORT.'
+    )
 }
 
 function Get-DomainQemuArgs {

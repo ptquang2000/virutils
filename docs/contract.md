@@ -988,12 +988,14 @@ same user-mode-NAT reasons, and in two of its own:
 
 - **`domain addr`** prints the forwards and says the guest address is not
   reachable, as on Windows. **`-o`** is accepted and ignored, as on Windows.
-  **`-p` and `-N`** exist, as on Windows -- but with no `-p`, the default RDP
-  forward is 13389 *or the next free port*, where the Windows driver always
-  writes 13389. Measured the hard way: a second domain on a port the first one
-  holds is a qemu that dies at startup ("Could not set up host forwarding
-  rule"), and before `domain_launch` learned to stop it, a swtpm left running
-  for every such attempt.
+  **`-p` and `-N`** exist, as on Windows, and with no `-p` the default RDP
+  forward is 13389 *or the next free port* on both hosts. Measured the hard
+  way: a second domain on a port the first one holds is a qemu that dies at
+  startup ("Could not set up host forwarding rule"), and before `domain_launch`
+  learned to stop it, a swtpm left running for every such attempt. The Windows
+  driver wrote a fixed 13389 until the same collision bit there; its `domain
+  start` now also refuses a forward a running domain already holds, naming
+  that domain and the `domain port` lines that move it.
 - **`domain create -c N` is honoured.** The reboot defect that shaped the
   Windows driver's vcpu handling is WHPX's own (`whpx_get_xsave_state`), and
   it does not happen here: measured, a 4-vcpu Windows 11 on Arm guest went

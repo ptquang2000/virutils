@@ -236,7 +236,7 @@ $completer = {
             Add-Match '-c' 'refused under create: a new domain gets 1 vcpu (set it with start -c N)'; Add-Match '--vcpus' 'refused under create: a new domain gets 1 vcpu (set it with start -c N)'
             Add-Match '-o' 'accepted and ignored: no libosinfo here';  Add-Match '--osinfo' 'accepted and ignored: no libosinfo here'
             Add-Match '-v' 'virtio-win ISO, or "none"';               Add-Match '--virtio' 'virtio-win ISO, or "none"'
-            Add-Match '-p' 'a port forward, repeatable (default 13389:3389)'; Add-Match '--port' 'a port forward, repeatable'
+            Add-Match '-p' 'a port forward, repeatable (default 13389:3389, or the next free port)'; Add-Match '--port' 'a port forward, repeatable'
             Add-Match '-N' 'create it without starting it';            Add-Match '--no-start' 'create it without starting it'
         }
         elseif ($module -eq 'domain' -and $verb -eq 'start') {
