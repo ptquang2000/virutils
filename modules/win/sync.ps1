@@ -112,9 +112,11 @@ function Get-SyncUsage {
         'one file moves one file.'
         ''
         "On this host the share comes from the machine's own SMB server, so the"
-        'delivery prompts once for Administrator and mints a throwaway local'
-        'account that the guest authenticates with and that is destroyed when'
-        'the run ends. See README.md, "On a Windows host".'
+        'delivery needs Administrator and mints a throwaway local account that'
+        'the guest authenticates with and that is destroyed when the run ends.'
+        "After 'virutil xfer setup' (once, elevated) that comes from a scheduled"
+        'task with no prompt; without it the delivery prompts once. See'
+        'README.md, "On a Windows host".'
         ''
         'This driver delivers to a Windows guest only: a config saying'
         '@guest=linux is refused; see docs/contract.md section 7. >pre-ui and'

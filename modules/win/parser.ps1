@@ -43,7 +43,13 @@ $ErrorActionPreference = 'Stop'
 # way it was -- is exactly the half this host cannot take. The measurements are
 # kept in docs/contract.md section 7, as the reason for the removal rather than
 # as a footnote to a command that still exists.
-$script:MODULES = @('domain', 'exec', 'pull', 'push', 'sync', 'ui', 'usb')
+#
+# `xfer` is the one name here the bash tree has no counterpart for, and it is a
+# Windows-host command by nature rather than a gap: it registers, once, the
+# scheduled task that lets push, pull and sync elevate without a UAC prompt.
+# A Linux host's transport has no elevation to arrange. modules/win/xfer.ps1
+# carries it beside the transport it serves.
+$script:MODULES = @('domain', 'exec', 'pull', 'push', 'sync', 'ui', 'usb', 'xfer')
 
 # Names the bash driver answers to that this one does not, and why. A name here
 # is refused with its own reason instead of "unknown module", because each is in
@@ -121,6 +127,8 @@ function Get-TopUsage {
         '  push       copy a file or directory from this host into a guest'
         '  pull       copy files out of a guest onto this host'
         "  sync       deliver a project's build output into a running guest"
+        '  xfer       set up, once, the scheduled task that lets transfers elevate'
+        '             without a UAC prompt'
         ''
         'guest'
         '  exec       run commands inside a guest via the QEMU guest agent'
@@ -137,9 +145,10 @@ function Get-TopUsage {
         'this one.'
         ''
         "push, pull, sync and ui setup publish a share on this machine's own SMB server,"
-        'so they prompt once for Administrator and mint a throwaway local'
-        'account for the length of the transfer. They deliver to a Windows'
-        'guest only. See README.md.'
+        'so they need Administrator and mint a throwaway local account for the'
+        "length of the transfer. After 'virutil xfer setup' (once, elevated) they"
+        'get it from a scheduled task with no prompt; without it, each prompts'
+        'once. They deliver to a Windows guest only. See README.md.'
         ''
         "Run 'virutil <module>' for a module's own usage."
     )

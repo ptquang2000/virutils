@@ -15,6 +15,7 @@ declare -A ELSEWHERE=(
     [pull]="needs the transfer layer, which this driver does not have yet"
     [ui]="delivers PsExec with push, and push is not ported yet"
     [usb]="has no macOS mechanism yet: host USB passthrough under hvf is unmeasured"
+    [xfer]="is a Windows-host command: it sets up the scheduled task that lets a transfer there elevate without a UAC prompt"
 )
 
 die()  { printf '%s\n' "$@" >&2; exit 1; }

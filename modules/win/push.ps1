@@ -11,8 +11,9 @@
 # that reaches the guest. Here it is served by the host's own SMB server, which
 # cannot be anonymous and cannot be bound to an interface -- so each transfer
 # mints a throwaway account, grants it on the share and on the filesystem, and
-# destroys it at teardown, and publishing the share prompts once for
-# Administrator. The guest side is byte-identical: the same payloads/push-*.ps1
+# destroys it at teardown, and publishing the share needs Administrator -- from
+# the scheduled task `virutil xfer setup` registers, or as one UAC prompt per
+# transfer where setup never ran. The guest side is byte-identical: the same payloads/push-*.ps1
 # both drivers send.
 
 function Get-PushUsage {
@@ -33,9 +34,11 @@ function Get-PushUsage {
         'what changed.'
         ''
         "On this host the share comes from the machine's own SMB server, so the"
-        'transfer prompts once for Administrator and mints a throwaway local'
-        'account that the guest authenticates with and that is destroyed when'
-        'the transfer ends. See README.md, "On a Windows host".'
+        'transfer needs Administrator and mints a throwaway local account that'
+        'the guest authenticates with and that is destroyed when the transfer'
+        "ends. After 'virutil xfer setup' (once, elevated) that comes from a"
+        'scheduled task with no prompt; without it the transfer prompts once.'
+        'See README.md, "On a Windows host".'
     )
 }
 

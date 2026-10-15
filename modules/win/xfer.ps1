@@ -28,9 +28,12 @@
 # already holds that one. The answer is not a second transport but the SMB
 # server the host already runs.
 #
-# Not listed in $MODULES: this is a shared library, picked up by the loader's
-# shared-libraries-first pass, the same way modules/linux/xfer is sourced ahead
-# of push and pull in the bash tree.
+# Listed in $MODULES, which modules/linux/xfer is not, and only for the
+# `virutil xfer` command at the bottom: setting up, once, the scheduled task
+# that lets a transfer elevate without a UAC prompt. Everything above that is
+# still the library push, pull and sync call, and none of them touches it while
+# the loader is still loading -- only at run time, by which point every module
+# is in.
 
 Set-StrictMode -Version Latest
 
@@ -64,6 +67,13 @@ $script:XferRcHostSetup         = 99
 # Generous, because the consent prompt itself is inside that window and someone
 # reaching for a smartcard or a second factor is not a failure.
 $script:XferHelperReadyMs = 120000
+# How long a helper started through the scheduled task gets to say it has
+# started at all. There is no prompt on that path and no process handle either,
+# so this is the only thing that turns "the task never ran it" -- a shell that
+# was uninstalled, a task someone disabled -- into a report rather than the
+# whole two-minute wait above. A cold pwsh under a virus scanner is seconds,
+# not twenty of them.
+$script:XferTaskStartMs = 20000
 # And how long to wait for it to finish tearing down once told to. Short: it has
 # three things to remove and nothing to ask anyone.
 $script:XferHelperStopMs = 30000
@@ -334,25 +344,64 @@ function Get-XferStrays {
 # helper-process boundary on purpose -- how elevation is achieved on Windows is
 # an implementation detail, and "publish a share" is the operation worth naming,
 # stubbing, and reading in one place.
-
-# The elevated helper, written into the transfer's scratch directory at publish
-# time rather than shipped as a file in modules/.
 #
-# Two reasons, and the first is mechanical: the loader dot-sources every
+# How elevation is achieved has two answers now, and Publish-XferShare picks:
+#
+#   the scheduled task   `virutil xfer setup` registered virutil-xfer-helper,
+#                        once, from an elevated prompt. Starting it raises no
+#                        prompt, which is the point: an unattended run (ralph,
+#                        a fan-out session) otherwise stalls on a consent
+#                        dialog nobody is there to answer.
+#   the UAC prompt       Start-Process -Verb RunAs, once per transfer, which is
+#                        what every transfer did before the task existed and
+#                        what one still does on a host where setup never ran.
+#
+# Inside Publish-XferShare there are three more seams, one per thing that
+# touches the machine -- Get-XferHelperTask, Start-XferHelperTask and
+# Start-XferHelperPrompt -- so that which path is taken, what the helper is
+# handed and how its pid comes back are testable without either path really
+# elevating.
+
+# The scheduled task, and where its copy of the helper lives.
+#
+# Under Program Files rather than beside the transfer, and that is the whole
+# difference between the task and a UAC bypass anyone can use. A task's action
+# is fixed when it is registered, but the file it runs is only as fixed as that
+# file's ACL: a helper under %USERPROFILE% could be rewritten by any process
+# running as this user, and the task would then run *that* elevated, without a
+# prompt. Program Files is writable by Administrators only, so the task runs
+# the text setup installed and nothing else, and that text does only what a
+# transfer does (see the header of $script:XferHelperSource).
+$script:XferTaskName   = 'virutil-xfer-helper'
+$script:XferTaskDir    = Join-Path $env:ProgramFiles 'virutil'
+$script:XferTaskHelper = Join-Path $script:XferTaskDir 'xfer-helper.ps1'
+
+# The elevated helper, rendered from the text below at publish time (the prompt
+# path) or at setup (the task path) rather than shipped as a file in modules/.
+#
+# Not a file in modules/ for a mechanical reason: the loader dot-sources every
 # modules/*.ps1 that $MODULES does not name, so a helper script living there
-# would be dot-sourced into every run of every command. The second is that a
-# script written beside the status file it answers through needs no argument
-# telling it where it is, and working out its own path is the thing that goes
-# wrong under elevation. The bash driver writes its smb.conf into scratch for
-# the same kind of reason.
+# would be dot-sourced into every run of every command. The scratch root is
+# baked into the text rather than worked out by the helper from its own path,
+# because working out its own path is the thing that goes wrong under
+# elevation, and because the installed copy does not live beside the transfer
+# at all. The bash driver writes its smb.conf into scratch for the same kind of
+# reason.
 #
 # A single-quoted here-string: nothing in it is expanded here, and everything in
 # it is expanded over there. The C# below is assembled from an array of lines
 # rather than from a here-string of its own, because a nested here-string
 # terminator at column 0 would close this one.
+#
+# Two placeholders, @ROOT@ and @PREFIX@, are filled by Get-XferHelperText and
+# nothing else is. There are two copies of this text in play and they are meant
+# to be the same text: the one a prompted transfer writes into its scratch
+# directory, and the one `virutil xfer setup` installs for the scheduled task.
 $script:XferHelperSource = @'
 # virutil transfer helper -- the elevated half of one transfer, and nothing
-# else. Written here by Publish-XferShare in modules/win/xfer.ps1; not a module,
+# else. Rendered by Get-XferHelperText in modules/win/xfer.ps1 and written
+# either into one transfer's scratch directory (the UAC-prompt path) or under
+# Program Files by `virutil xfer setup` (the scheduled-task path); not a module,
 # and not on the module search path.
 #
 # It mints the throwaway account, publishes the share, grants that account on
@@ -361,33 +410,62 @@ $script:XferHelperSource = @'
 #
 # It cannot talk back through a pipe: Start-Process -Verb RunAs requires
 # ShellExecute and ShellExecute forbids stream redirection, so asking for both
-# is a parameter-set error. Measured, not assumed. Hence the status file.
+# is a parameter-set error. Measured, not assumed. Hence the status file. A
+# scheduled task has no pipe to offer either, so both paths answer the same way.
 #
-# Every value it needs comes down as an argument, including the account-name
-# prefix: it is a separate process and cannot read $script:XferPrefix, and
-# re-spelling `vxp-` here would mean a change to that one constant silently
-# stopped the sweep from recognising its own strays.
-param(
-    [string]$Token,
-    [string]$User,
-    [string]$Prefix,
-    [string]$Password,
-    [string]$Path,
-    [string]$Access,
-    [int]$ParentPid,
-    [string]$Scratch,
-    [string]$Strays = ''
-)
+# **One argument, the token, and everything else is either baked in or derived
+# from it.** The scheduled task runs this elevated with no prompt, for any
+# process running as the user who set it up, and with whatever that process
+# hands it as $(Arg0). So nothing a caller passes may choose what gets shared,
+# which account gets minted or where the scratch directory is: the root and the
+# account prefix were fixed when this text was rendered, the share is always
+# <root>\<token>\share, and the account is always <prefix><token>. What does
+# come from the caller -- the password, ro or rw, the pid to wait on, the strays
+# to sweep -- is read from request.json in that directory and checked for shape
+# before it is used. The worst a hostile caller can make this do is what a
+# transfer does.
+#
+# The prefix is baked rather than re-spelled here for the reason it used to be
+# an argument: this is a separate process and cannot read $script:XferPrefix,
+# and spelling `vxp-` out a second time would mean a change to that one
+# constant silently stopped the sweep from recognising its own strays.
+param([string]$Token)
 
 $ErrorActionPreference = 'Stop'
 
-$share  = $Token
-$status = Join-Path $Scratch 'status.json'
-$done   = Join-Path $Scratch 'done'
+$Root   = '@ROOT@'
+$Prefix = '@PREFIX@'
+
+# The token's own alphabet (New-XferToken), and nothing that could climb out
+# of the root: no separator, no dot, no drive.
+if ($Token -notmatch '^[a-z0-9]{1,16}$') { exit 2 }
+
+$Scratch = Join-Path $Root $Token
+$Path    = Join-Path $Scratch 'share'
+$User    = "$Prefix$Token"
+$share   = $Token
+$status  = Join-Path $Scratch 'status.json'
+$done    = Join-Path $Scratch 'done'
+$request = Join-Path $Scratch 'request.json'
+
+# Everything under $Scratch was made by an unelevated process, and this one is
+# about to write, grant and delete in there as Administrator. A junction in
+# place of the scratch directory would point all three somewhere else, so it is
+# refused before the first write. It is a check, not a lock -- a caller racing
+# this could still swap the directory afterwards -- but that caller already had
+# to be running as the user who set the task up.
+function Test-Reparse {
+    param([string]$P)
+    $i = Get-Item -LiteralPath $P -Force -ErrorAction Stop
+    return [bool]($i.Attributes -band [IO.FileAttributes]::ReparsePoint)
+}
+try { if (Test-Reparse $Scratch) { exit 3 } } catch { exit 3 }
 
 function Write-Status {
-    param([bool]$Ok, [string]$Detail = '')
-    $body = @{ ok = $Ok; pid = $PID; detail = $Detail } | ConvertTo-Json -Compress
+    param([bool]$Ok, [string]$Detail = '', [switch]$Started)
+    $o = @{ ok = $Ok; pid = $PID; detail = $Detail }
+    if ($Started) { $o.started = $true }
+    $body = $o | ConvertTo-Json -Compress
     # Written beside the file and copied into place, so the parent -- which is
     # polling for it -- can never read half a line of JSON and act on it.
     $part = "$status.part"
@@ -395,6 +473,12 @@ function Write-Status {
     [IO.File]::Copy($part, $status, $true)
     [IO.File]::Delete($part)
 }
+
+# First, before anything that can fail: this process's own pid, so the parent
+# can tell a helper that is working from one that died before it said anything.
+# A task start hands the parent no process to watch, so this record is the only
+# way it learns which one to.
+Write-Status $false '' -Started
 
 # The logon rights, set directly against the account's SID rather than through
 # secedit. secedit exports, edits and reimports the machine's whole security
@@ -459,11 +543,41 @@ function Remove-Everything {
 }
 
 $made = $false
+$ParentPid = 0
 try {
+    # What the parent decided, read once and then deleted: it holds the
+    # password, and nothing needs it after this. Every field is checked for the
+    # shape its producer gives it rather than trusted -- see the header.
+    $req = (Get-Content -LiteralPath $request -Raw) | ConvertFrom-Json
+    try { [IO.File]::Delete($request) } catch { }
+    $Password  = [string]$req.password
+    $Access    = [string]$req.access
+    $ParentPid = [int]$req.parentPid
+    $Strays    = @($req.strays | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^[a-z0-9]{1,16}$' })
+    if ($Password -notmatch '^[A-Za-z0-9]{16,64}$') { throw 'request.json: the password is not the shape New-XferCredential makes' }
+    if ($Access -notin @('ro', 'rw'))               { throw "request.json: access is '$Access', not ro or rw" }
+    if ($ParentPid -le 0)                           { throw 'request.json: no parent pid to wait on' }
+
+    # The share and the ACL grant below both follow a junction, and icacls /T
+    # walks the whole tree. Staging copies bytes with robocopy and Copy-Item,
+    # neither of which leaves a reparse point behind, so there should be none in
+    # it; one that is there was put there, and granting through it could hand
+    # the throwaway account rights somewhere else entirely.
+    if (Test-Reparse $Path) { throw "$Path is a reparse point; refusing to share it" }
+    $walk = New-Object Collections.Generic.Stack[IO.DirectoryInfo]
+    $walk.Push([IO.DirectoryInfo]::new($Path))
+    while ($walk.Count -gt 0) {
+        foreach ($e in $walk.Pop().EnumerateFileSystemInfos()) {
+            if ($e.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "$($e.FullName) is a reparse point; refusing to share a tree that contains one"
+            }
+            if ($e -is [IO.DirectoryInfo]) { $walk.Push($e) }
+        }
+    }
+
     # The sweep first. The parent decided what is reapable and this only carries
     # it out, so a live sibling is never in this list.
-    foreach ($t in ($Strays -split ',')) {
-        if (-not $t) { continue }
+    foreach ($t in $Strays) {
         try { Remove-SmbShare -Name $t -Force -ErrorAction SilentlyContinue | Out-Null } catch { }
         try { Remove-LocalUser -Name "$Prefix$t" -ErrorAction SilentlyContinue } catch { }
     }
@@ -529,15 +643,172 @@ try {
 }
 '@
 
+# Get-XferHelperText [ROOT] -- the helper as it will run, for a scratch root.
+#
+# ROOT through GetFullPath because the helper is a different process with a
+# different working directory, and under the task a different one again: a
+# relative VIRUTILS_TMP_DIR has to mean here what it means to the run that
+# rendered it. Quoted for a single-quoted literal, which is the one place it
+# lands.
+function Get-XferHelperText {
+    param([string]$Root = $script:VirutilsTmpDir)
+    $full = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    return $script:XferHelperSource.Replace('@ROOT@', $full.Replace("'", "''")).Replace('@PREFIX@', $script:XferPrefix)
+}
+
+# Test-XferHelperCurrent TEXT -- is the installed helper the one this run would
+# have rendered?
+#
+# One comparison that answers two questions, which is why it is a comparison
+# and not a version number. The helper changes when virutil is updated, and the
+# root baked into it changes when VIRUTILS_TMP_DIR is moved; either way the task
+# would run a helper that does not match this run, and in the second case one
+# that looks for request.json in a directory this run never wrote. Line endings
+# and the trailing newline are not differences: Set-Content adds one, and git
+# may have checked this file out with either.
+function Test-XferHelperCurrent {
+    param([AllowNull()][string]$Text)
+    if (-not $Text) { return $false }
+    $norm = { param($t) ($t -replace "`r", '').TrimEnd() }
+    return ((& $norm $Text) -ceq (& $norm (Get-XferHelperText)))
+}
+
+# Get-XferHelperTask -- the registered task as a transfer needs to know it, or
+# $null when there is none this user can see. The first seam.
+#
+# Through the Schedule.Service COM object rather than Get-ScheduledTask, because
+# Start-XferHelperTask has to use it anyway (below) and the two should agree on
+# what "the task" is. Reading needs no privilege: setup grants this user read
+# and execute on it.
+function Get-XferHelperTask {
+    try {
+        $svc = New-Object -ComObject Schedule.Service
+        $svc.Connect()
+        $task = $svc.GetFolder('\').GetTask($script:XferTaskName)
+    } catch { return $null }
+
+    $shell = ''
+    foreach ($a in $task.Definition.Actions) { $shell = [string]$a.Path; break }
+    $text = $null
+    try { $text = [IO.File]::ReadAllText($script:XferTaskHelper) } catch { }
+    return @{
+        Enabled    = [bool]$task.Enabled
+        Shell      = $shell
+        HelperText = $text
+        LastResult = ('0x{0:X8}' -f $task.LastTaskResult)
+    }
+}
+
+# Start-XferHelperTask TOKEN -- run the task for one transfer. The second seam.
+#
+# **The token goes in as the task's $(Arg0).** IRegisteredTask.Run takes
+# parameters, and the Task Scheduler substitutes them into the action's
+# arguments textually -- measured, with the substitution inside a path as well
+# as standing alone. That is why it is the COM object here and not
+# Start-ScheduledTask, which has no way to pass one.
+#
+# The alternatives were a fixed pointer file naming "the current transfer" and
+# a queue directory the task drains, and both fail the same way: two transfers
+# started at once. A pointer is overwritten by the second before the first
+# task instance reads it, and a queue needs each instance to claim exactly one
+# entry and a rule for an entry whose parent died before starting its task.
+# A parameter is per start, so neither question exists -- and the task is
+# registered to run instances in parallel, so the second start does not queue
+# behind the first, whose helper lives as long as its transfer does.
+function Start-XferHelperTask {
+    param([Parameter(Mandatory)][string]$Token)
+    $svc = New-Object -ComObject Schedule.Service
+    $svc.Connect()
+    $task = $svc.GetFolder('\').GetTask($script:XferTaskName)
+    $task.Run($Token) | Out-Null
+}
+
+# Start-XferHelperPrompt SHELL ARGV -- the UAC path, returning the process. The
+# third seam, and the only one that can raise a consent dialog.
+function Start-XferHelperPrompt {
+    param([Parameter(Mandatory)][string]$Shell, [Parameter(Mandatory)][string[]]$Argv)
+    return (Start-Process -FilePath $Shell -Verb RunAs -WindowStyle Hidden -ArgumentList $Argv -PassThru)
+}
+
+# Get-XferLaunch -- which of the two paths this transfer takes: @{ Via =
+# 'task'|'prompt'; Why = a sentence when the task is there but cannot be used }.
+#
+# The task only when it is registered, enabled and running the helper this run
+# would have rendered. Anything less falls back to the prompt rather than
+# failing: a transfer that asks is a worse transfer than one that does not, but
+# a much better one than a transfer that refuses because of how the host was
+# set up. Not having run setup at all is said nowhere -- it is what every host
+# did before the task existed -- but a task that is there and cannot be used is
+# a setup someone did and is now not getting, so that is said.
+function Get-XferLaunch {
+    $task = Get-XferHelperTask
+    if ($null -eq $task) { return @{ Via = 'prompt'; Why = '' } }
+    if (-not $task.Enabled) {
+        return @{ Via = 'prompt'; Why = @(
+            "the scheduled task $($script:XferTaskName) is disabled, so this transfer"
+            "asks for Administrator instead. Enable it, or run 'virutil xfer setup'"
+            'again from an elevated PowerShell.'
+        ) }
+    }
+    if (-not (Test-XferHelperCurrent $task.HelperText)) {
+        return @{ Via = 'prompt'; Why = @(
+            "the scheduled task $($script:XferTaskName) runs a helper that is not the one"
+            'this virutil would use -- virutil was updated, or VIRUTILS_TMP_DIR moved,'
+            "since 'virutil xfer setup' last ran -- so this transfer asks for"
+            "Administrator instead. Run 'virutil xfer setup' again, elevated, to stop it."
+        ) }
+    }
+    return @{ Via = 'task'; Why = '' }
+}
+
+# Write-XferRequest TOKEN CRED ACCESS STRAYS -- what the helper is told, in the
+# file it reads it from: <scratch>\request.json.
+#
+# A file on both paths, not only the one that needs it. The task path has no
+# command line to put these on beyond $(Arg0), and the prompt path's command
+# line was where two things went wrong that a file cannot: the password was
+# readable there by anything that lists processes, and Start-Process flattens
+# ArgumentList so that an empty element vanishes -- a `-Strays ''` once arrived
+# as a bare `-Strays`, a binding error, and the parent sat out its whole ready
+# timeout for a helper that had died before it could say why.
+#
+# No ACL of its own. It is in this user's scratch directory, the password it
+# carries is a per-transfer throwaway's, and until this file existed it was on
+# a command line anyone on the machine could read. The helper deletes it once
+# read.
+function Write-XferRequest {
+    param(
+        [Parameter(Mandatory)][string]$Token,
+        [Parameter(Mandatory)]$Credential,
+        [Parameter(Mandatory)][string]$Access,
+        [string[]]$Strays = @()
+    )
+    $body = [ordered]@{
+        password  = $Credential.Password
+        access    = $Access
+        parentPid = $PID
+        strays    = @($Strays | Where-Object { $_ })
+    } | ConvertTo-Json -Compress
+    $file = Join-Path (Get-XferScratch $Token) 'request.json'
+    Set-Content -LiteralPath $file -Value $body -Encoding ASCII
+    return $file
+}
+
 # Publish-XferShare TOKEN PATH [-Write] -- a share over PATH that exactly one
 # throwaway account may reach, and a live helper holding it open. Returns the
 # session every other function here takes.
 #
-# The elevation prompt is here, once per transfer, and nothing before this point
-# has created anything or asked the developer for anything -- which is the whole
-# reason the preconditions are checked first. Being asked to approve
-# Administrator and *then* told the guest is not running is the worst available
-# ordering.
+# Elevation is here, once per transfer -- through the task when setup has run,
+# and as a UAC prompt when it has not -- and nothing before this point has
+# created anything or asked the developer for anything. That is the whole
+# reason the preconditions are checked first: being asked to approve
+# Administrator and *then* told the guest is not running is the worst
+# available ordering.
+#
+# PATH is always the transfer's own <scratch>\share, and the helper no longer
+# takes it as an argument: it derives the same path from the token, so that a
+# caller of the task cannot choose what gets shared. Anything else here is a
+# bug in this file, and is said as one rather than published.
 function Publish-XferShare {
     param(
         [Parameter(Mandatory)][string]$Token,
@@ -549,62 +820,74 @@ function Publish-XferShare {
     $status  = Get-XferStatusFile $Token
     $cred    = New-XferCredential $Token
 
+    if ($Path -ne (Join-Path $scratch 'share')) {
+        Die "internal: a transfer shares its own staging directory, not $Path"
+    }
+
     # Our own process id into the status file before anything is minted, so a
     # concurrent transfer's sweep sees a live owner for this token during the
     # window before the helper has written its own. The helper replaces it.
     Set-Content -LiteralPath $status -Encoding ASCII `
         -Value (@{ ok = $false; pid = $PID; detail = 'starting' } | ConvertTo-Json -Compress)
 
-    $helper = Join-Path $scratch 'helper.ps1'
-    Set-Content -LiteralPath $helper -Value $script:XferHelperSource -Encoding UTF8
-
-    $strays = Get-XferStrays -Except $Token
-
-    # The host this run is already running on, rather than a search of the PATH:
-    # a driver launched under Windows PowerShell 5.1 should elevate 5.1, and one
-    # under PowerShell 7 should elevate 7.
-    $shell = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-
     $access = 'ro'
     if ($Write) { $access = 'rw' }
+    Write-XferRequest $Token $cred $access (Get-XferStrays -Except $Token) | Out-Null
 
-    $argv = @(
-        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-        '-File', $helper,
-        '-Token', $Token,
-        '-User', $cred.User,
-        '-Prefix', $script:XferPrefix,
-        '-Password', $cred.Password,
-        '-Path', $Path,
-        '-Access', $access,
-        '-ParentPid', "$PID",
-        '-Scratch', $scratch
-    )
-    # **-Strays only when there are some**, and this is measured rather than
-    # tidy: Start-Process flattens ArgumentList into one command line, and an
-    # empty element vanishes on the way. `-Strays ''` therefore arrives at the
-    # helper as a `-Strays` with no value, which is a parameter binding error --
-    # so the helper died before it could write a status file, and the parent sat
-    # out its whole ready timeout waiting for one. Nothing in the diagnosis said
-    # "argument"; it said the share had not appeared.
-    if ($strays.Count -gt 0) { $argv += @('-Strays', ($strays -join ',')) }
+    $launch = Get-XferLaunch
+    if ($launch.Why) { Warn $launch.Why }
 
-    try {
-        $helperProc = Start-Process -FilePath $shell -Verb RunAs -WindowStyle Hidden `
-            -ArgumentList $argv -PassThru
-    } catch {
-        if (Test-XferElevationDeclined $_.Exception) {
-            DieWith $script:XferRcElevationDeclined @(
-                'the elevation prompt was declined, so no share was published and'
-                "nothing was transferred. Publishing a share on the host's own"
-                'SMB server needs Administrator; see the README.'
+    $proc = $null
+    if ($launch.Via -eq 'task') {
+        try {
+            Start-XferHelperTask $Token
+        } catch {
+            # Registered and current but would not start for this user -- most
+            # likely a task someone else's setup registered, whose ACL admits
+            # them and not us. The prompt still works, so it is the fallback.
+            Warn @(
+                "could not start the scheduled task $($script:XferTaskName):"
+                "  $($_.Exception.Message)"
+                'so this transfer asks for Administrator instead.'
             )
+            $launch.Via = 'prompt'
         }
-        DieWith $script:XferRcHostSetup `
-            "could not start the elevated helper: $($_.Exception.Message)"
+    }
+    if ($launch.Via -eq 'prompt') {
+        $helper = Join-Path $scratch 'helper.ps1'
+        Set-Content -LiteralPath $helper -Value (Get-XferHelperText) -Encoding UTF8
+
+        # The host this run is already running on, rather than a search of the
+        # PATH: a driver launched under Windows PowerShell 5.1 should elevate
+        # 5.1, and one under PowerShell 7 should elevate 7. The task path made
+        # the same choice once, at setup, and recorded it in the task's action.
+        $shell = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $argv = @(
+            '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            '-File', $helper, '-Token', $Token
+        )
+        try {
+            $proc = Start-XferHelperPrompt $shell $argv
+        } catch {
+            if (Test-XferElevationDeclined $_.Exception) {
+                DieWith $script:XferRcElevationDeclined @(
+                    'the elevation prompt was declined, so no share was published and'
+                    "nothing was transferred. Publishing a share on the host's own"
+                    "SMB server needs Administrator. 'virutil xfer setup', run once"
+                    'from an elevated PowerShell, makes transfers stop asking; see'
+                    'the README.'
+                )
+            }
+            DieWith $script:XferRcHostSetup `
+                "could not start the elevated helper: $($_.Exception.Message)"
+        }
     }
 
-    $reported = Wait-XferHelperReady $Token $helperProc
+    # The helper's pid comes back through the status file on both paths and is
+    # the only thing Unpublish-XferShare waits on. A task start returns no
+    # process at all, and even the prompt's process is not worth keeping past
+    # this call: the status file is where the helper says who it is.
+    $reported = Wait-XferHelperReady $Token -Process $proc -Via $launch.Via
     return @{
         Token     = $Token
         Scratch   = $scratch
@@ -612,6 +895,7 @@ function Publish-XferShare {
         User      = $cred.User
         Password  = $cred.Password
         HelperPid = [int]$reported.pid
+        Via       = $launch.Via
     }
 }
 
@@ -637,48 +921,103 @@ function Test-XferElevationDeclined {
     return $false
 }
 
-# Wait-XferHelperReady TOKEN [PROCESS] -- poll the status file the helper
-# answers through. Dies with the helper's own diagnosis, which is the half that
-# makes "could not publish the share" distinguishable from a guest problem.
-#
-# PROCESS is watched alongside the file, and it is what turns a fast failure
-# into a fast report: a helper that dies before it can write anything -- a bad
-# execution policy, a mis-bound argument, a host that will not start -- would
-# otherwise be indistinguishable from a consent prompt nobody has answered yet,
-# and the run would sit out the whole ready timeout to say so.
-function Wait-XferHelperReady {
-    param([Parameter(Mandatory)][string]$Token, $Process = $null)
+# Read-XferHelperStatus TOKEN -- what the helper has said so far, or $null when
+# it has said nothing: no file, half a file, or still the placeholder this
+# process wrote before starting it. Otherwise @{ ok; pid; detail; started },
+# where `started` is the helper's first record -- "I am running, and this is
+# my pid" -- and not yet an answer.
+function Read-XferHelperStatus {
+    param([Parameter(Mandatory)][string]$Token)
+    $s = $null
+    try { $s = (Get-Content -LiteralPath (Get-XferStatusFile $Token) -Raw) | ConvertFrom-Json } catch { return $null }
+    if ($null -eq $s) { return $null }
+    $names = @($s.PSObject.Properties.Name)
+    if ($names -notcontains 'ok' -or $names -notcontains 'pid') { return $null }
+    if ([int]$s.pid -eq $PID) { return $null }
+    return @{
+        ok      = [bool]$s.ok
+        pid     = [int]$s.pid
+        detail  = $(if ($names -contains 'detail') { [string]$s.detail } else { '' })
+        started = ($names -contains 'started')
+    }
+}
 
-    $status = Get-XferStatusFile $Token
-    $clock  = [Diagnostics.Stopwatch]::StartNew()
+# Wait-XferHelperReady TOKEN [-Process P] [-Via task|prompt] -- poll the status
+# file the helper answers through. Dies with the helper's own diagnosis, which
+# is the half that makes "could not publish the share" distinguishable from a
+# guest problem.
+#
+# **A helper that dies is reported when it dies, not at the timeout**, and there
+# are two ways to know it has. PROCESS, on the prompt path, is the one the
+# prompt handed back. On the task path there is no process handle at all, so
+# the helper's own first record is what names the pid to watch -- and a helper
+# that never got far enough to write even that is caught by
+# $script:XferTaskStartMs instead. Without either, a helper killed by a bad
+# execution policy, a missing shell or an argument it refused would look
+# exactly like a consent prompt nobody has answered yet, and the run would sit
+# out the whole ready timeout to say so.
+function Wait-XferHelperReady {
+    param([Parameter(Mandatory)][string]$Token, $Process = $null, [string]$Via = 'prompt')
+
+    # An answer is final either way: the share is up, or the helper says why not.
+    $answer = {
+        param($s)
+        if ($s.ok) { return $s }
+        DieWith $script:XferRcHostSetup @(
+            'the host could not publish the share for this transfer, so the'
+            'guest was never asked to fetch anything. Nothing was left behind.'
+            ''
+            "  $($s.detail)"
+        )
+    }
+
+    $helperPid = 0
+    $clock = [Diagnostics.Stopwatch]::StartNew()
     while ($clock.ElapsedMilliseconds -lt $script:XferHelperReadyMs) {
         Start-Sleep -Milliseconds 200
-        $s = $null
-        try { $s = (Get-Content -LiteralPath $status -Raw) | ConvertFrom-Json } catch { $s = $null }
-        if ($null -ne $s -and $s.PSObject.Properties.Name -contains 'ok') {
-            # Still the placeholder this process wrote before launching the helper.
-            if ([int]$s.pid -ne $PID) {
-                if ($s.ok) { return $s }
-                DieWith $script:XferRcHostSetup @(
-                    'the host could not publish the share for this transfer, so the'
-                    'guest was never asked to fetch anything. Nothing was left behind.'
-                    ''
-                    "  $($s.detail)"
-                )
-            }
-        }
-        # Checked after the file, not before it: the helper writes its status
-        # and then goes on living, but a helper that both succeeded and exited
-        # in the same 200ms should still be read as having succeeded.
+        $s = Read-XferHelperStatus $Token
+        if ($null -ne $s -and -not $s.started) { return (& $answer $s) }
+        if ($null -ne $s) { $helperPid = $s.pid }
+
+        $exited = $null
         if ($null -ne $Process -and $Process.HasExited) {
+            $exited = "exited with $($Process.ExitCode)"
+        } elseif ($helperPid -gt 0 -and -not (Test-XferProcessAlive $helperPid)) {
+            $exited = "(pid $helperPid) exited"
+        }
+        if ($exited) {
+            # One more look, because the order is write-then-exit: a helper that
+            # failed, said why, and exited inside the last 200ms has said
+            # something, and its own reason beats this one.
+            $s = Read-XferHelperStatus $Token
+            if ($null -ne $s -and -not $s.started) { return (& $answer $s) }
             DieWith $script:XferRcHostSetup @(
-                "the elevated helper exited with $($Process.ExitCode) without saying"
-                'what it had done, so no share was published and nothing was'
-                'transferred. It runs in its own elevated console with nowhere to'
-                'print; the run it was launched by is the only thing that can'
-                'report this.'
+                "the elevated helper $exited without saying what it had done, so"
+                'no share was published and nothing was transferred. It runs'
+                'elevated with nowhere to print; the run it was started by is'
+                'the only thing that can report this.'
             )
         }
+
+        if ($Via -eq 'task' -and $helperPid -eq 0 -and
+            $clock.ElapsedMilliseconds -ge $script:XferTaskStartMs) {
+            $last = 'unknown'
+            try { $t = Get-XferHelperTask; if ($t) { $last = $t.LastResult } } catch { }
+            DieWith $script:XferRcHostSetup @(
+                "the scheduled task $($script:XferTaskName) was started, but its helper"
+                "had not begun within $([int]($script:XferTaskStartMs / 1000))s, so no share was published and nothing"
+                "was transferred. The task's last result is $last; Task Scheduler's"
+                "history for it says more. 'virutil xfer status' checks the setup."
+            )
+        }
+    }
+
+    if ($Via -eq 'task') {
+        DieWith $script:XferRcHostSetup @(
+            "the elevated helper started by $($script:XferTaskName) did not report"
+            "within $([int]($script:XferHelperReadyMs / 1000))s. It publishes the share this transfer serves, so"
+            'nothing was transferred.'
+        )
     }
     DieWith $script:XferRcHostSetup @(
         "the elevated helper did not report within $([int]($script:XferHelperReadyMs / 1000))s."
@@ -886,5 +1225,239 @@ function Invoke-XferTransfer {
         }
     } finally {
         try { Remove-XferTree $scratch | Out-Null } catch { }
+    }
+}
+
+# --- virutil xfer: the scheduled task, set up once --------------------------
+#
+#   virutil xfer setup    register the task and install its helper (elevated)
+#   virutil xfer remove   take both away again (elevated)
+#   virutil xfer status   which path a transfer would take, and why
+#
+# A Windows-host command, and the only one in this driver with no counterpart
+# on the other side of contract section 2: a Linux host's transport has no
+# elevation to arrange, because its smbd is the bash driver's own. The bash
+# driver refuses `xfer` by name for that reason.
+#
+# A module of its own rather than a flag on push, pull or sync, because what it
+# changes is the host rather than one transfer, and because it is the one step
+# in the whole transfer story that *has* to be done by a person at an elevated
+# prompt. Spelling that as a separate command makes it impossible to hide
+# inside a run that was meant to be unattended.
+
+function Get-XferUsage {
+    @(
+        'usage: virutil xfer setup'
+        '       virutil xfer remove'
+        '       virutil xfer status'
+        ''
+        "  push, pull, sync and ui setup publish a share on this machine's own"
+        '  SMB server, which needs Administrator. Without setup, each transfer'
+        '  asks for it with a UAC prompt -- which an unattended run cannot'
+        "  answer. setup registers a scheduled task, $($script:XferTaskName), that"
+        '  runs the elevated half of a transfer as you with highest privileges,'
+        '  on demand only, startable by you alone; a transfer starts it instead'
+        '  of prompting.'
+        ''
+        '  setup    register the task and install its helper under'
+        "           $($script:XferTaskDir). Once, from an elevated PowerShell,"
+        '           as the user who runs the transfers. Again after updating'
+        '           virutil or moving VIRUTILS_TMP_DIR -- until then transfers'
+        '           fall back to the prompt, and say why.'
+        '  remove   unregister the task and delete its helper. Elevated.'
+        '  status   whether transfers will prompt, and why. Exits 0 when they'
+        '           will not, 1 when they will.'
+        ''
+        '  -h, --help     this message'
+    )
+}
+
+# Test-XferElevated -- is this process holding an Administrator token? Not
+# "is this user an administrator": under UAC an administrator's ordinary shell
+# holds a filtered token, and that is the shell this has to refuse.
+function Test-XferElevated {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return ([Security.Principal.WindowsPrincipal]::new($id)).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# Get-XferTaskArguments HELPER -- the action's arguments, with the token left as
+# $(Arg0) for the Task Scheduler to fill per start (see Start-XferHelperTask).
+# -WindowStyle Hidden because the task runs on the user's desktop with an
+# interactive token, and a console flashing up for every transfer is a cost.
+function Get-XferTaskArguments {
+    param([Parameter(Mandatory)][string]$Helper)
+    return "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Helper`" -Token `$(Arg0)"
+}
+
+# Get-XferTaskSddl SID -- who may do what to the task. SYSTEM and Administrators
+# own it; the one user it runs as may read and run it, and no one else may
+# even see it.
+#
+# Read-and-run and not more, and that is the half that matters: a user who
+# could *write* the task could point its action at anything and have that run
+# elevated with no prompt. Registered with TASK_DONT_ADD_PRINCIPAL_ACE, because
+# the scheduler otherwise adds an entry of its own for the principal, and this
+# list is meant to be the whole list.
+function Get-XferTaskSddl {
+    param([Parameter(Mandatory)][string]$Sid)
+    return "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;$Sid)"
+}
+
+# Invoke-XferSetup -- register the task and install the helper it runs.
+# Idempotent: a second run replaces both, which is also how a stale helper is
+# brought up to date.
+#
+# Refused unelevated rather than self-elevating. One prompt, the developer's
+# own, at an elevated PowerShell they opened for it, is the cost of every later
+# transfer asking for none; and a setup that elevated itself would run in a
+# window of its own with nowhere to report what it did.
+function Invoke-XferSetup {
+    if (-not (Test-XferElevated)) {
+        Die @(
+            'virutil xfer setup registers a scheduled task that runs elevated,'
+            'and registering one needs Administrator. Run it once from an'
+            'elevated PowerShell (Run as administrator), as the user who runs'
+            'the transfers:'
+            ''
+            '  virutil xfer setup'
+        )
+    }
+
+    $id  = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $sid = $id.User.Value
+
+    # The shell this setup runs under is the shell the task will run the helper
+    # under, recorded in the action. That is the prompt path's rule -- elevate
+    # whichever PowerShell the run is already in -- taken once, here, because a
+    # task cannot ask the run that starts it.
+    $shell = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+
+    # Program Files is Administrators-only to write, and the directory inherits
+    # that. See $script:XferTaskDir for why that is the point.
+    New-VirutilsDir $script:XferTaskDir | Out-Null
+    Set-Content -LiteralPath $script:XferTaskHelper -Value (Get-XferHelperText) -Encoding UTF8
+
+    $svc = New-Object -ComObject Schedule.Service
+    $svc.Connect()
+    $def = $svc.NewTask(0)
+    $def.RegistrationInfo.Author      = $id.Name
+    $def.RegistrationInfo.Description = @(
+        'The elevated half of a virutil push, pull or sync: mints a throwaway'
+        'account, publishes an SMB share over one transfer''s staging directory,'
+        'and takes both away when the transfer ends. Started on demand by'
+        'virutil; registered by `virutil xfer setup`, removed by `virutil xfer remove`.'
+    ) -join ' '
+
+    # As this user, with this user's full token, and only while they are
+    # logged on -- which a run that is starting the task always is. No stored
+    # password, and no run on a desktop nobody is sitting at.
+    $def.Principal.UserId    = $id.Name
+    $def.Principal.LogonType = 3        # TASK_LOGON_INTERACTIVE_TOKEN
+    $def.Principal.RunLevel  = 1        # TASK_RUNLEVEL_HIGHEST
+
+    # No trigger: it runs when a transfer starts it and at no other time.
+    # Parallel instances, because two transfers at once each need a helper and
+    # each helper lives as long as its transfer. No time limit, because a sync
+    # of a large tree is a long transfer and the helper's own wait on its
+    # parent's pid is what bounds it. On battery too, since a laptop is where
+    # the developer is.
+    $set = $def.Settings
+    $set.Enabled                    = $true
+    $set.AllowDemandStart           = $true
+    $set.MultipleInstances          = 0     # TASK_INSTANCES_PARALLEL
+    $set.ExecutionTimeLimit         = 'PT0S'
+    $set.DisallowStartIfOnBatteries = $false
+    $set.StopIfGoingOnBatteries     = $false
+
+    $action = $def.Actions.Create(0)        # TASK_ACTION_EXEC
+    $action.Path             = $shell
+    $action.Arguments        = Get-XferTaskArguments $script:XferTaskHelper
+    $action.WorkingDirectory = $script:XferTaskDir
+
+    # TASK_CREATE_OR_UPDATE | TASK_DONT_ADD_PRINCIPAL_ACE, as this user, with
+    # the interactive token, and the ACL above.
+    $svc.GetFolder('\').RegisterTaskDefinition(
+        $script:XferTaskName, $def, (0x6 -bor 0x10), $id.Name, $null, 3,
+        (Get-XferTaskSddl $sid)) | Out-Null
+
+    Say @(
+        "registered the scheduled task $($script:XferTaskName), for $($id.Name)"
+        "  helper  $($script:XferTaskHelper)"
+        "  shell   $shell"
+        "  scratch $([IO.Path]::GetFullPath($script:VirutilsTmpDir))"
+        'push, pull, sync and ui setup will start it instead of prompting.'
+    )
+}
+
+# Invoke-XferRemove -- the task and its helper, both gone. Saying so when there
+# was nothing to remove rather than failing: the end state is what was asked.
+function Invoke-XferRemove {
+    if (-not (Test-XferElevated)) {
+        Die @(
+            'virutil xfer remove unregisters a task only Administrators may'
+            'change. Run it from an elevated PowerShell (Run as administrator).'
+        )
+    }
+    $svc = New-Object -ComObject Schedule.Service
+    $svc.Connect()
+    $had = $true
+    try { $svc.GetFolder('\').DeleteTask($script:XferTaskName, 0) } catch { $had = $false }
+    $dir = $false
+    try { $dir = Remove-XferTree $script:XferTaskDir } catch {
+        Warn "could not remove $($script:XferTaskDir): $($_.Exception.Message)"
+    }
+    if ($had)     { Say "removed the scheduled task $($script:XferTaskName)" }
+    else          { Say "no scheduled task $($script:XferTaskName) was registered" }
+    if ($dir)     { Say "removed $($script:XferTaskDir)" }
+    Say 'transfers will ask for Administrator again, once each.'
+}
+
+# Invoke-XferStatus -- the decision Publish-XferShare would make, made now and
+# said out loud. The exit code is the answer, for a script that wants to know
+# before it starts something unattended: 0 when a transfer will not prompt.
+function Invoke-XferStatus {
+    $task   = Get-XferHelperTask
+    $launch = Get-XferLaunch
+    $out = @()
+    if ($null -eq $task) {
+        $out += "task     $($script:XferTaskName): not registered (or not visible to this user)"
+    } else {
+        $out += "task     $($script:XferTaskName): registered, $(if ($task.Enabled) { 'enabled' } else { 'disabled' }), last result $($task.LastResult)"
+        $out += "shell    $($task.Shell)"
+        $out += "helper   $($script:XferTaskHelper): $(if (-not $task.HelperText) { 'missing' } elseif (Test-XferHelperCurrent $task.HelperText) { 'current' } else { 'stale' })"
+    }
+    $out += "scratch  $([IO.Path]::GetFullPath($script:VirutilsTmpDir))"
+    if ($launch.Via -eq 'task') {
+        $out += 'transfers start the task: no prompt.'
+    } else {
+        $out += 'transfers ask for Administrator, once each.'
+        if ($launch.Why) { $out += @($launch.Why) }
+        else { $out += "Run 'virutil xfer setup' once, from an elevated PowerShell, to stop that." }
+    }
+    $out | ForEach-Object { [Console]::Out.WriteLine($_) }
+    if ($launch.Via -ne 'task') { $script:VirutilExit = 1 }
+}
+
+function Xfer-Main {
+    param([string[]]$Arguments)
+
+    if (-not $Arguments -or $Arguments.Count -eq 0) { Usage (Get-XferUsage) 1 }
+    $verb = $Arguments[0]
+    if ($verb -in @('-h', '--help')) { Usage (Get-XferUsage) 0 }
+
+    # Each verb takes nothing else, bar a help that is asked for after it.
+    $rest = Get-RestArgs $Arguments 1
+    foreach ($a in $rest) {
+        if ($a -in @('-h', '--help')) { Usage (Get-XferUsage) 0 }
+        Warn "unexpected argument: $a"
+        Usage (Get-XferUsage) 1
+    }
+
+    switch ($verb) {
+        'setup'  { Invoke-XferSetup;  break }
+        'remove' { Invoke-XferRemove; break }
+        'status' { Invoke-XferStatus; break }
+        default  { Usage (Get-XferUsage) 1 }
     }
 }

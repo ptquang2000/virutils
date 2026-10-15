@@ -17,9 +17,10 @@
 # section 3 names -- needs a running guest with an agent in it. The first two of
 # those now exist, in tests/win/transfer.ps1, which is driven from here and
 # **skips loudly when there is no guest** rather than failing. It is the one
-# test in the suite that is interactive when it does run: a transfer on a
+# test in the suite that can be interactive when it does run: a transfer on a
 # Windows host publishes a share on the host's own SMB server, so it prompts for
-# Administrator once per transfer. The other two are still a gap.
+# Administrator once per transfer -- unless `virutil xfer setup` has registered
+# the scheduled task that asks nobody. The other two are still a gap.
 #
 #   tests/linux/conformance.sh    both drivers, or whichever is runnable here
 #
@@ -219,7 +220,8 @@ else
     # It skips itself when no guest is up, so this costs nothing on a machine
     # with no VM running. When one *is* up it is the only interactive test in
     # the suite: a transfer on a Windows host publishes a share on the host's
-    # own SMB server, which prompts for Administrator once per transfer.
+    # own SMB server, which prompts for Administrator once per transfer unless
+    # `virutil xfer setup` has been run there.
     printf '\n-- PowerShell guest tier --\n'
     if out="$("$PWSH" -NoProfile -File "$ROOT/tests/win/transfer.ps1" 2>&1)"; then
         printf '%s\n' "$out" | sed 's/^/  /'

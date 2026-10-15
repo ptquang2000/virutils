@@ -10,10 +10,11 @@
   install.ps1 adds that line for you.
 
   This completes the *Windows* driver, so it offers domain, exec, push, pull,
-  sync, ui and usb and nothing else. snapshot is in the bash tree only, and
-  offering a name this driver would reject is worse than offering nothing --
+  sync, ui, usb and xfer and nothing else. snapshot is in the bash tree only,
+  and offering a name this driver would reject is worse than offering nothing --
   $MODULES in modules\win\parser.ps1 is the list to keep this in step with.
-  usb and ui are on both drivers, spelled the same way on each.
+  usb and ui are on both drivers, spelled the same way on each; xfer is on
+  this one alone.
 
   Everything lives inside the scriptblock rather than in functions beside it:
   a completer dot-sourced into a profile should leave nothing behind in the
@@ -189,6 +190,7 @@ $completer = {
         sync     = "deliver a project's build output into a running guest"
         ui       = 'launch a process on a Windows guest''s interactive desktop (PsExec)'
         usb      = 'pass a host USB device through to a guest'
+        xfer     = 'set up the scheduled task that lets transfers elevate without a prompt'
         help     = 'the module list'
     }
 
@@ -206,6 +208,12 @@ $completer = {
     $uiVerbs = [ordered]@{
         setup = 'cache PsExec on this host and deliver it into a guest'
         run   = 'launch a guest program on the interactive desktop'
+    }
+
+    $xferVerbs = [ordered]@{
+        setup  = 'register the elevated scheduled task, once (run elevated)'
+        remove = 'unregister it and delete its helper (run elevated)'
+        status = 'whether transfers will prompt for Administrator, and why'
     }
 
     $usbVerbs = [ordered]@{
@@ -366,6 +374,7 @@ $completer = {
             elseif ($module -eq 'exec') { foreach ($k in $execVerbs.Keys) { Add-Match $k $execVerbs[$k] } }
             elseif ($module -eq 'ui') { foreach ($k in $uiVerbs.Keys) { Add-Match $k $uiVerbs[$k] } }
             elseif ($module -eq 'usb') { foreach ($k in $usbVerbs.Keys) { Add-Match $k $usbVerbs[$k] } }
+            elseif ($module -eq 'xfer') { foreach ($k in $xferVerbs.Keys) { Add-Match $k $xferVerbs[$k] } }
         }
         2 {
             # `domain create` names a domain that does not exist yet, and
@@ -384,6 +393,10 @@ $completer = {
             }
             elseif (($module -eq 'domain' -or $module -eq 'usb') -and $verb -eq 'list') {
                 $hint = "$module list takes nothing else"
+            }
+            # Every xfer verb is about the host, never a domain.
+            elseif ($module -eq 'xfer') {
+                $hint = "xfer $verb takes nothing else"
             }
             elseif ($module -eq 'domain') {
                 $hint = $noDomain

@@ -199,6 +199,7 @@ host-side machinery in `modules/linux/xfer` and `modules/linux/guest`, which is
 | `sync` | Fetch a project's build output out of a build tree and deliver it into a **running** guest's `C:` drive, config-driven. | `virutil sync VM [-c NAME\|PATH]` |
 | `pull` | Copy a file or directory out of a **running** guest. | `virutil pull VM SRC DST` |
 | `push` | Copy a file or directory from the host into a guest's `C:` drive. | `virutil push VM SRC DST` |
+| `xfer` | **Windows host only.** Set up, once and elevated, the scheduled task that lets the three above elevate without a UAC prompt; see [On a Windows host](#on-a-windows-host). The bash driver refuses it by name. | `virutil xfer {setup\|remove\|status}` |
 
 All three write the same C:-shaped tree — see
 [How files move](#how-files-move). `sync` and `push` deliver into a **running**
@@ -289,12 +290,42 @@ operating system already holds it. So `virutil push` publishes a share with
 `New-SmbShare` on the machine's own server and retires it again when the
 transfer ends. `pull` and `sync` use the same publisher.
 
-**It prompts for Administrator, once per transfer.** Publishing a share needs
-it, and so does removing one. Only the share management is elevated — the run
-itself stays in the console you typed in, so the guest's output, the diagnoses
-and the exit code all land where you are looking. Declining the prompt is its
-own exit code (98), so a script can tell "I clicked No" from "SMB is broken"
-(99).
+**It needs Administrator, and asks for it once per transfer unless you set it
+up once.** Publishing a share needs it, and so does removing one. Only the
+share management is elevated — the run itself stays in the console you typed
+in, so the guest's output, the diagnoses and the exit code all land where you
+are looking.
+
+Out of the box each transfer raises a UAC prompt. Declining it is its own exit
+code (98), so a script can tell "I clicked No" from "SMB is broken" (99). An
+unattended run — a script, a scheduled build, an agent session — has nobody to
+click Yes, so it sits at the prompt until the transfer times out. To stop that,
+run this **once**, from an elevated PowerShell (*Run as administrator*), as the
+user who runs the transfers:
+
+```powershell
+virutil xfer setup     # registers the scheduled task virutil-xfer-helper
+virutil xfer status    # from any shell: exits 0 when transfers will not prompt
+```
+
+`setup` registers a scheduled task that runs the elevated half of a transfer as
+you, with highest privileges, on demand only — it has no trigger. Only you (and
+Administrators) may start it. A transfer then starts that task instead of
+prompting, and starting it asks nothing. `virutil xfer remove`, also elevated,
+takes it away again. If the task is not there, or cannot be used, transfers
+fall back to the prompt. A task that is there but out of date is the one
+case that prints a line saying so, and the fix is to run `setup` again. It goes
+out of date when virutil is updated, or when `VIRUTILS_TMP_DIR` moves.
+
+What that costs, said plainly: **any program running as you can now start that
+task without a prompt**, which is what "no human involved" means. What it gets
+by starting it is bounded. The task runs a helper that `setup` copied into
+`C:\Program Files\virutil\`, which only Administrators can change. That helper
+takes one argument, a transfer's token. It mints only a `vxp-<token>` account,
+shares only `%USERPROFILE%\.virutils\tmp\<token>\share`, and refuses a share or
+a scratch directory with a junction in it. So a program that starts the task
+can make it do what a transfer does, and nothing else. On a machine where that
+trade is wrong, don't run `setup`; the prompt is still there.
 
 **A throwaway local account is minted and dropped per transfer.** Windows has no
 anonymous share: a modern Windows guest refuses an insecure guest logon, and
@@ -971,9 +1002,10 @@ the fetch rules, the map rules, the excludes, the cleanup rules and the `>pre`
 and `>post` commands all mean what they mean regardless of which driver reads
 them. Five things about the *host* half differ on Windows.
 
-**It publishes a share the way `push` does**, which means it prompts once for
-Administrator per run and mints a throwaway local account for the length of it —
-see [On a Windows host](#on-a-windows-host) above, which describes the whole
+**It publishes a share the way `push` does**, which means it needs
+Administrator per run — one prompt, or none after `virutil xfer setup` — and
+mints a throwaway local account for the length of it. See
+[On a Windows host](#on-a-windows-host) above, which describes the whole
 transport. Declining the prompt is exit 98; a share that could not be published
 is 99.
 
@@ -986,8 +1018,8 @@ multi-gigabyte copy and then a refusal would be the worst available ordering.
 
 **`>pre-ui` and `>post-ui` work**, as they do on a Linux host: they launch
 through `virutil ui`, which is on this driver too. Stage PsExec in the guest
-once with `virutil ui setup VM` first — that is itself a `push`, so it prompts
-for Administrator the same way.
+once with `virutil ui setup VM` first — that is itself a `push`, so it needs
+Administrator the same way.
 
 **Configs are looked up in `%USERPROFILE%\.virutils\conf\` and nowhere else.**
 The bash driver also falls back to `~/.config/virutils` so an install predating

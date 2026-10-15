@@ -41,6 +41,13 @@ $env:VIRUTILS_DIR = Join-Path ([IO.Path]::GetTempPath()) ("virutil-test-" + [Gui
 . (Join-Path $moduleDir 'push.ps1')
 . (Join-Path $moduleDir 'pull.ps1')
 
+# The real publisher, kept before the stub below replaces it: the push and pull
+# tests stub the whole of it, and the launch tests stub only the three seams
+# underneath it (Get-XferHelperTask, Start-XferHelperTask,
+# Start-XferHelperPrompt) so that which path it takes, what it hands the helper
+# and where it gets the helper's pid from all run for real.
+$script:RealPublish = ${function:Publish-XferShare}
+
 $script:Pass = 0
 $script:Fail = 0
 function Check {
@@ -128,6 +135,42 @@ function Publish-XferShare {
     }
 }
 function Unpublish-XferShare { param($Session) $script:Unpublished++ }
+
+# The three seams under the real publisher. Nothing here registers, starts or
+# elevates anything: "the task" is whatever $TaskSeen says it is, and "the
+# helper" is $FakeHelper, which reads the request the way the real one does and
+# answers through the same status file.
+$script:TaskSeen       = $null
+$script:TaskStarts     = @()
+$script:TaskStartFails = $false
+$script:PromptArgv     = $null
+$script:LastRequest    = $null
+$script:FakeHelper     = { param($Token) }
+function Get-XferHelperTask { return $script:TaskSeen }
+function Start-XferHelperTask {
+    param([string]$Token)
+    if ($script:TaskStartFails) { throw 'Access is denied.' }
+    $script:TaskStarts += $Token
+    & $script:FakeHelper $Token
+}
+function Start-XferHelperPrompt {
+    param([string]$Shell, [string[]]$Argv)
+    $script:PromptArgv = $Argv
+    & $script:FakeHelper $Argv[$Argv.Count - 1]
+    return $null
+}
+function Get-XferStrays { param([string]$Except = '') return ,@('stray1') }
+# setup must never be able to register the real task from a test run, even one
+# started from an elevated shell.
+function Test-XferElevated { return $false }
+
+# What a helper would write, as it would write it.
+function WriteHelperStatus {
+    param([string]$Token, [bool]$Ok, [int]$HelperPid, [string]$Detail = '', [switch]$Started)
+    $o = @{ ok = $Ok; pid = $HelperPid; detail = $Detail }
+    if ($Started) { $o.started = $true }
+    Set-Content -LiteralPath (Get-XferStatusFile $Token) -Encoding ASCII -Value ($o | ConvertTo-Json -Compress)
+}
 
 # The preconditions, which need a domain, a monitor and an agent between them.
 # They are asserted for ordering below rather than for content.
@@ -260,6 +303,229 @@ try {
         (Test-XferElevationDeclined ([ComponentModel.Win32Exception]::new(5)))
     Check 'and neither is an ordinary error' $false `
         (Test-XferElevationDeclined ([InvalidOperationException]::new('no')))
+
+    # --- the helper text, as both paths render it ---------------------------
+    #
+    # One text, two copies: the prompt path writes it into scratch and setup
+    # installs it for the task. "Is the installed one current" is a comparison
+    # against what this run would render, so the rendering is what is pinned.
+    $text = Get-XferHelperText
+    $fullTmp = [IO.Path]::GetFullPath($script:VirutilsTmpDir).TrimEnd('\')
+    CheckTrue 'the helper has its scratch root baked in'  ($text.Contains("`$Root   = '$fullTmp'"))
+    CheckTrue 'and the account prefix'                    ($text.Contains("`$Prefix = 'vxp-'"))
+    CheckTrue 'and no placeholder is left in it'          (-not ($text -match '@(ROOT|PREFIX)@'))
+    CheckTrue "a root with a quote in it stays one literal" `
+        ((Get-XferHelperText "C:\it's\tmp").Contains("'C:\it''s\tmp'"))
+    $parseErrors = $null
+    [Management.Automation.Language.Parser]::ParseInput($text, [ref]$null, [ref]$parseErrors) | Out-Null
+    Check 'the rendered helper parses' 0 @($parseErrors).Count
+    CheckTrue 'and takes the token as its only parameter' ($text -match '(?m)^param\(\[string\]\$Token\)\r?$')
+
+    CheckTrue 'the helper this run renders is current'          (Test-XferHelperCurrent $text)
+    CheckTrue 'line endings and a trailing newline do not count' `
+        (Test-XferHelperCurrent (($text -replace "`r?`n", "`r`n") + "`r`n"))
+    Check 'an edited helper is stale'                $false (Test-XferHelperCurrent ($text + "`n# edited"))
+    Check 'one rendered for another root is stale'   $false (Test-XferHelperCurrent (Get-XferHelperText 'D:\elsewhere'))
+    Check 'a missing helper is not current'          $false (Test-XferHelperCurrent $null)
+
+    # --- the task's registration, as pure text ----------------------------
+    $taskArgs = Get-XferTaskArguments 'C:\Program Files\virutil\xfer-helper.ps1'
+    CheckTrue 'the task hands the helper the token as $(Arg0)' ($taskArgs.EndsWith('-Token $(Arg0)'))
+    CheckTrue 'and nothing else'  (-not ($taskArgs -match '-(Password|Path|Scratch|User|Access)\b'))
+    CheckTrue 'the helper path is quoted, Program Files has a space in it' `
+        ($taskArgs.Contains('-File "C:\Program Files\virutil\xfer-helper.ps1"'))
+    $sddl = Get-XferTaskSddl 'S-1-5-21-1-2-3-1001'
+    CheckTrue 'the user may read and run the task'  ($sddl.Contains('(A;;GRGX;;;S-1-5-21-1-2-3-1001)'))
+    CheckTrue 'and nobody else is granted anything' (-not ($sddl -match ';;;(AU|WD|BU|IU)\)'))
+    CheckTrue 'and the ACL does not inherit more'   ($sddl.StartsWith('D:P'))
+
+    # --- which path a transfer takes ---------------------------------------
+    $current = @{ Enabled = $true; Shell = 'pwsh.exe'; HelperText = $text; LastResult = '0x00000000' }
+    $script:TaskSeen = $null
+    $l = Get-XferLaunch
+    Check 'no task: the prompt, as before setup existed' 'prompt' $l.Via
+    Check 'and nothing is said about it'                 ''       "$($l.Why)"
+    $script:TaskSeen = $current
+    Check 'a current task: the task' 'task' (Get-XferLaunch).Via
+    $script:TaskSeen = @{} + $current; $script:TaskSeen.HelperText = $text + "`n# older"
+    $l = Get-XferLaunch
+    Check 'a stale helper: the prompt'          'prompt' $l.Via
+    CheckTrue 'and the fix is named'            ("$($l.Why)" -match 'virutil xfer setup')
+    $script:TaskSeen = @{} + $current; $script:TaskSeen.Enabled = $false
+    $l = Get-XferLaunch
+    Check 'a disabled task: the prompt'         'prompt' $l.Via
+    CheckTrue 'and that is said'                ("$($l.Why)" -match 'disabled')
+
+    # --- the real publisher above the three seams -------------------------
+    #
+    # A real process stands in for a live helper, so the pid the session ends
+    # up with can be checked for being the helper's rather than anyone else's.
+    $shellExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    $sleeper = Start-Process -FilePath $shellExe -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 120') `
+        -PassThru -WindowStyle Hidden
+    $keepReady = $script:XferHelperReadyMs; $keepStart = $script:XferTaskStartMs
+    $script:XferHelperReadyMs = 6000; $script:XferTaskStartMs = 1500
+    try {
+        $okHelper = {
+            param($Token)
+            $req = Join-Path (Get-XferScratch $Token) 'request.json'
+            $script:LastRequest = (Get-Content -LiteralPath $req -Raw) | ConvertFrom-Json
+            WriteHelperStatus $Token $false $sleeper.Id -Started
+            WriteHelperStatus $Token $true  $sleeper.Id
+        }
+        function NewStage {
+            $t = New-XferToken
+            $s = Join-Path (Get-XferScratch $t) 'share'
+            New-VirutilsDir $s | Out-Null
+            return @($t, $s)
+        }
+
+        # Through the task.
+        $script:TaskSeen = $current; $script:TaskStarts = @(); $script:PromptArgv = $null
+        $script:FakeHelper = $okHelper
+        $tok, $stage = NewStage
+        $sess = & $script:RealPublish -Token $tok -Path $stage
+        Check     'with the task registered, the task is started'  $tok "$($script:TaskStarts)"
+        Check     'and no prompt is raised'                        $null $script:PromptArgv
+        Check     'the session says which path it took'            'task' $sess.Via
+        Check     'the helper pid comes from the status file'      $sleeper.Id $sess.HelperPid
+        Check     'the request carries the password'               $sess.Password $script:LastRequest.password
+        Check     'and the access'                                 'ro' $script:LastRequest.access
+        Check     'and the pid to wait on'                         $PID $script:LastRequest.parentPid
+        Check     'and the strays'                                 'stray1' "$($script:LastRequest.strays)"
+        CheckTrue 'and no helper is written into scratch for the task to run' `
+            (-not (Test-Path -LiteralPath (Join-Path (Get-XferScratch $tok) 'helper.ps1')))
+
+        # Through the prompt.
+        $script:TaskSeen = $null; $script:TaskStarts = @()
+        $tok, $stage = NewStage
+        $sess = & $script:RealPublish -Token $tok -Path $stage -Write
+        Check     'with no task, the prompt is raised'             'prompt' $sess.Via
+        Check     'and the task is not touched'                    '' "$($script:TaskStarts)"
+        Check     'the prompted helper is handed the token alone'  "-File|-Token|$tok" `
+            ((@($script:PromptArgv) | Select-Object -Skip 4 | Where-Object { $_ -match '^-|^[a-z0-9]{12}$' }) -join '|')
+        CheckTrue 'and never the password'                         (@($script:PromptArgv) -notcontains $sess.Password)
+        Check     'the helper pid comes from the status file here too' $sleeper.Id $sess.HelperPid
+        Check     'a pull request is read-write'                   'rw' $script:LastRequest.access
+        CheckTrue 'the helper it runs is the rendered one' `
+            (Test-XferHelperCurrent (Get-Content -LiteralPath (Join-Path (Get-XferScratch $tok) 'helper.ps1') -Raw))
+
+        # A task that is there but will not start for this user.
+        $script:TaskSeen = $current; $script:TaskStartFails = $true; $script:PromptArgv = $null
+        $tok, $stage = NewStage
+        $sess = & $script:RealPublish -Token $tok -Path $stage
+        Check     'a task that will not start falls back to the prompt' 'prompt' $sess.Via
+        CheckTrue 'and the prompt was raised'                           ($null -ne $script:PromptArgv)
+        $script:TaskStartFails = $false
+
+        # A helper that said it started and then died without an answer.
+        $script:FakeHelper = { param($Token) WriteHelperStatus $Token $false $corpse.Id -Started }
+        $tok, $stage = NewStage
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $msg = Dies { & $script:RealPublish -Token $tok -Path $stage }
+        $rc  = ExitCodeOf { & $script:RealPublish -Token $tok -Path $stage }
+        CheckTrue 'a helper that dies after starting is reported'   ($msg -match 'exited without saying')
+        CheckTrue 'when it dies, not at the timeout'                ($clock.ElapsedMilliseconds -lt $script:XferHelperReadyMs)
+        Check     'and it is the host-setup code'                   99 $rc
+
+        # A task start that never runs a helper at all.
+        $script:FakeHelper = { param($Token) }
+        $tok, $stage = NewStage
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $msg = Dies { & $script:RealPublish -Token $tok -Path $stage }
+        CheckTrue 'a task that never runs its helper is reported'   ($msg -match 'virutil-xfer-helper was started')
+        CheckTrue 'after the start window, not the ready timeout'   ($clock.ElapsedMilliseconds -lt $script:XferHelperReadyMs)
+
+        # A helper that answers with a failure.
+        $script:FakeHelper = { param($Token) WriteHelperStatus $Token $false $sleeper.Id 'New-SmbShare: no' }
+        $tok, $stage = NewStage
+        $msg = Dies { & $script:RealPublish -Token $tok -Path $stage }
+        CheckTrue "a helper's own failure is what is reported"      ($msg -match 'New-SmbShare: no')
+
+        # Publish refuses to share anything but the transfer's own stage.
+        $tok, $stage = NewStage
+        CheckTrue 'a path that is not the stage is refused' `
+            ((Dies { & $script:RealPublish -Token $tok -Path $scratch }) -match 'internal')
+
+        # An empty stray list is an empty list, not a missing value.
+        $tok, $stage = NewStage
+        $req = Get-Content -LiteralPath (Write-XferRequest $tok (New-XferCredential $tok) 'ro' @()) -Raw
+        CheckTrue 'no strays is written as an empty list' ($req -match '"strays":\[\]')
+    } finally {
+        $script:XferHelperReadyMs = $keepReady; $script:XferTaskStartMs = $keepStart
+        $script:TaskSeen = $null
+        try { $sleeper.Kill() } catch { }
+    }
+
+    # --- the real helper, run unelevated, refusing --------------------------
+    #
+    # Each case below is refused before the helper mints, shares or grants
+    # anything, so running it for real needs no Administrator and changes
+    # nothing whether or not this shell happens to be elevated. What is checked
+    # is that a caller of the task -- who chooses the token and writes the
+    # request -- cannot steer it.
+    $helperFile = Join-Path $scratch 'helper.ps1'
+    Set-Content -LiteralPath $helperFile -Value (Get-XferHelperText) -Encoding UTF8
+    function RunHelper {
+        param([string]$Token)
+        & $shellExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $helperFile -Token $Token *> $null
+        return $LASTEXITCODE
+    }
+    function StatusDetail {
+        param([string]$Token)
+        try { return [string]((Get-Content -LiteralPath (Get-XferStatusFile $Token) -Raw | ConvertFrom-Json).detail) }
+        catch { return '' }
+    }
+    function GoodRequest {
+        param([string]$Token, [string]$Password = 'abcdefghijklmnopqrstuvwx')
+        Set-Content -LiteralPath (Join-Path (Get-XferScratch $Token) 'request.json') -Encoding ASCII `
+            -Value (@{ password = $Password; access = 'ro'; parentPid = $PID; strays = @() } | ConvertTo-Json -Compress)
+    }
+
+    Check 'a token that could climb out of the root is refused' 2 (RunHelper '..\..\windows')
+
+    # A junction in place of the scratch directory: the helper would write its
+    # status file, and grant, wherever it pointed.
+    $elsewhere = Join-Path $scratch 'elsewhere'
+    New-Item -ItemType Directory -Force -Path $elsewhere | Out-Null
+    $jtok = 'junction1234'
+    New-Item -ItemType Junction -Path (Get-XferScratch $jtok) -Target $elsewhere | Out-Null
+    Check     'a scratch directory that is a junction is refused' 3 (RunHelper $jtok)
+    CheckTrue 'and nothing was written through it' `
+        (-not (Test-Path -LiteralPath (Join-Path $elsewhere 'status.json')))
+    [IO.Directory]::Delete((Get-XferScratch $jtok))
+
+    $btok, $bstage = NewStage
+    GoodRequest $btok 'short'
+    Check     'a request the parent did not make is refused' 1 (RunHelper $btok)
+    CheckTrue 'and says which field'                         ((StatusDetail $btok) -match 'password')
+
+    $rtok, $rstage = NewStage
+    GoodRequest $rtok
+    New-Item -ItemType Junction -Path (Join-Path $rstage 'link') -Target $elsewhere | Out-Null
+    Check     'a share with a junction inside it is refused' 1 (RunHelper $rtok)
+    CheckTrue 'and says so'                                  ((StatusDetail $rtok) -match 'reparse point')
+    [IO.Directory]::Delete((Join-Path $rstage 'link'))
+
+    # --- virutil xfer -------------------------------------------------------
+    Check 'xfer -h is a help'                 0 (ExitCodeOf { Xfer-Main @('-h') })
+    Check 'xfer status -h is a help too'      0 (ExitCodeOf { Xfer-Main @('status', '-h') })
+    Check 'xfer with no verb is a usage error' 1 (ExitCodeOf { Xfer-Main @() })
+    Check 'an unknown verb is a usage error'  1 (ExitCodeOf { Xfer-Main @('bogus') })
+    Check 'a verb takes no arguments'         1 (ExitCodeOf { Xfer-Main @('setup', 'now') })
+    $msg = Dies { Xfer-Main @('setup') }
+    CheckTrue 'setup unelevated is refused, with the way to do it' ($msg -match 'elevated PowerShell')
+    CheckTrue 'remove unelevated is refused too' ((Dies { Xfer-Main @('remove') }) -match 'elevated')
+
+    $script:TaskSeen = $null; $script:VirutilExit = 0
+    $out = Capture { Xfer-Main @('status') }
+    Check     'status without the task exits 1' 1 $script:VirutilExit
+    CheckTrue 'and says transfers will prompt'  ($out -match 'ask for Administrator')
+    $script:TaskSeen = $current; $script:VirutilExit = 0
+    $out = Capture { Xfer-Main @('status') }
+    Check     'status with a current task exits 0' 0 $script:VirutilExit
+    CheckTrue 'and says there is no prompt'        ($out -match 'no prompt')
+    $script:TaskSeen = $null; $script:VirutilExit = 0
 
     # --- push, end to end above the two seams ------------------------------
     #

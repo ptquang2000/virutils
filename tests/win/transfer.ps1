@@ -18,11 +18,11 @@
   instead of asserted.
 
   Two things it needs that the rest of the suite does not: a running Windows
-  guest (named by VIRUTILS_TEST_VM, default win11) and a person to approve the
-  elevation prompts, one per transfer. There is no way to have the first
-  without the second -- publishing a share on this host's own SMB server is
-  what needs Administrator, and automating that prompt away would mean
-  installing a service.
+  guest (named by VIRUTILS_TEST_VM, default win11) and Administrator for each
+  transfer -- publishing a share on this host's own SMB server is what needs
+  it. Where `virutil xfer setup` has been run, the scheduled task supplies it
+  and this runs unattended; where it has not, a person approves one elevation
+  prompt per transfer.
 
   The second half is what no amount of unit testing reaches: that a transfer
   which ends, and a transfer which is killed in the middle, both leave no

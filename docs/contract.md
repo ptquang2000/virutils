@@ -66,7 +66,16 @@ virutil exec {ping|cmd|ps|sh} VM [-d] [--] [CMD...|-]
 virutil ui  {setup|run} VM [ARGS]
 
 virutil usb {list|show|attach|detach} [VM] [VENDOR:PRODUCT]
+
+virutil xfer {setup|remove|status}       # Windows host only
 ```
+
+`xfer` is the one command in this grammar that is a host's by nature rather
+than by a gap in a port. It registers, once and elevated, the scheduled task
+that lets `push`, `pull` and `sync` on a Windows host get Administrator without
+a UAC prompt per transfer (section 7). A Linux host's transport has its own
+`smbd` and nothing to elevate, and macOS has no transport yet, so the bash
+driver refuses `virutil xfer` by name on both, with that reason.
 
 `usb` is on both drivers and holds to one grammar over two mechanisms -- a
 libvirt `<hostdev>` on the bash side, `device_add` over the QEMU monitor on the
@@ -100,10 +109,11 @@ Invariants that are contract, not implementation:
   `@guest=linux` out of the config, before it fetches anything. That is a gap in
   the port rather than in the grammar -- the Linux-guest side is payload
   selection against payloads that already exist -- and section 7 says what is
-  still unmeasured about it. The same host also prompts once per transfer for
-  Administrator and mints a throwaway local account, because the share comes
-  from its own SMB server; the grammar, the guest-side behaviour and the exit
-  codes are unchanged by that.
+  still unmeasured about it. The same host also needs Administrator per
+  transfer and mints a throwaway local account, because the share comes from
+  its own SMB server -- from the scheduled task `virutil xfer setup` registers,
+  or as one UAC prompt per transfer where setup never ran. The grammar, the
+  guest-side behaviour and the exit codes are unchanged by either.
 - **`sync`'s `>pre-ui` and `>post-ui` run rules are on both hosts**, because
   they are `virutil ui` and `ui` is on both (section 7). They were refused on
   the Windows driver while it had no `ui`; they now launch through the same
@@ -174,10 +184,17 @@ something in each.
 
 `tmp` stopped being an empty promise on the Windows host when `push` and `pull`
 landed there. Each transfer gets `<root>/tmp/<token>/`, holding its staging
-tree, the status file the elevated helper answers through, and that helper
-itself; all three go at teardown. It is deliberately not the system temp
+tree, the request the elevated helper reads its orders from, the status file it
+answers through, and -- when the transfer elevates by prompt -- that helper
+itself; all of it goes at teardown. It is deliberately not the system temp
 directory: under elevation `%TEMP%` resolves to an 8.3 short path that an
 ordinary recursive remove refuses to delete through.
+
+The one thing a Windows host keeps outside the root is the scheduled task's
+copy of that helper, in `%ProgramFiles%\virutil\`, written by `virutil xfer
+setup` and removed by `virutil xfer remove`. It is outside on purpose: the
+root is the user's to write, and a file a task runs elevated without a prompt
+has to be one only Administrators can change (section 7).
 
 **A transfer's staging tree is under `tmp`, not under `staging`**, and the
 distinction is what each row means rather than an inconsistency. `staging` holds
@@ -244,7 +261,7 @@ match on:
 | 94 | SRC matched nothing in the guest (pull) |
 | 95 | robocopy failed, exit >= 8 (pull) |
 | 97 | PsExec is not present in the guest (ui) |
-| 98 | the elevation prompt was declined (Windows host, push/pull/sync) |
+| 98 | the elevation prompt was declined (Windows host, push/pull/sync, when `virutil xfer setup` has not run) |
 | 99 | the host could not publish the share (Windows host, push/pull/sync) |
 
 Otherwise the guest's own exit code passes through (`exec`).
@@ -599,8 +616,8 @@ host-portable. Its guest half is one powershell script -- resolve the console
 session, start PsExec `-i <session> -d` -- which both drivers send
 statement for statement, and its delivery is `push`, which means smbd on a
 Linux host and `New-SmbShare` on a Windows one. On the Windows host `ui setup
-VM` therefore carries `push`'s cost: one Administrator prompt and a throwaway
-account, once per guest. The host-side download is `Invoke-WebRequest` plus
+VM` therefore carries `push`'s cost: Administrator (one prompt, or none after
+`virutil xfer setup`) and a throwaway account, once per guest. The host-side download is `Invoke-WebRequest` plus
 .NET's `ZipFile` rather than curl-or-wget and unzip-or-bsdtar; both are on
 every Windows machine, so there is no fallback chain.
 
@@ -659,7 +676,9 @@ marker file crosses and is read back in the guest by content.
 
 **Elevation is not a differentiator, and that is settled for all three.**
 `New-SmbShare` requires Administrator whichever credential answer wins, so the
-auth question does not decide whether `push` needs elevation. It does.
+auth question does not decide whether `push` needs elevation. It does. What
+*was* still open is whether it needs a person each time, and that is answered
+below: once, at `virutil xfer setup`, and never per transfer after it.
 
 **One credential per (client, server) pair, and this is the constraint that was
 missing.** Windows permits a client exactly one identity toward a given server,
@@ -721,15 +740,47 @@ it that are contract rather than implementation:
   developer typed in -- keeping the guest's stdout, the diagnoses and the exit
   code where they belong -- and a short-lived elevated helper mints the account,
   publishes the share, fixes the filesystem ACL and takes all three away again.
-  One prompt per transfer. The helper keys its teardown on waiting for the
-  *parent's* process to exit, which is the nearest thing this host has to the
-  `trap ... EXIT` the bash transport relies on: teardown fires on Ctrl-C, on an
-  exception, and on the run being killed while the agent hangs.
+  The helper keys its teardown on waiting for the *parent's* process to exit,
+  which is the nearest thing this host has to the `trap ... EXIT` the bash
+  transport relies on: teardown fires on Ctrl-C, on an exception, and on the
+  run being killed while the agent hangs.
+- **The helper is elevated one of two ways, and a person is needed at most
+  once.** `virutil xfer setup`, run once from an elevated prompt, registers a
+  scheduled task (`virutil-xfer-helper`): as that user, highest privileges,
+  interactive token, no trigger, parallel instances, readable and runnable by
+  that user alone. A transfer starts it with the token as `$(Arg0)` --
+  `IRegisteredTask.Run` substitutes parameters into the action textually,
+  which was measured -- and starting it raises no prompt. Without the task,
+  or with one whose installed helper is not the one this virutil would render
+  (an update, a moved `VIRUTILS_TMP_DIR`), a transfer falls back to
+  `Start-Process -Verb RunAs`: one UAC prompt, as before the task existed. A
+  stale task is the one fallback that says so. An unattended run was the
+  reason. A consent dialog nobody is there to answer stalls it for the whole
+  ready timeout, and the sooner a run like that is told it will be asked, the
+  better: `virutil xfer status` exits 0 only when it will not be.
+- **What the task makes possible is bounded, because the helper decides
+  nothing a caller passes.** Any process running as the user who set the task
+  up can start it without a prompt, so the task runs a copy of the helper that
+  setup wrote under `%ProgramFiles%\virutil\` -- writable by Administrators
+  only -- and that copy takes one argument, the token. The scratch root and the
+  account prefix are baked in when it is rendered; the share is always
+  `<root>/tmp/<token>/share` and the account always `vxp-<token>`. The rest
+  (password, ro or rw, the pid to wait on, the strays) is read from
+  `request.json` and checked for shape. A scratch directory or a share tree
+  with a reparse point in it is refused before anything is granted. The worst
+  a hostile caller can have it do is what a transfer does. The checks are
+  checks, not locks: a caller racing the helper could still swap a directory
+  between the check and the use, and that is written down rather than
+  claimed solved.
 - The two halves cannot use a pipe, and the reason is measured rather than
   assumed: `Start-Process -Verb RunAs -RedirectStandardOutput` is a parameter-set
   error, because the verb requires ShellExecute and ShellExecute forbids
-  redirection. The parent passes the token, the account and the password down as
-  arguments and the helper answers upward through a status file.
+  redirection, and a task start has no pipe to offer either. On both paths the
+  parent writes the transfer's orders into `request.json` in its scratch
+  directory -- no longer onto a command line, where the password was readable
+  by anything that lists processes -- and the helper answers upward through a
+  status file. Its first record carries its own pid, which is how the parent
+  learns what to watch when a task start hands it no process at all.
 - **Every transfer stages**, into `<root>/tmp/<token>/`, and the staged copy is
   what the share points at. This diverges from the bash driver, which serves a
   directory source in place, and the divergence is deliberate: serving in place
@@ -738,7 +789,7 @@ it that are contract rather than implementation:
   network the host is attached to. `pull` seeds its staging tree from the
   destination first, so the guest still sees what the host already holds and
   still sends only what differs.
-- **Nothing is created and nothing is prompted for until the transfer is known
+- **Nothing is created and nothing is elevated until the transfer is known
   to be possible.** Domain running, agent answering and source readable are all
   settled first. Being asked to approve Administrator and *then* told the guest
   is not running is the worst available ordering.
@@ -818,7 +869,7 @@ drivers:
 | `tests/linux/payloads.sh`, `tests/win/payloads.ps1` | render all eleven payloads under each driver and diff both against `tests/golden/payloads.txt`. This is what makes section 6's "byte-identical" checkable. |
 | `tests/win/domain.ps1` | the launcher round trip: monitor port, agent channel and port forwards written, read back, edited and read again. |
 | `tests/mac/domain.sh` | the macOS driver against a real hvf domain with no OS: create's files, start, port forwards live and in the launcher, every snapshot verb with the domain running and shut off, the launcher edits, delete. Driven from the runner on a Mac; skips anywhere else. |
-| `tests/win/xfer.ps1` | `push` and `pull` on a Windows host with both seams substituted -- the guest agent and the share publisher -- so the guest path rules, credential generation, the free-space refusal, the sweep's liveness decision, the rendered payload and the teardown all run with no VM and no Administrator. |
+| `tests/win/xfer.ps1` | `push` and `pull` on a Windows host with both seams substituted -- the guest agent and the share publisher -- so the guest path rules, credential generation, the free-space refusal, the sweep's liveness decision, the rendered payload and the teardown all run with no VM and no Administrator. Under the publisher, its own three seams (the task lookup, the task start, the UAC start) are substituted instead, so the choice between task and prompt, the request the helper is handed and the helper pid read back from the status file are asserted too; and the real helper is run unelevated against the requests it must refuse. Nothing registers a task or elevates. |
 | `tests/win/sync.ps1` | `sync` on a Windows host, over the same two seams, with a real staging tree and a real delivery tree built on the host: what each config directive parses to, that the two a Windows host cannot honour are refused **before anything is fetched**, the layout the map rules build, the payload the guest would have been sent, and that a failed delivery tears down as completely as a successful one. |
 | `tests/win/transfer.ps1` | the guest tier: the transfer minimum below, plus the property that a completed transfer and a killed one both leave no account, no share and no staged tree. |
 
@@ -838,9 +889,9 @@ round-trips (above).
 
 The PowerShell half skips itself, loudly, on a host with no `pwsh`, and
 `tests/win/transfer.ps1` skips itself the same way when no guest is up. When a guest
-*is* up it is the only interactive test in the suite: a transfer on a Windows
-host prompts for Administrator once, and suppressing that would mean installing
-a service.
+*is* up it is the only interactive test in the suite, unless `virutil xfer
+setup` has been run on that host: without the task, a transfer on a Windows
+host prompts for Administrator once.
 
 **Still missing, and named so it is not mistaken for covered:** `exec`
 propagating a guest exit code against a real guest, `domain create` leaving

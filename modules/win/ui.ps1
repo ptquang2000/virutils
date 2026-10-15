@@ -17,9 +17,10 @@
 #     ZipFile, where bash needs curl-or-wget and unzip-or-bsdtar. Both are on
 #     every Windows machine, so there is no fallback chain to walk.
 #   * **the delivery** is Push-Main, as the bash side's is push_main -- which on
-#     this host means the machine's own SMB server, an Administrator prompt and
-#     a throwaway account for the length of it. That is push's cost, taken once
-#     per guest, and it is the transport contract section 7 said ui would ride.
+#     this host means the machine's own SMB server, Administrator (a prompt, or
+#     the task `virutil xfer setup` registers) and a throwaway account for the
+#     length of it. That is push's cost, taken once per guest, and it is the
+#     transport contract section 7 said ui would ride.
 #
 # The guest half -- the script that resolves the console session and starts
 # PsExec -- is the bash module's text statement for statement, since both drivers
@@ -67,8 +68,9 @@ function Get-UiUsage {
         '  PsExec missing, that is the fix.'
         ''
         "  setup delivers over the same SMB transport as 'virutil push', so on"
-        '  this host it prompts once for Administrator and mints a throwaway'
-        '  local account for the length of the delivery.'
+        '  this host it needs Administrator -- one prompt, or none after'
+        "  'virutil xfer setup' -- and mints a throwaway local account for the"
+        '  length of the delivery.'
         ''
         '  -f, --force    re-download PsExec even if the host cache holds it'
         '  -h, --help     this message'

@@ -39,9 +39,11 @@ function Get-PullUsage {
         'itself with robocopy and so moves only what changed.'
         ''
         "On this host the share comes from the machine's own SMB server, so the"
-        'transfer prompts once for Administrator and mints a throwaway local'
-        'account that the guest authenticates with and that is destroyed when'
-        'the transfer ends. See README.md, "On a Windows host".'
+        'transfer needs Administrator and mints a throwaway local account that'
+        'the guest authenticates with and that is destroyed when the transfer'
+        "ends. After 'virutil xfer setup' (once, elevated) that comes from a"
+        'scheduled task with no prompt; without it the transfer prompts once.'
+        'See README.md, "On a Windows host".'
     )
 }
 

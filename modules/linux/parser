@@ -53,5 +53,13 @@ parse_dispatch() {
         REST=("$@")
         return 0
     done
+    # In the Windows driver's grammar and in no other, and refused by name for
+    # the reason the macOS driver refuses what it lacks: someone who read
+    # docs/contract.md section 2 has been told it exists.
+    if [[ "$MODULE" == xfer ]]; then
+        die "virutil xfer is a Windows-host command: it sets up the scheduled task" \
+            "that lets a transfer there elevate without a UAC prompt, and a Linux" \
+            "host's transport has no elevation to arrange. See docs/contract.md section 2."
+    fi
     die "virutil: unknown module: $MODULE (see: virutil help)"
 }
