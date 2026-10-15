@@ -910,12 +910,24 @@ function Publish-XferShare {
 # it. A cast against the outer exception therefore never matches, and the one
 # failure that has its own exit code -- so that a wrapping script can tell "I
 # clicked No" from "SMB is broken" -- would have been reported as the other one.
+#
+# **And under PowerShell 7 there is no inner exception at all.** Its
+# Start-Process catches the Win32Exception and throws a fresh
+# InvalidOperationException carrying only the message -- measured, with a
+# missing executable: one exception, no InnerException. So a declined (or
+# timed-out: UAC cancels an unanswered dialog after about two minutes) prompt
+# exited 99 under pwsh 7. What survives is the text, and the text is the
+# system's own for ERROR_CANCELLED, localised the same way pwsh's copy of it
+# is -- so the match is against that, asked of Windows rather than spelled in
+# English here.
 function Test-XferElevationDeclined {
     param($Exception)
+    $cancelled = ([ComponentModel.Win32Exception]::new(1223)).Message.TrimEnd('.')
     $e = $Exception
     while ($null -ne $e) {
         $w = $e -as [ComponentModel.Win32Exception]
         if ($w -and $w.NativeErrorCode -eq 1223) { return $true }   # ERROR_CANCELLED
+        if ($cancelled -and $e.Message -and $e.Message.Contains($cancelled)) { return $true }
         $e = $e.InnerException
     }
     return $false

@@ -299,6 +299,15 @@ try {
         (Test-XferElevationDeclined $wrapped)
     CheckTrue 'and unwrapped, for a host that does not wrap it' `
         (Test-XferElevationDeclined $cancelled)
+    # PowerShell 7's own shape: one exception, the Win32 error's text inside
+    # its message, no inner exception. Measured; see the function.
+    $flat = [InvalidOperationException]::new(
+        "This command cannot be run due to the error: An error occurred trying to start process 'pwsh.exe' with working directory 'C:\'. $($cancelled.Message)")
+    CheckTrue "and PowerShell 7's flattened one, which has no inner exception" `
+        (Test-XferElevationDeclined $flat)
+    $notFound = [InvalidOperationException]::new(
+        "This command cannot be run due to the error: An error occurred trying to start process 'x.exe'. $(([ComponentModel.Win32Exception]::new(2)).Message)")
+    Check 'but a flattened file-not-found is not a decline' $false (Test-XferElevationDeclined $notFound)
     Check 'another Win32 failure is not read as a decline' $false `
         (Test-XferElevationDeclined ([ComponentModel.Win32Exception]::new(5)))
     Check 'and neither is an ordinary error' $false `
