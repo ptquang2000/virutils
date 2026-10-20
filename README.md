@@ -561,9 +561,23 @@ measured.
   of Setup's reboots survive under WHPX, which Windows 11's do not. Setup takes
   about 25 minutes.
 - **`exec`** needs a qemu-ga old enough to run on XP and new enough to have
-  `guest-exec`: 2.5 to 3.1 (QEMU dropped < Vista in 4.0). The domain puts the
-  agent channel on COM1, not virtio-serial:
-  `qemu-ga.exe -s install -m isa-serial -p COM1`.
+  `guest-exec`: QEMU 2.5 to 3.1 (QEMU dropped < Vista in 4.0). Measured:
+  virtio-win's `archive-qemu-ga/qemu-ga-win-7.6.2-2.el7ev/qemu-ga-x86.msi`
+  runs on XP SP3, lists `isa-serial`, and ships the `gspawn-win32-helper`
+  that `guest-exec` needs. The 7.3.x/7.4.x MSIs are agent 0.12.1, too old to
+  have `guest-exec` at all. The domain puts the channel on COM1, not
+  virtio-serial. Unpack with `msiexec /a` (no VSS, nothing registered), then:
+
+      qemu-ga.exe -s install
+      sc config qemu-ga binPath= "\"<dir>\qemu-ga.exe\" -d -m isa-serial -p COM1"
+      net start qemu-ga
+
+  The `sc config` is not optional: this build's `-s install` writes only `-d`
+  into the service, whatever `-m` and `-p` it was given, and the service
+  then opens a virtio-serial port the domain does not have. Then `exec ping`,
+  `exec cmd` (exit codes pass through) and `exec cmd -d` all work, and the
+  agent comes back by itself after a guest reboot. `exec ps` does not: XP has
+  no `powershell.exe` until KB968930 is installed.
 - **`push`, `pull`, `sync` and `ui` do not reach an XP guest.** They use this
   host's SMB server, and XP speaks only SMB1, which Windows 11 does not serve.
   The guest payloads also need PowerShell 2.0 and robocopy, which XP does not

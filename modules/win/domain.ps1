@@ -220,10 +220,13 @@ $script:DomainCpu = 'Skylake-Client'
 #   -rtc base=localtime     Windows keeps the RTC in local time.
 #   isa-serial (COM1)       the guest agent channel without virtio-serial. An XP
 #                           qemu-ga -- 2.5 to 3.1: guest-exec arrived in 2.5, and
-#                           the < Vista code left in 4.0 -- runs as
-#                             qemu-ga.exe -s install -m isa-serial -p COM1
-#                           It is the same qga0 socket chardev, so
-#                           Get-GuestAgentPort and exec need no change.
+#                           the < Vista code left in 4.0. Measured: virtio-win's
+#                           archived qemu-ga-win-7.6.2 x86 runs on XP. Its
+#                           `-s install` drops -m and -p, so the service needs
+#                             sc config qemu-ga binPath= "\"...\qemu-ga.exe\" -d -m isa-serial -p COM1"
+#                           (README: A Windows XP guest). It is the same qga0
+#                           socket chardev, so Get-GuestAgentPort and exec need
+#                           no change: exec ping/cmd/-d work and exit codes pass.
 #   1 vcpu                  XP fixes its HAL at install time: one vcpu gets the
 #                           ACPI Uniprocessor HAL, and a later -c 2 still runs on
 #                           one cpu. XP never enables XSAVE either.
@@ -1296,9 +1299,14 @@ function New-Domain {
                 'No answer file: Setup asks everything. -u winnt.sif answers it.'
             })
             ''
-            'For exec, install an XP-capable qemu-ga (2.5 to 3.1) in the guest on'
-            'the serial port this domain gives it:'
-            '  qemu-ga.exe -s install -m isa-serial -p COM1'
+            'For exec, install an XP-capable qemu-ga (2.5 to 3.1; virtio-win''s'
+            'archived qemu-ga-win-7.6.2 x86 is measured) as a service, then give'
+            'the service the serial port this domain has -- its -s install drops'
+            '-m and -p:'
+            '  qemu-ga.exe -s install'
+            '  sc config qemu-ga binPath= "\"<dir>\qemu-ga.exe\" -d -m isa-serial -p COM1"'
+            '  net start qemu-ga'
+            'README: A Windows XP guest on a Windows host.'
         )
         Say "RDP once it is up (XP Professional only): mstsc /v:localhost:$(($ports[0] -split ':')[0])"
         return
