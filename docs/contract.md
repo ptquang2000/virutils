@@ -43,6 +43,7 @@ every module, exit 0 for an asked-for help and 1 for a usage error.
 ```
 virutil domain create   VM ISO [-s GiB] [-m MiB] [-c N] [-o ID] [-v ISO|none]
                                [-p SPEC] [-N]            # Windows and macOS hosts
+                               [-u FILE]                 # Windows host, -o winxp only
                                # -c N: Linux and macOS hosts; a Windows host creates
                                #       at 1 vcpu and refuses it (section 9)
 virutil domain delete   VM
@@ -146,7 +147,7 @@ One root, everything under it, one variable relocates the lot.
 | path | holds |
 |---|---|
 | `<root>/conf` | sync configs, looked up here first |
-| `<root>/images` | domain disks, snapshot overlays, memory files, UEFI nvram, and -- Windows host only -- the per-VM `.cmd` launcher and its OVMF log |
+| `<root>/images` | domain disks, snapshot overlays, memory files, UEFI nvram, and -- Windows host only -- the per-VM `.cmd` launcher, its firmware log (OVMF, or SeaBIOS for `-o winxp`) and, for `-o winxp -u`, the answer-file floppy `VM-a.img` |
 | `<root>/staging` | sync's incremental staging trees |
 | `<root>/ports` | port-forward state and logs |
 | `<root>/mnt` | host mount points for guest filesystems |
@@ -995,10 +996,20 @@ thing neither driver may do, because it reports a change that was not made.
   are the only way in -- and says plainly that the guest address is not
   reachable, rather than printing 10.0.2.15 and letting someone spend an
   afternoon pinging it. It exits 0: the question has an answer, and that is it.
-- **`domain create -o ID` is accepted and ignored there.** There is no
-  libosinfo, and nothing on that host consults an os id. It stays in the grammar
-  so a command line written for one driver parses under the other, and it says
-  so when used.
+- **`domain create -o ID` honours one id there, `winxp`, and ignores the
+  rest.** There is no libosinfo, so no other id is consulted; it stays in the
+  grammar so a command line written for one driver parses under the other, and
+  says so when used. `winxp` -- libosinfo's own id, so it names the same guest
+  on both drivers -- builds a legacy PC that 32-bit Windows XP has inbox drivers
+  for: SeaBIOS, i440fx, IDE, rtl8139, cirrus, UHCI, the guest agent on an ISA
+  serial port, one vcpu. The header of `modules/win/domain.ps1` has the table
+  and what was measured. `VIRUTILS_OSINFO` is still ignored on that host: with
+  no ISO detection there is nothing for a fallback to fall back from.
+- **`domain create -u FILE` is a Windows-only addition, and `-o winxp` only.**
+  It writes FILE, a `winnt.sif`, to a 1.44 MB floppy that XP Setup reads as A:.
+  Without `-o winxp` it is refused by name: Windows 11 Setup reads
+  `autounattend.xml`, which neither driver builds. The bash driver has no `-u`;
+  virt-install's own `--unattend` is libosinfo's and is not wired through.
 - **`domain create -c N` is refused on a Windows host.** A domain is created
   with one vcpu there and there is nothing to choose: section 7's defect kills a
   guest with more than one at its own reboot, which is what Windows Setup does

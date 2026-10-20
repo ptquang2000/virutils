@@ -276,6 +276,55 @@ try {
         $mon.Stop()
     }
 
+    # --- the legacy profile, -o winxp ----------------------------------------
+    #
+    # XP has inbox drivers for none of what the default profile builds, so the
+    # profile is a different machine; but everything the rest of this driver
+    # reads back out of a launcher has to read back the same.
+    $xv = 'xpvm'
+    $xargs = Get-DomainQemuArgs -Vm $xv -Qemu @{ Code = 'C:\q\share\edk2-x86_64-code.fd' } `
+        -Disk (Get-DomainDisk $xv) -Nvram (Get-DomainNvram $xv) -Iso 'C:\iso\xp.iso' `
+        -Virtio '' -Memory 1024 -Vcpus 1 -Ports @('13390:3389') `
+        -MonitorPort 44450 -AgentPort 44451 -Legacy -Floppy (Get-DomainFloppy $xv)
+    $xline = ($xargs -join ' ')
+    Check 'winxp: a pc machine'               $true  ($xline -match '-machine pc,smm=off')
+    Check 'winxp: no UEFI firmware'           $false ($xline -match 'pflash')
+    Check 'winxp: an IDE disk, booted first'  $true  ($xline -match 'ide-hd,bus=ide\.0,unit=0,drive=hd0,bootindex=0')
+    Check 'winxp: the CD second'              $true  ($xline -match 'ide-cd,bus=ide\.1,unit=0,drive=cd0,bootindex=1')
+    Check 'winxp: nothing virtio'             $false ($xline -match 'virtio')
+    Check 'winxp: an inbox NIC'               $true  ($xline -match 'rtl8139,netdev=net0')
+    Check 'winxp: cirrus'                     $true  ($xline -match '-vga cirrus')
+    Check 'winxp: no xhci'                    $false ($xline -match 'xhci')
+    Check 'winxp: local-time RTC'             $true  ($xline -match '-rtc base=localtime')
+    Check 'winxp: the agent on an ISA serial' $true  ($xline -match 'isa-serial,chardev=qga0')
+    Check 'winxp: the answer floppy is A:'    $true  ($xline -match 'if=floppy,index=0')
+    Write-DomainLauncher (Get-DomainLauncher $xv) 'C:\q\qemu-system-x86_64w.exe' $xargs $xv
+    Check 'winxp: the monitor port reads back' 44450 (Get-DomainMonitorPort $xv)
+    Check 'winxp: the agent port reads back'   44451 (Get-GuestAgentPort $xv)
+    Check 'winxp: the forward reads back'      13390 (@(Get-DomainForwards $xv)[0].Host)
+    Set-LauncherVcpus $xv 1
+    Check 'winxp: -c rewrites its -smp'        $true ((Get-DomainLauncherText $xv) -match '-smp "1,sockets=1,cores=1,threads=1"')
+    Set-LauncherMemory $xv 2048
+    Check 'winxp: -m rewrites its memory'      $true ((Get-DomainLauncherText $xv) -match '(?m)^\s*-m 2048')
+
+    # -u belongs to the legacy profile, and is refused by name without it --
+    # after parsing, before the ISO is looked at.
+    $said = ''
+    try { New-Domain @('w11', 'C:\nonexistent.iso', '-u', 'C:\x.sif') } catch { $said = $_.Exception.Message }
+    Check '-u without -o winxp is refused'     $true  ($said -match '-u is for -o winxp only')
+    $said = ''
+    try { New-Domain @('xp', 'C:\nonexistent.iso', '-o', 'winxp', '--unattend', 'C:\nonexistent.sif') } catch { $said = $_.Exception.Message }
+    Check 'a missing answer file is named'     $true  ($said -match 'answer file not found')
+    $said = ''
+    try { New-Domain @('xp', 'C:\nonexistent.iso', '-o', 'winxp') } catch { $said = $_.Exception.Message }
+    Check '-o winxp parses through to the ISO' $true  ($said -match 'install ISO not found')
+
+    # The floppy is a file the domain owns, so delete takes it.
+    Set-Content -LiteralPath (Get-DomainFloppy $xv) -Value 'x'
+    Remove-Domain @($xv) *> $null
+    Check 'delete takes the answer floppy'     $false (Test-Path -LiteralPath (Get-DomainFloppy $xv))
+    Check 'and the launcher'                   $false (Test-Domain $xv)
+
     # --- deleting through an 8.3 short path ---------------------------------
     #
     # Remove-Item cannot do it, -LiteralPath notwithstanding, which broke

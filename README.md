@@ -542,6 +542,35 @@ statically addressed guest, and `virsh shutdown --mode agent` need.
 | **QEMU guest agent** (`qemu-ga`) | `virtio-win-guest-tools.exe`, or `guest-agent\qemu-ga-x86_64.msi` on the ISO | `sync`, `push` and `pull`, `virutil exec`, and `virsh shutdown --mode agent` |
 | **SPICE guest agent** (`spice-vdagent`) | [spice-guest-tools](https://www.spice-space.org/download/windows/spice-guest-tools/spice-guest-tools-latest.exe) | the `spice` display and `spicevmc` channel of every `virutil domain create` domain — clipboard sharing and display auto-resize |
 
+### A Windows XP guest on a Windows host
+
+`virutil domain create VM ISO -o winxp [-u winnt.sif]` builds a legacy PC that
+32-bit Windows XP has inbox drivers for: SeaBIOS, i440fx with an IDE disk,
+rtl8139, cirrus, a UHCI tablet, local-time RTC, one vcpu, 1024 MiB, 24 GiB, and
+nothing virtio. None of the table above applies to it. The header of
+`modules/win/domain.ps1` says why each device is the one it is, and what was
+measured.
+
+- **Media and key are yours.** virutil fetches neither. With `-u`, leave
+  `ProductKey` out of the answer file: GUI Setup then stops at the key page
+  and the key is typed into the guest window, so it is never written to the
+  floppy or to the guest's `$winnt$.inf`.
+- **The install is unattended up to that page** with an answer file such as
+  `[Data] AutoPartition=1` plus `[Unattended] UnattendMode=DefaultHide`,
+  `Repartition=Yes`, `OemSkipEula=Yes`. Measured here with XP Pro SP3 VL: both
+  of Setup's reboots survive under WHPX, which Windows 11's do not. Setup takes
+  about 25 minutes.
+- **`exec`** needs a qemu-ga old enough to run on XP and new enough to have
+  `guest-exec`: 2.5 to 3.1 (QEMU dropped < Vista in 4.0). The domain puts the
+  agent channel on COM1, not virtio-serial:
+  `qemu-ga.exe -s install -m isa-serial -p COM1`.
+- **`push`, `pull`, `sync` and `ui` do not reach an XP guest.** They use this
+  host's SMB server, and XP speaks only SMB1, which Windows 11 does not serve.
+  The guest payloads also need PowerShell 2.0 and robocopy, which XP does not
+  have. Re-enabling SMB1 on the host is not the fix.
+- **RDP** is XP Professional only, and XP refuses a remote logon to an account
+  with a blank password.
+
 ### A Windows guest on a macOS host
 
 The guest is **Windows 11 on Arm** — hvf runs the host's own architecture only —
@@ -1524,7 +1553,8 @@ The flags are what you vary per domain. Everything else is a property of the
 | `-s`, `--size GiB` | `64` | Disk size. |
 | `-m`, `--memory MiB` | half the host's | Guest RAM, rounded down to 512 MiB, floor 2048. |
 | `-c`, `--vcpus N` | half the host's, max 8 | Virtual CPUs. **Linux host only** — a Windows host creates the domain at 1 vcpu and refuses this flag, because a guest with more than one dies at its own reboot there and that is what Setup does twice. Set the count afterwards with `domain start VM -c N`. |
-| `-o`, `--osinfo ID` | **detected from the ISO** | libosinfo id; see `osinfo-query os`. |
+| `-o`, `--osinfo ID` | **detected from the ISO** | libosinfo id; see `osinfo-query os`. On a Windows host only `winxp` means anything: it builds the legacy XP machine ([A Windows XP guest on a Windows host](#a-windows-xp-guest-on-a-windows-host)); any other id is ignored and says so. |
+| `-u`, `--unattend FILE` | none | **Windows host, `-o winxp` only.** A `winnt.sif`, written to a 1.44 MB floppy (`VM-a.img`) that XP Setup reads as A:. Leave the product key out of it. |
 | `-v`, `--virtio ISO` | `virtio-win*.iso` beside the install ISO | Driver ISO to attach as a second cdrom. `none` attaches none. |
 
 The disk image is always `$VIRUTILS_IMAGE_DIR/VM.qcow2` (default

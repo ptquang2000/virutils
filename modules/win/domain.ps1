@@ -202,6 +202,44 @@
 
 $script:DomainCpu = 'Skylake-Client'
 
+# The legacy profile, `domain create -o winxp`: a machine 32-bit Windows XP has
+# inbox drivers for, because XP has none for anything the default profile
+# builds. winxp is libosinfo's own id for XP, so a command line written for the
+# bash driver names the same guest here. Every choice is a driver XP ships:
+#
+#   SeaBIOS, not OVMF       XP does not boot UEFI. It is the pc machine's default
+#                           firmware, so no pflash and no nvram.
+#   pc (i440fx), not q35    PIIX IDE, which atapi.sys drives. q35 has only AHCI,
+#                           which XP Setup cannot see without an F6 floppy.
+#   ide-hd, not virtio-blk  XP media has no virtio driver.
+#   rtl8139                 inbox. QEMU's e1000 is the 82540EM, which XP has no
+#                           inbox driver for. pcnet is the other inbox choice.
+#   -vga cirrus             inbox cirrus.sys, 1024x768. std (Bochs VBE) has no XP
+#                           driver and leaves the guest at 640x480x16.
+#   -usb + usb-tablet       PIIX3 UHCI. XP has no xHCI driver.
+#   -rtc base=localtime     Windows keeps the RTC in local time.
+#   isa-serial (COM1)       the guest agent channel without virtio-serial. An XP
+#                           qemu-ga -- 2.5 to 3.1: guest-exec arrived in 2.5, and
+#                           the < Vista code left in 4.0 -- runs as
+#                             qemu-ga.exe -s install -m isa-serial -p COM1
+#                           It is the same qga0 socket chardev, so
+#                           Get-GuestAgentPort and exec need no change.
+#   1 vcpu                  XP fixes its HAL at install time: one vcpu gets the
+#                           ACPI Uniprocessor HAL, and a later -c 2 still runs on
+#                           one cpu. XP never enables XSAVE either.
+#   no boot prompt          Send-BootPrompt is skipped. An XP CD boots by itself
+#                           from a blank disk, and Enter on its first screen is
+#                           "set up Windows XP now".
+#
+# Measured on this host, qemu v11.1.0-12130, XP Pro SP3 VL: SeaBIOS under WHPX
+# boots this machine; the rtl8139 iPXE ROM took 10.0.2.15 from slirp's DHCP;
+# a winnt.sif floppy drove text mode unattended; and **both of Setup's own
+# reboots survived** -- no xsave crash and no MemDetect ASSERT, the fifth and
+# sixth facts above, which are OVMF's and multi-vcpu's. GUI Setup stopped only
+# at the product key page, and the desktop came up at 1024x768 on cirrus.sys.
+# About 25 minutes end to end.
+$script:LegacyOsinfo = 'winxp'
+
 # The band `domain create` allocates the monitor and guest agent ports from,
 # and it is deliberately *below* the ephemeral range rather than inside it.
 #
@@ -252,9 +290,17 @@ function Get-DomainUsage {
         '                    should run on once OOBE is done:'
         '                    domain start VM -c N.'
         '                    See the header of modules/win/domain.ps1.'
-        '  -o, --osinfo ID   accepted and ignored: there is no libosinfo here'
+        '  -o, --osinfo ID   winxp builds a legacy PC for 32-bit Windows XP:'
+        '                    SeaBIOS, i440fx, IDE disk, rtl8139, cirrus, UHCI'
+        '                    tablet, the guest agent on COM1, 1 vcpu, 1024 MiB,'
+        '                    24 GiB, no virtio. Any other id is ignored: there'
+        '                    is no libosinfo here.'
+        '  -u, --unattend F  winxp only: F is a winnt.sif, written to a FAT12'
+        '                    floppy (VM-a.img) that XP Setup reads as A:.'
+        '                    Never put a product key in it -- leave it out and'
+        '                    Setup stops at the key page for you to type it.'
         '  -v, --virtio ISO  virtio-win ISO to attach as a second cdrom, or'
-        '                    "none" (default: found beside ISO)'
+        '                    "none" (default: found beside ISO; never for winxp)'
         '  -p, --port SPEC   a port forward, repeatable (default 13389:3389, or'
         '                    the next free host port when another domain has it)'
         '  -N, --no-start    create it without starting it'
@@ -383,6 +429,7 @@ function Get-DomainNvram    { param([string]$Vm) Join-Path $script:VirutilsImage
 function Get-DomainLauncher { param([string]$Vm) Join-Path $script:VirutilsImageDir "$Vm.cmd" }
 function Get-DomainOvmfLog  { param([string]$Vm) Join-Path $script:VirutilsImageDir "$Vm-ovmf.log" }
 function Get-DomainQemuLog  { param([string]$Vm) Join-Path $script:VirutilsImageDir "$Vm-qemu.log" }
+function Get-DomainFloppy   { param([string]$Vm) Join-Path $script:VirutilsImageDir "$Vm-a.img" }
 
 function Test-Domain {
     param([string]$Vm)
@@ -926,6 +973,15 @@ function Set-LauncherVcpus {
     # rewrite happens before the start -- the domain never started at all.
     $smp = '-smp\s+"?\d+,sockets=1,cores=\d+,threads=1"?'
     if ($text -notmatch $smp) { Die "could not find -smp in $path to change" }
+    # A legacy guest is warned rather than refused: the count is honoured, it
+    # just does not change the HAL XP installed with.
+    if ($Vcpus -gt 1 -and $text -match '-machine\s+"?pc,') {
+        Warn @(
+            "$Vm is a legacy (winxp) domain: XP keeps the HAL it was installed"
+            'with, so a guest installed on one vcpu will still use one. Changing'
+            'that is a HAL swap inside the guest, not a launcher edit.'
+        )
+    }
     $new = [regex]::Replace($text, $smp,
                             "-smp `"$Vcpus,sockets=1,cores=$Vcpus,threads=1`"", 1)
 
@@ -1039,7 +1095,7 @@ function Remove-Domain {
     # "$Vm*" in a shared image directory would take win11-backup.qcow2 with
     # win11, and delete never asks.
     foreach ($f in @((Get-DomainDisk $vm), (Get-DomainNvram $vm), (Get-DomainLauncher $vm),
-                     (Get-DomainOvmfLog $vm), (Get-DomainQemuLog $vm))) {
+                     (Get-DomainOvmfLog $vm), (Get-DomainQemuLog $vm), (Get-DomainFloppy $vm))) {
         if (Remove-VirutilsFile $f) { Say "removed $f" }
     }
 }
@@ -1050,10 +1106,12 @@ function New-Domain {
     param([string[]]$Arguments)
 
     $vm = $null; $iso = $null
-    # Two vcpus, because one is a domain Windows 11 Setup will not install on
-    # at all. See the header: create used to write 1 and refuse -c.
-    $size = 64; $memory = 0; $vcpus = 2; $virtio = $null
-    $ports = @(); $noStart = $false
+    # Zero means "not asked for": the profile below decides the default. Two
+    # vcpus for the default profile, because one is a domain Windows 11 Setup
+    # will not install on at all. See the header: create used to write 1 and
+    # refuse -c.
+    $size = 0; $memory = 0; $vcpus = 0; $virtio = $null
+    $ports = @(); $noStart = $false; $osinfo = $null; $unattend = $null
 
     # if/elseif rather than `switch -Regex`: a PowerShell switch runs *every*
     # branch whose pattern matches unless each one breaks, so a catch-all '^-'
@@ -1069,15 +1127,8 @@ function New-Domain {
         elseif ($a -in @('-v', '--virtio'))   { $i++; $virtio = Get-FlagValue $Arguments $i $a }
         elseif ($a -in @('-p', '--port'))     { $i++; $ports += Get-FlagValue $Arguments $i $a }
         elseif ($a -in @('-N', '--no-start')) { $noStart = $true }
-        elseif ($a -in @('-o', '--osinfo')) {
-            $i++
-            [void](Get-FlagValue $Arguments $i $a)
-            Warn @(
-                '-o is accepted and ignored: there is no libosinfo on this host'
-                'and nothing here consults an os id. It is in the grammar so a'
-                'command line written for one driver parses under the other.'
-            )
-        }
+        elseif ($a -in @('-o', '--osinfo'))   { $i++; $osinfo   = Get-FlagValue $Arguments $i $a }
+        elseif ($a -in @('-u', '--unattend')) { $i++; $unattend = Get-FlagValue $Arguments $i $a }
         elseif ($a.StartsWith('-')) { Die "virutil domain create: unknown flag: $a" }
         elseif ($null -eq $vm)      { $vm = $a }
         elseif ($null -eq $iso)     { $iso = $a }
@@ -1085,16 +1136,60 @@ function New-Domain {
         $i++
     }
     if (-not $vm -or -not $iso) { Usage (Get-DomainUsage) 1 }
+
+    # The profile. winxp is the one os id this host acts on (see the header);
+    # any other is accepted and ignored and says so, as contract section 9
+    # requires of a flag a host cannot honour.
+    $legacy = ($osinfo -eq $script:LegacyOsinfo)
+    if ($osinfo -and -not $legacy) {
+        Warn @(
+            "-o $osinfo is accepted and ignored: there is no libosinfo on this"
+            "host, and the only id it acts on is $($script:LegacyOsinfo). It is in"
+            'the grammar so a command line written for one driver parses under'
+            'the other.'
+        )
+    }
+    if ($unattend -and -not $legacy) {
+        Die @(
+            "-u is for -o $($script:LegacyOsinfo) only: it writes a winnt.sif floppy,"
+            'which is how XP Setup is answered. Windows 11 Setup reads'
+            'autounattend.xml, and this driver does not build one.'
+        )
+    }
+    if ($unattend -and -not (Test-Path -LiteralPath $unattend -PathType Leaf)) {
+        Die "answer file not found: $unattend"
+    }
+    if ($legacy) {
+        if (-not $size)   { $size   = 24 }
+        if (-not $memory) { $memory = 1024 }
+        if (-not $vcpus)  { $vcpus  = 1 }
+        if ($virtio -and $virtio -ne 'none') {
+            Warn "-v $virtio is ignored for $($script:LegacyOsinfo): XP has no virtio drivers, so nothing here is virtio."
+        }
+        $virtio = 'none'
+    } else {
+        if (-not $size)  { $size  = 64 }
+        if (-not $vcpus) { $vcpus = 2 }
+    }
+
     # RDP on 13389, or the next port up that is free. This was a fixed 13389,
     # so every domain created without -p asked for the same host port, and
     # whichever started second died on it -- see Assert-DomainForwardsFree.
     if ($ports.Count -eq 0) { $ports = @("$(Get-FreeForwardPort 13389):3389") }
     if ($vcpus -lt 1) { Die "--vcpus wants a whole number, got '$vcpus'" }
+    if ($legacy -and $vcpus -gt 1) {
+        Warn @(
+            "-c $vcpus on $($script:LegacyOsinfo): XP picks its HAL at install, so this"
+            'installs the ACPI Multiprocessor HAL and stays on it. One vcpu is'
+            'the measured path: both of Setup''s reboots survived at one, and'
+            'more than one is what dies at a guest reboot on this host.'
+        )
+    }
     # Accepted, then warned about, rather than refused: a single vcpu is a
     # legitimate machine for a guest that is already installed, and refusing it
     # here would be the same mistake create made in the other direction. What
     # it is not is a machine an install can start on.
-    if ($vcpus -lt 2) {
+    if (-not $legacy -and $vcpus -lt 2) {
         Warn @(
             "-c 1 creates a domain Windows 11 Setup will not install on. It"
             'stops at "This PC can''t run Windows 11" before the disk step, and'
@@ -1149,7 +1244,8 @@ function New-Domain {
     $agentPort   = Get-FreeLoopbackPort $monitorPort
     New-VirutilsDir $script:VirutilsImageDir | Out-Null
 
-    Say ('{0,-10}{1}' -f 'domain:',   "$vm (whpx, $($script:DomainCpu))")
+    $machine = if ($legacy) { "$($script:LegacyOsinfo): pc, SeaBIOS" } else { 'q35, OVMF' }
+    Say ('{0,-10}{1}' -f 'domain:',   "$vm (whpx, $($script:DomainCpu), $machine)")
     Say ('{0,-10}{1}' -f 'cpu:',      "$vcpus vcpu (1 socket x $vcpus core x 1 thread) -- set the real count after OOBE")
     Say ('{0,-10}{1}' -f 'memory:',   "$memory MiB")
     Say ('{0,-10}{1}' -f 'disk:',     "$disk ($size GiB)")
@@ -1162,11 +1258,20 @@ function New-Domain {
     # the whole image out up front.
     & $qemu.Img create -f qcow2 -o cluster_size=1M,lazy_refcounts=on -- $disk "${size}G" | Out-Null
     if ($LASTEXITCODE -ne 0) { Die "could not create $disk" }
-    Copy-Item -LiteralPath $qemu.VarsTemplate -Destination $nvram -Force
+    # SeaBIOS keeps no variables, so a legacy domain has no nvram at all.
+    if (-not $legacy) { Copy-Item -LiteralPath $qemu.VarsTemplate -Destination $nvram -Force }
+
+    $floppy = $null
+    if ($unattend) {
+        $floppy = Get-DomainFloppy $vm
+        New-UnattendFloppy $qemu $unattend $floppy
+        Say ('{0,-10}{1}' -f 'unattend:', "$floppy (A:\WINNT.SIF)")
+    }
 
     $qemuArgs = Get-DomainQemuArgs -Vm $vm -Qemu $qemu -Disk $disk -Nvram $nvram `
         -Iso $iso -Virtio $virtio -Memory $memory -Vcpus $vcpus `
-        -Ports $ports -MonitorPort $monitorPort -AgentPort $agentPort
+        -Ports $ports -MonitorPort $monitorPort -AgentPort $agentPort `
+        -Legacy:$legacy -Floppy $floppy
 
     Write-DomainLauncher $launcher $qemu.Display $qemuArgs $vm
     Say ('{0,-10}{1}' -f 'launcher:', $launcher)
@@ -1175,6 +1280,29 @@ function New-Domain {
     Say ('{0,-10}{1}' -f 'forwards:', ($ports -join ', '))
 
     if ($noStart) { return }
+
+    if ($legacy) {
+        # No Send-BootPrompt: see the header's legacy-profile table.
+        Start-DomainProcess $vm
+        Say @(
+            ''
+            'XP Setup should be on screen. Boot it again later with:'
+            "  virutil domain start $vm"
+            ''
+            $(if ($floppy) {
+                'Text mode runs from A:\WINNT.SIF; GUI Setup stops at any page the'
+                'answer file leaves open -- the product key page, if it has no key.'
+            } else {
+                'No answer file: Setup asks everything. -u winnt.sif answers it.'
+            })
+            ''
+            'For exec, install an XP-capable qemu-ga (2.5 to 3.1) in the guest on'
+            'the serial port this domain gives it:'
+            '  qemu-ga.exe -s install -m isa-serial -p COM1'
+        )
+        Say "RDP once it is up (XP Professional only): mstsc /v:localhost:$(($ports[0] -split ':')[0])"
+        return
+    }
 
     # The launcher, not $qemuArgs again. These were the same command line
     # twice and they had already drifted: this one went through Start-Process
@@ -1224,6 +1352,32 @@ function New-Domain {
         )
     }
     Say "RDP once it is up: mstsc /v:localhost:$(($ports[0] -split ':')[0])"
+}
+
+# New-UnattendFloppy QEMU SIF OUT -- a 1.44 MB FAT12 image at OUT holding SIF as
+# WINNT.SIF, which XP Setup booted from CD reads from A: by itself.
+#
+# qemu-img builds it from a directory through vvfat, so it needs no admin, no
+# mounted VHD and no tool beyond the qemu already here. The `12` in
+# fat:floppy:12: is what makes it 1.44 MB (18 sectors a track); a bare
+# fat:floppy: is a 2.88 MB image. Both measured here.
+#
+# The answer file is copied, not referenced: vvfat would otherwise be serving a
+# live directory, and the floppy is a frozen image like every other file a
+# domain owns. A product key in SIF ends up on the floppy and, through Setup, in
+# the guest's $winnt$.inf -- which is why the usage says to leave it out.
+function New-UnattendFloppy {
+    param($Qemu, [string]$Sif, [string]$Out)
+    $src = Join-Path $script:VirutilsTmpDir ("unattend-" + [Guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($src)
+    try {
+        Copy-Item -LiteralPath $Sif -Destination (Join-Path $src 'WINNT.SIF')
+        & $Qemu.Img convert -f vvfat -O raw "fat:floppy:12:$src" $Out | Out-Null
+        if ($LASTEXITCODE -ne 0) { Die "could not write the answer file floppy $Out" }
+    } finally {
+        # [IO.Directory]::Delete, not Remove-Item -- see Remove-VirutilsFile.
+        [IO.Directory]::Delete($src, $true)
+    }
 }
 
 # Windows Setup boots from the CD only if a key is pressed at the "Press any
@@ -1391,7 +1545,7 @@ function Get-DomainQemuArgs {
     param(
         [string]$Vm, $Qemu, [string]$Disk, [string]$Nvram, [string]$Iso,
         [string]$Virtio, [int]$Memory, [int]$Vcpus, [string[]]$Ports, [int]$MonitorPort,
-        [int]$AgentPort
+        [int]$AgentPort, [switch]$Legacy, [string]$Floppy
     )
 
     $hostfwd = ($Ports | ForEach-Object {
@@ -1400,6 +1554,12 @@ function Get-DomainQemuArgs {
         $g = if ($parts.Count -gt 1 -and $parts[1]) { $parts[1] } else { $h }
         "hostfwd=tcp::${h}-:${g}"
     }) -join ','
+
+    if ($Legacy) {
+        return Get-LegacyQemuArgs -Vm $Vm -Disk $Disk -Iso $Iso -Floppy $Floppy `
+            -Memory $Memory -Vcpus $Vcpus -Hostfwd $hostfwd `
+            -MonitorPort $MonitorPort -AgentPort $AgentPort
+    }
 
     $qemuArgs = @(
         '-name', $Vm
@@ -1498,6 +1658,57 @@ function Get-DomainQemuArgs {
         # on the guest once it is running: sendkey, system_powerdown,
         # hostfwd_add, hostfwd_remove. Its port is per-domain, read back out of
         # the launcher by everything in this file.
+        '-monitor', "tcp:127.0.0.1:$MonitorPort,server,nowait"
+    )
+    return $qemuArgs
+}
+
+# The legacy profile's machine -- see the table at the head of this file for why
+# each device is the one it is. What it shares with the default profile is kept
+# byte-for-byte the same, because everything else in this driver reads it back:
+# the -smp shape Set-LauncherVcpus rewrites, the `-m` line, the user netdev
+# forwards are appended to, the qga0 socket chardev, the monitor, and the
+# debugcon log -- SeaBIOS writes its own debug output to port 0x402 as well, so
+# VM-ovmf.log is still where a boot that stops is read.
+function Get-LegacyQemuArgs {
+    param(
+        [string]$Vm, [string]$Disk, [string]$Iso, [string]$Floppy, [int]$Memory,
+        [int]$Vcpus, [string]$Hostfwd, [int]$MonitorPort, [int]$AgentPort
+    )
+    $qemuArgs = @(
+        '-name', $Vm
+        '-accel', 'whpx'
+        # smm=off for the same reason as q35: WHPX cannot run SMM.
+        '-machine', 'pc,smm=off,vmport=off'
+        '-cpu', $script:DomainCpu
+        '-smp', "$Vcpus,sockets=1,cores=$Vcpus,threads=1"
+        '-m', "$Memory"
+        '-rtc', 'base=localtime'
+        # Disk first and the CD second, as in the default profile and for the
+        # same reason: an empty disk falls through to the CD, an installed one
+        # wins every boot after. Primary master and secondary master, which is
+        # where XP expects them.
+        '-drive', "file=$Disk,if=none,id=hd0,format=qcow2,cache=writeback"
+        '-device', 'ide-hd,bus=ide.0,unit=0,drive=hd0,bootindex=0'
+        '-drive', "file=$Iso,if=none,id=cd0,media=cdrom,readonly=on"
+        '-device', 'ide-cd,bus=ide.1,unit=0,drive=cd0,bootindex=1'
+    )
+    if ($Floppy) {
+        $qemuArgs += '-drive', "file=$Floppy,if=floppy,index=0,format=raw"
+    }
+    $qemuArgs += @(
+        '-netdev', "user,id=net0,$Hostfwd"
+        '-device', 'rtl8139,netdev=net0'
+        '-vga', 'cirrus'
+        '-usb', ''
+        '-device', 'usb-tablet'
+        '-display', 'gtk'
+        '-audiodev', 'none,id=snd0'
+        '-debugcon', "file:$(Get-DomainOvmfLog $Vm)"
+        '-global', 'isa-debugcon.iobase=0x402'
+        # COM1 rather than virtio-serial: the agent is qemu-ga -m isa-serial -p COM1.
+        '-chardev', "socket,id=qga0,host=127.0.0.1,port=$AgentPort,server=on,wait=off"
+        '-device', 'isa-serial,chardev=qga0'
         '-monitor', "tcp:127.0.0.1:$MonitorPort,server,nowait"
     )
     return $qemuArgs
