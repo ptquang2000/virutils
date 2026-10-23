@@ -342,6 +342,15 @@ sync_main() {
         esac
     done < "$CONF"
 
+    # A relative @repo is relative to the directory the config is in, never to
+    # wherever virutil was run from: the same command has to mean the same
+    # config from any directory. That lets a config kept inside the project it
+    # builds say @repo=.. without knowing where the checkout lives. Empty is
+    # left empty, so "@repo is required" still says what is wrong.
+    if [[ -n "$REPO" && "$REPO" != /* ]]; then
+        REPO="$(cd "$(dirname "$CONF")" && pwd)/$REPO"
+    fi
+
     [[ -n "$STAGING" ]] || die "$CONF: @staging is required"
     # A name under the root, never a path: '..' is refused outright, since
     # stripping leading slashes alone would not contain '../../etc'.

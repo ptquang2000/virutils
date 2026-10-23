@@ -833,7 +833,7 @@ and is rejected.
 
 | Setting | Required | Default | Description |
 | --- | --- | --- | --- |
-| `@repo` | yes | — | Root of the build tree on the host. Fetch sources are relative to it. |
+| `@repo` | yes | — | Root of the build tree on the host. Fetch sources are relative to it. A relative path is resolved against the directory the config file is in — never the current directory — so a config kept inside its project can say `@repo=..`. |
 | `@staging` | yes | — | Staging directory *name*. Always placed under `~/.virutils/staging/`, whatever is written here. |
 | `@guest` | no | `windows` | Which OS the guest runs: `windows` or `linux`. It selects the guest half of the delivery — SMB + `robocopy` + PowerShell, or an `rsync` daemon + `rsync` + `/bin/sh`. |
 | `@dest` | no | *(empty)* | Install directory in the guest, relative to the guest's root — `C:\`, or `/` when `@guest=linux`. Every map destination hangs off it, so the install path is spelled once. Empty means that root itself. |

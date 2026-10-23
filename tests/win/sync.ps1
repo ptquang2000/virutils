@@ -215,6 +215,16 @@ try {
         '@dest=C:\Program Files\Example', '<a|.', '*|')))
     Check 'a drive-prefixed @dest normalises' 'Program Files/Example' $script:SyncDest
 
+    # A relative @repo is the config's directory's, not the caller's: run from
+    # anywhere else, it has to land on the same tree.
+    Push-Location ([IO.Path]::GetTempPath())
+    try {
+        Read-SyncConfig (WriteConf 'rel.conf' @('@repo=../repo', '@staging=p'))
+        Check 'a relative @repo is resolved against the config' $repo $script:SyncRepo
+        Read-SyncConfig (WriteConf 'dot.conf' @('@repo=.', '@staging=p'))
+        Check '@repo=. is the config directory' $conf $script:SyncRepo
+    } finally { Pop-Location }
+
     # The directives that were removed are refused by name and with what
     # replaced them, exactly as the bash module refuses them.
     CheckTrue '@domain is refused by name' `

@@ -220,6 +220,23 @@ function Read-SyncConfig {
             }
         }
     }
+
+    $script:SyncRepo = Resolve-SyncRepo $script:SyncRepo $Path
+}
+
+# Resolve-SyncRepo REPO CONF -- a relative @repo is relative to the directory
+# the config is in, never to wherever virutil was run from: the same command has
+# to mean the same config from any directory. That lets a config kept inside the
+# project it builds say `@repo=..` without knowing where the checkout lives.
+# Empty is left empty, so "@repo is required" still says what is wrong.
+function Resolve-SyncRepo {
+    param([string]$Repo, [string]$Conf)
+
+    if (-not $Repo -or [IO.Path]::IsPathRooted($Repo)) { return $Repo }
+    $dir = Split-Path -Parent $Conf
+    if (-not $dir) { $dir = '.' }
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+        (Join-Path $dir $Repo))
 }
 
 # Set-SyncSetting WHERE KEY VALUE -- one @key=value. The settings that were
