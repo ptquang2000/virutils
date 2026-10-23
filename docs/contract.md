@@ -748,10 +748,13 @@ it that are contract rather than implementation:
 - **The helper is elevated one of two ways, and a person is needed at most
   once.** `virutil xfer setup`, run once from an elevated prompt, registers a
   scheduled task (`virutil-xfer-helper`): as that user, highest privileges,
-  interactive token, no trigger, parallel instances, readable and runnable by
-  that user alone. A transfer starts it with the token as `$(Arg0)` --
-  `IRegisteredTask.Run` substitutes parameters into the action textually,
-  which was measured -- and starting it raises no prompt. Without the task,
+  interactive token, no trigger, parallel instances, normal priority (the
+  scheduler's default of 7 starved the helper for minutes on a busy host),
+  readable and runnable by that user alone. A transfer starts it with the
+  token as `$(Arg0)` -- `IRegisteredTask.Run` substitutes parameters into the
+  action textually, which was measured -- and starting it raises no prompt.
+  The start hands back the helper's process, so a helper slow to say it has
+  begun is waited for rather than reported as one that never ran. Without the task,
   or with one whose installed helper is not the one this virutil would render
   (an update, a moved `VIRUTILS_TMP_DIR`), a transfer falls back to
   `Start-Process -Verb RunAs`: one UAC prompt, as before the task existed. A

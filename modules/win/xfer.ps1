@@ -68,11 +68,17 @@ $script:XferRcHostSetup         = 99
 # reaching for a smartcard or a second factor is not a failure.
 $script:XferHelperReadyMs = 120000
 # How long a helper started through the scheduled task gets to say it has
-# started at all. There is no prompt on that path and no process handle either,
-# so this is the only thing that turns "the task never ran it" -- a shell that
-# was uninstalled, a task someone disabled -- into a report rather than the
-# whole two-minute wait above. A cold pwsh under a virus scanner is seconds,
-# not twenty of them.
+# started at all, when the start named no process to watch instead. There is
+# no prompt on that path, so this is what turns "the task never ran it" -- a
+# shell that was uninstalled, a task someone disabled -- into a report rather
+# than the whole two-minute wait above.
+#
+# Only a fallback. It used to be the whole check, on the belief that a cold
+# pwsh is seconds, and under the task it was not: measured on a busy host, the
+# helper took 38s to write its first record, the parent gave up at 20, and a
+# helper that was running was reported as one that never began. A task start
+# hands back the helper's process (Start-XferHelperTask), and a live process is
+# waited for however slow it is to say so.
 $script:XferTaskStartMs = 20000
 # And how long to wait for it to finish tearing down once told to. Short: it has
 # three things to remove and nothing to ask anyone.
@@ -375,6 +381,15 @@ function Get-XferStrays {
 $script:XferTaskName   = 'virutil-xfer-helper'
 $script:XferTaskDir    = Join-Path $env:ProgramFiles 'virutil'
 $script:XferTaskHelper = Join-Path $script:XferTaskDir 'xfer-helper.ps1'
+# Normal priority, and not the scheduler's default of 7. That default is
+# below-normal CPU with low I/O and memory priority, which is meant for
+# background maintenance and is wrong for a helper a developer's run is
+# waiting on: pwsh's start, the Add-Type compile and the SMB and account
+# modules are mostly loading DLLs, and at 7 on a busy host -- a build running,
+# an endpoint scanner looking at every load -- they took over two minutes
+# where an ordinary start takes seconds. Measured against the same script in
+# a task at 4: half the time, before elevation made 7 worse again.
+$script:XferTaskPriority = 4
 
 # The elevated helper, rendered from the text below at publish time (the prompt
 # path) or at setup (the task path) rather than shipped as a file in modules/.
@@ -696,6 +711,7 @@ function Get-XferHelperTask {
         Shell      = $shell
         HelperText = $text
         LastResult = ('0x{0:X8}' -f $task.LastTaskResult)
+        Priority   = [int]$task.Definition.Settings.Priority
     }
 }
 
@@ -715,12 +731,19 @@ function Get-XferHelperTask {
 # A parameter is per start, so neither question exists -- and the task is
 # registered to run instances in parallel, so the second start does not queue
 # behind the first, whose helper lives as long as its transfer does.
+#
+# Returns the helper's process id, or 0 when the start did not say. Run hands
+# back the running instance, and for an exec action its EnginePID is the shell
+# the action started -- measured: the pwsh that went on to write the helper's
+# status record. That is what lets the parent tell a slow helper from one that
+# never ran, without waiting for the helper to say anything.
 function Start-XferHelperTask {
     param([Parameter(Mandatory)][string]$Token)
     $svc = New-Object -ComObject Schedule.Service
     $svc.Connect()
     $task = $svc.GetFolder('\').GetTask($script:XferTaskName)
-    $task.Run($Token) | Out-Null
+    $running = $task.Run($Token)
+    try { return [int]$running.EnginePID } catch { return 0 }
 }
 
 # Start-XferHelperPrompt SHELL ARGV -- the UAC path, returning the process. The
@@ -756,6 +779,16 @@ function Get-XferLaunch {
             'this virutil would use -- virutil was updated, or VIRUTILS_TMP_DIR moved,'
             "since 'virutil xfer setup' last ran -- so this transfer asks for"
             "Administrator instead. Run 'virutil xfer setup' again, elevated, to stop it."
+        ) }
+    }
+    # Still the task, because a slow helper is better than a prompt nobody is
+    # there to answer -- but said, because it is a setup that predates the fix.
+    if ($task.ContainsKey('Priority') -and $task.Priority -ne $script:XferTaskPriority) {
+        return @{ Via = 'task'; Why = @(
+            "the scheduled task $($script:XferTaskName) runs at priority $($task.Priority), the"
+            "scheduler's background default, which can make its helper too slow to"
+            "answer in time. Run 'virutil xfer setup' again, elevated, to register it"
+            "at $($script:XferTaskPriority)."
         ) }
     }
     return @{ Via = 'task'; Why = '' }
@@ -838,9 +871,10 @@ function Publish-XferShare {
     if ($launch.Why) { Warn $launch.Why }
 
     $proc = $null
+    $enginePid = 0
     if ($launch.Via -eq 'task') {
         try {
-            Start-XferHelperTask $Token
+            $enginePid = [int](Start-XferHelperTask $Token)
         } catch {
             # Registered and current but would not start for this user -- most
             # likely a task someone else's setup registered, whose ACL admits
@@ -887,7 +921,7 @@ function Publish-XferShare {
     # the only thing Unpublish-XferShare waits on. A task start returns no
     # process at all, and even the prompt's process is not worth keeping past
     # this call: the status file is where the helper says who it is.
-    $reported = Wait-XferHelperReady $Token -Process $proc -Via $launch.Via
+    $reported = Wait-XferHelperReady $Token -Process $proc -Via $launch.Via -HelperPid $enginePid
     return @{
         Token     = $Token
         Scratch   = $scratch
@@ -954,22 +988,22 @@ function Read-XferHelperStatus {
     }
 }
 
-# Wait-XferHelperReady TOKEN [-Process P] [-Via task|prompt] -- poll the status
-# file the helper answers through. Dies with the helper's own diagnosis, which
-# is the half that makes "could not publish the share" distinguishable from a
-# guest problem.
+# Wait-XferHelperReady TOKEN [-Process P] [-Via task|prompt] [-HelperPid N] --
+# poll the status file the helper answers through. Dies with the helper's own
+# diagnosis, which is the half that makes "could not publish the share"
+# distinguishable from a guest problem.
 #
 # **A helper that dies is reported when it dies, not at the timeout**, and there
 # are two ways to know it has. PROCESS, on the prompt path, is the one the
-# prompt handed back. On the task path there is no process handle at all, so
-# the helper's own first record is what names the pid to watch -- and a helper
-# that never got far enough to write even that is caught by
-# $script:XferTaskStartMs instead. Without either, a helper killed by a bad
+# prompt handed back. On the task path there is no process handle, but the
+# start names the helper's pid (HELPERPID), and failing that the helper's own
+# first record does -- and only a helper that neither the start nor its own
+# record names is caught by $script:XferTaskStartMs instead. Without either, a helper killed by a bad
 # execution policy, a missing shell or an argument it refused would look
 # exactly like a consent prompt nobody has answered yet, and the run would sit
 # out the whole ready timeout to say so.
 function Wait-XferHelperReady {
-    param([Parameter(Mandatory)][string]$Token, $Process = $null, [string]$Via = 'prompt')
+    param([Parameter(Mandatory)][string]$Token, $Process = $null, [string]$Via = 'prompt', [int]$HelperPid = 0)
 
     # An answer is final either way: the share is up, or the helper says why not.
     $answer = {
@@ -983,7 +1017,7 @@ function Wait-XferHelperReady {
         )
     }
 
-    $helperPid = 0
+    $helperPid = $HelperPid
     $clock = [Diagnostics.Stopwatch]::StartNew()
     while ($clock.ElapsedMilliseconds -lt $script:XferHelperReadyMs) {
         Start-Sleep -Milliseconds 200
@@ -1381,6 +1415,7 @@ function Invoke-XferSetup {
     $set.ExecutionTimeLimit         = 'PT0S'
     $set.DisallowStartIfOnBatteries = $false
     $set.StopIfGoingOnBatteries     = $false
+    $set.Priority                   = $script:XferTaskPriority
 
     $action = $def.Actions.Create(0)        # TASK_ACTION_EXEC
     $action.Path             = $shell
@@ -1437,11 +1472,13 @@ function Invoke-XferStatus {
     } else {
         $out += "task     $($script:XferTaskName): registered, $(if ($task.Enabled) { 'enabled' } else { 'disabled' }), last result $($task.LastResult)"
         $out += "shell    $($task.Shell)"
+        $out += "priority $($task.Priority)$(if ($task.Priority -ne $script:XferTaskPriority) { " (setup registers $($script:XferTaskPriority))" })"
         $out += "helper   $($script:XferTaskHelper): $(if (-not $task.HelperText) { 'missing' } elseif (Test-XferHelperCurrent $task.HelperText) { 'current' } else { 'stale' })"
     }
     $out += "scratch  $([IO.Path]::GetFullPath($script:VirutilsTmpDir))"
     if ($launch.Via -eq 'task') {
         $out += 'transfers start the task: no prompt.'
+        if ($launch.Why) { $out += @($launch.Why) }
     } else {
         $out += 'transfers ask for Administrator, once each.'
         if ($launch.Why) { $out += @($launch.Why) }

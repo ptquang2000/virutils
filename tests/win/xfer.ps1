@@ -146,12 +146,14 @@ $script:TaskStartFails = $false
 $script:PromptArgv     = $null
 $script:LastRequest    = $null
 $script:FakeHelper     = { param($Token) }
+$script:EnginePid      = 0
 function Get-XferHelperTask { return $script:TaskSeen }
 function Start-XferHelperTask {
     param([string]$Token)
     if ($script:TaskStartFails) { throw 'Access is denied.' }
     $script:TaskStarts += $Token
     & $script:FakeHelper $Token
+    return $script:EnginePid
 }
 function Start-XferHelperPrompt {
     param([string]$Shell, [string[]]$Argv)
@@ -347,9 +349,12 @@ try {
     CheckTrue 'the user may read and run the task'  ($sddl.Contains('(A;;GRGX;;;S-1-5-21-1-2-3-1001)'))
     CheckTrue 'and nobody else is granted anything' (-not ($sddl -match ';;;(AU|WD|BU|IU)\)'))
     CheckTrue 'and the ACL does not inherit more'   ($sddl.StartsWith('D:P'))
+    # The scheduler's default is 7: below-normal CPU and low I/O priority, under
+    # which the helper took minutes on a busy host instead of seconds.
+    Check 'the task runs at normal priority, not the scheduler default' 4 $script:XferTaskPriority
 
     # --- which path a transfer takes ---------------------------------------
-    $current = @{ Enabled = $true; Shell = 'pwsh.exe'; HelperText = $text; LastResult = '0x00000000' }
+    $current = @{ Enabled = $true; Shell = 'pwsh.exe'; HelperText = $text; LastResult = '0x00000000'; Priority = 4 }
     $script:TaskSeen = $null
     $l = Get-XferLaunch
     Check 'no task: the prompt, as before setup existed' 'prompt' $l.Via
@@ -364,6 +369,11 @@ try {
     $l = Get-XferLaunch
     Check 'a disabled task: the prompt'         'prompt' $l.Via
     CheckTrue 'and that is said'                ("$($l.Why)" -match 'disabled')
+    $script:TaskSeen = @{} + $current; $script:TaskSeen.Priority = 7
+    $l = Get-XferLaunch
+    Check 'a task registered at the old priority: still the task' 'task' $l.Via
+    CheckTrue 'but setup is named as the fix'   ("$($l.Why)" -match 'virutil xfer setup')
+    Check 'a current task says nothing'         '' "$((& { $script:TaskSeen = $current; Get-XferLaunch }).Why)"
 
     # --- the real publisher above the three seams -------------------------
     #
@@ -444,6 +454,31 @@ try {
         $msg = Dies { & $script:RealPublish -Token $tok -Path $stage }
         CheckTrue 'a task that never runs its helper is reported'   ($msg -match 'virutil-xfer-helper was started')
         CheckTrue 'after the start window, not the ready timeout'   ($clock.ElapsedMilliseconds -lt $script:XferHelperReadyMs)
+
+        # A task start whose helper is running but slow to say so. Measured on
+        # this host: under the task, pwsh took 38s to write its first record
+        # and the parent had given up at 20s, calling a live helper one that
+        # never began. The task start names the helper's process, so a live
+        # one is waited for and not mistaken for a task that never ran.
+        $tok, $stage = NewStage
+        $statusFile = Get-XferStatusFile $tok
+        $late = "Start-Sleep -Milliseconds 2500; Set-Content -LiteralPath '$statusFile' -Encoding ASCII " +
+                "-Value '{`"ok`":true,`"pid`":$($sleeper.Id),`"detail`":`"`"}'; Start-Sleep 5"
+        $slow = Start-Process -FilePath $shellExe -WindowStyle Hidden -PassThru -ArgumentList @(
+            '-NoProfile', '-EncodedCommand', [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($late)))
+        $script:FakeHelper = { param($Token) }; $script:EnginePid = $slow.Id
+        $msg = Dies { $script:SlowSess = & $script:RealPublish -Token $tok -Path $stage }
+        Check     'a live helper slower than the start window is waited for' '' $msg
+        Check     'and its answer is taken'  $sleeper.Id $(if ($script:SlowSess) { $script:SlowSess.HelperPid } else { '' })
+
+        # And one whose process the task start named, gone before a word.
+        $tok, $stage = NewStage
+        $script:EnginePid = $corpse.Id
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $msg = Dies { & $script:RealPublish -Token $tok -Path $stage }
+        CheckTrue 'a task-started helper that dies silently is reported as exiting' ($msg -match 'exited without saying')
+        CheckTrue 'inside the start window, not after it' ($clock.ElapsedMilliseconds -lt $script:XferTaskStartMs)
+        $script:EnginePid = 0
 
         # A helper that answers with a failure.
         $script:FakeHelper = { param($Token) WriteHelperStatus $Token $false $sleeper.Id 'New-SmbShare: no' }
