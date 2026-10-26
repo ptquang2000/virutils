@@ -344,11 +344,42 @@ try {
     Check 'a missing helper is not current'          $false (Test-XferHelperCurrent $null)
 
     # --- the task's registration, as pure text ----------------------------
-    $taskArgs = Get-XferTaskArguments 'C:\Program Files\virutil\xfer-helper.ps1'
+    $action = Get-XferTaskAction 'C:\Program Files\PowerShell\7\pwsh.exe' 'C:\Program Files\virutil\xfer-helper.ps1'
+    $taskArgs = $action.Arguments
     CheckTrue 'the task hands the helper the token as $(Arg0)' ($taskArgs.EndsWith('-Token $(Arg0)'))
     CheckTrue 'and nothing else'  (-not ($taskArgs -match '-(Password|Path|Scratch|User|Access)\b'))
     CheckTrue 'the helper path is quoted, Program Files has a space in it' `
         ($taskArgs.Contains('-File "C:\Program Files\virutil\xfer-helper.ps1"'))
+    # No console window per transfer: the task runs conhost --headless, which
+    # runs the shell with a console that has no window to flash.
+    Check     'the task runs System32 conhost' (Join-Path $env:SystemRoot 'System32\conhost.exe') $action.Path
+    CheckTrue 'headless, with the shell quoted as its program' `
+        ($taskArgs.StartsWith('--headless "C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile'))
+    CheckTrue 'a task registered that way is recognised as headless' `
+        (Test-XferTaskHeadless @{ Shell = $action.Path; Arguments = $action.Arguments })
+    Check     'and one that starts pwsh directly is not' $false `
+        (Test-XferTaskHeadless @{ Shell = 'C:\pwsh.exe'; Arguments = '-NoProfile -WindowStyle Hidden -File "x" -Token $(Arg0)' })
+
+    # The prompt path, the same way.
+    $prompt = Get-XferPromptLaunch 'C:\Program Files\PowerShell\7\pwsh.exe' @('-NoProfile', '-File', 'C:\a b\helper.ps1', '-Token', 'abc123')
+    Check     'the prompt elevates conhost'      (Join-Path $env:SystemRoot 'System32\conhost.exe') $prompt.FilePath
+    Check     'headless, then the shell and its arguments, quoted where spaced' `
+        '--headless|"C:\Program Files\PowerShell\7\pwsh.exe"|-NoProfile|-File|"C:\a b\helper.ps1"|-Token|abc123' `
+        ($prompt.ArgumentList -join '|')
+    # And it really is windowless: a child of conhost --headless has no console
+    # window at all, where a hidden start still has one.
+    $probe = Join-Path $scratch 'probe.ps1'
+    $probeOut = Join-Path $scratch 'probe.txt'
+    Set-Content -LiteralPath $probe -Encoding ASCII -Value @(
+        'param([string]$Out)'
+        '$k = Add-Type -Name W -Namespace VirutilProbe -PassThru -MemberDefinition ''[DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();'''
+        'Set-Content -LiteralPath $Out -Value ([string]$k::GetConsoleWindow())'
+    )
+    $shellExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    $real = Get-XferPromptLaunch $shellExe @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $probe, '-Out', $probeOut)
+    $p = Start-Process -FilePath $real.FilePath -ArgumentList $real.ArgumentList -PassThru
+    [void]$p.WaitForExit(60000)
+    Check 'a shell started that way has no console window' '0' $(if (Test-Path -LiteralPath $probeOut) { (Get-Content -LiteralPath $probeOut -Raw).Trim() } else { 'never ran' })
     $sddl = Get-XferTaskSddl 'S-1-5-21-1-2-3-1001'
     CheckTrue 'the user may read and run the task'  ($sddl.Contains('(A;;GRGX;;;S-1-5-21-1-2-3-1001)'))
     CheckTrue 'and nobody else is granted anything' (-not ($sddl -match ';;;(AU|WD|BU|IU)\)'))
@@ -358,7 +389,7 @@ try {
     Check 'the task runs at normal priority, not the scheduler default' 4 $script:XferTaskPriority
 
     # --- which path a transfer takes ---------------------------------------
-    $current = @{ Enabled = $true; Shell = 'pwsh.exe'; HelperText = $text; LastResult = '0x00000000'; Priority = 4 }
+    $current = @{ Enabled = $true; Shell = $action.Path; Arguments = $action.Arguments; HelperText = $text; LastResult = '0x00000000'; Priority = 4 }
     $script:TaskSeen = $null
     $l = Get-XferLaunch
     Check 'no task: the prompt, as before setup existed' 'prompt' $l.Via
@@ -377,6 +408,15 @@ try {
     $l = Get-XferLaunch
     Check 'a task registered at the old priority: still the task' 'task' $l.Via
     CheckTrue 'but setup is named as the fix'   ("$($l.Why)" -match 'virutil xfer setup')
+    $script:TaskSeen = @{} + $current; $script:TaskSeen.Shell = 'C:\pwsh.exe'
+    $script:TaskSeen.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "x" -Token $(Arg0)'
+    $l = Get-XferLaunch
+    Check 'a task registered before headless: still the task' 'task' $l.Via
+    CheckTrue 'but the console window is named, and setup as its fix' `
+        (("$($l.Why)" -match 'console') -and ("$($l.Why)" -match 'virutil xfer setup'))
+    $script:TaskSeen.Priority = 7
+    Check 'and both reasons are said when both apply' 2 `
+        @(@((Get-XferLaunch).Why) | Where-Object { $_ -match 'virutil xfer setup' }).Count
     Check 'a current task says nothing'         '' "$((& { $script:TaskSeen = $current; Get-XferLaunch }).Why)"
 
     # --- the real publisher above the three seams -------------------------

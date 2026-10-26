@@ -321,6 +321,16 @@ fall back to the prompt. A task that is there but out of date is the one
 case that prints a line saying so, and the fix is to run `setup` again. It goes
 out of date when virutil is updated, or when `VIRUTILS_TMP_DIR` moves.
 
+**No console window comes up for a transfer.** Both the task and the prompt
+start the helper's PowerShell under `conhost.exe --headless`, which gives it a
+console with no window at all. A task started PowerShell directly in a
+console window that flashed up for every push, pull and sync. A task
+registered before that change still works, but each transfer warns and
+`virutil xfer status` says `a console window per transfer`. Run `virutil xfer
+setup` once more, elevated, to register it headless. Because of the same
+change, the UAC prompt names "Console Window Host" (Microsoft Windows) as the
+program asking, not PowerShell.
+
 What that costs, said plainly: **any program running as you can now start that
 task without a prompt**, which is what "no human involved" means. What it gets
 by starting it is bounded. The task runs a helper that `setup` copied into

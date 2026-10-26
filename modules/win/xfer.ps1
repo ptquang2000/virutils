@@ -391,6 +391,12 @@ $script:XferTaskHelper = Join-Path $script:XferTaskDir 'xfer-helper.ps1'
 # a task at 4: half the time, before elevation made 7 worse again.
 $script:XferTaskPriority = 4
 
+# What both elevation paths start the helper's shell under, so that it gets a
+# console with no window (see Get-XferTaskAction). System32's copy, named in
+# full: the task records this path, and a conhost found on PATH could be any
+# file.
+$script:XferConhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
+
 # The elevated helper, rendered from the text below at publish time (the prompt
 # path) or at setup (the task path) rather than shipped as a file in modules/.
 #
@@ -702,13 +708,14 @@ function Get-XferHelperTask {
         $task = $svc.GetFolder('\').GetTask($script:XferTaskName)
     } catch { return $null }
 
-    $shell = ''
-    foreach ($a in $task.Definition.Actions) { $shell = [string]$a.Path; break }
+    $shell = ''; $taskArgs = ''
+    foreach ($a in $task.Definition.Actions) { $shell = [string]$a.Path; $taskArgs = [string]$a.Arguments; break }
     $text = $null
     try { $text = [IO.File]::ReadAllText($script:XferTaskHelper) } catch { }
     return @{
         Enabled    = [bool]$task.Enabled
         Shell      = $shell
+        Arguments  = $taskArgs
         HelperText = $text
         LastResult = ('0x{0:X8}' -f $task.LastTaskResult)
         Priority   = [int]$task.Definition.Settings.Priority
@@ -733,10 +740,12 @@ function Get-XferHelperTask {
 # behind the first, whose helper lives as long as its transfer does.
 #
 # Returns the helper's process id, or 0 when the start did not say. Run hands
-# back the running instance, and for an exec action its EnginePID is the shell
-# the action started -- measured: the pwsh that went on to write the helper's
-# status record. That is what lets the parent tell a slow helper from one that
-# never ran, without waiting for the helper to say anything.
+# back the running instance, and for an exec action its EnginePID is the
+# program the action started -- measured: the pwsh that went on to write the
+# helper's status record. Under conhost --headless (Get-XferTaskAction) it is
+# that conhost, which lives exactly as long as the pwsh under it, so it answers
+# the same question. That is what lets the parent tell a slow helper from one
+# that never ran, without waiting for the helper to say anything.
 function Start-XferHelperTask {
     param([Parameter(Mandatory)][string]$Token)
     $svc = New-Object -ComObject Schedule.Service
@@ -750,7 +759,25 @@ function Start-XferHelperTask {
 # third seam, and the only one that can raise a consent dialog.
 function Start-XferHelperPrompt {
     param([Parameter(Mandatory)][string]$Shell, [Parameter(Mandatory)][string[]]$Argv)
-    return (Start-Process -FilePath $Shell -Verb RunAs -WindowStyle Hidden -ArgumentList $Argv -PassThru)
+    $spec = Get-XferPromptLaunch $Shell $Argv
+    return (Start-Process -FilePath $spec.FilePath -Verb RunAs -WindowStyle Hidden -ArgumentList $spec.ArgumentList -PassThru)
+}
+
+# Get-XferPromptLaunch SHELL ARGV -- what the UAC path starts: SHELL under
+# conhost --headless, as the task does (Get-XferTaskAction). This path asks
+# for SW_HIDE, and measured unelevated, a child started that way gets a
+# console window that is created hidden. Under --headless it gets no window at
+# all, so nothing is left for a terminal or a show call to bring up. One rule
+# for both paths.
+#
+# The consent dialog therefore names "Console Window Host", a Microsoft
+# binary, where it used to name PowerShell. Elements with a space are quoted
+# because Start-Process joins ArgumentList with plain spaces, and a shell
+# under Program Files has one.
+function Get-XferPromptLaunch {
+    param([Parameter(Mandatory)][string]$Shell, [Parameter(Mandatory)][string[]]$Argv)
+    $quoted = @(foreach ($a in $Argv) { if ($a -match '\s') { "`"$a`"" } else { $a } })
+    return @{ FilePath = $script:XferConhost; ArgumentList = @('--headless', "`"$Shell`"") + $quoted }
 }
 
 # Get-XferLaunch -- which of the two paths this transfer takes: @{ Via =
@@ -781,16 +808,26 @@ function Get-XferLaunch {
             "Administrator instead. Run 'virutil xfer setup' again, elevated, to stop it."
         ) }
     }
-    # Still the task, because a slow helper is better than a prompt nobody is
-    # there to answer -- but said, because it is a setup that predates the fix.
+    # Still the task in both cases below, because a slow helper or a console
+    # window flashing up is better than a prompt nobody is there to answer.
+    # But each is said, because each is a setup that predates its fix.
+    $why = @()
     if ($task.ContainsKey('Priority') -and $task.Priority -ne $script:XferTaskPriority) {
-        return @{ Via = 'task'; Why = @(
+        $why += @(
             "the scheduled task $($script:XferTaskName) runs at priority $($task.Priority), the"
             "scheduler's background default, which can make its helper too slow to"
             "answer in time. Run 'virutil xfer setup' again, elevated, to register it"
             "at $($script:XferTaskPriority)."
-        ) }
+        )
     }
+    if ($task.ContainsKey('Arguments') -and -not (Test-XferTaskHeadless $task)) {
+        $why += @(
+            "the scheduled task $($script:XferTaskName) starts its helper in a console"
+            'window, which flashes up on this desktop for every transfer. Run'
+            "'virutil xfer setup' again, elevated, to register it under conhost --headless."
+        )
+    }
+    if ($why.Count -gt 0) { return @{ Via = 'task'; Why = $why } }
     return @{ Via = 'task'; Why = '' }
 }
 
@@ -1026,8 +1063,11 @@ function Wait-XferHelperReady {
         if ($null -ne $s) { $helperPid = $s.pid }
 
         $exited = $null
+        # Not the exit code: PROCESS is the conhost the helper runs under, and
+        # conhost exits 0 whatever its child returned (measured: a child that
+        # exited 7). The status file is where the helper's outcome is.
         if ($null -ne $Process -and $Process.HasExited) {
-            $exited = "exited with $($Process.ExitCode)"
+            $exited = "(pid $($Process.Id)) exited"
         } elseif ($helperPid -gt 0 -and -not (Test-XferProcessAlive $helperPid)) {
             $exited = "(pid $helperPid) exited"
         }
@@ -1327,13 +1367,33 @@ function Test-XferElevated {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-# Get-XferTaskArguments HELPER -- the action's arguments, with the token left as
-# $(Arg0) for the Task Scheduler to fill per start (see Start-XferHelperTask).
-# -WindowStyle Hidden because the task runs on the user's desktop with an
-# interactive token, and a console flashing up for every transfer is a cost.
-function Get-XferTaskArguments {
-    param([Parameter(Mandatory)][string]$Helper)
-    return "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Helper`" -Token `$(Arg0)"
+# Get-XferTaskAction SHELL HELPER -- the action's program and arguments, with
+# the token left as $(Arg0) for the Task Scheduler to fill per start (see
+# Start-XferHelperTask).
+#
+# The program is conhost --headless, which runs SHELL with a console that has
+# no window, because the task runs on the user's desktop with an interactive
+# token. Started directly by the scheduler, pwsh gets an ordinary visible
+# console window and hides it only once it has started and read -WindowStyle
+# Hidden. That is a window flashing up on the developer's screen for every
+# push, pull and sync. Measured here: a child started with a normal window has
+# a visible console window (IsWindowVisible true). A child of
+# conhost --headless has GetConsoleWindow() == 0: no window at all, and
+# nothing to flash.
+function Get-XferTaskAction {
+    param([Parameter(Mandatory)][string]$Shell, [Parameter(Mandatory)][string]$Helper)
+    return @{
+        Path      = $script:XferConhost
+        Arguments = "--headless `"$Shell`" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Helper`" -Token `$(Arg0)"
+    }
+}
+
+# Test-XferTaskHeadless TASK -- does the registered action run the helper
+# through conhost --headless? A task registered before it did still works, but
+# flashes a console window per transfer until setup is run again.
+function Test-XferTaskHeadless {
+    param($Task)
+    return ([string]$Task.Shell -like '*\conhost.exe' -and [string]$Task.Arguments -like '--headless *')
 }
 
 # Get-XferTaskSddl SID -- who may do what to the task. SYSTEM and Administrators
@@ -1417,9 +1477,10 @@ function Invoke-XferSetup {
     $set.StopIfGoingOnBatteries     = $false
     $set.Priority                   = $script:XferTaskPriority
 
+    $spec = Get-XferTaskAction $shell $script:XferTaskHelper
     $action = $def.Actions.Create(0)        # TASK_ACTION_EXEC
-    $action.Path             = $shell
-    $action.Arguments        = Get-XferTaskArguments $script:XferTaskHelper
+    $action.Path             = $spec.Path
+    $action.Arguments        = $spec.Arguments
     $action.WorkingDirectory = $script:XferTaskDir
 
     # TASK_CREATE_OR_UPDATE | TASK_DONT_ADD_PRINCIPAL_ACE, as this user, with
@@ -1431,7 +1492,7 @@ function Invoke-XferSetup {
     Say @(
         "registered the scheduled task $($script:XferTaskName), for $($id.Name)"
         "  helper  $($script:XferTaskHelper)"
-        "  shell   $shell"
+        "  shell   $shell, under conhost --headless: no console window"
         "  scratch $([IO.Path]::GetFullPath($script:VirutilsTmpDir))"
         'push, pull and sync will start it instead of prompting.'
     )
@@ -1471,7 +1532,7 @@ function Invoke-XferStatus {
         $out += "task     $($script:XferTaskName): not registered (or not visible to this user)"
     } else {
         $out += "task     $($script:XferTaskName): registered, $(if ($task.Enabled) { 'enabled' } else { 'disabled' }), last result $($task.LastResult)"
-        $out += "shell    $($task.Shell)"
+        $out += "shell    $($task.Shell)$(if (Test-XferTaskHeadless $task) { ' --headless: no console window' } else { ': a console window per transfer (setup again to fix)' })"
         $out += "priority $($task.Priority)$(if ($task.Priority -ne $script:XferTaskPriority) { " (setup registers $($script:XferTaskPriority))" })"
         $out += "helper   $($script:XferTaskHelper): $(if (-not $task.HelperText) { 'missing' } elseif (Test-XferHelperCurrent $task.HelperText) { 'current' } else { 'stale' })"
     }
