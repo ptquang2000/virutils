@@ -1,12 +1,11 @@
 <#
 .SYNOPSIS
-  ui on a Windows host, with the guest agent and push substituted.
+  ui on a Windows host, with the guest agent substituted.
 
 .DESCRIPTION
-  The two seams are the guest agent boundary -- so the launch script that would
-  have gone into the guest is captured and read back -- and Push-Main, which is
-  the whole of setup's delivery and is tested in its own right by
-  tests/win/transfer.ps1.
+  The seam is the guest agent boundary, so the launch script that would have
+  gone into the guest is captured and read back. Push-Main is stubbed only to
+  prove the retired setup pushes nothing.
 
   What is asserted:
 
@@ -16,8 +15,7 @@
     * the guest turns that argv into one command line by the MSVC rules,
       run for real with the launch swapped for an echo;
     * a guest answering 96 (no one logged on) names the fix, with code 96;
-    * setup with a warm cache touches no network and hands push exactly
-      the cached PsExec and C:\virutil\ -- and with no VM, no push at all.
+    * setup is retired: exit 0, a note, and no push.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -107,11 +105,8 @@ try {
     Check 'an unknown verb exits 1'   1 (Dies { Ui-Main @('bogus') }).Code
     Check 'run with no VM exits 1'    1 (Dies { Ui-Main @('run') }).Code
     Check 'run with no APP exits 1'   1 (Dies { Ui-Main @('run', 'win11') }).Code
-    Check 'setup -h exits 0'          0 (Dies { Ui-Main @('setup', '-h') }).Code
-    Check 'setup with two VMs exits 1' 1 (Dies { Ui-Main @('setup', 'a', 'b') }).Code
-    Check 'setup with a bad flag exits 1' 1 (Dies { Ui-Main @('setup', '--nope') }).Code
-    CheckTrue 'the usage names both verbs' `
-        ((Dies { Ui-Main @() }).Msg -match 'ui setup' -and (Dies { Ui-Main @() }).Msg -match 'ui run')
+    CheckTrue 'the usage names run, and no setup or PsExec' `
+        ((Dies { Ui-Main @() }).Msg -match 'ui run' -and (Dies { Ui-Main @() }).Msg -notmatch 'setup|PsExec')
 
     Check 'run -h exits 0'                 0 (Dies { Ui-Main @('run', '-h') }).Code
     Check 'run VM -i with no number exits 1' 1 (Dies { Ui-Main @('run', 'win11', '-i', 'notepad.exe') }).Code
@@ -121,7 +116,7 @@ try {
 
     # --- run ----------------------------------------------------------------
     #
-    # The launch is payloads/win/ui.ps1 -- the native PsExec-service recipe --
+    # The launch is payloads/win/ui.ps1 -- the native launcher --
     # and what is asserted is the values it was rendered with. Its text is
     # pinned by tests/golden/payloads.txt.
     $us = [string][char]0x1F
@@ -197,25 +192,16 @@ try {
         ($script:Sent[0] -match [regex]::Escape("`$cmdline = '`"C:\Program Files\App\app.exe`" --restored'"))
     CheckTrue 'as the logged-on user' ($script:Sent[0] -match [regex]::Escape("`$as = 'user'"))
 
-    # --- setup, with the cache already warm ---------------------------------
+    # --- setup, retired ----------------------------------------------------
     #
-    # A pre-seeded cache is the assertion that no network is touched: nothing
-    # stubs Invoke-WebRequest, so a download attempt would fail the run.
-    New-VirutilsDir $script:UiCache | Out-Null
-    Set-Content -LiteralPath $script:UiCacheExe -Value 'not really psexec' -Encoding ASCII
-
+    # run stages nothing, so setup is a no-op that says so and exits 0 --
+    # an old script that calls it first keeps working, and nothing is pushed.
     $script:Pushed = @()
-    $out = Capture { Ui-Main @('setup') }
-    CheckTrue 'setup with no VM says the cache is ready' ($out -match 'host cache ready')
+    $r = Dies { Capture { Ui-Main @('setup', 'win11') } }
+    Check     'setup exits 0' $null $r.Code
     Check     'and pushes nothing' 0 $script:Pushed.Count
-
-    $script:Pushed = @()
     $out = Capture { Ui-Main @('setup', 'win11') }
-    Check 'setup VM pushes once' 1 $script:Pushed.Count
-    Check 'into that VM'         'win11' $script:Pushed[0][0]
-    Check 'the cached PsExec'    $script:UiCacheExe $script:Pushed[0][1]
-    Check 'into C:\virutil\ as a directory' 'virutil\' $script:Pushed[0][2]
-    CheckTrue 'and says what to do next' ($out -match "virutil ui run win11")
+    CheckTrue 'and says run needs none' ($out -match 'needs no setup')
 } finally {
     Remove-Item -LiteralPath $env:VIRUTILS_DIR -Recurse -Force -ErrorAction SilentlyContinue
 }

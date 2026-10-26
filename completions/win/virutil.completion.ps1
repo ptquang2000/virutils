@@ -206,7 +206,6 @@ $completer = {
 
 
     $uiVerbs = [ordered]@{
-        setup = 'cache PsExec on this host and deliver it into a guest'
         run   = 'launch a guest program on a session''s interactive desktop, as its user'
     }
 
@@ -267,10 +266,6 @@ $completer = {
             Add-Match '-s' 'as SYSTEM on that session''s desktop'
             Add-Match '--system' 'as SYSTEM on that session''s desktop'
             Add-Match '--elevated' 'the user''s full admin token, when UAC split it'
-        }
-        elseif ($module -eq 'ui' -and $verb -eq 'setup') {
-            Add-Match '-f' 're-download PsExec even if the host cache holds it'
-            Add-Match '--force' 're-download PsExec even if the host cache holds it'
         }
         elseif ($module -eq 'sync') {
             Add-Match '-c' 'config to use (default sync.conf)'
@@ -465,12 +460,9 @@ $completer = {
                 $hint = 'a path inside the guest, relative to C:\ -- a trailing \ means a directory'
             }
             # `ui run VM APP` is a full path inside the guest -- nothing on this
-            # side can enumerate it -- and `ui setup VM` takes nothing more.
+            # side can enumerate it.
             elseif ($module -eq 'ui' -and $verb -eq 'run') {
                 $hint = 'the program to launch: a guest path or a name on its PATH, then its arguments'
-            }
-            elseif ($module -eq 'ui' -and $verb -eq 'setup') {
-                $hint = 'ui setup takes only a domain (and -f)'
             }
         }
     }

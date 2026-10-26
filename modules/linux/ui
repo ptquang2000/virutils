@@ -1,40 +1,16 @@
 # ui -- launch a process on a Windows guest's *interactive* desktop.
 #
-#   virutil ui run   VM [-i N] [-s] [--elevated] APP...
-#   virutil ui setup VM [-f]     cache PsExec on the host, deliver it to the guest
+#   virutil ui run VM [-i N] [-s] [--elevated] [--] APP...
 #
 # Why this exists at all. Everything virutil runs in a Windows guest goes through
 # qemu-ga, which is a service in session 0. A process it spawns is invisible: it
 # lands on session 0's window station, not the desktop the logged-in user is
 # looking at. Getting a *visible* process onto session 1 means starting it with
 # a token stamped for that session and binding it to that session's
-# winsta0\default -- what PsExec's service does for `-i`. `run` does the same in
-# place, from the SYSTEM powershell qemu-ga already gives it: the guest half is
-# payloads/win/ui.ps1, shared byte for byte with the PowerShell driver, and the
-# PsExec reading behind it is written down there. It no longer needs PsExec;
-# `setup` is what used to stage it and is all that still does.
-#
-# The tool is NOT vendored. The Sysinternals licence forbids redistributing it
-# ("you may not publish the software for others to copy"), but freely allows
-# installing copies on your own devices -- so setup fetches it from the official
-# download host into a host-side cache, once, and pushes that copy into each
-# guest. The repo carries a URL, never the binary.
-
-# The official Sysinternals bundle. HTTPS to Microsoft's own host is the trust
-# anchor; there is no separate signature check here on purpose (see setup).
-UI_URL="https://download.sysinternals.com/files/PSTools.zip"
-
-# Where PsExec lives, host and guest. The guest path is fixed at C:\virutil\ so
-# `run` never has to be told where setup put it.
-UI_CACHE="$VIRUTILS_CACHE_DIR/pstools"
-UI_CACHE_EXE="$UI_CACHE/PsExec.exe"
-UI_GUEST_DIR='virutil'                       # under C:\, so C:\virutil\
-UI_GUEST_EXE='C:\virutil\PsExec.exe'
-
-# run maps this one guest exit code back to "PsExec is not there yet". Chosen
-# clear of PsExec's own codes (it returns the launched PID under -d) and of the
-# 0/1 the powershell wrapper uses.
-UI_RC_NO_PSEXEC=97
+# winsta0\default. `run` does that from the SYSTEM powershell qemu-ga already
+# gives it: the guest half is payloads/win/ui.ps1, shared byte for byte with the
+# PowerShell driver, which says how; docs/ui-psexec.md says why that recipe.
+# Nothing is staged in the guest first.
 
 # The guest's "no one is logged on in that session", contract section 5. The
 # payload raises it; run turns it into the fix.
@@ -42,8 +18,7 @@ UI_RC_NO_USER=96
 
 ui_usage() {
     printf '%s\n' \
-        "usage: virutil ui run   VM [-i N] [-s] [--elevated] [--] APP..." \
-        "       virutil ui setup [VM] [-f]" \
+        "usage: virutil ui run VM [-i N] [-s] [--elevated] [--] APP..." \
         "" \
         "  run VM APP...   start APP on a guest session's interactive desktop" \
         "                  (winsta0\\default) and return without waiting for it." \
@@ -56,94 +31,17 @@ ui_usage() {
         "                  there would give, UAC-filtered if they are an admin." \
         "" \
         "    -i, --session N  that session instead of the console one" \
-        "    -s, --system     as SYSTEM on that session's desktop (PsExec -s -i)" \
+        "    -s, --system     as SYSTEM on that session's desktop" \
         "    --elevated       the user's full admin token, when UAC split it" \
-        "                     (PsExec -h). No prompt; no effect with -s." \
+        "                     -- no prompt. No effect with -s." \
         "    --               end of options; everything after it is APP" \
         "" \
         "                  Options stop at the first word that is not one, so" \
         "                  APP's own flags stay APP's. Exits 96 when no user is" \
         "                  logged on in that session (log one on, or use -s)." \
         "" \
-        "  setup [VM] [-f] fetch PsExec into the host cache (once) and deliver" \
-        "                  it to the guest at C:\\virutil\\. run no longer needs" \
-        "                  it. -f re-downloads even if the cache holds it." \
-        "" \
         "  -h, --help     this message" >&2
     exit "${1:-1}"
-}
-
-# ui_fetch_cache FORCE -- ensure $UI_CACHE_EXE exists on the host. Downloads the
-# PSTools bundle and lifts PsExec.exe out of it; a no-op when the cache is
-# already warm and FORCE is not 1. This is the "cache on the host" half: the
-# network is touched once, not once per guest.
-ui_fetch_cache() {
-    local force="$1" tmp zip
-
-    if [[ -f "$UI_CACHE_EXE" && "$force" != 1 ]]; then
-        say "PsExec cached: $UI_CACHE_EXE"
-        return 0
-    fi
-
-    mkdir -p "$UI_CACHE" || die "could not create the host cache dir: $UI_CACHE"
-    tmp="$(mktemp -d "${TMPDIR:-/tmp}/virutil-pstools.XXXXXX")" \
-        || die "could not create a temp dir for the download"
-    zip="$tmp/PSTools.zip"
-
-    say "downloading PsExec from $UI_URL"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fSL --retry 2 -o "$zip" "$UI_URL" \
-            || { rm -rf "$tmp"; die "download failed (curl). Check this host's" \
-                                    "connection to download.sysinternals.com."; }
-    elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$zip" "$UI_URL" \
-            || { rm -rf "$tmp"; die "download failed (wget). Check this host's" \
-                                    "connection to download.sysinternals.com."; }
-    else
-        rm -rf "$tmp"; die "need curl or wget on this host to download PsExec."
-    fi
-
-    # Lift just PsExec.exe out of the bundle, flattening any path. unzip first;
-    # bsdtar reads a zip too and is the fallback on a host that has one but not
-    # the other -- both were present when this was written.
-    if command -v unzip >/dev/null 2>&1; then
-        unzip -o -j "$zip" PsExec.exe -d "$UI_CACHE" >/dev/null \
-            || { rm -rf "$tmp"; die "could not extract PsExec.exe from the bundle (unzip)."; }
-    elif command -v bsdtar >/dev/null 2>&1; then
-        bsdtar -x -f "$zip" -C "$UI_CACHE" PsExec.exe \
-            || { rm -rf "$tmp"; die "could not extract PsExec.exe from the bundle (bsdtar)."; }
-    else
-        rm -rf "$tmp"; die "need unzip or bsdtar on this host to extract PsExec."
-    fi
-
-    rm -rf "$tmp"
-    [[ -f "$UI_CACHE_EXE" ]] || die "the bundle did not contain PsExec.exe as expected."
-    say "PsExec cached: $UI_CACHE_EXE"
-}
-
-# ui_setup ARGS -- warm the host cache, then (if a VM was named) deliver PsExec
-# into it. Delivery reuses push wholesale: same SMB transport, same "moves only
-# what changed" so a second setup of an unchanged binary moves nothing.
-ui_setup() {
-    local VM="" force=0 a
-    for a in "$@"; do
-        case "$a" in
-            -f|--force) force=1 ;;
-            -h|--help)  ui_usage 0 ;;
-            -*)         warn "unrecognised argument: $a"; ui_usage ;;
-            *)          if [[ -z "$VM" ]]; then VM="$a"; else warn "unexpected argument: $a"; ui_usage; fi ;;
-        esac
-    done
-
-    ui_fetch_cache "$force"
-
-    # No VM: host cache only. Useful for pre-seeding before a guest exists.
-    [[ -n "$VM" ]] || { say "host cache ready; pass a VM to deliver it into a guest."; return 0; }
-
-    # A trailing separator makes DST a directory, so PsExec.exe lands at
-    # C:\virutil\PsExec.exe and push creates the directory if it is missing.
-    push_main "$VM" "$UI_CACHE_EXE" "$UI_GUEST_DIR\\"
-    say "$VM: ready -- 'virutil ui run $VM <app>' will launch on the desktop."
 }
 
 # ui_dispatch VM SESSION AS ELEVATE ARGV CMDLINE -- render payloads/win/ui.ps1
@@ -207,7 +105,9 @@ ui_main() {
     [[ -n "$CMD" ]] || ui_usage
     shift || true
     case "$CMD" in
-        setup)     ui_setup "$@" ;;
+        # Retired: run stages nothing. Kept answering 0 so a script that still
+        # calls it before run keeps working.
+        setup)     say "ui needs no setup: 'virutil ui run' stages nothing in the guest." ;;
         run)       ui_run "$@" ;;
         -h|--help) ui_usage 0 ;;
         *)         ui_usage ;;

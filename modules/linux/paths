@@ -9,7 +9,7 @@
 #   $VIRUTILS_PORT_DIR     domain port forward state and logs
 #   $VIRUTILS_MNT_ROOT     host mount points for guest filesystems
 #   $VIRUTILS_TMP_DIR      scratch for transfer payloads
-#   $VIRUTILS_CACHE_DIR    third-party tools fetched once and reused (PsExec)
+#   $VIRUTILS_CACHE_DIR    third-party tools fetched once and reused
 
 # --- one spelling, and the other accepted -----------------------------------
 #

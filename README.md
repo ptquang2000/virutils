@@ -578,10 +578,12 @@ measured.
   `exec cmd` (exit codes pass through) and `exec cmd -d` all work, and the
   agent comes back by itself after a guest reboot. `exec ps` does not: XP has
   no `powershell.exe` until KB968930 is installed.
-- **`push`, `pull`, `sync` and `ui` do not reach an XP guest.** They use this
+- **`push`, `pull` and `sync` do not reach an XP guest.** They use this
   host's SMB server, and XP speaks only SMB1, which Windows 11 does not serve.
   The guest payloads also need PowerShell 2.0 and robocopy, which XP does not
   have. Re-enabling SMB1 on the host is not the fix.
+- **`ui` is unmeasured on XP.** It needs the guest's PowerShell, which XP
+  lacks until KB968930 is installed.
 - **RDP** is XP Professional only, and XP refuses a remote logon to an account
   with a blank password.
 

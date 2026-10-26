@@ -10,7 +10,7 @@
 #   $VirutilsPortDir     domain port forward state and logs
 #   $VirutilsMntRoot     host mount points for guest filesystems
 #   $VirutilsTmpDir      scratch for transfer payloads
-#   $VirutilsCacheDir    third-party tools fetched once and reused (PsExec)
+#   $VirutilsCacheDir    third-party tools fetched once and reused
 
 # --- one spelling, and the other accepted -----------------------------------
 #

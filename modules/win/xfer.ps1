@@ -1297,7 +1297,7 @@ function Get-XferUsage {
         '       virutil xfer remove'
         '       virutil xfer status'
         ''
-        "  push, pull, sync and ui setup publish a share on this machine's own"
+        "  push, pull and sync publish a share on this machine's own"
         '  SMB server, which needs Administrator. Without setup, each transfer'
         '  asks for it with a UAC prompt -- which an unattended run cannot'
         "  answer. setup registers a scheduled task, $($script:XferTaskName), that"
@@ -1433,7 +1433,7 @@ function Invoke-XferSetup {
         "  helper  $($script:XferTaskHelper)"
         "  shell   $shell"
         "  scratch $([IO.Path]::GetFullPath($script:VirutilsTmpDir))"
-        'push, pull, sync and ui setup will start it instead of prompting.'
+        'push, pull and sync will start it instead of prompting.'
     )
 }
 

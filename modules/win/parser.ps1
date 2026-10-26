@@ -144,7 +144,7 @@ function Get-TopUsage {
         'saving a running guest memory image, and that is what took it out of'
         'this one.'
         ''
-        "push, pull, sync and ui setup publish a share on this machine's own SMB server,"
+        "push, pull and sync publish a share on this machine's own SMB server,"
         'so they need Administrator and mint a throwaway local account for the'
         "length of the transfer. After 'virutil xfer setup' (once, elevated) they"
         'get it from a scheduled task with no prompt; without it, each prompts'

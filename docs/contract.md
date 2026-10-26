@@ -64,7 +64,7 @@ virutil pull VM SRC DST
 
 virutil exec {ping|cmd|ps|sh} VM [-d] [--] [CMD...|-]
 
-virutil ui  {setup|run} VM [ARGS]
+virutil ui  run VM [-i N] [-s] [--elevated] [--] APP...
 
 virutil usb {list|show|attach|detach} [VM] [VENDOR:PRODUCT]
 
@@ -152,7 +152,7 @@ One root, everything under it, one variable relocates the lot.
 | `<root>/ports` | port-forward state and logs |
 | `<root>/mnt` | host mount points for guest filesystems |
 | `<root>/tmp` | transfer payload scratch |
-| `<root>/cache` | third-party tools fetched once (PsExec) |
+| `<root>/cache` | third-party tools fetched once (the macOS host's own qemu) |
 
 The overlays and memory files in the `images` row are the Linux host's alone:
 `snapshot` is not on the Windows driver (section 7), so a Windows host's
@@ -262,7 +262,7 @@ match on:
 | 94 | SRC matched nothing in the guest (pull) |
 | 95 | robocopy failed, exit >= 8 (pull) |
 | 96 | no user is logged on in the target session (ui run, sync's ui rules) |
-| 97 | PsExec is not present in the guest (ui) |
+| 97 | retired: was "PsExec is not present in the guest" (ui); no longer raised |
 | 98 | the elevation prompt was declined (Windows host, push/pull/sync, when `virutil xfer setup` has not run) |
 | 99 | the host could not publish the share (Windows host, push/pull/sync) |
 
@@ -459,7 +459,7 @@ user and reached through a slirp `guestfwd`, which needs no root and is offered
 on no host interface at all -- qemu's own `-nic user,smb=` is that mechanism.
 The second is the likely answer and is what the next pass measures, against the
 two refusals a stock 24H2 client brings (insecure guest logons off, signing
-required). `ui` delivers with `push`, so it waits on the same thing. `usb` is
+required). `ui` needs only `exec`, so it waits on nothing but being wired in. `usb` is
 unmeasured: whether qemu under hvf can claim a device from macOS's own USB stack
 at all is the first question, and it has not been asked.
 
@@ -613,21 +613,19 @@ refusal to unlink a file the guest still reads) never had a counterpart here,
 because an internal snapshot is a region of a disk image rather than a file.
 That asymmetry is now moot rather than vacuously satisfied.
 
-### `ui`: ported, on `push`
+### `ui`: ported, on `exec` alone
 
 `ui` was always going to port: it is Windows-*guest*-only, but host-portable.
 Its guest half is `payloads/win/ui.ps1`, which both drivers render byte for
-byte: PsExec's service recipe for `-i`, done in place from the SYSTEM shell
-qemu-ga already provides -- a primary token stamped with the session
-(`WTSQueryUserToken` for the logged-on user, or its own SYSTEM token with
-`TokenSessionId` set for `-s`), `TokenLinkedToken` for `--elevated`, an
-environment block, and `CreateProcessAsUser` onto `winsta0\default`. `run`
-needs nothing in the guest. `setup` still stages PsExec, and its delivery is
-`push`, which means smbd on a Linux host and `New-SmbShare` on a Windows one. On the Windows host `ui setup
-VM` therefore carries `push`'s cost: Administrator (one prompt, or none after
-`virutil xfer setup`) and a throwaway account, once per guest. The host-side download is `Invoke-WebRequest` plus
-.NET's `ZipFile` rather than curl-or-wget and unzip-or-bsdtar; both are on
-every Windows machine, so there is no fallback chain.
+byte. It runs from the SYSTEM shell qemu-ga already provides. It stamps a
+primary token with the session: `WTSQueryUserToken` for the logged-on user, or
+its own SYSTEM token with `TokenSessionId` set for `-s`. It takes
+`TokenLinkedToken` for `--elevated`, builds an environment block, and calls
+`CreateProcessAsUser` onto `winsta0\default`. It needs nothing staged in the
+guest and no transfer, so it costs no more than `exec`. docs/ui-psexec.md
+records the PsExec reading this came from. `ui setup`, which used to deliver
+PsExec over `push`, is retired: it exits 0 and says so, and exit 97 is no
+longer raised.
 
 ### The transfer layer, and what is measured about it
 
