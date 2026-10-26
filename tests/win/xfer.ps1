@@ -460,6 +460,12 @@ try {
         # and the parent had given up at 20s, calling a live helper one that
         # never began. The task start names the helper's process, so a live
         # one is waited for and not mistaken for a task that never ran.
+        #
+        # The 2500ms sleep is what puts the answer past the start window. The
+        # ready timeout only bounds the wait, so it is raised for this case:
+        # at the 6s the others use, a fresh pwsh slow to start on a loaded
+        # host spent the margin before its sleep began, and the run failed
+        # on how busy the machine was rather than on what is asserted.
         $tok, $stage = NewStage
         $statusFile = Get-XferStatusFile $tok
         $late = "Start-Sleep -Milliseconds 2500; Set-Content -LiteralPath '$statusFile' -Encoding ASCII " +
@@ -467,7 +473,12 @@ try {
         $slow = Start-Process -FilePath $shellExe -WindowStyle Hidden -PassThru -ArgumentList @(
             '-NoProfile', '-EncodedCommand', [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($late)))
         $script:FakeHelper = { param($Token) }; $script:EnginePid = $slow.Id
+        $script:XferHelperReadyMs = 60000
+        # Set before the call, so a publish that dies leaves it $null and the
+        # Check below reports that rather than StrictMode ending the file.
+        $script:SlowSess = $null
         $msg = Dies { $script:SlowSess = & $script:RealPublish -Token $tok -Path $stage }
+        $script:XferHelperReadyMs = 6000
         Check     'a live helper slower than the start window is waited for' '' $msg
         Check     'and its answer is taken'  $sleeper.Id $(if ($script:SlowSess) { $script:SlowSess.HelperPid } else { '' })
 
