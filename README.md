@@ -1325,7 +1325,7 @@ virutil pull -h
 | --- | --- |
 | `VM` | libvirt domain to read from. Must be **running**. |
 | `SRC` | Guest path, relative to the root of `C:`. Wildcards allowed. |
-| `DST` | Host directory to copy into. Created if it does not exist. |
+| `DST` | Host directory to copy into. Created if it does not exist. Or the file itself: see below. |
 
 `SRC` may be spelled with backslashes and an optional `C:`/`C:\` prefix, and is
 normalised to a `C:`-relative path; one containing `..` is refused. It is
@@ -1347,6 +1347,24 @@ virutil pull win11 'Users/me/Desktop/note.txt' ~/
 
 Quote the source in the shell: the wildcards are for the guest to match, not
 the host.
+
+**One file to a `DST` that does not exist yet is that file**, by `push`'s rule,
+which is `cp`'s and rsync's. That applies when `SRC` has no wildcard, `DST` has
+no trailing slash, and what the guest sends turns out to be a single file:
+
+| Command | Result |
+| --- | --- |
+| `virutil pull win11 uat/run.json out/run.json` | `out/run.json`, the file (and `out/` created if needed) |
+| `virutil pull win11 uat/run.json out/renamed.json` | the same file under the new name |
+| `virutil pull win11 uat/run.json out` (`out/` exists) | `out/run.json` |
+| `virutil pull win11 uat/run.json new/` | `new/run.json`: a trailing slash always means a directory |
+| `virutil pull win11 'uat/*.json' out.json` | `out.json/` is a directory: a wildcard always fills one |
+| `virutil pull win11 uat/logs out.d` | `out.d/logs/...`: a directory lands inside `DST` |
+
+Until this rule, `out/run.json` came back as a directory named `run.json`
+with the file inside it. A script that pulls one file into a directory that
+does not exist yet, named without a trailing slash, now gets the file under
+that name. Add the slash to keep the directory.
 
 ### How the read is taken
 

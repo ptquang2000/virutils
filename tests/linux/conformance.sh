@@ -108,10 +108,12 @@ if [[ "$BASH_TREE" == mac ]]; then
 fi
 
 # shot and input with virsh substituted: grammar, refusals, a PPM converted to
-# PNG, and the QMP each input verb sends. tests/mac/input.sh sources the macOS
-# module with qmp() substituted, so it runs here too, on any host.
+# PNG, and the QMP each input verb sends. pull with its transport substituted:
+# whether DST is the file or the directory it goes in. tests/mac/input.sh
+# sources the macOS module with qmp() substituted, so it runs here too, on any
+# host.
 printf '\n-- bash unit tests --\n'
-for t in "$HERE/shot.sh" "$HERE/input.sh" "$ROOT/tests/mac/input.sh"; do
+for t in "$HERE/shot.sh" "$HERE/input.sh" "$HERE/pull.sh" "$ROOT/tests/mac/input.sh"; do
     name="tests/${t#"$ROOT/tests/"}"
     if out="$(bash "$t" 2>&1)"; then
         printf '%s\n' "$out" | sed 's/^/  /'

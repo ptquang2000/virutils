@@ -86,6 +86,7 @@ function ExitCodeOf {
 # transfer would have sent is decoded back out of the -EncodedCommand and kept,
 # so what reaches the guest is what is asserted rather than how it got there.
 $script:Sent      = @()
+$script:GuestWrites = $null
 $script:GuestRc   = 0
 $script:GuestOut  = ''
 function Invoke-GuestAgent {
@@ -102,6 +103,9 @@ function Invoke-GuestAgent {
             # credential half, and a test that wants the *copy* to fail should
             # not have to arrange for the logon to fail first.
             $last = $script:Sent[$script:Sent.Count - 1]
+            # What a pull's guest would have copied into the share, written
+            # into the staging tree the share stands for.
+            if ($last -notmatch 'net use' -and $script:GuestWrites) { & $script:GuestWrites $script:PublishedDir }
             $rc = if ($last -match 'net use') { 0 } else { $script:GuestRc }
             $out = if ($last -match 'net use') { 'ok' } else { $script:GuestOut }
             return ([pscustomobject]@{
@@ -640,6 +644,53 @@ try {
     $rc = ExitCodeOf { Capture { Pull-Main @('testvm', 'nothing\here\*', $dest) } }
     Check 'no match in the guest is exit 94' 94 $rc
     $script:GuestRc = 0
+
+    # --- pull: is DST the file, or the directory it goes in? ----------------
+    #
+    # push's rule, which is rsync's and cp's. A DST that does not exist, has no
+    # trailing slash and is fed one file is that file. A UAT run pulled four
+    # evidence files to out\NAME.json and got four empty-looking directories
+    # named NAME.json instead.
+    $script:GuestOut = '1 0 5'
+    $script:GuestWrites = { param($Dir) Set-Content -LiteralPath (Join-Path $Dir 'restore-success.json') -Value '{"ok":true}' -Encoding ASCII }
+    $ev = Join-Path $scratch 'evidence'
+    $file = Join-Path $ev 'restore-success.json'
+    $out = Capture { Pull-Main @('testvm', 'uat\restore-success.json', $file) }
+    CheckTrue 'pull file -> a DST that does not exist writes that file' (Test-Path -LiteralPath $file -PathType Leaf)
+    Check     'with the bytes the guest sent'      '{"ok":true}' ((Get-Content -LiteralPath $file -Raw).Trim())
+    CheckTrue 'and announces the file as the end'  ($out -match 'pull: C:\\uat\\restore-success\.json -> .*evidence\\restore-success\.json')
+    CheckTrue 'a file pull leaves no staged tree'  (-not (Test-Path -LiteralPath $script:LastScratch))
+
+    $renamed = Join-Path $ev 'renamed.json'
+    [void](Capture { Pull-Main @('testvm', 'uat\restore-success.json', $renamed) })
+    CheckTrue 'pull file -> another name renames'  (Test-Path -LiteralPath $renamed -PathType Leaf)
+
+    [void](Capture { Pull-Main @('testvm', 'uat\restore-success.json', $ev) })
+    CheckTrue 'pull file -> an existing directory goes inside it' `
+        ((Test-Path -LiteralPath $ev -PathType Container) -and (Test-Path -LiteralPath $file -PathType Leaf))
+
+    $slashed = Join-Path $scratch 'newdir.json'
+    [void](Capture { Pull-Main @('testvm', 'uat\restore-success.json', ($slashed + '\')) })
+    CheckTrue 'a trailing \ makes DST a directory, even one named like a file' `
+        (Test-Path -LiteralPath (Join-Path $slashed 'restore-success.json') -PathType Leaf)
+
+    $globbed = Join-Path $scratch 'globbed.json'
+    [void](Capture { Pull-Main @('testvm', 'uat\*.json', $globbed) })
+    CheckTrue 'a wildcard SRC always fills a directory' `
+        (Test-Path -LiteralPath (Join-Path $globbed 'restore-success.json') -PathType Leaf)
+
+    # A directory source keeps landing inside DST, whatever DST is called.
+    $script:GuestOut = '1 1 5'
+    $script:GuestWrites = {
+        param($Dir)
+        New-Item -ItemType Directory -Force -Path (Join-Path $Dir 'logs') | Out-Null
+        Set-Content -LiteralPath (Join-Path $Dir 'logs\a.log') -Value 'a' -Encoding ASCII
+    }
+    $dirDst = Join-Path $scratch 'dir-dst.json'
+    [void](Capture { Pull-Main @('testvm', 'uat\logs', $dirDst) })
+    CheckTrue 'a directory SRC still lands inside a DST that did not exist' `
+        (Test-Path -LiteralPath (Join-Path $dirDst 'logs\a.log') -PathType Leaf)
+    $script:GuestWrites = $null
 
     # --- nothing before the transfer is known to be possible ----------------
     #

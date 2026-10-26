@@ -30,7 +30,9 @@ pull_usage() {
         "       since each guest's own matching is what does it. On Windows," \
         "       backslashes and a C:\\ prefix are tolerated; '..' is refused" \
         "       either way." \
-        "  DST  host directory to copy into (created if needed)" \
+        "  DST  host directory to copy into (created if needed) -- or, when SRC" \
+        "       is one file with no wildcard and DST does not exist and has no" \
+        "       trailing /, the file to write: pull VM logs/run.json out/run.json" \
         "" \
         "  -h, --help              this message" \
         "" \
@@ -92,11 +94,42 @@ pull_main() {
     [[ -n "$SRC" ]] \
         || die "source may not be the root of $(pull_guest_root)"
 
-    mkdir -p "$DST" || die "could not create destination: $DST"
+    # DST is a file or a directory by push's rule, which is rsync's and cp's:
+    # one that does not exist yet, has no trailing slash, and is fed a single
+    # file *is* that file. `pull VM logs/run.json out/run.json` used to make a
+    # directory called run.json with run.json inside it. A wildcard SRC always
+    # means a directory. Whether SRC is a file is only known once the guest has
+    # copied it, so this picks where to land and pull_place where it ends up.
+    local as_file=0
+    if [[ ! -e "$DST" && "$DST" != */ && "$SRC" != *[\*\?\[]* ]]; then
+        as_file=1
+        mkdir -p -- "$(dirname -- "$DST")" || die "could not create destination: $(dirname -- "$DST")"
+    else
+        mkdir -p -- "$DST" || die "could not create destination: $DST"
+    fi
 
     xfer_check net
     # Reports for itself: it knows what came back and how long it took.
-    pull_net "$SRC" "$DST"
+    pull_net "$SRC" "$DST" "$as_file"
+}
+
+# pull_place LAND DST -- what the guest copied into LAND, put where the caller
+# asked: a single file becomes DST; anything else -- a directory source --
+# becomes the directory DST, holding what it always held. LAND is a fresh
+# directory beside DST, so both are a rename on one filesystem.
+pull_place() {
+    local land="$1" dst="$2"
+    local -a items=()
+    mapfile -t items < <(find "$land" -mindepth 1 -maxdepth 1)
+    if (( ${#items[@]} == 1 )) && [[ -f "${items[0]}" ]]; then
+        mv -f -- "${items[0]}" "$dst" && rmdir -- "$land"
+    elif (( ${#items[@]} > 0 )); then
+        # mktemp made it 0700; a DST that mkdir -p would have made follows
+        # the umask.
+        mv -- "$land" "$dst" && chmod -- "$(umask -S)" "$dst"
+    else
+        rmdir -- "$land"
+    fi
 }
 
 # --- copying out of the running guest, over SMB ------------------------------
@@ -144,8 +177,8 @@ pull_net_die() {
 }
 
 pull_net() {
-    local SRC="$1" DST="$2"
-    local ip host export_dir rc=0 reported t0 elapsed
+    local SRC="$1" DST="$2" as_file="${3:-0}"
+    local ip host export_dir land="" rc=0 reported t0 elapsed
 
     ip="$(domain_ip "$DOMAIN")" \
         || die "could not work out $DOMAIN's address, so it has nowhere to" \
@@ -161,22 +194,38 @@ pull_net() {
     # root's and not the caller's. A relative DST -- `./out`, the ordinary way
     # to name a directory you are standing in -- would name a path that does not
     # exist over there, and the share would come up pointing at nothing.
-    export_dir="$(cd -- "$DST" && pwd -P)" \
-        || die "could not resolve $DST to an absolute path to serve it from"
+    #
+    # A DST that is to be a file is not a directory to serve, so the guest
+    # copies into a fresh one beside it instead, and pull_place moves the
+    # result out.
+    if (( as_file )); then
+        land="$(mktemp -d "$(dirname -- "$DST")/.virutil-pull-XXXXXX")" \
+            || die "could not make a directory beside $DST to copy into"
+        export_dir="$(cd -- "$land" && pwd -P)"
+    else
+        export_dir="$(cd -- "$DST" && pwd -P)" \
+            || die "could not resolve $DST to an absolute path to serve it from"
+    fi
     [[ -w "$export_dir" ]] \
         || die "$export_dir is not writable by you, and the guest writes into" \
                "it as you: both servers export it under the invoking user."
 
     pull_net_serve "$export_dir" "$host"
+    # After the serve, which arms its own EXIT trap: this one keeps it.
+    # shellcheck disable=SC2064 # expanded now, on purpose
+    [[ -n "$land" ]] && trap "xfer_stop; rm -rf -- '$land'" EXIT
 
     echo "pull: $(pull_show_src "$SRC") -> $DST"
 
     t0="$(now_ms)"
     reported="$(pull_net_fetch "$SRC")" || rc=$?
     elapsed=$(( $(now_ms) - t0 ))
+    xfer_stop
+    # Once the share is down, and on the failure path too: anything the guest
+    # did copy is left where it landed, as pull_net_die says.
+    [[ -n "$land" ]] && pull_place "$land" "$DST"
     (( rc == 0 )) || pull_net_die "$rc" "$SRC" "$host"
 
-    xfer_stop
     pull_smb_report "$reported" "$elapsed"
 }
 

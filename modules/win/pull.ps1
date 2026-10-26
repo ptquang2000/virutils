@@ -31,7 +31,9 @@ function Get-PullUsage {
         '       allowed and match case-INsensitively, since the guest does the'
         "       matching itself. Backslashes and a C:\ prefix are tolerated;"
         "       '..' is refused."
-        '  DST  host directory to copy into (created if needed)'
+        '  DST  host directory to copy into (created if needed) -- or, when SRC'
+        '       is one file with no wildcard and DST does not exist and has no'
+        '       trailing \, the file to write: pull VM logs\run.json out\run.json'
         ''
         '  -h, --help              this message'
         ''
@@ -83,46 +85,78 @@ function Pull-Main {
     if (-not $rel) { Die 'source may not be the root of C:\' }
     $guestSrc = 'C:\' + $rel.Replace('/', '\')
 
-    # Created before anything is staged, and resolved to an absolute path: the
-    # staging seed reads it and the copy back writes it, and a relative path
-    # would be resolved against whatever directory each of those happened to
-    # run in.
-    if (-not (Test-Path -LiteralPath $dst)) {
-        try { New-Item -ItemType Directory -Force -Path $dst | Out-Null }
-        catch { Die "could not create destination: $dst ($($_.Exception.Message))" }
+    # Resolved to an absolute path before anything is staged: the staging seed
+    # reads it and the copy back writes it, and a relative path would be
+    # resolved against whatever directory each of those happened to run in.
+    $dstFull = [IO.Path]::GetFullPath([IO.Path]::Combine((Get-Location).ProviderPath, $dst))
+
+    # DST is a file or a directory by push's rule, which is rsync's and cp's:
+    # one that does not exist yet, has no trailing slash, and is fed a single
+    # file *is* that file. `pull VM logs\run.json out\run.json` used to make a
+    # directory called run.json with run.json inside it. A wildcard SRC always
+    # means a directory, however many files it turns out to match. Whether SRC
+    # is a file is only known once the guest has copied it, so this decides
+    # which way to stage and Move-PullResult decides where it lands.
+    $asFile = -not (Test-Path -LiteralPath $dstFull) -and
+              -not ($dst.EndsWith('\') -or $dst.EndsWith('/')) -and
+              $guestSrc -notmatch '[*?]'
+    $dstDir = if ($asFile) { Split-Path -Parent $dstFull } else { $dstFull }
+    if (-not (Test-Path -LiteralPath $dstDir)) {
+        try { New-Item -ItemType Directory -Force -Path $dstDir | Out-Null }
+        catch { Die "could not create destination: $dstDir ($($_.Exception.Message))" }
     }
-    $dstFull = (Resolve-Path -LiteralPath $dst).ProviderPath
 
     [Console]::Out.WriteLine("pull: $guestSrc -> $dstFull")
 
+    # A DST that does not exist yet has nothing to seed the staging tree with,
+    # so it stages empty rather than from the parent directory.
+    $stageArgs = if ($asFile) { @{ StageWith = {}; StageNeed = 0 } } else { @{ StageFrom = $dstFull } }
+
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    $reported = Invoke-XferTransfer -Vm $vm -StageFrom $dstFull -Write -Body {
+    $reported = Invoke-XferTransfer -Vm $vm @stageArgs -Write -Body {
         param($Session, $Stage)
 
         $text = Invoke-Payload 'pull.ps1' @{ SRC = $guestSrc; DST = $Session.Unc }
         $out = Invoke-GuestPsText $vm $text -Capture
         $rc  = $script:VirutilExit
 
-        # Out of the staging tree and into the directory the caller named, while
-        # the staging tree still exists -- teardown removes it as soon as this
-        # returns. robocopy again, so the write back is itself a delta and a
-        # re-pull that changed nothing rewrites nothing.
+        # Out of the staging tree and into what the caller named, while the
+        # staging tree still exists -- teardown removes it as soon as this
+        # returns.
         #
         # It runs on the failure path too, and best-effort there. The bash
         # driver serves DST itself, so a copy that failed halfway leaves what it
         # managed in DST; staging would otherwise throw that away, and "anything
         # it did copy is left where it landed" is what pull says on both hosts.
         if ($rc -ne 0) {
-            try { Invoke-XferRobocopy $Stage $dstFull 'partial copy' } catch { }
+            try { Move-PullResult $Stage $dstFull $asFile 'partial copy' } catch { }
             Pull-Die $rc $guestSrc
         }
-        Invoke-XferRobocopy $Stage $dstFull `
+        Move-PullResult $Stage $dstFull $asFile `
             "the guest copied the files out, but they could not be moved from the staging tree into $dstFull"
         return $out
     }
     $clock.Stop()
 
     Write-PullReport $vm $reported $clock.ElapsedMilliseconds
+}
+
+# Move-PullResult STAGE DST ASFILE WHAT -- what the guest copied into STAGE, put
+# where the caller asked. With ASFILE and a single file in STAGE, that file
+# becomes DST. Otherwise DST is a directory and STAGE is copied into it with
+# robocopy, so the write back is itself a delta and a re-pull that changed
+# nothing rewrites nothing. That covers a directory source named with a DST
+# that did not exist, which gets the directory it always got.
+function Move-PullResult {
+    param([string]$Stage, [string]$Dst, [bool]$AsFile, [string]$What)
+    $items = @(Get-ChildItem -LiteralPath $Stage -Force -ErrorAction SilentlyContinue)
+    if ($AsFile -and $items.Count -eq 1 -and -not $items[0].PSIsContainer) {
+        try { Copy-Item -LiteralPath $items[0].FullName -Destination $Dst -Force }
+        catch { Die "$What ($($_.Exception.Message))" }
+        return
+    }
+    if ($AsFile -and $items.Count -eq 0) { return }
+    Invoke-XferRobocopy $Stage $Dst $What
 }
 
 # Write-PullReport VM REPORTED MS -- what came back. REPORTED is the guest's own

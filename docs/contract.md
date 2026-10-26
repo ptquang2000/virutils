@@ -111,7 +111,11 @@ Invariants that are contract, not implementation:
   guest's own network and touches neither the disk image nor guest uptime.
 - `SRC`/`DST` guest paths are relative to the guest root -- `C:\` on Windows,
   `/` on Linux. Backslashes and a `C:\` prefix are tolerated; `..` is refused.
-  A trailing slash means a directory, as with rsync.
+  A trailing slash means a directory, as with rsync. The rule is the same in
+  both directions: a single file sent to a `DST` that does not exist, has no
+  trailing slash and (for `pull`) came from a `SRC` with no wildcard *is* that
+  file. Any other `DST` is a directory that the source lands inside.
+  tests/win/xfer.ps1 and tests/linux/pull.sh hold `pull` to it.
 - `pull` wildcards match with the *guest's* own matching: case-insensitive on
   Windows, case-sensitive on Linux.
 - **On a Windows host, `push`, `pull` and `sync` reach a Windows guest only**,
