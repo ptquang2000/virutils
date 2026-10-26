@@ -169,7 +169,7 @@ One root, everything under it, one variable relocates the lot.
 | path | holds |
 |---|---|
 | `<root>/conf` | sync configs, looked up here first |
-| `<root>/images` | domain disks, snapshot overlays, memory files, UEFI nvram, and -- Windows host only -- the per-VM `.cmd` launcher, its firmware log (OVMF, or SeaBIOS for `-o winxp`) and, for `-o winxp -u`, the answer-file floppy `VM-a.img` |
+| `<root>/images` | domain disks, snapshot overlays, memory files, UEFI nvram, and -- Windows host only -- the per-VM `.cmd` launcher, its firmware log (OVMF, or SeaBIOS for `-o winxp`) and, for `-o winxp -u`, the answer-file floppy `VM-a.img`; on Windows and macOS hosts, `VM.agent.lock` once anything has talked to the guest agent (section 4) |
 | `<root>/staging` | sync's incremental staging trees |
 | `<root>/ports` | port-forward state and logs |
 | `<root>/mnt` | host mount points for guest filesystems |
@@ -184,7 +184,8 @@ and nvram qcow2s, memory included -- so its `images` holds, per domain, the
 disk, the nvram (`VM_VARS.qcow2`), the launcher (`VM.sh`), the qemu log, and
 while it runs a pidfile and two Unix sockets (`VM.qmp`, `VM.qga`), plus a
 `VM.tpm/` directory holding swtpm's state and the copies a disk-only snapshot
-keeps of it. Nothing outside that list is ever written there.
+keeps of it, and the guest agent lock `VM.agent.lock`. Nothing outside that
+list is ever written there, and `domain delete` removes all of it.
 
 Root is `~/.virutils` on Linux and macOS and `%USERPROFILE%\.virutils` on
 Windows. The
@@ -270,6 +271,39 @@ libosinfo, no libvirt network, and neither WHPX booting Windows 11 nor an
 arm64 guest has anything but UEFI -- so those drivers read them, say they are
 ignored when one has actually been set, and carry on. A variable being in
 this table means both drivers must *accept* it, not that both can act on it.
+
+| variable | meaning |
+|---|---|
+| `VIRUTILS_AGENT_WAIT` | seconds a guest agent call waits for another run's (default 120), Windows and macOS hosts |
+
+**Several runs may use one guest's agent at once, and they take turns per
+command.** The agent channel serves one host client at a time and qemu-ga
+answers in order on one stream, so two runs used to collide: one timed out, or
+read the other's reply (`docs/qga-multi-client.md` has the sources and the
+measurements). On a Linux host libvirt's agent job already serialises every
+`virsh qemu-agent-command`. The Windows and macOS drivers do the same
+themselves: every agent call is one round trip -- take the domain's lock, connect,
+`guest-sync-delimited`, one command, its reply, close, let go -- so nothing is
+held between calls, and a long `exec` or `sync` polls in between other runs'
+commands rather than shutting them out. The lock is `images/VM.agent.lock`,
+held open (Windows) or flock'd (macOS) by the run that has it; the OS drops it
+when that process dies, however it dies, so a crashed run never leaves a stale
+lock. A call that has waited 2s says who it is waiting for, once per holder --
+
+    waiting for win11's guest agent: held by virutil pid 4242, `sync win11`, since 14:03:22
+
+-- and a call that has waited `VIRUTILS_AGENT_WAIT` seconds fails with 1,
+naming the holder. The one caller that holds the lock across retries is the
+wait for an agent that is not up yet, which keeps one connection for the whole
+wait: with nothing in the guest reading the port, qemu never notices a client
+that has gone, so reconnecting in a loop would use up the one accept slot.
+
+No request carries an `"id"`. The sync is what makes the next line this
+command's answer, and the qemu-ga a Windows XP guest runs (virtio-win's 7.6.2)
+refuses a request carrying one ("QMP input object member 'id' is unexpected").
+The bash driver on a Linux host accepts `VIRUTILS_AGENT_WAIT` and has nothing to
+apply it to: how long a libvirt caller waits for the agent job is libvirt's
+(30s).
 
 ## 5. Exit codes
 
@@ -993,6 +1027,7 @@ drivers:
 | `tests/win/shot.ps1`, `tests/linux/shot.sh` | `shot`'s grammar, its refusals, and the PPM fallback with pixels checked, behind a substituted monitor (Windows) or `virsh` (Linux). The Windows half also captures from a real paused qemu with no disk and no guest, and skips that part where no qemu is installed. |
 | `tests/win/input.ps1`, `tests/linux/input.sh`, `tests/mac/input.sh` | `input`'s grammar, its refusals (before anything is sent), the pixel-to-tablet mapping, US-layout typing, and the events each verb sends, behind a substituted monitor and barrier (Windows), `virsh` (Linux) or `qmp()` (macOS, runnable on any host with bash and jq). The Windows half also drives a real running qemu with its `input_event_*` trace on and checks that qemu took exactly what was sent; it skips that part where no qemu is installed. |
 | `tests/win/transfer.ps1` | the guest tier: the transfer minimum below, plus the property that a completed transfer and a killed one both leave no account, no share and no staged tree. |
+| `tests/win/agent.ps1`, `tests/mac/agent.sh` | several runs against one guest agent (section 4): the lock's wait message, its timeout naming the holder, a killed holder freeing it, re-entrance; the round trip against a stand-in agent with the real channel's one-client, in-order, late-reply-to-the-next-client behaviour (`tests/win/fake-qga.ps1`, `tests/mac/fake-qga.pl`) -- stale replies, an agent refusing an `"id"`, a reply after its caller gave up, an agent not up yet waited for over one connection; and three concurrent `exec` loops each getting only its own output. The macOS half runs on any host with bash, jq, perl and `nc -U` or socat. The Windows half takes a live guest the way `transfer.ps1` does (`-Vm`/`VIRUTILS_TEST_VM`, never a default) for the same loops, a call during another run's 15s command, and a push alongside when the guest has robocopy. |
 
 On a Mac the bash half runs `modules/mac` -- the module list is read from
 whichever tree `uname` selects -- and adds two things of its own: each command

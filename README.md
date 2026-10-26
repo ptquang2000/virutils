@@ -16,6 +16,7 @@ utilities it calls.
    - [domains](#domains)
    - [transfer](#transfer)
    - [guest](#guest)
+   - [Several runs at one guest](#several-runs-at-one-guest)
    - [hardware](#hardware)
 - [How files move](#how-files-move)
    - [On a Windows host](#on-a-windows-host)
@@ -129,7 +130,7 @@ in one go. The layout, and what fills each subdirectory:
 | Path | Filled by |
 | --- | --- |
 | `~/.virutils/conf/` | sync configs (`sync.conf`, `NAME.conf`) |
-| `~/.virutils/images/` | domain disks (`domain create`), snapshot overlays and memory files (`snapshot`) |
+| `~/.virutils/images/` | domain disks (`domain create`), snapshot overlays and memory files (`snapshot`), and on Windows and macOS hosts each domain's guest agent lock, `VM.agent.lock` |
 | `~/.virutils/staging/` | sync's incremental staging trees (`@staging` names) |
 | `~/.virutils/ports/` | `domain port` forward state and relay logs |
 | `~/.virutils/mnt/` | host mount points left by removed commands, swept by `domain delete` (`<VM>`) |
@@ -215,6 +216,30 @@ way.
 | `exec` | Run commands inside a guest through the QEMU guest agent, with no guest networking required. `cmd` and `ps` address a Windows guest, `sh` a Linux one. | `virutil exec {ping\|cmd\|ps\|sh} VM [FLAGS] [ARGS]` |
 | `shot` | Capture a **running** guest's screen to a PNG on the host, from the hypervisor: nothing runs in the guest. Every host. See [virutil shot](#virutil-shot). | `virutil shot VM [-o FILE]` |
 | `input` | Click, drag, scroll, press keys and type in a **running** guest, at the pixel coordinates of a shot, through its emulated tablet and keyboard: nothing runs in the guest. Every host. See [virutil input](#virutil-input). | `virutil input {click\|move\|drag\|wheel\|key\|type} VM ...` |
+
+### Several runs at one guest
+
+Two sessions can drive one guest at the same time: an `exec` loop in one, a
+`sync` or `push` in another. Everything that runs inside the guest goes through
+its one QEMU guest agent channel, which serves one client at a time, so the
+runs **take turns per agent command** rather than each holding the channel for
+the whole run. A long `exec` or `sync` polls in between the other run's commands
+instead of shutting it out. On a Linux host libvirt does the turn-taking; on a
+Windows or macOS host virutil does, with a lock file per domain,
+`images/VM.agent.lock`, held only for one command's round trip and dropped by
+the OS if the run that holds it dies.
+
+A call that has waited more than 2s says who it is waiting for:
+
+```
+waiting for win11's guest agent: held by virutil pid 4242, `sync win11`, since 14:03:22
+```
+
+and one that has waited `VIRUTILS_AGENT_WAIT` seconds (default 120) gives up,
+exit 1, naming the holder. A wait that long means the holder is stuck on a
+reply that is not coming, or is waiting for the guest to boot; ending it frees
+the agent. See [docs/qga-multi-client.md](docs/qga-multi-client.md) for why the
+channel works this way.
 
 ### hardware
 
@@ -1678,6 +1703,7 @@ profile once, or prefix a single `create` with them.
 | `VIRUTILS_VIRTIO` | `virtio-win*.iso` beside the install ISO | Default for `-v`: driver ISO to attach as a second cdrom, or `none`. |
 | `VIRUTILS_NETWORK` | `network=default,model=virtio` | Passed to `virt-install --network`. |
 | `VIRUTILS_FIRMWARE` | `uefi` | `bios` selects SeaBIOS instead. Windows 11 will not install without UEFI. |
+| `VIRUTILS_AGENT_WAIT` | `120` | Seconds a guest agent call waits for another run's to finish before giving up. Windows and macOS hosts; on Linux libvirt's own wait applies. See [Several runs at one guest](#several-runs-at-one-guest). |
 
 The same names spelled with the singular `VIRUTIL_` prefix are still read,
 second, and print one deprecation line when they are. They used to disagree:

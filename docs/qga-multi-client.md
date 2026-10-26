@@ -16,6 +16,11 @@ numbers below refer to them. Also the virtio v1.3 spec and Linux v6.12
 mailing-list archive (lore.kernel.org) was behind a bot challenge, so the
 commit messages quoted here stand in for the threads.
 
+**Status: implemented** as §6 designs it, with three changes the
+implementation measured its way to. They are listed in §6a. The behaviour
+users see is in `docs/contract.md` section 4 and in the README's "Several runs
+at one guest".
+
 ## Summary
 
 - **The host side serves one client at a time, and that is by design.**
@@ -214,8 +219,10 @@ What these show:
   - **Inference, not measured:** this should clear once a guest agent opens the
     port and the read path resumes.
   - Either way, a client should not open and drop connections in a loop while
-    the agent is down. `Test-GuestAgent` already retries over one held
-    connection, and the new design must keep that.
+    the agent is down. (This note first said `Test-GuestAgent` already retried
+    over one held connection. It did not: a sync that timed out disposed of the
+    connection, and the next attempt opened a new one. The implementation
+    fixed that; see §6a.)
 
 ## 4. The options
 
@@ -327,17 +334,17 @@ which is why it works sometimes. But:
 The round trip, per agent call:
 
 1. **Take the per-VM agent lock.**
-   - Wait up to `VIRUTIL_AGENT_LOCK_SECS` (default 120). This is separate from
-     the reply timeout.
+   - Wait up to `VIRUTILS_AGENT_WAIT` seconds (default 120). This is separate
+     from the reply timeout.
    - While waiting, print once: `waiting for <VM>'s guest agent: held by
      virutil pid N (<command>) since T`.
    - At the limit, die naming the holder.
 2. **Connect, then send 0xFF + `guest-sync-delimited` with a random id.**
    Discard input up to the 0xFF and until `return == id`. This is today's
    `Open-GuestAgent` and `agent_open`, unchanged.
-3. **Send the command with an `"id"` of its own.** Read lines until one carries
-   that id. Discard others, which belt-and-braces the sync. A reply with no id
-   is a parse error and is reported as such.
+3. ~~**Send the command with an `"id"` of its own.** Read lines until one
+   carries that id. Discard others, which belt-and-braces the sync.~~ Dropped:
+   an old qemu-ga refuses the id (§6a).
 4. **Close the connection, then release the lock.** On a reply timeout, close
    and release, and the next call's sync cleans up after it. libvirt re-syncs
    instead of reconnecting; here the reconnect itself is cheap (row 5).
@@ -404,6 +411,31 @@ run one at a time in qemu-ga, but each command is short: virutil's long work
 runs as guest processes that the agent only starts and polls. If real
 parallelism is ever needed, option C is the path, and §3 rows 8 and 9 are its
 first evidence.
+
+## 6a. What the implementation changed
+
+1. **No `"id"` on requests** (step 3 dropped). The qemu-ga in the winxp guest
+   (virtio-win 7.6.2) refused every command that carried one: `QMP input
+   object member 'id' is unexpected`. The sync on every connect is what makes
+   the next line this command's answer, as it is for libvirt, which sends no
+   id either. The fakes have a mode that refuses an id, so a regression shows
+   up in the tests.
+2. **The sync before a command gets the call's own timeout, not 2s.** After a
+   call that gave up, the agent may still be running that call's command, and
+   the next call's sync queues behind it (§1c: one request at a time). A 2s
+   sync would report a busy agent as a dead one.
+3. **The waiting message comes after 2s, not at once.** Two runs taking turns
+   wait on each other's round trips, tens of milliseconds each, all the time.
+   Printed at once, the message filled the output of every interleaved `exec`.
+
+Measured on the throwaway winxp `-snapshot` qemu, through the real CLI:
+
+- One run held `exec cmd 'ping -n 15 127.0.0.1'` and a second run called
+  `exec cmd 'echo second'` 6s in. With the old code (HEAD `4b2bbdf`), the
+  second run failed after 4.5s with "not answering". With the new code it
+  answered in 3.2s, and the first run finished too.
+- Three parallel loops of ten `exec cmd` calls each all came back with their
+  own output, under pwsh 7 (38s) and under 5.1 (49s).
 
 ## 7. How to test it
 
