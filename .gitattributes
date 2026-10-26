@@ -22,3 +22,4 @@ modules/linux/*  text eol=lf
 modules/mac/*    text eol=lf
 tests/linux/*.sh text eol=lf
 tests/mac/*.sh   text eol=lf
+tests/mac/*.pl   text eol=lf
