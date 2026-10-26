@@ -731,8 +731,11 @@ window by 200,200, `key win+r`, `ctrl+a` and `alt+f4`, and `type` of every
 ASCII punctuation character all did what they should. Against win11 (Windows
 11 22H2, WHPX, 1280x800), a `click` on an In-Session tab put the cursor's tip
 on the requested pixel and switched the tab. That window's process runs at
-medium integrity, not elevated, so the UIPI claim is still unmeasured. The
-macOS module has run only with QMP stubbed (tests/mac/input.sh).
+medium integrity, not elevated. A notepad started with `ui run -s` (System
+integrity, 0x4000) then took a `click` and 15 typed characters in full, so the
+UIPI claim is measured on win11 too. `ui run --elevated` is not a way to get
+one there: the guest's user has no split token and the process stays at
+medium. The macOS module has run only with QMP stubbed (tests/mac/input.sh).
 
 ### The transfer layer, and what is measured about it
 

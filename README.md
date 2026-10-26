@@ -2054,8 +2054,18 @@ Against win11 (Windows 11 22H2 under WHPX, 1280x800, In-Session's UI on the
 console desktop), `click` on the History tabs landed with the cursor's tip on
 the requested pixel and switched the tab, both ways. That UI runs at medium
 integrity (`elevationType` default, integrity 0x2000, read from its token), the
-same as explorer. So it was an ordinary window, and **the UIPI point above,
-reaching an elevated window, is still unmeasured.**
+same as explorer. So it was an ordinary window. An elevated one was measured
+afterwards (Windows 11 on win11, 2026-10-26): a notepad started with `ui run
+-s` ran at System integrity (0x4000, read from its token). `click` on its edge
+brought it to the front, a `click` in its text area focused it, and `type` of
+15 characters arrived in full, with the host and the guest both unelevated. The
+UIPI point above holds for that window. A control into a medium-integrity
+(Store) Notepad also focused and took text, but only 9 of 14 characters
+arrived; that was the app dropping fast input, not integrity. `ui run
+--elevated` gave no elevation on this guest: the user `lens` has no split
+token, so In-Session's UI and MetaDefenderDrive.exe, notepad included, all
+measured medium (0x2000) whether started plainly or with `--elevated`. For a
+test of an elevated window, start it with `-s`.
 
 ## virutil usb
 
