@@ -11,23 +11,30 @@
   test is the observable behaviour of `virutil push` and `virutil pull` and not
   any function inside them.
 
-  **It skips, loudly, when there is no guest**, following the pattern
-  tests/linux/conformance.sh already uses when it cannot find a PowerShell
-  interpreter. A test that exists and skips is worth more than one that stays
-  hypothetical: the moment a guest is up, the minimum starts being checked
-  instead of asserted.
+  **It has no default VM, and skips, loudly, without one.** The guest is
+  named by -Vm or by VIRUTILS_TEST_VM and by nothing else: no fallback name, no
+  pick from `domain list`. This test pushes into the guest, kills a push
+  half-way and deletes C:\virutil-xfer-test* there, and a default once pointed
+  it at a domain that was leased to a UAT recording. Whoever runs it names a
+  guest that is theirs to write to. A test that exists and skips is still worth
+  more than one that stays hypothetical: the moment a guest is named, the
+  minimum starts being checked instead of asserted.
 
-  Two things it needs that the rest of the suite does not: a running Windows
-  guest (named by VIRUTILS_TEST_VM, default win11) and Administrator for each
-  transfer -- publishing a share on this host's own SMB server is what needs
-  it. Where `virutil xfer setup` has been run, the scheduled task supplies it
-  and this runs unattended; where it has not, a person approves one elevation
-  prompt per transfer.
+  Two things it needs that the rest of the suite does not: that running
+  Windows guest, and Administrator for each transfer -- publishing a share on
+  this host's own SMB server is what needs it. Where `virutil xfer setup` has
+  been run, the scheduled task supplies it and this runs unattended; where it
+  has not, a person approves one elevation prompt per transfer.
+
+      tests\win\transfer.ps1 -Vm scratch-win11
+      $env:VIRUTILS_TEST_VM = 'scratch-win11'; tests\win\transfer.ps1
 
   The second half is what no amount of unit testing reaches: that a transfer
   which ends, and a transfer which is killed in the middle, both leave no
   account, no share and no staged tree on this machine.
 #>
+
+param([string]$Vm)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -43,7 +50,9 @@ $driver  = Join-Path $root 'virutil.ps1'
 . (Join-Path $root 'modules\win\paths.ps1')
 
 $shell   = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-$vm      = if ($env:VIRUTILS_TEST_VM) { $env:VIRUTILS_TEST_VM } else { 'win11' }
+# Named by the caller or not at all. No `else 'win11'` here, ever: see the
+# header for what a default once did.
+$vm      = if ($Vm) { $Vm } elseif ($env:VIRUTILS_TEST_VM) { $env:VIRUTILS_TEST_VM } else { $null }
 $guestDir = 'virutil-xfer-test'
 
 $script:Pass = 0
@@ -102,9 +111,21 @@ function Get-TreeFingerprint {
 
 # --- is there a guest? ------------------------------------------------------
 
+if (-not $vm) {
+    Skipped (@(
+        'no guest named, and there is no default: this test writes to and deletes from'
+        "         C:\$guestDir* in the guest. Name one that is yours to change with -Vm VM"
+        '         or VIRUTILS_TEST_VM=VM -- never a domain someone else has leased.'
+    ) -join "`n")
+    [Console]::Out.WriteLine('')
+    [Console]::Out.WriteLine("$($script:Pass) passed, $($script:Fail) failed, $($script:Skip) skipped")
+    exit 0
+}
+[Console]::Out.WriteLine("guest    $vm (named by $(if ($Vm) { '-Vm' } else { 'VIRUTILS_TEST_VM' }))")
+
 $ping = Drive @('exec', 'ping', $vm)
 if ($ping.Code -ne 0) {
-    Skipped "no guest to test against: 'virutil exec ping $vm' failed. Start one, or set VIRUTILS_TEST_VM."
+    Skipped "no guest to test against: 'virutil exec ping $vm' failed. Start it, or name another."
     [Console]::Out.WriteLine('')
     [Console]::Out.WriteLine("$($script:Pass) passed, $($script:Fail) failed, $($script:Skip) skipped")
     exit 0

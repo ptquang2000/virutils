@@ -999,11 +999,24 @@ again after a guest reboot, `shutdown` through the agent powers the domain off
 in 4s, a cold `start` has the agent answering in 12s, and a memory snapshot
 round-trips (above).
 
-The PowerShell half skips itself, loudly, on a host with no `pwsh`, and
-`tests/win/transfer.ps1` skips itself the same way when no guest is up. When a guest
-*is* up it is the only interactive test in the suite, unless `virutil xfer
-setup` has been run on that host: without the task, a transfer on a Windows
-host prompts for Administrator once.
+The PowerShell half skips itself, loudly, on a host with no `pwsh`.
+
+**A test that reaches a real guest has no default guest.**
+`tests/win/transfer.ps1` is the one test that does: it pushes into the guest,
+kills a push half-way, and deletes `C:\virutil-xfer-test*` there. It takes the
+guest from `-Vm VM` or `VIRUTILS_TEST_VM` and from nowhere else: no fallback
+name and no pick from `domain list`. With neither set it skips and says why.
+It used to default to `win11`, and an unattended run of the Windows tests then
+pushed into a `win11` that was leased to a UAT recording. Every other test
+here runs under a scratch `VIRUTILS_DIR` with no launcher for a real domain,
+or, like `tests/mac/domain.sh` and the real-qemu halves of `shot.ps1` and
+`input.ps1`, against a qemu it starts and stops itself. A new test that needs
+a real guest follows `transfer.ps1`, and the runner never names one for it.
+
+`transfer.ps1` also skips when the guest it was given does not answer. Run
+against a live guest, it is the only interactive test in the suite, unless
+`virutil xfer setup` has been run on that host: without the task, a transfer
+on a Windows host prompts for Administrator once.
 
 **Still missing, and named so it is not mistaken for covered:** `exec`
 propagating a guest exit code against a real guest, `domain create` leaving
