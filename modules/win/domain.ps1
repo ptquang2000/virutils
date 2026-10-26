@@ -1098,7 +1098,8 @@ function Remove-Domain {
     # "$Vm*" in a shared image directory would take win11-backup.qcow2 with
     # win11, and delete never asks.
     foreach ($f in @((Get-DomainDisk $vm), (Get-DomainNvram $vm), (Get-DomainLauncher $vm),
-                     (Get-DomainOvmfLog $vm), (Get-DomainQemuLog $vm), (Get-DomainFloppy $vm))) {
+                     (Get-DomainOvmfLog $vm), (Get-DomainQemuLog $vm), (Get-DomainFloppy $vm),
+                     (Get-GuestAgentLockPath $vm))) {
         if (Remove-VirutilsFile $f) { Say "removed $f" }
     }
 }

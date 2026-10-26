@@ -137,6 +137,7 @@ domain_pidfile()  { printf '%s/%s.pid'        "$VIRUTILS_IMAGE_DIR" "$1"; }
 domain_qmp()      { printf '%s/%s.qmp'        "$VIRUTILS_IMAGE_DIR" "$1"; }
 domain_qga()      { printf '%s/%s.qga'        "$VIRUTILS_IMAGE_DIR" "$1"; }
 domain_tpmdir()   { printf '%s/%s.tpm'        "$VIRUTILS_IMAGE_DIR" "$1"; }
+domain_agent_lock() { printf '%s/%s.agent.lock' "$VIRUTILS_IMAGE_DIR" "$1"; }
 
 # The first line every launcher carries after its #!. It is how `list` tells a
 # launcher from any other .sh someone left in the image directory.
@@ -203,7 +204,13 @@ CHAN_PID="" CHAN_IN="" CHAN_OUT=""
 chan_open() {
     chan_close
     [[ -S "$1" ]] || return 1
-    coproc VIRUTIL_CHAN { exec nc -U "$1" 2>/dev/null; }
+    # Not with the guest agent lock's fd (modules/mac/guest): a flock lasts as
+    # long as any process holds the fd, and an nc orphaned by a killed run
+    # would hold the agent for every other run.
+    coproc VIRUTIL_CHAN {
+        if [[ -n "${AGENT_LOCK_FD:-}" ]]; then exec {AGENT_LOCK_FD}>&-; fi
+        exec nc -U "$1" 2>/dev/null
+    }
     CHAN_PID="$VIRUTIL_CHAN_PID"
     exec {CHAN_IN}<&"${VIRUTIL_CHAN[0]}" {CHAN_OUT}>&"${VIRUTIL_CHAN[1]}"
 }

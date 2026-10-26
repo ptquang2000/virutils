@@ -60,6 +60,13 @@ Get-ChildItem -LiteralPath $moduleDir -Filter '*.ps1' | Sort-Object Name | ForEa
 }
 foreach ($m in $commandModules) { . (Join-Path $moduleDir $m) }
 
+# What another run waiting on a guest agent this one holds is told it is doing:
+# the module and its first operands, short, and never a script's text.
+$script:GuestAgentLockCommand = (@($args | Select-Object -First 3) -join ' ')
+if ($script:GuestAgentLockCommand.Length -gt 60) {
+    $script:GuestAgentLockCommand = $script:GuestAgentLockCommand.Substring(0, 60) + '...'
+}
+
 $code = $null
 try {
     Invoke-Dispatch $args
@@ -78,10 +85,9 @@ try {
     }
     if ($e.Message) { [Console]::Error.WriteLine($e.Message) }
 } finally {
-    # The guest agent channel is one per qemu process rather than one per
-    # command -- qemu's chardev does not go back to listening once a client has
-    # come and gone -- so the run holds it open and closes it here, once,
-    # however the run ends. See Get-GuestAgentChannel in modules/win/guest.ps1.
+    # Every guest agent call is its own round trip under a per-domain lock, so
+    # nothing is normally open here; this releases a lock a throw left held.
+    # See Invoke-GuestAgent in modules/win/guest.ps1.
     Close-GuestAgentChannels
 }
 

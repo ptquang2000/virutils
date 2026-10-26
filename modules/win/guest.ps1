@@ -86,75 +86,180 @@ function Get-GuestAgentPort {
     )
 }
 
-# --- one channel for the whole run ------------------------------------------
+# --- one round trip per call, under a per-domain lock -----------------------
 #
-# **qemu's chardev does not go back to listening once a client has come and
-# gone.** Measured on this host: with a real qemu carrying exactly the arguments
-# domain create writes, a `pipe` chardev accepts one connection and refuses
-# every later one, and a `socket` chardev accepts two and then refuses. Neither
-# recovers with time.
+# The channel serves one host client at a time: qemu's socket chardev stops
+# accepting while a client is connected and listens with a backlog of 1, so a
+# second client's connect succeeds but sits unanswered until the first one
+# leaves. qemu-ga then answers in strict FIFO order on the one stream, so a
+# client that leaves early hands its unread replies to whoever connects next.
+# docs/qga-multi-client.md has the sources and the measurements.
 #
-# So a connection per command is wrong: `exec` polls guest-exec-status in a
-# loop, and the second poll would find the channel gone. One channel is opened
-# lazily, kept for the life of the run, and closed once at the end.
+# So every call is one round trip -- lock, connect, guest-sync-delimited, one
+# command, its reply, close, unlock -- and two virutil runs against one domain
+# interleave per command, the way libvirt's agent job makes them on the bash
+# driver. The channel used to be held for the whole run, on the belief that a
+# socket chardev "accepts two and then refuses". That was measured with no
+# guest behind the port, and it is true only then: with nothing in the guest
+# reading, qemu never reads the client's socket either, never sees its EOF,
+# and the accept slot stays taken. With an agent running, 50 connect/sync/close
+# cycles in a row all succeeded, about 35ms each, on isa-serial.
 #
-# **The probe was taken with no guest behind the port, and that is a real
-# confound** -- with nothing on the guest side the virtserialport is never
-# opened, and qemu's chardev may not run its ordinary disconnect handling at
-# all. Whether a *second* virutil run can reach the same guest is therefore
-# unknown, and it is the first thing to measure once a guest exists. Holding one
-# channel is the right shape either way, which is why it is not being waited on.
-$script:GuestAgentChannels = @{}
+# The guestless case is still why Test-GuestAgent, the one caller that waits
+# for an agent that may not be up yet, retries over one held connection rather
+# than reconnecting.
 
-# Get-GuestAgentChannel VM -- the run's channel to VM, opened on first use.
-# $null if it cannot be opened; the caller says what that means.
-function Get-GuestAgentChannel {
-    param([Parameter(Mandatory)][string]$Vm, [int]$TimeoutMs = 2000)
-    if ($script:GuestAgentChannels.ContainsKey($Vm)) {
-        return $script:GuestAgentChannels[$Vm]
+# The lock is a file beside the launcher, held open for writing with read
+# sharing only. A second opener gets a sharing violation, which is the wait;
+# the OS drops the handle when its process dies, however it dies, so a crashed
+# holder never leaves a stale lock behind -- only stale text, which the next
+# holder overwrites. Read sharing is what lets a waiter read who holds it.
+# A file rather than a named mutex because it is the same object to an
+# elevated and an unelevated process, which a Local\ mutex is not.
+$script:GuestAgentLocks = @{}
+
+# What a waiter is shown: set once by virutil.ps1 from its own arguments.
+$script:GuestAgentLockCommand = ''
+
+function Get-GuestAgentLockPath {
+    param([Parameter(Mandatory)][string]$Vm)
+    return (Join-Path $script:VirutilsImageDir "$Vm.agent.lock")
+}
+
+# How long a call waits for another run's round trip, in seconds. Generous: a
+# round trip is milliseconds, so a wait this long means the holder is stuck on a
+# reply that is not coming, or is Test-GuestAgent waiting for a guest to boot.
+function Get-GuestAgentLockWait {
+    $v = Get-VirutilsEnv 'AGENT_WAIT' '120'
+    $n = 0
+    if (-not [int]::TryParse($v, [ref]$n) -or $n -lt 0) {
+        Die "VIRUTILS_AGENT_WAIT must be a whole number of seconds, not '$v'"
     }
-    $pipe = Open-GuestAgent $Vm -TimeoutMs $TimeoutMs
-    if ($null -ne $pipe) { $script:GuestAgentChannels[$Vm] = $pipe }
-    return $pipe
+    return $n
+}
+
+# The holder's own line, or '' if it cannot be read. Never throws: it is only
+# ever said to a person.
+function Read-GuestAgentLockHolder {
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        try {
+            $r = New-Object IO.StreamReader($fs)
+            return $r.ReadToEnd().Trim()
+        } finally { $fs.Dispose() }
+    } catch { return '' }
+}
+
+# True if this exception is the sharing violation that means "held".
+function Test-GuestAgentLockBusy {
+    param($Exception)
+    $e = $Exception
+    while ($e -is [Management.Automation.MethodInvocationException] -and $e.InnerException) {
+        $e = $e.InnerException
+    }
+    if ($e -isnot [IO.IOException]) { return $false }
+    # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+    $code = $e.HResult -band 0xFFFF
+    return ($code -eq 32 -or $code -eq 33)
+}
+
+# Enter-GuestAgentLock VM -- hold VM's agent lock, waiting for another run's
+# round trip to end. Dies, naming the holder, once VIRUTILS_AGENT_WAIT runs out.
+# Re-entrant within a run, so a helper that holds it can call one that takes it.
+function Enter-GuestAgentLock {
+    param([Parameter(Mandatory)][string]$Vm)
+    if ($script:GuestAgentLocks.ContainsKey($Vm)) {
+        $script:GuestAgentLocks[$Vm].Depth++
+        return
+    }
+    $path = Get-GuestAgentLockPath $Vm
+    New-VirutilsDir (Split-Path -Parent $path) | Out-Null
+    $waitS = Get-GuestAgentLockWait
+    $started = Get-GuestAgentTick
+    $deadline = $started + [long]$waitS * 1000
+    $told = $null
+    while ($true) {
+        try {
+            $fs = [IO.File]::Open($path, 'OpenOrCreate', 'ReadWrite', 'Read')
+            break
+        } catch {
+            if (-not (Test-GuestAgentLockBusy $_.Exception)) { throw }
+        }
+        $holder = Read-GuestAgentLockHolder $path
+        if (-not $holder) { $holder = 'another virutil' }
+        if ((Get-GuestAgentTick) -ge $deadline) {
+            Die @(
+                "gave up after ${waitS}s waiting for $Vm's guest agent, which is"
+                "held by $holder."
+                'The agent serves one client at a time, and that run has held it'
+                'for longer than any one command takes. If it is stuck, ending it'
+                'frees the agent; VIRUTILS_AGENT_WAIT sets how long to wait.'
+            )
+        }
+        # Not at once: two runs taking turns wait on each other's round trips,
+        # tens of milliseconds each, all the time, and that is working rather
+        # than news. A wait that lasts is said, once per holder rather than once
+        # per poll, because a busy domain changes hands between other runs'
+        # commands.
+        if ((Get-GuestAgentTick) - $started -ge 2000 -and $holder -ne $told) {
+            Say "waiting for $Vm's guest agent: held by $holder"
+            $told = $holder
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    try {
+        $line = "virutil pid $PID"
+        if ($script:GuestAgentLockCommand) { $line += ", ``$($script:GuestAgentLockCommand)``" }
+        $line += ", since $([DateTime]::Now.ToString('HH:mm:ss'))"
+        $bytes = [Text.Encoding]::UTF8.GetBytes($line + "`n")
+        $fs.SetLength(0)
+        $fs.Write($bytes, 0, $bytes.Length)
+        $fs.Flush()
+    } catch {
+        # The text is for a waiter to read; the lock is the handle, and that
+        # is held whether or not the text made it.
+    }
+    $script:GuestAgentLocks[$Vm] = [pscustomobject]@{ Stream = $fs; Depth = 1 }
+}
+
+function Exit-GuestAgentLock {
+    param([Parameter(Mandatory)][string]$Vm)
+    if (-not $script:GuestAgentLocks.ContainsKey($Vm)) { return }
+    $l = $script:GuestAgentLocks[$Vm]
+    $l.Depth--
+    if ($l.Depth -gt 0) { return }
+    try { $l.Stream.Dispose() } catch { }
+    $script:GuestAgentLocks.Remove($Vm)
 }
 
 # Close-GuestAgentChannels -- called once by virutil.ps1 however the run ends.
-# The channel is one per qemu process rather than one per command, so leaving it
-# open past the run would be leaving it open for good.
+# Nothing stays open between calls any more, so this only releases a lock a
+# throw left held; the OS would release it at exit regardless.
 function Close-GuestAgentChannels {
-    foreach ($k in @($script:GuestAgentChannels.Keys)) {
-        try { $script:GuestAgentChannels[$k].Dispose() } catch { }
+    foreach ($k in @($script:GuestAgentLocks.Keys)) {
+        try { $script:GuestAgentLocks[$k].Stream.Dispose() } catch { }
     }
-    $script:GuestAgentChannels = @{}
+    $script:GuestAgentLocks = @{}
 }
 
-# Reset-GuestAgentChannel VM -- forget a channel that has gone bad, so a later
-# call opens a fresh one rather than writing into a dead stream. Whether that
-# fresh open can succeed is the unknown above.
-function Reset-GuestAgentChannel {
-    param([Parameter(Mandatory)][string]$Vm)
-    if ($script:GuestAgentChannels.ContainsKey($Vm)) {
-        try { $script:GuestAgentChannels[$Vm].Dispose() } catch { }
-        $script:GuestAgentChannels.Remove($Vm)
-    }
-}
-
-# Open-GuestAgent VM [-TimeoutMs N] -- a connected, synchronised channel, or
-# $null. The caller closes it.
+# --- the connection ---------------------------------------------------------
 #
-# The synchronise is not optional politeness. The channel survives the host
-# process that last used it, so a reply nobody read -- from a run that was
-# interrupted, or from a guest that answered late -- is still sitting in the
-# buffer, and the next command would read that stale reply as its own. The
-# documented fix is guest-sync-delimited: an 0xFF byte, which qemu-ga treats as
-# "discard what you were parsing", then a request carrying an id, and everything
-# before the answering 0xFF is thrown away.
-function Open-GuestAgent {
-    param([Parameter(Mandatory)][string]$Vm, [int]$TimeoutMs = 2000)
+# A channel is the TCP client, its stream, and the one read that may still be
+# outstanding on it. ReadAsync and Wait rather than a plain Read, and this is
+# the difference between a timeout and a hang: a synchronous Read for a byte the
+# guest is never going to send blocks forever and no deadline checked around it
+# is ever reached. A read whose wait expires is kept rather than abandoned:
+# a second ReadAsync on the same stream would race it, and the byte the first
+# one eventually took -- often the sync's 0xFF -- would be lost to the reader.
 
+# Connect-GuestAgent VM [-TimeoutMs N] -- a connected channel, or $null.
+function Connect-GuestAgent {
+    param([Parameter(Mandatory)][string]$Vm, [int]$TimeoutMs = 2000)
+    $port = Get-GuestAgentPort $Vm
     $tcp = New-Object Net.Sockets.TcpClient
     try {
-        if (-not $tcp.ConnectAsync('127.0.0.1', (Get-GuestAgentPort $Vm)).Wait($TimeoutMs)) {
+        if (-not $tcp.ConnectAsync('127.0.0.1', $port).Wait($TimeoutMs)) {
             $tcp.Close()
             return $null
         }
@@ -162,53 +267,36 @@ function Open-GuestAgent {
         $tcp.Close()
         return $null
     }
-    # The stream, not the client: everything below reads and writes a Stream,
-    # and NetworkStream honours the same ReadAsync the pipe did. Disposing it
-    # closes the socket with it.
-    $pipe = $tcp.GetStream()
-
-    $id = Get-Random -Minimum 1 -Maximum ([int]::MaxValue)
-    # The delimiter is a raw 0xFF byte and is prepended as one. Putting U+00FF
-    # in the string instead would encode as two bytes (0xC3 0xBF), which is not
-    # the byte qemu-ga looks for, and the sync would silently never happen.
-    $req = @([byte]0xFF) + [Text.Encoding]::UTF8.GetBytes(
-        "{""execute"":""guest-sync-delimited"",""arguments"":{""id"":$id}}`n")
-    try {
-        $pipe.Write($req, 0, $req.Length)
-        $pipe.Flush()
-        if (-not (Wait-GuestAgentDelimiter $pipe $TimeoutMs)) { $pipe.Dispose(); return $null }
-        $line = Read-GuestAgentLine $pipe $TimeoutMs
-        if ($null -eq $line) { $pipe.Dispose(); return $null }
-        # The id has to match, or this is still an older run's reply and the
-        # sync has not actually caught up.
-        $reply = $line | ConvertFrom-Json
-        if ($reply.return -ne $id) { $pipe.Dispose(); return $null }
-    } catch {
-        $pipe.Dispose()
-        return $null
+    return [pscustomobject]@{
+        Tcp = $tcp; Stream = $tcp.GetStream(); Buf = (New-Object byte[] 1); Pending = $null; Closed = $false
     }
-    return $pipe
 }
 
-# One byte, or $null if none arrived before DEADLINE.
-#
-# ReadAsync and Wait rather than a plain Read, and this is the difference
-# between a timeout and a hang: NamedPipeClientStream honours no ReadTimeout, so
-# a synchronous Read for a byte the guest is never going to send blocks forever
-# and no deadline checked around it is ever reached. The pipe is opened
-# Asynchronous for exactly this. A read left outstanding when the wait expires
-# is cancelled by the Dispose that every timeout path here leads to.
+function Close-GuestAgent {
+    param($Chan)
+    if ($null -eq $Chan) { return }
+    try { $Chan.Stream.Dispose() } catch { }
+    try { $Chan.Tcp.Close() } catch { }
+}
+
+# Send-GuestAgentBytes CHAN BYTES -- throws if the channel is gone.
+function Send-GuestAgentBytes {
+    param($Chan, [byte[]]$Bytes)
+    $Chan.Stream.Write($Bytes, 0, $Bytes.Length)
+    $Chan.Stream.Flush()
+}
+
 # A monotonic millisecond count that exists on both PowerShells.
 #
 # This was [Environment]::TickCount64, which is .NET Core only: the .NET
 # Framework that Windows PowerShell 5.1 runs on has no such property, and
 # reading a property that is not there throws under the
 # $ErrorActionPreference = 'Stop' that virutil.ps1 sets. Every caller below sits
-# inside Open-GuestAgent's catch, which turns any throw into a silent $null --
-# so on 5.1 the channel never opened and the failure was reported as "$Vm's
-# QEMU guest agent is not answering", pointing at a qemu-ga that was running
-# the whole time. Measured: virutil under pwsh 7 worked and the same command
-# under 5.1 did not, against the same guest, seconds apart.
+# inside a catch that turns any throw into a silent $null -- so on 5.1 the
+# channel never opened and the failure was reported as "$Vm's QEMU guest agent
+# is not answering", pointing at a qemu-ga that was running the whole time.
+# Measured: virutil under pwsh 7 worked and the same command under 5.1 did not,
+# against the same guest, seconds apart.
 #
 # A Stopwatch rather than [Environment]::TickCount, which is a 32-bit count
 # that wraps about every 49.7 days -- PowerShell widens it to Int64 before the
@@ -217,41 +305,91 @@ function Open-GuestAgent {
 $script:GuestAgentClock = [Diagnostics.Stopwatch]::StartNew()
 function Get-GuestAgentTick { return $script:GuestAgentClock.ElapsedMilliseconds }
 
+# One byte, or $null if none arrived before DEADLINE. Throws on a closed peer,
+# which is not a timeout and must not be retried as one.
 function Read-GuestAgentByte {
-    param($Pipe, [long]$Deadline)
+    param($Chan, [long]$Deadline)
     $remaining = $Deadline - (Get-GuestAgentTick)
     if ($remaining -le 0) { return $null }
-    $buf = New-Object byte[] 1
-    $task = $Pipe.ReadAsync($buf, 0, 1)
-    if (-not $task.Wait([int]$remaining)) { return $null }
-    if ($task.Result -eq 0) { return $null }
-    return $buf[0]
+    if ($null -eq $Chan.Pending) { $Chan.Pending = $Chan.Stream.ReadAsync($Chan.Buf, 0, 1) }
+    if (-not $Chan.Pending.Wait([int]$remaining)) { return $null }
+    $n = $Chan.Pending.Result
+    $Chan.Pending = $null
+    if ($n -eq 0) { $Chan.Closed = $true; throw 'the guest agent channel closed' }
+    return $Chan.Buf[0]
 }
 
-# Everything up to and including the 0xFF that answers a sync, discarded.
-function Wait-GuestAgentDelimiter {
-    param($Pipe, [int]$TimeoutMs)
-    $deadline = (Get-GuestAgentTick) + $TimeoutMs
-    while ($true) {
-        $b = Read-GuestAgentByte $Pipe $deadline
-        if ($null -eq $b) { return $false }
-        if ($b -eq 0xFF) { return $true }
-    }
-}
-
-# One newline-terminated JSON object, as a string, or $null on timeout. A byte
-# at a time because the reply is a line: a fixed-size read would either block
-# for bytes that are not coming or swallow the start of the next reply.
+# One newline-terminated line, as a string, or $null if DEADLINE passed first.
+# A byte at a time because the reply is a line: a fixed-size read would either
+# block for bytes that are not coming or swallow the start of the next reply.
+# With -StopAtDelimiter an 0xFF, the sync delimiter, comes back on its own as
+# [char]0xFF, ending whatever line it interrupted.
 function Read-GuestAgentLine {
-    param($Pipe, [int]$TimeoutMs)
-    $deadline = (Get-GuestAgentTick) + $TimeoutMs
+    param($Chan, [long]$Deadline, [switch]$StopAtDelimiter)
     $out = New-Object System.IO.MemoryStream
     while ($true) {
-        $b = Read-GuestAgentByte $Pipe $deadline
+        $b = Read-GuestAgentByte $Chan $Deadline
         if ($null -eq $b) { return $null }
+        if ($b -eq 0xFF -and $StopAtDelimiter) { return [char]0xFF }
         if ($b -eq 0x0A) { return [Text.Encoding]::UTF8.GetString($out.ToArray()) }
         $out.WriteByte($b)
     }
+}
+
+# Sync-GuestAgent CHAN TIMEOUTMS -- true once the stream is known to hold
+# nothing older than this call.
+#
+# The synchronise is not optional politeness. A reply nobody read -- from a run
+# that was interrupted, or from a guest that answered late -- is still on its
+# way down the stream, and the next command would read it as its own. The
+# documented fix is guest-sync-delimited: an 0xFF byte, which qemu-ga treats as
+# "discard what you were parsing", then a request carrying an id. Its answer
+# comes back behind an 0xFF of its own, and everything before the reply that
+# carries *this* id is stale -- including the answers to earlier syncs, which is
+# what a retry over a held channel finds: an id that does not match is skipped,
+# not taken as failure.
+function Sync-GuestAgent {
+    param($Chan, [int]$TimeoutMs = 2000)
+    $id = Get-Random -Minimum 1 -Maximum ([int]::MaxValue)
+    # The delimiter is a raw 0xFF byte and is prepended as one. Putting U+00FF
+    # in the string instead would encode as two bytes (0xC3 0xBF), which is not
+    # the byte qemu-ga looks for, and the sync would silently never happen.
+    $req = @([byte]0xFF) + [Text.Encoding]::UTF8.GetBytes(
+        "{""execute"":""guest-sync-delimited"",""arguments"":{""id"":$id}}`n")
+    try {
+        Send-GuestAgentBytes $Chan $req
+        $deadline = (Get-GuestAgentTick) + $TimeoutMs
+        $delimited = $false
+        while ($true) {
+            $line = Read-GuestAgentLine $Chan $deadline -StopAtDelimiter
+            if ($null -eq $line) { return $false }
+            if ($line -eq [string][char]0xFF) { $delimited = $true; continue }
+            if (-not $delimited) { continue }
+            $delimited = $false
+            try { $reply = $line | ConvertFrom-Json } catch { continue }
+            if ($reply.PSObject.Properties.Name -contains 'return' -and "$($reply.return)" -eq "$id") {
+                return $true
+            }
+        }
+    } catch {
+        # Not a timeout: the far end is gone, and the caller must not retry
+        # over this channel.
+        $Chan.Closed = $true
+        return $false
+    }
+}
+
+# Open-GuestAgent VM [-TimeoutMs N] -- a connected, synchronised channel, or
+# $null. The caller closes it, and holds the lock around it.
+function Open-GuestAgent {
+    param([Parameter(Mandatory)][string]$Vm, [int]$TimeoutMs = 2000)
+    $chan = Connect-GuestAgent $Vm -TimeoutMs $TimeoutMs
+    if ($null -eq $chan) { return $null }
+    if (-not (Sync-GuestAgent $chan $TimeoutMs)) {
+        Close-GuestAgent $chan
+        return $null
+    }
+    return $chan
 }
 
 # Invoke-GuestAgent VM COMMAND [ARGUMENTS] -- one round trip, the `return`
@@ -260,7 +398,14 @@ function Read-GuestAgentLine {
 #
 # TimeoutMs is the wait for *this* reply, not for the command: guest-exec
 # returns a pid immediately and it is guest-exec-status that is polled, so
-# nothing here ever waits out a long-running guest process.
+# nothing here ever waits out a long-running guest process. Nor does it count
+# the wait for the lock, which is VIRUTILS_AGENT_WAIT's.
+#
+# The request carries no "id", and that is measured rather than overlooked: the
+# qemu-ga a Windows XP guest runs (virtio-win's 7.6.2) refuses one -- "QMP input
+# object member 'id' is unexpected" -- and so fails every command. Nor does it
+# need one. Under the lock and behind a sync nothing else is on the stream, so
+# the next line is this command's answer; libvirt sends none either.
 function Invoke-GuestAgent {
     param(
         [Parameter(Mandatory)][string]$Vm,
@@ -269,72 +414,86 @@ function Invoke-GuestAgent {
         [int]$TimeoutMs = 10000
     )
 
-    $pipe = Get-GuestAgentChannel $Vm
-    if ($null -eq $pipe) {
-        Die @(
-            "$Vm's QEMU guest agent is not answering on 127.0.0.1:$(Get-GuestAgentPort $Vm)."
-            'The agent is what runs anything inside the guest, so nothing can'
-            'proceed without it. Check that the domain is running, and that'
-            'qemu-ga is running in the guest -- on a Windows guest that is the'
-            "'QEMU Guest Agent' service, installed by virtio-win-guest-tools."
-        )
-    }
-
-    # Not disposed here. The channel belongs to the run, not to this command --
-    # see Get-GuestAgentChannel for why closing it would be closing it for good.
+    Enter-GuestAgentLock $Vm
     try {
-        $req = @{ execute = $Command }
-        if ($null -ne $Arguments) { $req['arguments'] = $Arguments }
-        $json = ($req | ConvertTo-Json -Depth 10 -Compress) + "`n"
-        $bytes = [Text.Encoding]::UTF8.GetBytes($json)
-        $pipe.Write($bytes, 0, $bytes.Length)
-        $pipe.Flush()
-    } catch {
-        Reset-GuestAgentChannel $Vm
-        Die "$Vm's guest agent channel dropped while sending $Command`: $($_.Exception.Message)"
+        # The sync gets the call's own patience, not a short one: after a call
+        # that gave up, the agent may still be working on that call's command,
+        # and the sync's answer queues behind it.
+        $chan = Open-GuestAgent $Vm -TimeoutMs $TimeoutMs
+        if ($null -eq $chan) {
+            Die @(
+                "$Vm's QEMU guest agent is not answering on 127.0.0.1:$(Get-GuestAgentPort $Vm)."
+                'The agent is what runs anything inside the guest, so nothing can'
+                'proceed without it. Check that the domain is running, and that'
+                'qemu-ga is running in the guest -- on a Windows guest that is the'
+                "'QEMU Guest Agent' service, installed by virtio-win-guest-tools."
+            )
+        }
+        try {
+            $req = [ordered]@{ execute = $Command }
+            if ($null -ne $Arguments) { $req['arguments'] = $Arguments }
+            $json = ($req | ConvertTo-Json -Depth 10 -Compress) + "`n"
+            try {
+                Send-GuestAgentBytes $chan ([Text.Encoding]::UTF8.GetBytes($json))
+            } catch {
+                Die "$Vm's guest agent channel dropped while sending $Command`: $($_.Exception.Message)"
+            }
+
+            $line = $null
+            try { $line = Read-GuestAgentLine $chan ((Get-GuestAgentTick) + $TimeoutMs) } catch {
+                Die "$Vm's guest agent channel dropped while waiting for $Command"
+            }
+            if ($null -eq $line) {
+                Die "$Vm's guest agent did not answer $Command within $($TimeoutMs)ms"
+            }
+            $reply = $line | ConvertFrom-Json
+            $names = $reply.PSObject.Properties.Name
+        } finally {
+            Close-GuestAgent $chan
+        }
+    } finally {
+        Exit-GuestAgentLock $Vm
     }
 
-    $line = Read-GuestAgentLine $pipe $TimeoutMs
-    if ($null -eq $line) {
-        Reset-GuestAgentChannel $Vm
-        Die "$Vm's guest agent did not answer $Command within $($TimeoutMs)ms"
-    }
-    $reply = $line | ConvertFrom-Json
-    if ($reply.PSObject.Properties.Name -contains 'error') {
+    if ($names -contains 'error') {
         Die "$Vm's guest agent refused $Command`: $($reply.error.desc)"
     }
     # A command with nothing to return -- guest-ping -- answers {"return": {}},
     # so an absent member is a protocol surprise rather than an empty result.
-    if ($reply.PSObject.Properties.Name -notcontains 'return') {
+    if ($names -notcontains 'return') {
         Die "$Vm's guest agent answered $Command with neither a result nor an error"
     }
     return $reply.return
 }
 
 # Test-GuestAgent VM [SECONDS] -- true once the agent answers, waiting up to
-# SECONDS for it. guest-ping, not the channel state: the pipe connects with
-# nothing listening behind it.
+# SECONDS for it. A sync, not the connection: the port accepts with nothing
+# listening behind it in the guest.
 #
-# The retry is over the *held* channel rather than over fresh connections. A
-# connect-per-attempt loop would spend the one connection qemu's chardev grants
-# on the first attempt and then have nothing left to retry with -- which is
-# exactly the failure Get-GuestAgentChannel exists to avoid, and it would be
-# hidden here behind what looks like patience.
+# The retry is over one *held* connection rather than over fresh ones, and the
+# lock is held for the whole wait. With no agent reading the port, qemu never
+# notices a client that has gone, so every connect-and-drop would use up the one
+# accept slot until the agent starts -- the "accepts two and then refuses" that
+# was measured before there was a guest. Only a refused or dropped connection is
+# replaced.
 function Test-GuestAgent {
     param([Parameter(Mandatory)][string]$Vm, [int]$Seconds = 0)
-    for ($i = 0; ; $i++) {
-        $pipe = Get-GuestAgentChannel $Vm -TimeoutMs 500
-        if ($null -ne $pipe) {
-            try {
-                $bytes = [Text.Encoding]::UTF8.GetBytes("{""execute"":""guest-ping""}`n")
-                $pipe.Write($bytes, 0, $bytes.Length); $pipe.Flush()
-                if ($null -ne (Read-GuestAgentLine $pipe 2000)) { return $true }
-            } catch {
-                Reset-GuestAgentChannel $Vm
+    Enter-GuestAgentLock $Vm
+    $chan = $null
+    try {
+        $deadline = (Get-GuestAgentTick) + [long]$Seconds * 1000
+        while ($true) {
+            if ($null -eq $chan) { $chan = Connect-GuestAgent $Vm -TimeoutMs 500 }
+            if ($null -ne $chan) {
+                if (Sync-GuestAgent $chan 2000) { return $true }
+                if ($chan.Closed) { Close-GuestAgent $chan; $chan = $null }
             }
+            if ((Get-GuestAgentTick) -ge $deadline) { return $false }
+            Start-Sleep -Seconds 1
         }
-        if ($i -ge $Seconds) { return $false }
-        Start-Sleep -Seconds 1
+    } finally {
+        Close-GuestAgent $chan
+        Exit-GuestAgentLock $Vm
     }
 }
 

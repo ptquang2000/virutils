@@ -58,8 +58,8 @@ exec_usage() {
     exit "${1:-1}"
 }
 
-# agent JSON -> stdout lives in modules/mac/guest, on the channel exec_main
-# opens before the first call.
+# agent JSON -> stdout lives in modules/mac/guest: one locked round trip per
+# call, to the domain exec_main named with agent_need.
 
 # flags -> DETACH, remainder -> E_REST
 parse_flags() {

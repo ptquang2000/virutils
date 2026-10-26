@@ -10,43 +10,136 @@
 #   -device  virtio-serial-pci
 #   -device  virtserialport,chardev=qga0,name=org.qemu.guest_agent.0
 #
-# -- through the one socket channel in modules/mac/qemu. It is held for the rest
-# of the run once opened, because exec polls guest-exec-status over it in a
-# loop and the Windows host measured qemu's chardev refusing a client after it
-# had already served one or two.
+# -- through the one socket channel in modules/mac/qemu.
+#
+# The socket serves one host client at a time, and qemu-ga answers in FIFO
+# order on the one stream, so a client that leaves early hands its unread
+# replies to whoever connects next (docs/qga-multi-client.md). So every call is
+# one round trip under a per-domain lock -- lock, connect, guest-sync-delimited,
+# one command, its reply, close, unlock -- and two virutil runs against one
+# domain interleave per command, as libvirt's agent job makes them on the bash
+# driver. It is modules/win/guest.ps1's design; the reasons are written there.
 
 AGENT_VM=""
 
-# agent_open VM [SECS] -- a connected, synchronised channel to VM's qemu-ga,
-# held for the rest of the run. 1 if the agent does not answer within SECS.
+# --- the lock ------------------------------------------------------------------
 #
-# The synchronise is not politeness. The channel outlives the virutil that last
-# used it, so a reply nobody read -- an interrupted run, a guest that answered
-# late -- is still in the buffer, and the next command would read it as its
-# own. guest-sync-delimited is the documented fix: a raw 0xFF, which qemu-ga
-# takes as "discard what you were parsing", then a request carrying an id; the
-# answer comes back behind a 0xFF of its own, and everything before that is
-# stale. LC_ALL=C (set in virutil) is what makes $'\xff' one byte rather than a
-# character, both in the write and as read's delimiter.
-agent_open() {
-    local vm="$1" secs="${2:-3}" id
-    [[ "$AGENT_VM" == "$vm" && -n "$CHAN_PID" ]] && return 0
-    chan_open "$(domain_qga "$vm")" || return 1
+# <VM>.agent.lock beside the launcher, flock'd. macOS has no flock(1), so the
+# lock is taken by a perl child on an fd this shell holds: a flock belongs to the
+# open file description, not to the process that asked for it, so it outlives
+# the child and is dropped when this shell closes the fd -- or dies, however it
+# dies. A crashed holder leaves stale text in the file and no lock.
+
+# What a waiter is shown: the module and its first operands, never a script's
+# text. Taken at source time, when "$@" is still virutil's own arguments.
+AGENT_LOCK_COMMAND="${*:1:3}"
+(( ${#AGENT_LOCK_COMMAND} <= 60 )) || AGENT_LOCK_COMMAND="${AGENT_LOCK_COMMAND:0:60}..."
+
+AGENT_LOCK_FD="" AGENT_LOCK_VM="" AGENT_LOCK_DEPTH=0
+
+# agent_lock VM -- hold VM's agent lock, waiting out another run's round trip.
+# Dies, naming the holder, once VIRUTILS_AGENT_WAIT seconds (default 120) pass.
+# Re-entrant, so a helper that holds it can call one that takes it.
+agent_lock() {
+    local vm="$1" f waits deadline holder told="" rc polls=0
+    if [[ -n "$AGENT_LOCK_FD" && "$AGENT_LOCK_VM" == "$vm" ]]; then
+        AGENT_LOCK_DEPTH=$(( AGENT_LOCK_DEPTH + 1 ))
+        return 0
+    fi
+    command -v perl >/dev/null \
+        || die "perl not found: the guest agent lock is taken with perl's flock"
+    virutils_env AGENT_WAIT 120; waits="$VIRUTILS_ENV"
+    [[ "$waits" =~ ^[0-9]+$ ]] \
+        || die "VIRUTILS_AGENT_WAIT must be a whole number of seconds, not '$waits'"
+    f="$(domain_agent_lock "$vm")"
+    mkdir -p -- "${f%/*}"
+    # Append, not truncate: opening is not holding, and the holder's line is
+    # what a waiter reads.
+    exec {AGENT_LOCK_FD}>>"$f"
+    deadline=$(( SECONDS + waits ))
+    while :; do
+        rc=0
+        perl -MFcntl=:flock -e \
+            'open(my $f, ">&=", $ARGV[0]) or exit 2; exit(flock($f, LOCK_EX | LOCK_NB) ? 0 : 1)' \
+            "$AGENT_LOCK_FD" || rc=$?
+        (( rc == 0 )) && break
+        if (( rc != 1 )); then
+            exec {AGENT_LOCK_FD}>&-; AGENT_LOCK_FD=""
+            die "could not lock $f"
+        fi
+        holder="$(head -n 1 -- "$f" 2>/dev/null || true)"
+        [[ -n "$holder" ]] || holder="another virutil"
+        if (( SECONDS >= deadline )); then
+            exec {AGENT_LOCK_FD}>&-; AGENT_LOCK_FD=""
+            die "gave up after ${waits}s waiting for $vm's guest agent, which is" \
+                "held by $holder." \
+                "The agent serves one client at a time, and that run has held it" \
+                "for longer than any one command takes. If it is stuck, ending it" \
+                "frees the agent; VIRUTILS_AGENT_WAIT sets how long to wait."
+        fi
+        # Not at once: two runs taking turns wait on each other's round trips,
+        # tens of milliseconds each, all the time, and that is working rather
+        # than news. A wait that lasts (20 polls, 2s) is said, once per holder
+        # rather than once per poll, because a busy domain changes hands
+        # between other runs' commands.
+        polls=$(( polls + 1 ))
+        if (( polls >= 20 )) && [[ "$holder" != "$told" ]]; then
+            say "waiting for $vm's guest agent: held by $holder"
+            told="$holder"
+        fi
+        sleep 0.1
+    done
+    local line="virutil pid $$"
+    [[ -z "$AGENT_LOCK_COMMAND" ]] || line+=", \`$AGENT_LOCK_COMMAND\`"
+    printf '%s, since %s\n' "$line" "$(date +%H:%M:%S)" > "$f" 2>/dev/null || true
+    AGENT_LOCK_VM="$vm" AGENT_LOCK_DEPTH=1
+}
+
+agent_unlock() {
+    [[ -n "$AGENT_LOCK_FD" ]] || return 0
+    AGENT_LOCK_DEPTH=$(( AGENT_LOCK_DEPTH - 1 ))
+    if (( AGENT_LOCK_DEPTH > 0 )); then return 0; fi
+    exec {AGENT_LOCK_FD}>&-
+    AGENT_LOCK_FD="" AGENT_LOCK_VM="" AGENT_LOCK_DEPTH=0
+}
+
+# --- the round trip --------------------------------------------------------------
+
+# agent_sync SECS -- true once the open channel is known to hold nothing older
+# than this call.
+#
+# The synchronise is not politeness. A reply nobody read -- an interrupted run,
+# a guest that answered late -- is still on its way down the stream, and the
+# next command would read it as its own. guest-sync-delimited is the documented
+# fix: a raw 0xFF, which qemu-ga takes as "discard what you were parsing", then
+# a request carrying an id; the answer comes back behind a 0xFF of its own, and
+# everything before the reply that carries *this* id is stale -- including the
+# answers to earlier syncs, which a retry over a held channel finds. LC_ALL=C
+# (set in virutil) is what makes $'\xff' one byte rather than a character, both
+# in the write and as read's delimiter.
+agent_sync() {
+    local secs="$1" id
     id=$(( (RANDOM << 15 | RANDOM) + 1 ))
     chan_send $'\xff'"{\"execute\":\"guest-sync-delimited\",\"arguments\":{\"id\":$id}}" \
-        || { chan_close; return 1; }
-    IFS= read -r -d $'\xff' -t "$secs" -u "$CHAN_IN" _ || { chan_close; return 1; }
-    chan_line "$secs" || { chan_close; return 1; }
-    # The id has to match, or this is still an older run's reply and the sync
-    # has not caught up.
-    [[ "$(jq -r '.return // empty' <<<"$CHAN_LINE" 2>/dev/null)" == "$id" ]] \
-        || { chan_close; return 1; }
+        || return 1
+    while :; do
+        IFS= read -r -d $'\xff' -t "$secs" -u "$CHAN_IN" _ || return 1
+        chan_line "$secs" || return 1
+        [[ "$(jq -r '.return // empty' <<<"$CHAN_LINE" 2>/dev/null)" == "$id" ]] && return 0
+    done
+}
+
+# agent_open VM [SECS] -- a connected, synchronised channel to VM's qemu-ga, or
+# 1 if the agent does not answer within SECS. The caller holds the lock, and
+# closes the channel when its one command is done.
+agent_open() {
+    local vm="$1" secs="${2:-3}"
+    chan_open "$(domain_qga "$vm")" || return 1
+    agent_sync "$secs" || { chan_close; return 1; }
     AGENT_VM="$vm"
 }
 
-# agent_need VM -- agent_open, or die saying why nothing can run in the guest.
-agent_need() {
-    agent_open "$1" && return 0
+agent_dead() {
     domain_running "$1" || die "$1 is not running"
     die "$1's QEMU guest agent is not answering on" \
         "  $(domain_qga "$1")" \
@@ -56,18 +149,45 @@ agent_need() {
         "README.md, 'A Windows guest on a macOS host'."
 }
 
-# agent JSON [SECS] -- one round trip on the held channel; the whole reply on
-# stdout, as modules/linux/exec's agent() prints virsh's. Dies on an agent-level
-# error rather than handing a caller JSON with no "return" in it.
+# agent_need VM -- VM becomes the domain agent() talks to, or die saying why
+# nothing can run in the guest. One round trip of its own, so a dead agent is
+# reported as one before the command is built.
+AGENT_TARGET=""
+agent_need() {
+    agent_lock "$1"
+    agent_open "$1" || agent_dead "$1"
+    chan_close
+    agent_unlock
+    AGENT_TARGET="$1"
+}
+
+# agent JSON [SECS] [VM] -- one round trip; the whole reply on stdout, as
+# modules/linux/exec's agent() prints virsh's. VM defaults to agent_need's.
+# Dies on an agent-level error rather than handing a caller JSON with no
+# "return" in it.
 #
 # SECS is the wait for this reply, not for the command: guest-exec answers with
 # a pid at once and it is guest-exec-status that is polled, so nothing here
-# waits out a long-running guest process.
+# waits out a long-running guest process. Nor does it count the wait for the
+# lock, which is VIRUTILS_AGENT_WAIT's.
+#
+# The request carries no "id", and that is measured rather than overlooked: an
+# older qemu-ga (virtio-win's 7.6.2) refuses one -- "QMP input object member
+# 'id' is unexpected" -- and so fails every command. Nor does it need one.
+# Under the lock and behind a sync nothing else is on the stream, so the next
+# line is this command's answer; libvirt sends none either.
 agent() {
-    local secs="${2:-10}" what
+    local secs="${2:-10}" vm="${3:-$AGENT_TARGET}" what
+    [[ -n "$vm" ]] || die "agent: no domain to talk to"
     what="$(jq -r '.execute' <<<"$1")"
+    agent_lock "$vm"
+    # The sync gets the call's own patience: after a call that gave up, the
+    # agent may still be working on its command, and the sync queues behind it.
+    agent_open "$vm" "$secs" || agent_dead "$vm"
     chan_send "$1" || { chan_close; die "the guest agent channel dropped before $what"; }
     chan_line "$secs" || { chan_close; die "the guest agent did not answer $what within ${secs}s"; }
+    chan_close
+    agent_unlock
     if [[ "$CHAN_LINE" == *'"error"'* ]]; then
         printf '%s\n' "$CHAN_LINE" >&2
         exit 1
@@ -76,14 +196,27 @@ agent() {
 }
 
 # guest_agent_wait VM [SECS] -- true once the agent answers, retrying for up to
-# SECS. guest-sync, not the socket: the socket accepts with nothing listening
-# behind it in the guest.
+# SECS. A sync, not the socket: the socket accepts with nothing listening behind
+# it in the guest.
+#
+# The retry is over one *held* connection, under the lock for the whole wait.
+# With no agent reading the port, qemu never reads a client's socket either, so
+# never sees it go, and every connect-and-drop would use up the one accept slot
+# until the agent starts. Only a channel whose nc has gone is replaced.
 guest_agent_wait() {
     local vm="$1" secs="${2:-0}" i
+    agent_lock "$vm"
     for (( i = 0; ; i++ )); do
-        agent_open "$vm" 1 && return 0
-        (( i >= secs )) && return 1
-        sleep 1
+        if [[ -z "$CHAN_PID" ]] || ! kill -0 "$CHAN_PID" 2>/dev/null; then
+            chan_open "$(domain_qga "$vm")" || true
+        fi
+        if [[ -n "$CHAN_PID" ]] && agent_sync 1; then
+            chan_close; agent_unlock; return 0
+        fi
+        if (( i >= secs )); then chan_close; agent_unlock; return 1; fi
+        # Without the lock's fd, as nc has (modules/mac/qemu chan_open): a
+        # sleep left behind by a killed run would hold the lock until it ends.
+        sleep 1 {AGENT_LOCK_FD}>&-
     done
 }
 
@@ -97,9 +230,9 @@ GUEST_OS_DEFAULT=windows
 
 guest_os() {
     local vm="$1" id=""
-    if agent_open "$vm" 2; then
-        id="$(agent '{"execute":"guest-get-osinfo"}' 2>/dev/null | jq -r '.return.id // empty' || true)"
-    fi
+    # agent dies when there is no agent; in the substitution that is only the
+    # subshell, and an empty id.
+    id="$(agent '{"execute":"guest-get-osinfo"}' 3 "$vm" 2>/dev/null | jq -r '.return.id // empty' || true)"
     case "$id" in
         mswindows|windows) printf windows ;;
         "")

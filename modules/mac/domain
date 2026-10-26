@@ -543,14 +543,17 @@ domain_shutdown() {
     domain_need "$VM" || die "usage: virutil domain shutdown VM"
     domain_running "$VM" || die "$VM is not running"
 
+    agent_lock "$VM"
     if agent_open "$VM" 2; then
         # guest-shutdown sends no reply on success: the agent is on its way
         # down with the guest. So it is sent and not waited on.
         chan_send '{"execute":"guest-shutdown","arguments":{"mode":"powerdown"}}' || true
         chan_close
+        agent_unlock
         say "$VM is being shut down (guest agent)"
         return 0
     fi
+    agent_unlock
     qmp_need "$VM"
     qmp system_powerdown >/dev/null
     qmp_close
@@ -674,7 +677,8 @@ domain_delete() {
     # every snapshot with them; the TPM directory holds the state the
     # disk-only ones saved beside it.
     for f in "$(domain_disk "$VM")" "$(domain_nvram "$VM")" "$(domain_log "$VM")" \
-             "$(domain_pidfile "$VM")" "$(domain_qmp "$VM")" "$(domain_qga "$VM")"; do
+             "$(domain_pidfile "$VM")" "$(domain_qmp "$VM")" "$(domain_qga "$VM")" \
+             "$(domain_agent_lock "$VM")"; do
         [[ -e "$f" || -S "$f" ]] || continue
         rm -f -- "$f" && say "removed $f"
     done
