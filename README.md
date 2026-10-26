@@ -57,6 +57,7 @@ utilities it calls.
    - [list, shutdown, addr](#list-shutdown-addr)
    - [port](#port)
    - [On a macOS host](#on-a-macos-host)
+- [virutil shot](#virutil-shot)
 - [virutil usb](#virutil-usb)
    - [USB passthrough under WSL, with usbipd](#usb-passthrough-under-wsl-with-usbipd)
 - [Requirements](#requirements)
@@ -180,7 +181,7 @@ the warning simply never fires.
 
 ## Modules
 
-The seven modules fall into four groups, which is also the order
+The modules fall into four groups, which is also the order
 `virutil help` prints them in. The three transfer modules additionally share the
 host-side machinery in `modules/linux/xfer` and `modules/linux/guest`, which is
 [how the bytes move](#how-files-move).
@@ -211,6 +212,7 @@ way.
 | Module | Purpose | Usage |
 | --- | --- | --- |
 | `exec` | Run commands inside a guest through the QEMU guest agent, with no guest networking required. `cmd` and `ps` address a Windows guest, `sh` a Linux one. | `virutil exec {ping\|cmd\|ps\|sh} VM [FLAGS] [ARGS]` |
+| `shot` | Capture a **running** guest's screen to a PNG on the host, from the hypervisor: nothing runs in the guest. Every host. See [virutil shot](#virutil-shot). | `virutil shot VM [-o FILE]` |
 
 ### hardware
 
@@ -1890,6 +1892,41 @@ What differs from the other hosts, and why:
 See [A Windows guest on a macOS host](#a-windows-guest-on-a-macos-host) for
 what to do inside Setup.
 
+## virutil shot
+
+Capture a running domain's screen to a PNG on this host. The command prints the
+file's path on stdout and the frame size on stderr.
+
+```
+virutil shot VM [-o FILE]
+```
+
+```sh
+$ virutil shot win11 -o before.png
+win11: 1280x800
+/home/me/before.png
+```
+
+Without `-o`, the file is `VM-YYYYMMDD-HHMMSS.png` in the current directory.
+If FILE already exists, it is replaced, and only once the capture has worked. A
+failed shot leaves the old file alone.
+
+The frame comes from the hypervisor, not from the guest. Nothing runs in the
+guest and no input is sent, so `shot` works on a guest with no agent, a guest
+still in firmware or Setup, and a guest that has hung. Each host gets the frame
+its own way:
+
+| host | how | format |
+| --- | --- | --- |
+| Linux | `virsh screenshot` | whatever libvirt returns; a PPM is converted to PNG with `python3` |
+| Windows | `screendump -f png` over the QEMU monitor | PNG from qemu; a qemu without libpng gets PPM, converted here |
+| macOS | QMP `screendump`, format `png` | PNG from qemu |
+
+**This is the domain's console, not an RDP session.** `shot` captures the
+emulated display: what the domain's own window or virt-viewer shows. That is
+the console session, or the logon screen when no one is signed in there. An RDP
+connection is a separate session with its own desktop, and it never shows up
+in a shot.
 ## virutil usb
 
 Pass a physical USB device from the host through to a guest. Both drivers have
@@ -2072,6 +2109,8 @@ Host, for `virutil domain`:
 - `swtpm`, optional: without it the guest gets no TPM 2.0 device, which a
    **stock** Windows 11 ISO refuses to install without. Debloated images have the
    check removed.
+- `python3`, for `virutil shot` only, and only when libvirt hands back a PPM
+   rather than a PNG
 - `acl`, optional: an install ISO under a `0700` home directory is unreachable
    by the qemu user, and `virutil domain create` prints the `setfacl` that fixes
    it

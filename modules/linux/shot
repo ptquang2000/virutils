@@ -1,0 +1,124 @@
+# shot -- capture a running domain's screen to a PNG on this host.
+#
+# The counterpart of modules/win/shot.ps1 and modules/mac/shot. All three ask
+# the hypervisor for the frame rather than the guest: here it is `virsh
+# screenshot`, which has libvirt take qemu's screendump and stream it back to
+# the caller. Nothing is staged in the guest and no input is sent, so a shot
+# works on a guest with no agent, one still in firmware or Setup, and one that
+# has hung.
+#
+# virsh rather than a screendump over `qemu-monitor-command`: qemu would write
+# that file itself, as the qemu user and under the domain's security label, so
+# it could not write into the caller's directory. virsh hands the bytes back
+# through libvirt instead.
+#
+# **What it captures is qemu's console, not a remote desktop.** The frame is the
+# emulated display's, what virt-viewer shows: the physical console session, or
+# the logon screen when nobody is on it. An RDP session is a separate desktop.
+#
+# libvirt answers in whatever format qemu gave it -- PNG where libvirt and qemu
+# both support it, PPM otherwise -- so the bytes are sniffed rather than the
+# MIME line parsed, and a PPM is converted (shot_ppm_to_png).
+
+shot_usage() {
+    printf '%s\n' \
+        "usage: virutil shot VM [-o FILE]" \
+        "" \
+        "Capture VM's screen to a PNG on this host and print its path." \
+        "" \
+        "  -o, --output FILE  where to write it (default: VM-YYYYMMDD-HHMMSS.png" \
+        "                     in the current directory). An existing FILE is" \
+        "                     replaced. It is PNG whatever its extension." \
+        "  -h, --help         this message" \
+        "" \
+        "The frame is the domain's emulated display, through virsh screenshot:" \
+        "what virt-viewer shows, firmware and logon screen included. An RDP" \
+        "session is a separate desktop and is not in it. Nothing runs in the" \
+        "guest and no input is sent, so the guest needs no agent." >&2
+    exit "${1:-1}"
+}
+
+# shot_ppm_to_png PPM PNG -- qemu's binary PPM (P6, maxval 255) to PNG, with
+# python3's zlib: the one encoder a host with libvirt is all but certain to have.
+shot_ppm_to_png() {
+    command -v python3 >/dev/null ||
+        die "libvirt returned a PPM and converting it to PNG needs python3, which is not on PATH"
+    python3 - "$1" "$2" <<'PY' || die "could not convert the screendump to PNG"
+import struct, sys, zlib
+data = open(sys.argv[1], 'rb').read()
+fields, pos = [], 0
+while len(fields) < 4:
+    while data[pos:pos + 1].isspace():
+        pos += 1
+    if data[pos:pos + 1] == b'#':
+        pos = data.index(b'\n', pos)
+        continue
+    start = pos
+    while pos < len(data) and not data[pos:pos + 1].isspace():
+        pos += 1
+    fields.append(data[start:pos])
+pos += 1
+if fields[0] != b'P6' or fields[3] != b'255':
+    sys.exit('unexpected screendump format')
+w, h = int(fields[1]), int(fields[2])
+rows = b''.join(b'\0' + data[pos + y * w * 3:pos + (y + 1) * w * 3] for y in range(h))
+def chunk(kind, body):
+    return struct.pack('>I', len(body)) + kind + body + struct.pack('>I', zlib.crc32(kind + body))
+with open(sys.argv[2], 'wb') as f:
+    f.write(b'\x89PNG\r\n\x1a\n')
+    f.write(chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)))
+    f.write(chunk(b'IDAT', zlib.compress(rows, 6)))
+    f.write(chunk(b'IEND', b''))
+PY
+}
+
+# shot_png_size PNG -- "WxH" from the IHDR chunk, big-endian at 16 and 20.
+shot_png_size() {
+    od -An -tu1 -j16 -N8 -- "$1" |
+        awk '{ printf "%dx%d", (($1*256+$2)*256+$3)*256+$4, (($5*256+$6)*256+$7)*256+$8 }'
+}
+
+shot_main() {
+    local VM="" OUT="" raw png magic state
+    while (( $# )); do
+        case "$1" in
+            -h|--help)   shot_usage 0 ;;
+            -o|--output) [[ $# -ge 2 ]] || die "virutil shot: $1 needs a value"
+                         OUT="$2"; shift ;;
+            -*)          die "virutil shot: unknown flag: $1 (see: virutil shot -h)" ;;
+            *)           [[ -z "$VM" ]] || shot_usage 1
+                         VM="$1" ;;
+        esac
+        shift
+    done
+    [[ -n "$VM" ]] || shot_usage 1
+
+    state="$("${VIRSH[@]}" domstate "$VM" 2>/dev/null | head -1)" ||
+        die "no such VM: $VM (see: virsh -c qemu:///system list --all)"
+    [[ "$state" == running ]] || die "$VM is not running: there is no display to capture"
+
+    OUT="${OUT:-$VM-$(date +%Y%m%d-%H%M%S).png}"
+    [[ "$OUT" == /* ]] || OUT="$PWD/$OUT"
+    [[ -d "$(dirname -- "$OUT")" ]] || die "virutil shot: no such directory: $(dirname -- "$OUT")"
+
+    # Written under <root>/tmp and moved into place after, so a failed capture
+    # never truncates a file -o already names.
+    mkdir -p -- "$VIRUTILS_TMP_DIR"
+    raw="$(mktemp "$VIRUTILS_TMP_DIR/shot-XXXXXX")"
+    png="$raw.png"
+    # shellcheck disable=SC2064 # expanded now, on purpose
+    trap "rm -f -- '$raw' '$png'" EXIT
+
+    "${VIRSH[@]}" screenshot "$VM" --file "$raw" >/dev/null ||
+        die "virsh could not take a screenshot of $VM"
+    magic="$(od -An -tx1 -N8 -- "$raw" | tr -d ' \n')"
+    case "$magic" in
+        89504e470d0a1a0a) mv -f -- "$raw" "$png" ;;
+        5036*)            shot_ppm_to_png "$raw" "$png" ;;
+        *)                die "virsh returned an image in a format this does not read (magic $magic)" ;;
+    esac
+    mv -f -- "$png" "$OUT"
+
+    say "$VM: $(shot_png_size "$OUT")"
+    printf '%s\n' "$OUT"
+}

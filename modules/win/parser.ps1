@@ -49,7 +49,10 @@ $ErrorActionPreference = 'Stop'
 # scheduled task that lets push, pull and sync elevate without a UAC prompt.
 # A Linux host's transport has no elevation to arrange. modules/win/xfer.ps1
 # carries it beside the transport it serves.
-$script:MODULES = @('domain', 'exec', 'pull', 'push', 'sync', 'ui', 'usb', 'xfer')
+#
+# `shot` is on every driver from the start: it asks the hypervisor for a frame
+# (`screendump` on the monitor here) and needs nothing from the guest.
+$script:MODULES = @('domain', 'exec', 'pull', 'push', 'shot', 'sync', 'ui', 'usb', 'xfer')
 
 # Names the bash driver answers to that this one does not, and why. A name here
 # is refused with its own reason instead of "unknown module", because each is in
@@ -134,6 +137,7 @@ function Get-TopUsage {
         '  exec       run commands inside a guest via the QEMU guest agent'
         '  ui         launch a process on a Windows guest''s interactive desktop,'
         '             as the logged-on user or SYSTEM'
+        '  shot       capture a guest''s screen to a PNG on this host'
         ''
         'hardware'
         '  usb        pass a host USB device through to a guest'

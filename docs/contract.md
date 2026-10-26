@@ -66,6 +66,8 @@ virutil exec {ping|cmd|ps|sh} VM [-d] [--] [CMD...|-]
 
 virutil ui  run VM [-i N] [-s] [--elevated] [--] APP...
 
+virutil shot VM [-o FILE]
+
 virutil usb {list|show|attach|detach} [VM] [VENDOR:PRODUCT]
 
 virutil xfer {setup|remove|status}       # Windows host only
@@ -92,7 +94,7 @@ what a command line means should not have to find them somewhere else -- but a
 script using them is a script for one host. `snapshot` is marked the same way
 for the same reason, the other way round: it was on both drivers and was taken
 out of the Windows one (section 7). Everything else above is on the Linux and
-Windows drivers; the macOS driver carries `domain`, `snapshot` and `exec` so far
+Windows drivers; the macOS driver carries `domain`, `snapshot`, `exec` and `shot` so far
 and refuses the rest by name (section 7). Section 9 says what each flag *does*
 where the drivers cannot agree.
 
@@ -138,6 +140,9 @@ Invariants that are contract, not implementation:
   host is refused by name with that reason, never silently.
 - `exec` runs as SYSTEM (Windows) / root (Linux) and the guest's exit code
   becomes virutil's.
+- `shot` requires the domain **running**, takes the frame from the hypervisor
+  with nothing run in the guest, and always writes PNG. The frame is the
+  emulated console's; an RDP session is a separate desktop and is never in it.
 - The disk is always `<image dir>/VM.qcow2`.
 
 ## 3. State layout
@@ -361,7 +366,7 @@ an intention.
 
 Not every module ports. What the Windows driver ships today is:
 
-`domain`, `exec`, `push`, `pull`, `sync`, `ui` and `usb`. That is the whole
+`domain`, `exec`, `push`, `pull`, `shot`, `sync`, `ui` and `usb`. That is the whole
 intended surface; `snapshot` is bash-only now. All of them are below. A module
 that works beats two half-ported.
 
@@ -409,8 +414,8 @@ qemu on PATH -- and `domain create` warns, by name, when it is about to write a
 launcher around stock qemu. With the patch, Windows Setup is on screen 30
 seconds after `domain create`.
 
-**What ships: `domain`, `snapshot` and `exec`.** That is enough to build,
-run, script and roll back a guest. `exec` is `modules/linux/exec` with the
+**What ships: `domain`, `snapshot`, `exec` and `shot`.** That is enough to build,
+run, script and roll back a guest, and to see its screen. `exec` is `modules/linux/exec` with the
 agent reached over the socket and base64 spelled for BSD; `domain` and
 `snapshot` are new code over QMP and `qemu-img`.
 
@@ -627,6 +632,34 @@ records the PsExec reading this came from. `ui setup`, which used to deliver
 PsExec over `push`, is retired: it exits 0 and says so, and exit 97 is no
 longer raised.
 
+### `shot`: on every host, from the hypervisor
+
+`shot` asks the hypervisor for the frame and never the guest, so it needs no
+agent and no payload. It works the same on a guest in firmware, in Setup, or
+hung. Each host takes the frame its own way:
+
+| | mechanism | format qemu writes |
+| --- | --- | --- |
+| Linux | `virsh screenshot`, which streams the bytes back through libvirt | PNG or PPM, as libvirt and qemu agree; a PPM is converted with `python3` |
+| Windows | `screendump "FILE" -f png` on the human monitor | PNG; a qemu without libpng refuses the format by name and gets `-f ppm`, converted with System.Drawing |
+| macOS | QMP `screendump` with `"format": "png"` | PNG; both qemus that driver runs are built with libpng |
+
+On Linux the frame goes through virsh rather than through
+`qemu-monitor-command`. With the monitor command, qemu writes the file itself,
+as the qemu user and under the domain's security label, and so cannot write
+into the caller's directory. On the Windows and macOS hosts qemu runs as the
+caller, so it can write the file directly.
+
+On every host the frame is written under `<root>/tmp` and moved onto `-o` only
+after it has been read back as an image. A failed shot therefore never
+truncates an existing file.
+
+Measured on the Windows host (qemu v11.1.0-12130): `-f png` gives a PNG
+directly. A q35 paused with `-S` and no disk gives a 640x480 frame, and that
+paused qemu is what tests/win/shot.ps1 runs against. Against a live win11
+(WHPX, `-vga std`), one capture wrote a 1280x800 PNG of the console desktop
+in 7s end to end, pwsh start included, and nothing in the guest was touched.
+The macOS module has run only with QMP stubbed, never yet on a Mac.
 ### The transfer layer, and what is measured about it
 
 `sync`, `push` and `pull` all deliver the same way: **the host serves a tree and
@@ -880,6 +913,7 @@ drivers:
 | `tests/mac/domain.sh` | the macOS driver against a real hvf domain with no OS: create's files, start, port forwards live and in the launcher, every snapshot verb with the domain running and shut off, the launcher edits, delete. Driven from the runner on a Mac; skips anywhere else. |
 | `tests/win/xfer.ps1` | `push` and `pull` on a Windows host with both seams substituted -- the guest agent and the share publisher -- so the guest path rules, credential generation, the free-space refusal, the sweep's liveness decision, the rendered payload and the teardown all run with no VM and no Administrator. Under the publisher, its own three seams (the task lookup, the task start, the UAC start) are substituted instead, so the choice between task and prompt, the request the helper is handed and the helper pid read back from the status file are asserted too; and the real helper is run unelevated against the requests it must refuse. Nothing registers a task or elevates. |
 | `tests/win/sync.ps1` | `sync` on a Windows host, over the same two seams, with a real staging tree and a real delivery tree built on the host: what each config directive parses to, that the two a Windows host cannot honour are refused **before anything is fetched**, the layout the map rules build, the payload the guest would have been sent, and that a failed delivery tears down as completely as a successful one. |
+| `tests/win/shot.ps1`, `tests/linux/shot.sh` | `shot`'s grammar, its refusals, and the PPM fallback with pixels checked, behind a substituted monitor (Windows) or `virsh` (Linux). The Windows half also captures from a real paused qemu with no disk and no guest, and skips that part where no qemu is installed. |
 | `tests/win/transfer.ps1` | the guest tier: the transfer minimum below, plus the property that a completed transfer and a killed one both leave no account, no share and no staged tree. |
 
 On a Mac the bash half runs `modules/mac` -- the module list is read from

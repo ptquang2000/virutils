@@ -6,7 +6,7 @@
 # launchers in the image directory rather than libvirt.
 #
 # This completes the *bash* driver, so it offers every module in $MODULES:
-# domain, snapshot, sync, pull, push, exec, ui, usb. The Windows driver carries
+# domain, snapshot, sync, pull, push, exec, ui, shot, usb. The Windows driver carries
 # domain, snapshot, exec and usb, and its completer says so; usb and snapshot
 # are on both, spelled the same way on each -- though a snapshot there is
 # disk-only and needs the domain shut off (docs/contract.md section 9).
@@ -27,6 +27,7 @@ _virutil() {
   guest=(
     'exec:run commands inside a guest via the QEMU guest agent'
     'ui:launch a process on a Windows guest interactive desktop'
+    'shot:capture a guest screen to a PNG on this host'
   )
   hardware=(
     'usb:pass a host USB device through to a guest'
@@ -39,7 +40,7 @@ _virutil() {
     # modules/mac/parser's MODULES; the rest are refused by name there.
     domains[2]='snapshot:qcow2 snapshots (disk and memory) for a domain'
     transfer=()
-    guest=(${guest[1]})
+    guest=(${guest[1]} ${guest[3]})
     hardware=()
   fi
 
@@ -60,6 +61,7 @@ _virutil() {
     push)     _virutil_push ;;
     exec)     _virutil_exec ;;
     ui)       _virutil_ui ;;
+    shot)     _virutil_shot ;;
     usb)      _virutil_usb ;;
   esac
 }
@@ -165,6 +167,16 @@ _virutil_ui() {
     3) _describe -t command 'command' cmds ;;
     4) _virutil_domains ;;
   esac
+}
+
+# shot VM [-o FILE]: FILE is the PNG to write on this host.
+_virutil_shot() {
+  local state line
+  _arguments \
+    '(-o --output)'{-o,--output}'[the PNG to write]:file:_files' \
+    '(-h --help)'{-h,--help}'[print usage and exit]' \
+    '2:domain:->domain'
+  [[ $state == domain ]] && _virutil_domains
 }
 
 _virutil_sync() {

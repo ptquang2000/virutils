@@ -1,0 +1,82 @@
+# shot -- capture a running domain's screen to a PNG on this host.
+#
+# The counterpart of modules/win/shot.ps1 and modules/linux/shot. All three ask
+# the hypervisor for the frame rather than the guest: here it is QMP's
+# `screendump` with format png, which qemu answers by writing the file itself --
+# it runs as the invoking user, so it can. Nothing is staged in the guest and no
+# input is sent, so a shot works on a guest with no agent, one still in firmware
+# or Setup, and one that has hung.
+#
+# PNG only, with no PPM fallback: both qemus this driver runs have libpng, the
+# one install.sh builds (--enable-png) and Homebrew's. A qemu without it refuses
+# the format by name, and qmp() passes that refusal on.
+#
+# **What it captures is qemu's console, not a remote desktop.** The frame is the
+# ramfb display's, what the domain's window shows: the physical console
+# session, or the logon screen when nobody is on it. An RDP session is a
+# separate desktop and is not in it.
+
+shot_usage() {
+    printf '%s\n' \
+        "usage: virutil shot VM [-o FILE]" \
+        "" \
+        "Capture VM's screen to a PNG on this host and print its path." \
+        "" \
+        "  -o, --output FILE  where to write it (default: VM-YYYYMMDD-HHMMSS.png" \
+        "                     in the current directory). An existing FILE is" \
+        "                     replaced. It is PNG whatever its extension." \
+        "  -h, --help         this message" \
+        "" \
+        "The frame is the domain's emulated display, taken over QMP: what its" \
+        "window shows, firmware and logon screen included. An RDP session is a" \
+        "separate desktop and is not in it. Nothing runs in the guest and no" \
+        "input is sent, so the guest needs no agent." >&2
+    exit "${1:-1}"
+}
+
+# shot_png_size PNG -- "WxH" from the IHDR chunk, big-endian at 16 and 20.
+shot_png_size() {
+    od -An -tu1 -j16 -N8 -- "$1" |
+        awk '{ printf "%dx%d", (($1*256+$2)*256+$3)*256+$4, (($5*256+$6)*256+$7)*256+$8 }'
+}
+
+shot_main() {
+    local VM="" OUT="" png magic
+    while (( $# )); do
+        case "$1" in
+            -h|--help)   shot_usage 0 ;;
+            -o|--output) [[ $# -ge 2 ]] || die "virutil shot: $1 needs a value"
+                         OUT="$2"; shift ;;
+            -*)          die "virutil shot: unknown flag: $1 (see: virutil shot -h)" ;;
+            *)           [[ -z "$VM" ]] || shot_usage 1
+                         VM="$1" ;;
+        esac
+        shift
+    done
+    domain_need "$VM" || shot_usage 1
+    domain_running "$VM" || die "$VM is not running: there is no display to capture"
+
+    OUT="${OUT:-$VM-$(date +%Y%m%d-%H%M%S).png}"
+    [[ "$OUT" == /* ]] || OUT="$PWD/$OUT"
+    [[ -d "$(dirname -- "$OUT")" ]] || die "virutil shot: no such directory: $(dirname -- "$OUT")"
+
+    # Written under <root>/tmp and moved into place after, so a failed capture
+    # never truncates a file -o already names. The trap keeps modules/mac/qemu's
+    # chan_close, which it would otherwise replace.
+    mkdir -p -- "$VIRUTILS_TMP_DIR"
+    png="$(mktemp "$VIRUTILS_TMP_DIR/shot-XXXXXX")"
+    # shellcheck disable=SC2064 # expanded now, on purpose
+    trap "chan_close; rm -f -- '$png'" EXIT
+
+    qmp_need "$VM"
+    qmp screendump "$(jq -cn --arg f "$png" '{filename: $f, format: "png"}')" >/dev/null
+    qmp_close
+
+    magic="$(od -An -tx1 -N8 -- "$png" | tr -d ' \n')"
+    [[ "$magic" == 89504e470d0a1a0a ]] ||
+        die "$VM's qemu answered the screendump but wrote no PNG"
+    mv -f -- "$png" "$OUT"
+
+    say "$VM: $(shot_png_size "$OUT")"
+    printf '%s\n' "$OUT"
+}

@@ -10,11 +10,11 @@
   install.ps1 adds that line for you.
 
   This completes the *Windows* driver, so it offers domain, exec, push, pull,
-  sync, ui, usb and xfer and nothing else. snapshot is in the bash tree only,
-  and offering a name this driver would reject is worse than offering nothing --
-  $MODULES in modules\win\parser.ps1 is the list to keep this in step with.
-  usb and ui are on both drivers, spelled the same way on each; xfer is on
-  this one alone.
+  shot, sync, ui, usb and xfer and nothing else. snapshot is in the bash tree
+  only, and offering a name this driver would reject is worse than offering
+  nothing -- $MODULES in modules\win\parser.ps1 is the list to keep this in step
+  with. usb and ui are on the Linux driver too and shot is on all three,
+  spelled the same way on each; xfer is on this one alone.
 
   Everything lives inside the scriptblock rather than in functions beside it:
   a completer dot-sourced into a profile should leave nothing behind in the
@@ -52,7 +52,7 @@ $completer = {
     # Get-FlagValues' problem, and that one does look at the verb.
     $valueFlags = @(
         '-s', '--size', '-m', '--memory', '-c', '--vcpus', '-o', '--osinfo',
-        '-v', '--virtio', '-p', '--port', '--close', '--config'
+        '-v', '--virtio', '-p', '--port', '--close', '--config', '--output'
     )
 
     # Flags do not consume a slot, so the positional index counts only the
@@ -190,6 +190,7 @@ $completer = {
         sync     = "deliver a project's build output into a running guest"
         ui       = 'launch a process on a Windows guest''s interactive desktop'
         usb      = 'pass a host USB device through to a guest'
+        shot     = "capture a guest's screen to a PNG on this host"
         xfer     = 'set up the scheduled task that lets transfers elevate without a prompt'
         help     = 'the module list'
     }
@@ -267,6 +268,10 @@ $completer = {
             Add-Match '--system' 'as SYSTEM on that session''s desktop'
             Add-Match '--elevated' 'the user''s full admin token, when UAC split it'
         }
+        elseif ($module -eq 'shot') {
+            Add-Match '-o' 'the PNG to write (default VM-YYYYMMDD-HHMMSS.png here)'
+            Add-Match '--output' 'the PNG to write (default VM-YYYYMMDD-HHMMSS.png here)'
+        }
         elseif ($module -eq 'sync') {
             Add-Match '-c' 'config to use (default sync.conf)'
             Add-Match '--config' 'config to use (default sync.conf)'
@@ -303,7 +308,8 @@ $completer = {
     if ($prev -in $valueFlags) {
         # -v/--virtio is the one that wants the fallback, so it is the one that
         # leaves $hint null.
-        $hint = if ($prev -in @('-v', '--virtio')) { $null }
+        # So does shot's -o, whose value is the host file to write.
+        $hint = if ($prev -in @('-v', '--virtio') -or $module -eq 'shot') { $null }
                 elseif ($module -eq 'domain' -and $verb -eq 'port') { "$($positional[2]) has no forwards open" }
                 elseif ($module -eq 'sync') { "no config in $confDir starts with '$wordToComplete'" }
                 else { "$prev takes a value, and it is not a path" }
@@ -331,7 +337,7 @@ $completer = {
                     foreach ($n in 1, 2, 4, 6, 8, 12, 16) { Add-Match "$n" 'vcpus' }
                 }
             }
-            { $_ -in @('-o', '--osinfo') } {
+            { $_ -in @('-o', '--osinfo') -and $module -ne 'shot' } {
                 Add-Match 'win11' 'accepted and ignored here: there is no libosinfo on this host'
             }
             { $_ -in @('-p', '--port') } {
@@ -365,10 +371,10 @@ $completer = {
         }
         1 {
             $hint = "$module has no verb starting with '$wordToComplete'"
-            # push, pull and sync have no verb: VM is the first word after
-            # the module, so this position wants a domain rather than a
+            # push, pull, shot and sync have no verb: VM is the first word
+            # after the module, so this position wants a domain rather than a
             # subcommand.
-            if ($module -in @('push', 'pull', 'sync')) {
+            if ($module -in @('push', 'pull', 'shot', 'sync')) {
                 $hint = $noDomain
                 foreach ($d in $domains) { Add-Match $d 'domain' }
             }
@@ -429,6 +435,9 @@ $completer = {
             # rest of the interface, and it arrives through -c.
             elseif ($module -eq 'sync') {
                 $hint = 'sync takes only a domain; everything else is in the config (-c)'
+            }
+            elseif ($module -eq 'shot') {
+                $hint = 'shot takes only a domain; the file it writes is -o'
             }
         }
         3 {

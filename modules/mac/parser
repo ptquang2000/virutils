@@ -2,7 +2,7 @@
 # host's counterpart of modules/linux/parser: same bash, same helpers, a
 # different module list.
 
-MODULES=(domain snapshot exec)
+MODULES=(domain snapshot exec shot)
 
 # The commands in docs/contract.md section 2 that this driver does not have yet,
 # each with the reason. They are refused by name rather than falling through to
@@ -35,6 +35,7 @@ domains
 
 guest
   exec       run commands inside a guest via the QEMU guest agent
+  shot       capture a guest's screen to a PNG on this host
 
 Not on this host yet: sync, push, pull, ui, usb. Each is refused by name,
 with the reason; see docs/contract.md section 7.

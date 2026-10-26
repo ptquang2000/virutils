@@ -1,6 +1,6 @@
 # parser -- top-level dispatch plus the helpers every module shares
 
-MODULES=(domain snapshot sync pull push exec ui usb)
+MODULES=(domain snapshot sync pull push exec ui shot usb)
 
 die()  { printf '%s\n' "$@" >&2; exit 1; }
 warn() { printf '%s\n' "$@" >&2; }
@@ -29,6 +29,7 @@ guest
   exec       run commands inside a guest via the QEMU guest agent
   ui         launch a process on a Windows guest's interactive desktop, as
              the logged-on user or SYSTEM
+  shot       capture a guest's screen to a PNG on this host
 
 hardware
   usb        pass a host USB device through to a guest: list, show, attach, detach
