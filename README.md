@@ -2048,8 +2048,14 @@ right-click opened the desktop menu at the cursor. `key win+r`, `type notepad`
 and `key enter` opened Notepad. `type` then entered every shifted and unshifted
 punctuation character, the digits, a newline and a tab correctly. A `drag` of
 the title bar moved the window by exactly 200,200, and `ctrl+a` and `alt+f4`
-did what they should. A Windows 11 guest, and so the UIPI point above, has not
-been measured yet.
+did what they should.
+
+Against win11 (Windows 11 22H2 under WHPX, 1280x800, In-Session's UI on the
+console desktop), `click` on the History tabs landed with the cursor's tip on
+the requested pixel and switched the tab, both ways. That UI runs at medium
+integrity (`elevationType` default, integrity 0x2000, read from its token), the
+same as explorer. So it was an ordinary window, and **the UIPI point above,
+reaching an elevated window, is still unmeasured.**
 
 ## virutil usb
 

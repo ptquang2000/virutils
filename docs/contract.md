@@ -728,9 +728,11 @@ codes that were sent. Against winxp's disk booted read-only (`-snapshot`) in a
 throwaway qemu at 1024x768, `move` put the cursor's tip on the requested pixel
 at 0,0, 300,200, 517,383 and 1023,767. A right-click menu, a `drag` of a
 window by 200,200, `key win+r`, `ctrl+a` and `alt+f4`, and `type` of every
-ASCII punctuation character all did what they should. A Windows 11 guest, and
-with it the UIPI claim, is not measured yet. The macOS module has run only with
-QMP stubbed (tests/mac/input.sh).
+ASCII punctuation character all did what they should. Against win11 (Windows
+11 22H2, WHPX, 1280x800), a `click` on an In-Session tab put the cursor's tip
+on the requested pixel and switched the tab. That window's process runs at
+medium integrity, not elevated, so the UIPI claim is still unmeasured. The
+macOS module has run only with QMP stubbed (tests/mac/input.sh).
 
 ### The transfer layer, and what is measured about it
 
