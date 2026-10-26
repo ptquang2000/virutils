@@ -204,7 +204,7 @@ sync_run() {
         mode="${entry%%$'\t'*}"
         cmd="${entry#*$'\t'}"
         if [[ "$mode" == ui ]]; then
-            # ui rules cross Session 0 Isolation with PsExec, which is a Windows
+            # ui rules cross Session 0 Isolation onto a Windows desktop, a Windows
             # notion; a Linux guest has no equivalent, so refuse rather than run
             # the command in the guest shell as if the tag were not there.
             [[ "$GUEST_OS" == windows ]] \
@@ -316,8 +316,8 @@ sync_main() {
                  [[ -n "$cmd" ]] \
                      || die "$CONF:$lineno: run rule has no command: $line"
                  # Each rule is stored tagged with how it runs -- "sh" in the
-                 # guest shell as SYSTEM, or "ui" on the interactive desktop via
-                 # PsExec -- so sync_run can dispatch while keeping pre/post
+                 # guest shell as SYSTEM, or "ui" on the interactive desktop as
+                 # its user -- so sync_run can dispatch while keeping pre/post
                  # order intact. The tab never appears in a hand-written command.
                  case "$when" in
                      pre)     RUN_PRE+=("sh"$'\t'"$cmd") ;;
@@ -327,7 +327,7 @@ sync_main() {
                      *) die "$CONF:$lineno: run rule needs 'pre', 'post', 'pre-ui' or 'post-ui': $line" \
                             "  >pre  COMMAND      before the files reach the guest (guest shell, as SYSTEM)" \
                             "  >post COMMAND      after they have" \
-                            "  >pre-ui  COMMAND   same timing, launched on the interactive desktop (Windows guest, PsExec)" \
+                            "  >pre-ui  COMMAND   same timing, launched on the interactive desktop (Windows guest, as its user)" \
                             "  >post-ui COMMAND   likewise -- e.g. relaunch a GUI app the sync replaced" ;;
                  esac ;;
             \<*) [[ "$line" == *"|"* ]] \

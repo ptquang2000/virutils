@@ -26,7 +26,7 @@ _virutil() {
   )
   guest=(
     'exec:run commands inside a guest via the QEMU guest agent'
-    'ui:deliver PsExec into a Windows guest, then launch on its desktop'
+    'ui:launch a process on a Windows guest interactive desktop'
   )
   hardware=(
     'usb:pass a host USB device through to a guest'
@@ -149,12 +149,17 @@ _virutil_exec() {
 _virutil_ui() {
   local -a cmds=(
     'setup:cache PsExec on the host and deliver it into the guest'
-    'run:launch an app on the guest interactive desktop (PsExec -i)'
+    'run:launch an app on a guest session desktop, as its user'
   )
   if [[ $words[CURRENT] == -* ]]; then
     case $words[3] in
       setup) _values 'option' \
                '(-f --force)'{-f,--force}'[re-download even if the host cache holds it]' \
+               '-h[this message]' '--help[this message]' ;;
+      run)   _values 'option' \
+               '(-i --session)'{-i,--session}'[that session instead of the console one]' \
+               '(-s --system)'{-s,--system}'[as SYSTEM on that session desktop]' \
+               '--elevated[the user full admin token, when UAC split it]' \
                '-h[this message]' '--help[this message]' ;;
       *)     _virutil_help_flag ;;
     esac

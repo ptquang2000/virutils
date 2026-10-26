@@ -63,3 +63,6 @@ Section 'sync.sh'               (Invoke-Payload 'sync.sh'       @{ SRC = "$url/"
 Section 'probe.sh'              (Invoke-Payload 'probe.sh')
 Section 'mount.ps1'             (Invoke-Payload 'mount.ps1'   @{ UNC = $munc; USER = $muser; PASS = $mpass })
 Section 'unmount.ps1'           (Invoke-Payload 'unmount.ps1' @{ UNC = $munc })
+Section 'ui.ps1 argv'           (Invoke-Payload 'ui.ps1' @{ SESSION = '2'; AS = 'user'; ELEVATE = '1'; ARGV = (@('C:\Program Files\App\app.exe', "it's", '--flag') -join [char]0x1F); CMDLINE = '' })
+Section 'ui.ps1 cmdline'        (Invoke-Payload 'ui.ps1' @{ SESSION = ''; AS = 'user'; ELEVATE = ''; ARGV = ''; CMDLINE = '"C:\Program Files\App\app.exe" --restored' })
+Section 'ui.ps1 system'         (Invoke-Payload 'ui.ps1' @{ SESSION = ''; AS = 'system'; ELEVATE = ''; ARGV = 'notepad.exe'; CMDLINE = '' })

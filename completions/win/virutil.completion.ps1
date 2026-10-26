@@ -1,4 +1,4 @@
-﻿<#
+<#
   PowerShell completion for virutil -- mirrors the dispatch in
   modules\win\parser.ps1, the way completions\linux\_virutil mirrors
   modules/linux/parser.
@@ -188,7 +188,7 @@ $completer = {
         push     = 'copy a file or directory from this host into a guest'
         pull     = 'copy files out of a guest onto this host'
         sync     = "deliver a project's build output into a running guest"
-        ui       = 'launch a process on a Windows guest''s interactive desktop (PsExec)'
+        ui       = 'launch a process on a Windows guest''s interactive desktop'
         usb      = 'pass a host USB device through to a guest'
         xfer     = 'set up the scheduled task that lets transfers elevate without a prompt'
         help     = 'the module list'
@@ -207,7 +207,7 @@ $completer = {
 
     $uiVerbs = [ordered]@{
         setup = 'cache PsExec on this host and deliver it into a guest'
-        run   = 'launch a guest program on the interactive desktop'
+        run   = 'launch a guest program on a session''s interactive desktop, as its user'
     }
 
     $xferVerbs = [ordered]@{
@@ -260,6 +260,13 @@ $completer = {
         elseif ($module -eq 'domain' -and $verb -eq 'port') {
             Add-Match '-c' 'close the forward on host PORT'
             Add-Match '--close' 'close the forward on host PORT'
+        }
+        elseif ($module -eq 'ui' -and $verb -eq 'run') {
+            Add-Match '-i' 'that session instead of the console one'
+            Add-Match '--session' 'that session instead of the console one'
+            Add-Match '-s' 'as SYSTEM on that session''s desktop'
+            Add-Match '--system' 'as SYSTEM on that session''s desktop'
+            Add-Match '--elevated' 'the user''s full admin token, when UAC split it'
         }
         elseif ($module -eq 'ui' -and $verb -eq 'setup') {
             Add-Match '-f' 're-download PsExec even if the host cache holds it'
@@ -460,7 +467,7 @@ $completer = {
             # `ui run VM APP` is a full path inside the guest -- nothing on this
             # side can enumerate it -- and `ui setup VM` takes nothing more.
             elseif ($module -eq 'ui' -and $verb -eq 'run') {
-                $hint = 'the program to launch: a full path inside the guest, then its arguments'
+                $hint = 'the program to launch: a guest path or a name on its PATH, then its arguments'
             }
             elseif ($module -eq 'ui' -and $verb -eq 'setup') {
                 $hint = 'ui setup takes only a domain (and -f)'

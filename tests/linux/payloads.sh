@@ -62,3 +62,6 @@ section 'sync.sh'               ; sync_lin_fetch
 section 'probe.sh'              ; payload_render probe.sh; echo
 section 'mount.ps1'             ; payload_render mount.ps1 UNC="$XFER_MOUNT_UNC" USER="$XFER_MOUNT_USER" PASS="$XFER_MOUNT_PASS"; echo
 section 'unmount.ps1'           ; payload_render unmount.ps1 UNC="$XFER_MOUNT_UNC"; echo
+section 'ui.ps1 argv'           ; ui_run win11 -i 2 --elevated 'C:\Program Files\App\app.exe' "it's" --flag
+section 'ui.ps1 cmdline'        ; ui_run_cmdline win11 '"C:\Program Files\App\app.exe" --restored'
+section 'ui.ps1 system'         ; ui_run win11 -s notepad.exe

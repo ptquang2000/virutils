@@ -261,6 +261,7 @@ match on:
 | 93 | robocopy failed, exit >= 8 (push, sync) |
 | 94 | SRC matched nothing in the guest (pull) |
 | 95 | robocopy failed, exit >= 8 (pull) |
+| 96 | no user is logged on in the target session (ui run, sync's ui rules) |
 | 97 | PsExec is not present in the guest (ui) |
 | 98 | the elevation prompt was declined (Windows host, push/pull/sync, when `virutil xfer setup` has not run) |
 | 99 | the host could not publish the share (Windows host, push/pull/sync) |
@@ -301,12 +302,14 @@ payloads/win/sync.ps1        Windows guest  robocopy the whole share onto C:\
 payloads/linux/sync.sh       Linux guest    rsync the whole export onto /
 payloads/win/mount.ps1       Windows guest  authenticate to a credentialled share
 payloads/win/unmount.ps1     Windows guest  let go of it again
+payloads/win/ui.ps1          Windows guest  start a process on a session's desktop
 ```
 
 Nine of them rather than the five this section first guessed at, because push
 needs two shapes on each side: robocopy cannot rename onto a new name, so a
 single file goes through Copy-Item, and the rsync side is split to match rather
-than to differ. The last two came later and are a different kind of thing.
+than to differ. The mount pair came later and is a different kind of thing;
+`ui.ps1` came last, when `ui` stopped wrapping PsExec.
 
 **The mount pair is keyed on the host, and it is the only pair that is.** Every
 other payload is keyed on the guest, because what a guest can run is the guest's
@@ -612,11 +615,15 @@ That asymmetry is now moot rather than vacuously satisfied.
 
 ### `ui`: ported, on `push`
 
-`ui` (PsExec) was always going to port: it is Windows-*guest*-only, but
-host-portable. Its guest half is one powershell script -- resolve the console
-session, start PsExec `-i <session> -d` -- which both drivers send
-statement for statement, and its delivery is `push`, which means smbd on a
-Linux host and `New-SmbShare` on a Windows one. On the Windows host `ui setup
+`ui` was always going to port: it is Windows-*guest*-only, but host-portable.
+Its guest half is `payloads/win/ui.ps1`, which both drivers render byte for
+byte: PsExec's service recipe for `-i`, done in place from the SYSTEM shell
+qemu-ga already provides -- a primary token stamped with the session
+(`WTSQueryUserToken` for the logged-on user, or its own SYSTEM token with
+`TokenSessionId` set for `-s`), `TokenLinkedToken` for `--elevated`, an
+environment block, and `CreateProcessAsUser` onto `winsta0\default`. `run`
+needs nothing in the guest. `setup` still stages PsExec, and its delivery is
+`push`, which means smbd on a Linux host and `New-SmbShare` on a Windows one. On the Windows host `ui setup
 VM` therefore carries `push`'s cost: Administrator (one prompt, or none after
 `virutil xfer setup`) and a throwaway account, once per guest. The host-side download is `Invoke-WebRequest` plus
 .NET's `ZipFile` rather than curl-or-wget and unzip-or-bsdtar; both are on

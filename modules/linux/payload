@@ -34,6 +34,7 @@ payload_raw_value() {
         RC_PUSH_ROBO)    printf '%s' "$PUSH_RC_ROBO" ;;
         RC_PULL_NOMATCH) printf '%s' "$PULL_RC_NOMATCH" ;;
         RC_PULL_ROBO)    printf '%s' "$PULL_RC_ROBO" ;;
+        RC_UI_NO_USER)   printf '%s' "$UI_RC_NO_USER" ;;
         *)               return 1 ;;
     esac
 }

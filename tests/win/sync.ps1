@@ -19,7 +19,7 @@
     * the one thing this host cannot do -- @guest=linux -- is refused
       **before anything is fetched**, which is a property of ordering and not
       of the message;
-    * the >pre-ui / >post-ui run rules, once refused here too, go to PsExec
+    * the >pre-ui / >post-ui run rules, once refused here too, go to the native launcher
       through modules/win/ui.ps1 exactly as the bash module sends them;
     * the map rules build a tree whose layout is the guest's own root, which is
       the whole reason the guest side is one robocopy.
@@ -87,8 +87,8 @@ function Invoke-GuestAgent {
             $last  = $script:Sent[$script:Sent.Count - 1]
             $isDelivery = $last -match '\$dst = "C:\\"'
             # $UiRc is the same idea for a ui run rule's launch script, so the
-            # missing-PsExec answer can be given to that script and no other.
-            $isUi = $last -match 'PsExec\.exe'
+            # no-user answer can be given to that script and no other.
+            $isUi = $last -match 'WTSQueryUserToken'
             $rc  = if ($isDelivery) { $script:GuestRc } elseif ($isUi) { $script:UiRc } else { 0 }
             $out = if ($isDelivery) { $script:GuestOut } else { 'ok' }
             return ([pscustomobject]@{
@@ -273,27 +273,28 @@ try {
     #
     # Refused here once, because this driver had no `ui`. Now it runs, and what
     # is asserted is what reaches the guest: the rule's command line, verbatim
-    # and single-quoted, after PsExec's own -i <console session> -d.
+    # and single-quoted, into the native launcher, as the console user.
 
     $uiConf = WriteConf 'ui.conf' ($base + @('>post-ui "C:\Program Files\Example\app.exe" --restored'))
     $script:Published = 0
     $out = Capture { Sync-Main @('win11', '-c', $uiConf) }
     CheckTrue 'a ui run rule runs, and says so' ($out -match [regex]::Escape('run (post/ui): "C:\Program Files\Example\app.exe" --restored'))
-    $launch = @($script:Sent | Where-Object { $_ -match 'PsExec\.exe' })
+    $launch = @($script:Sent | Where-Object { $_ -match 'WTSQueryUserToken' })
     Check     'the launch script was sent once' 1 $launch.Count
-    CheckTrue 'it launches on the console session' `
-        ($launch[0] -match [regex]::Escape("'-accepteula -i ' + `$sid + ' -d ' + "))
+    CheckTrue 'it launches on the console session, as its user' `
+        ($launch[0] -match [regex]::Escape("`$session = ''") -and $launch[0] -match [regex]::Escape("`$as = 'user'"))
+    CheckTrue 'and never through PsExec' ($launch[0] -notmatch 'PsExec')
     CheckTrue 'it carries the rule as a raw command line' `
-        ($launch[0] -match [regex]::Escape("'`"C:\Program Files\Example\app.exe`" --restored'"))
+        ($launch[0] -match [regex]::Escape("`$cmdline = '`"C:\Program Files\Example\app.exe`" --restored'"))
     CheckTrue 'and the run still completes' ($out -match 'copy complete -> win11')
 
-    # PsExec not staged yet: the fix is named, with contract section 5's code.
-    $script:UiRc = 97
+    # No one logged on: the fix is named, with contract section 5's code.
+    $script:UiRc = 96
     $code = 0
     try { Capture { Sync-Main @('win11', '-c', $uiConf) } | Out-Null }
     catch { $why = $_.Exception.Message; $code = [int]$_.Exception.Data['VirutilCode'] }
-    CheckTrue 'a missing PsExec names the fix' ($why -match 'virutil ui setup win11')
-    Check     'and exits 97' 97 $code
+    CheckTrue 'no logged-on user names the fix' ($why -match 'log a user on')
+    Check     'and exits 96' 96 $code
     $script:UiRc = 0
 
     # --- a whole run --------------------------------------------------------

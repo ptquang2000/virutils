@@ -54,6 +54,7 @@ $script:PayloadCodes = @{
     RC_PUSH_ROBO    = 93
     RC_PULL_NOMATCH = 94
     RC_PULL_ROBO    = 95
+    RC_UI_NO_USER   = 96
 }
 
 # Get-PayloadText PATH -- the file with its commentary removed. A PowerShell

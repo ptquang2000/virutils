@@ -27,8 +27,8 @@ transfer
 
 guest
   exec       run commands inside a guest via the QEMU guest agent
-  ui         deliver PsExec into a Windows guest, then launch a process on its
-             interactive desktop
+  ui         launch a process on a Windows guest's interactive desktop, as
+             the logged-on user or SYSTEM
 
 hardware
   usb        pass a host USB device through to a guest: list, show, attach, detach

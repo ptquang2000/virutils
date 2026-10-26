@@ -1,17 +1,17 @@
 # ui -- launch a process on a Windows guest's *interactive* desktop.
 #
+#   virutil ui run   VM [-i N] [-s] [--elevated] APP...
 #   virutil ui setup [VM] [-f]   cache PsExec on the host, deliver it to the guest
-#   virutil ui run   VM APP...   run APP on the logged-in user's desktop
 #
 # The counterpart of modules/linux/ui, and the same command grammar, because the
-# grammar is contract. Why the module exists at all is written down there and is
-# not a property of either host: everything virutil runs in a Windows guest goes
-# through qemu-ga, a session-0 service, so a process it spawns lands invisibly on
-# session 0's window station. PsExec `-i` is the one in-box way across Session 0
-# Isolation, so `run` is a thin wrapper over it and `setup` is what puts it where
-# `run` expects it.
+# grammar is contract. Everything virutil runs in a Windows guest goes through
+# qemu-ga, a session-0 service, so a process it spawns lands invisibly on session
+# 0's window station. `run` crosses Session 0 Isolation the way PsExec's service
+# does, in place: the guest half is payloads/win/ui.ps1, shared byte for byte
+# with the bash driver, and why it works is written down there. It no longer
+# needs PsExec; `setup` is what used to stage it and is all that still does.
 #
-# What differs from the bash host is where the two halves stand on this side:
+# What differs from the bash host is where setup's two halves stand on this side:
 #
 #   * **the download** is Invoke-WebRequest and the zip is read with .NET's own
 #     ZipFile, where bash needs curl-or-wget and unzip-or-bsdtar. Both are on
@@ -21,10 +21,6 @@
 #     the task `virutil xfer setup` registers) and a throwaway account for the
 #     length of it. That is push's cost, taken once per guest, and it is the
 #     transport contract section 7 said ui would ride.
-#
-# The guest half -- the script that resolves the console session and starts
-# PsExec -- is the bash module's text statement for statement, since both drivers
-# send it into the same guest.
 #
 # The tool is NOT vendored: the Sysinternals licence forbids redistributing it,
 # but freely allows installing copies on your own devices. setup fetches it from
@@ -48,31 +44,39 @@ $script:UiGuestExe = 'C:\virutil\PsExec.exe'
 # 0/1 the powershell wrapper uses.
 $script:UiRcNoPsExec = 97
 
+# The guest's "no one is logged on in that session", contract section 5. The
+# payload raises it; run turns it into the fix.
+$script:UiRcNoUser = 96
+
 function Get-UiUsage {
     @(
-        'usage: virutil ui setup [VM] [-f]'
-        '       virutil ui run   VM APP...'
+        'usage: virutil ui run   VM [-i N] [-s] [--elevated] [--] APP...'
+        '       virutil ui setup [VM] [-f]'
+        ''
+        '  run VM APP...   start APP on a guest session''s interactive desktop'
+        '                  (winsta0\default) and return without waiting for it.'
+        '                  APP is a program plus its arguments; a bare name is'
+        '                  looked up on the guest''s PATH. Prints'
+        '                  "started PID <pid> in session <n> as <user>".'
+        '                  By default APP runs as the user logged on to the'
+        '                  console session, with that user''s own token,'
+        '                  environment and profile -- what double-clicking it'
+        '                  there would give, UAC-filtered if they are an admin.'
+        ''
+        '    -i, --session N  that session instead of the console one'
+        '    -s, --system     as SYSTEM on that session''s desktop (PsExec -s -i)'
+        '    --elevated       the user''s full admin token, when UAC split it'
+        '                     (PsExec -h). No prompt; no effect with -s.'
+        '    --               end of options; everything after it is APP'
+        ''
+        '                  Options stop at the first word that is not one, so'
+        '                  APP''s own flags stay APP''s. Exits 96 when no user is'
+        '                  logged on in that session (log one on, or use -s).'
         ''
         '  setup [VM] [-f] fetch PsExec into the host cache (once) and deliver'
-        '                  it to the guest at C:\virutil\. With no VM it warms'
-        '                  the host cache and stops there. -f re-downloads even'
-        '                  if the host cache already holds it.'
+        '                  it to the guest at C:\virutil\. run no longer needs'
+        '                  it. -f re-downloads even if the cache holds it.'
         ''
-        '  run VM APP...   launch APP on the interactive (console) desktop via'
-        '                  PsExec -i. APP is a full guest path plus any'
-        '                  arguments. The process runs as SYSTEM on that'
-        '                  desktop, detached, and virutil returns as soon as'
-        '                  PsExec has started it.'
-        ''
-        "  Run 'virutil ui setup VM' once per guest before 'run'. If run reports"
-        '  PsExec missing, that is the fix.'
-        ''
-        "  setup delivers over the same SMB transport as 'virutil push', so on"
-        '  this host it needs Administrator -- one prompt, or none after'
-        "  'virutil xfer setup' -- and mints a throwaway local account for the"
-        '  length of the delivery.'
-        ''
-        '  -f, --force    re-download PsExec even if the host cache holds it'
         '  -h, --help     this message'
     )
 }
@@ -168,62 +172,25 @@ function Invoke-UiSetup {
     Say "$vm`: ready -- 'virutil ui run $vm <app>' will launch on the desktop."
 }
 
-# ConvertTo-UiPsQuote S -- S as one single-quoted powershell string. The bash
-# module's push_ps_quote: a single quote is doubled, and nothing else inside
-# single quotes means anything to powershell.
-function ConvertTo-UiPsQuote {
-    param([string]$Text)
-    return "'" + $Text.Replace("'", "''") + "'"
-}
-
-# Get-UiScript PSARGS_LINE -- the guest powershell for one launch, with
-# PSARGS_LINE (a line that assigns $psargs, and may reference the $sid computed
-# just above it) spliced in. Two callers differ only in that one line: the CLI
-# builds an argv array, sync builds a raw command line.
-#
-# This is modules/linux/ui's ui_build_script line for line, and the reasons are
-# written down there: `-i` is given the console session explicitly because a
-# bare `-i` from a session-0 service targets session 0; PsExec's stderr
-# narrative goes through Start-Process with both streams redirected to files so
-# PowerShell's error records never touch it; and a PsExec that is not there makes
-# Start-Process throw, which becomes $UiRcNoPsExec.
-function Get-UiScript {
-    param([string]$PsArgsLine)
-    @(
-        "`$exe = '$($script:UiGuestExe)'"
-        'Add-Type -Name Wts -Namespace Vu -MemberDefinition ''[DllImport("kernel32.dll")] public static extern uint WTSGetActiveConsoleSessionId();'''
-        '$sid = [Vu.Wts]::WTSGetActiveConsoleSessionId()'
-        'if ($sid -eq 0xFFFFFFFF) { [Console]::Error.WriteLine("no interactive session is attached to the console (no one is logged in)."); exit 1 }'
-        $PsArgsLine
-        '$o = [IO.Path]::GetTempFileName(); $e = [IO.Path]::GetTempFileName()'
-        'try {'
-        '  Start-Process -FilePath $exe -ArgumentList $psargs -Wait -NoNewWindow -RedirectStandardOutput $o -RedirectStandardError $e -ErrorAction Stop | Out-Null'
-        '} catch {'
-        '  Remove-Item -LiteralPath $o,$e -Force -ErrorAction SilentlyContinue'
-        "  exit $($script:UiRcNoPsExec)"
-        '}'
-        '$txt = (Get-Content -Raw -LiteralPath $e -ErrorAction SilentlyContinue) + (Get-Content -Raw -LiteralPath $o -ErrorAction SilentlyContinue)'
-        'Remove-Item -LiteralPath $o,$e -Force -ErrorAction SilentlyContinue'
-        'if ($txt) { [Console]::Out.Write($txt.Trim()) }'
-        'exit 0'
-    ) -join "`n"
-}
-
-# Invoke-UiDispatch VM PSARGS_LINE -- run one launch and map "PsExec absent" to
-# a message that names the fix, with contract section 5's code.
+# Invoke-UiDispatch VM VALUES -- render payloads/win/ui.ps1 and run it. A
+# session with no one logged on comes back as $UiRcNoUser, with the guest's own
+# line on stderr saying which session that was.
 function Invoke-UiDispatch {
-    param([string]$Vm, [string]$PsArgsLine)
-    Invoke-GuestPsText $Vm (Get-UiScript $PsArgsLine)
-    if ($script:VirutilExit -eq $script:UiRcNoPsExec) {
-        DieWith $script:UiRcNoPsExec @("PsExec is not installed in $Vm at $($script:UiGuestExe)."
-                                       "Run 'virutil ui setup $Vm' first.")
+    param([string]$Vm, [hashtable]$Values)
+    $v = @{ SESSION = ''; AS = 'user'; ELEVATE = ''; ARGV = ''; CMDLINE = '' }
+    foreach ($k in $Values.Keys) { $v[$k] = $Values[$k] }
+    Invoke-GuestPsText $Vm (Invoke-Payload 'ui.ps1' $v)
+    if ($script:VirutilExit -eq $script:UiRcNoUser) {
+        DieWith $script:UiRcNoUser @("$Vm`: nothing to launch into -- log a user on to the guest first,"
+                                     "or pass -s to run as SYSTEM on that session's desktop.")
     }
 }
 
-# Invoke-UiRun VM APP... -- the CLI launch. Each APP token becomes one
-# single-quoted powershell string in an argv array, so a path with spaces stays
-# one argument and Start-Process quotes each element back onto PsExec's command
-# line.
+# Invoke-UiRun VM [OPTIONS] APP... -- the CLI launch. Options sit between VM and
+# APP and stop at the first word that is not one, so APP's own flags -- even a
+# -s -- are APP's. The APP words travel as an argv joined with U+001F, which no
+# argument has reason to hold, and the guest quotes them onto one command line;
+# a path with spaces stays one argument.
 function Invoke-UiRun {
     param([string[]]$Arguments)
 
@@ -232,23 +199,40 @@ function Invoke-UiRun {
     if ($argv.Count -lt 2) { Usage (Get-UiUsage) 1 }
 
     $vm = $argv[0]
+    $v = @{}
+    $i = 1
+    :opts while ($i -lt $argv.Count) {
+        switch -Regex ($argv[$i]) {
+            '^(-s|--system)$' { $v['AS'] = 'system'; $i++; break }
+            '^--elevated$'    { $v['ELEVATE'] = '1'; $i++; break }
+            '^(-i|--session)$' {
+                if ($i + 1 -ge $argv.Count -or $argv[$i + 1] -notmatch '^\d+$') {
+                    Warn "$($argv[$i]) needs a session number"; Usage (Get-UiUsage) 1
+                }
+                $v['SESSION'] = $argv[$i + 1]; $i += 2; break
+            }
+            '^--$'            { $i++; break opts }
+            '^(-h|--help)$'   { Usage (Get-UiUsage) 0 }
+            '^-'              { Warn "unrecognised option: $($argv[$i])"; Usage (Get-UiUsage) 1 }
+            default           { break opts }
+        }
+    }
+    if ($i -ge $argv.Count) { Usage (Get-UiUsage) 1 }
+
     # Through a variable, not piped straight out of Get-RestArgs: it returns its
-    # array comma-wrapped, so the pipeline would see one object -- the whole
-    # array -- and quote every token as a single space-joined argument.
-    $apps = Get-RestArgs $argv 1
-    $joined = ($apps | ForEach-Object { ConvertTo-UiPsQuote $_ }) -join ','
-    Invoke-UiDispatch $vm "`$psargs = @('-accepteula','-i',`"`$sid`",'-d',$joined)"
+    # array comma-wrapped, so the pipeline would see one object.
+    $apps = Get-RestArgs $argv $i
+    $v['ARGV'] = @($apps) -join [char]0x1F
+    Invoke-UiDispatch $vm $v
 }
 
 # Invoke-UiRunCmdline VM CMDLINE -- launch a whole guest command line on the
-# desktop, passed verbatim after PsExec's options. This is what sync's >pre-ui
+# desktop as the logged-on user, used as written. This is what sync's >pre-ui
 # and >post-ui rules use: a config line is free text the way a command line is,
-# so quoting a space-path is the author's to do, exactly as at a prompt. $psargs
-# is built as a single string, which Start-Process hands to PsExec as the raw
-# command line rather than re-quoting element by element.
+# so quoting a space-path is the author's to do, exactly as at a prompt.
 function Invoke-UiRunCmdline {
     param([string]$Vm, [string]$Cmdline)
-    Invoke-UiDispatch $Vm "`$psargs = '-accepteula -i ' + `$sid + ' -d ' + $(ConvertTo-UiPsQuote $Cmdline)"
+    Invoke-UiDispatch $Vm @{ CMDLINE = $Cmdline }
 }
 
 function Ui-Main {

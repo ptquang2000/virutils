@@ -1,20 +1,18 @@
 # ui -- launch a process on a Windows guest's *interactive* desktop.
 #
+#   virutil ui run   VM [-i N] [-s] [--elevated] APP...
 #   virutil ui setup VM [-f]     cache PsExec on the host, deliver it to the guest
-#   virutil ui run   VM APP...   run APP on the logged-in user's desktop
 #
 # Why this exists at all. Everything virutil runs in a Windows guest goes through
 # qemu-ga, which is a service in session 0. A process it spawns is invisible: it
 # lands on session 0's window station, not the desktop the logged-in user is
-# looking at. Getting a *visible* process onto session 1 means binding it to that
-# session's desktop from outside the session -- which Session 0 Isolation walls
-# off, and which a bare CreateProcessAsUser from qemu-ga cannot do (it fails at
-# process init with STATUS_DLL_INIT_FAILED). The one in-box path across that wall
-# is a helper that already knows how to do it: Sysinternals PsExec, `-i`.
-#
-# So `run` is a thin wrapper over `PsExec.exe -accepteula -i <console> -d APP`
-# (the console session is resolved in the guest -- see ui_run for why a bare `-i`
-# is wrong here), and `setup` is what puts PsExec where `run` expects it.
+# looking at. Getting a *visible* process onto session 1 means starting it with
+# a token stamped for that session and binding it to that session's
+# winsta0\default -- what PsExec's service does for `-i`. `run` does the same in
+# place, from the SYSTEM powershell qemu-ga already gives it: the guest half is
+# payloads/win/ui.ps1, shared byte for byte with the PowerShell driver, and the
+# PsExec reading behind it is written down there. It no longer needs PsExec;
+# `setup` is what used to stage it and is all that still does.
 #
 # The tool is NOT vendored. The Sysinternals licence forbids redistributing it
 # ("you may not publish the software for others to copy"), but freely allows
@@ -38,29 +36,39 @@ UI_GUEST_EXE='C:\virutil\PsExec.exe'
 # 0/1 the powershell wrapper uses.
 UI_RC_NO_PSEXEC=97
 
+# The guest's "no one is logged on in that session", contract section 5. The
+# payload raises it; run turns it into the fix.
+UI_RC_NO_USER=96
+
 ui_usage() {
     printf '%s\n' \
-        "usage: virutil ui setup [VM] [-f]" \
-        "       virutil ui run   VM APP..." \
+        "usage: virutil ui run   VM [-i N] [-s] [--elevated] [--] APP..." \
+        "       virutil ui setup [VM] [-f]" \
+        "" \
+        "  run VM APP...   start APP on a guest session's interactive desktop" \
+        "                  (winsta0\\default) and return without waiting for it." \
+        "                  APP is a program plus its arguments; a bare name is" \
+        "                  looked up on the guest's PATH. Prints" \
+        "                  \"started PID <pid> in session <n> as <user>\"." \
+        "                  By default APP runs as the user logged on to the" \
+        "                  console session, with that user's own token," \
+        "                  environment and profile -- what double-clicking it" \
+        "                  there would give, UAC-filtered if they are an admin." \
+        "" \
+        "    -i, --session N  that session instead of the console one" \
+        "    -s, --system     as SYSTEM on that session's desktop (PsExec -s -i)" \
+        "    --elevated       the user's full admin token, when UAC split it" \
+        "                     (PsExec -h). No prompt; no effect with -s." \
+        "    --               end of options; everything after it is APP" \
+        "" \
+        "                  Options stop at the first word that is not one, so" \
+        "                  APP's own flags stay APP's. Exits 96 when no user is" \
+        "                  logged on in that session (log one on, or use -s)." \
         "" \
         "  setup [VM] [-f] fetch PsExec into the host cache (once) and deliver" \
-        "                  it to the guest at C:\\virutil\\. With no VM it warms" \
-        "                  the host cache and stops there. -f re-downloads even" \
-        "                  if the host cache already holds it." \
+        "                  it to the guest at C:\\virutil\\. run no longer needs" \
+        "                  it. -f re-downloads even if the cache holds it." \
         "" \
-        "  run VM APP...   launch APP on the interactive (console) desktop via" \
-        "                  PsExec -i. APP is a full guest path plus any" \
-        "                  arguments. The process runs as SYSTEM on that" \
-        "                  desktop, detached, and virutil returns as soon as" \
-        "                  PsExec has started it." \
-        "" \
-        "  Run 'virutil ui setup VM' once per guest before 'run'. If run reports" \
-        "  PsExec missing, that is the fix." \
-        "" \
-        "  setup delivers over the same SMB transport as 'virutil push', so on a" \
-        "  Windows guest it needs smbd and root on this host." \
-        "" \
-        "  -f, --force    re-download PsExec even if the host cache holds it" \
         "  -h, --help     this message" >&2
     exit "${1:-1}"
 }
@@ -138,92 +146,60 @@ ui_setup() {
     say "$VM: ready -- 'virutil ui run $VM <app>' will launch on the desktop."
 }
 
-# ui_build_script PSARGS_LINE -- the guest powershell for one launch, with
-# PSARGS_LINE (a line that assigns $psargs, and may reference the $sid computed
-# just above it) spliced in. Two callers differ only in that one line: the CLI
-# builds an argv array, sync builds a raw command line.
-#
-# `-i` is given the active console session explicitly. Bare `-i` does NOT do the
-# right thing here: PsExec is started by qemu-ga, which is a session-0 service,
-# so with no session number PsExec targets session 0 -- and the process lands
-# invisibly there rather than on the desktop the user is looking at. So the guest
-# resolves its own console session with WTSGetActiveConsoleSessionId (one call,
-# no locale-sensitive text to parse) and PsExec is told `-i <that>`. `-d` returns
-# as soon as the process starts instead of waiting on it, so virutil does not
-# block on a GUI the user will close by hand. The process runs as SYSTEM on that
-# desktop; add -u/-p yourself if it must run as the logged-in user.
-#
-# PsExec writes its whole progress narrative -- banner, "Starting PSEXESVC", and
-# the closing "started ... with process ID N" -- to stderr. Through PowerShell's
-# call operator each line becomes an ErrorRecord that decorates or mis-stringifies
-# (a NativeCommandError block, or the bare type name RemoteException), and even a
-# 2> file redirect leaks the first line back. Start-Process with its streams
-# redirected to files keeps PowerShell's object pipeline out of it entirely, so
-# the files hold PsExec's own bytes and nothing else. A PsExec that is not there
-# makes Start-Process -ErrorAction Stop throw, which the catch turns into
-# UI_RC_NO_PSEXEC -- the run never has to stat the path first.
-ui_build_script() {
-    printf '%s\n' \
-        "\$exe = '$UI_GUEST_EXE'" \
-        "Add-Type -Name Wts -Namespace Vu -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern uint WTSGetActiveConsoleSessionId();'" \
-        '$sid = [Vu.Wts]::WTSGetActiveConsoleSessionId()' \
-        'if ($sid -eq 0xFFFFFFFF) { [Console]::Error.WriteLine("no interactive session is attached to the console (no one is logged in)."); exit 1 }' \
-        "$1" \
-        '$o = [IO.Path]::GetTempFileName(); $e = [IO.Path]::GetTempFileName()' \
-        'try {' \
-        '  Start-Process -FilePath $exe -ArgumentList $psargs -Wait -NoNewWindow -RedirectStandardOutput $o -RedirectStandardError $e -ErrorAction Stop | Out-Null' \
-        '} catch {' \
-        '  Remove-Item -LiteralPath $o,$e -Force -ErrorAction SilentlyContinue' \
-        "  exit $UI_RC_NO_PSEXEC" \
-        '}' \
-        '$txt = (Get-Content -Raw -LiteralPath $e -ErrorAction SilentlyContinue) + (Get-Content -Raw -LiteralPath $o -ErrorAction SilentlyContinue)' \
-        'Remove-Item -LiteralPath $o,$e -Force -ErrorAction SilentlyContinue' \
-        'if ($txt) { [Console]::Out.Write($txt.Trim()) }' \
-        'exit 0'
-}
-
-# ui_dispatch VM PSARGS_LINE -- run one launch and map "PsExec absent" to a
-# message that names the fix. The local VM is what exec_ps_text's agent helpers
-# address, by dynamic scope.
+# ui_dispatch VM SESSION AS ELEVATE ARGV CMDLINE -- render payloads/win/ui.ps1
+# and run it. A session with no one logged on comes back as UI_RC_NO_USER and
+# leaves with it, the guest's own line on stderr saying which session that was.
+# The local VM is what exec_ps_text's agent helpers address, by dynamic scope.
 ui_dispatch() {
-    local VM="$1" psline="$2" script rc=0
-    script="$(ui_build_script "$psline")"
+    local VM="$1" script rc=0
+    script="$(payload_render ui.ps1 SESSION="$2" AS="$3" ELEVATE="$4" \
+                                     ARGV="$5" CMDLINE="$6")" || exit 1
     exec_ps_text "$script" || rc=$?
-    if [[ "$rc" == "$UI_RC_NO_PSEXEC" ]]; then
-        die "PsExec is not installed in $VM at $UI_GUEST_EXE." \
-            "Run 'virutil ui setup $VM' first."
+    if [[ "$rc" == "$UI_RC_NO_USER" ]]; then
+        warn "$VM: nothing to launch into -- log a user on to the guest first," \
+             "or pass -s to run as SYSTEM on that session's desktop."
+        exit "$UI_RC_NO_USER"
     fi
     return "$rc"
 }
 
-# ui_run VM APP... -- the CLI launch. Each APP token becomes one single-quoted
-# powershell string in an argv array, so a path with spaces stays one argument
-# and Start-Process quotes each element back onto PsExec's command line.
+# ui_run VM [OPTIONS] APP... -- the CLI launch. Options sit between VM and APP
+# and stop at the first word that is not one, so APP's own flags -- even a -s --
+# are APP's. The APP words travel as an argv joined with U+001F, which no
+# argument has reason to hold, and the guest quotes them onto one command line;
+# a path with spaces stays one argument.
 ui_run() {
-    local VM="${1:-}"
+    local VM="${1:-}" session="" as=user elevate=""
     [[ -n "$VM" ]] || ui_usage
+    [[ "$VM" == -h || "$VM" == --help ]] && ui_usage 0
     shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -s|--system)  as=system; shift ;;
+            --elevated)   elevate=1; shift ;;
+            -i|--session) [[ "${2:-}" =~ ^[0-9]+$ ]] \
+                              || { warn "$1 needs a session number"; ui_usage; }
+                          session="$2"; shift 2 ;;
+            --)           shift; break ;;
+            -h|--help)    ui_usage 0 ;;
+            -*)           warn "unrecognised option: $1"; ui_usage ;;
+            *)            break ;;
+        esac
+    done
     [[ $# -gt 0 ]] || ui_usage
 
-    local -a q=()
-    local a
-    for a in "$@"; do q+=("$(push_ps_quote "$a")"); done
     local joined
-    joined="$(printf '%s,' "${q[@]}")"; joined="${joined%,}"
-
-    ui_dispatch "$VM" "\$psargs = @('-accepteula','-i',\"\$sid\",'-d',$joined)"
+    joined="$(printf '%s\x1f' "$@")"; joined="${joined%$'\x1f'}"
+    ui_dispatch "$VM" "$session" "$as" "$elevate" "$joined" ""
 }
 
-# ui_run_cmdline VM CMDLINE -- launch a whole guest command line on the desktop,
-# passed verbatim after PsExec's options. This is what sync's ui run rules use:
+# ui_run_cmdline VM CMDLINE -- launch a whole guest command line on the desktop
+# as the logged-on user, used as written. This is what sync's ui run rules use:
 # a config line is free text the way a command line is, so quoting a space-path
 # is the author's to do (>post-ui "C:\Program Files\app\a.exe" --flag), exactly
-# as at a prompt. $psargs is built as a single string, which Start-Process hands
-# to PsExec as the raw command line rather than re-quoting element by element.
+# as at a prompt.
 ui_run_cmdline() {
-    local VM="$1" cmdline="$2" q
-    q="$(push_ps_quote "$cmdline")"
-    ui_dispatch "$VM" "\$psargs = '-accepteula -i ' + \$sid + ' -d ' + $q"
+    ui_dispatch "$1" "" user "" "" "$2"
 }
 
 ui_main() {

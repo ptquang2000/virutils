@@ -822,7 +822,7 @@ unknown setting or an unrecognised directive is reported with its line number.
 | `-path` | Delete this guest path after copying — a directory is emptied and kept, a file is removed. |
 | `>pre CMD` | Run `CMD` in the guest's shell before the files reach it — PowerShell, or `/bin/sh` when `@guest=linux`. |
 | `>post CMD` | Run `CMD` in the guest's shell after they have. |
-| `>pre-ui CMD` | Like `>pre`, but launch `CMD` on the guest's *interactive desktop* via PsExec (see `virutil ui`). Windows guest only. |
+| `>pre-ui CMD` | Like `>pre`, but launch `CMD` on the guest's *interactive desktop*, as the logged-on user (see `virutil ui`). Windows guest only. |
 | `>post-ui CMD` | Like `>post`, on the interactive desktop — e.g. relaunch a GUI app the sync replaced. |
 
 Map rules are the only unsigilled form. A line starting with punctuation that is
@@ -939,18 +939,15 @@ already landed.
 ```
 
 An ordinary `>post` command runs as SYSTEM in session 0, where a window it opens
-is invisible to the logged-in user. A `>post-ui` command is handed to PsExec's
-`-i` so it lands on the desktop the user is looking at — the usual reason being
-to relaunch a GUI app the sync just replaced. It is fire-and-forget: the rule
-returns as soon as the process starts, and the process runs as SYSTEM on that
-desktop (add `-u`/`-p` to the command if it must be the logged-in user).
+is invisible to the logged-in user. A `>post-ui` command goes through
+`virutil ui run`, so it lands on the console session's desktop as the user
+logged on there — the usual reason being to relaunch a GUI app the sync just
+replaced. It is fire-and-forget: the rule returns as soon as the process
+starts. With no one logged on the rule fails with exit 96.
 
 The command is a command line, not a bare exe, so quote a path that contains
 spaces exactly as you would at a prompt. These rules are Windows-*guest*-only —
-a `@guest=linux` config that carries one is refused — and they need PsExec
-staged in the guest first (`virutil ui setup VM`); a config that runs before
-that fails with the same "run `virutil ui setup`" message `virutil ui run`
-gives.
+a `@guest=linux` config that carries one is refused.
 
 They work the same from a Windows host: `virutil ui` is on both drivers.
 
@@ -1060,9 +1057,8 @@ The refusal comes before the fetch on purpose: an elevation prompt, a
 multi-gigabyte copy and then a refusal would be the worst available ordering.
 
 **`>pre-ui` and `>post-ui` work**, as they do on a Linux host: they launch
-through `virutil ui`, which is on this driver too. Stage PsExec in the guest
-once with `virutil ui setup VM` first — that is itself a `push`, so it needs
-Administrator the same way.
+through `virutil ui`, which is on this driver too, and need nothing staged in
+the guest first.
 
 **Configs are looked up in `%USERPROFILE%\.virutils\conf\` and nowhere else.**
 The bash driver also falls back to `~/.config/virutils` so an install predating

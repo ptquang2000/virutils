@@ -11,10 +11,11 @@
   What is asserted:
 
     * the grammar and its exit codes, which are contract;
-    * run's argv quoting: each APP token one single-quoted powershell string,
-      so a space-path stays one argument and an embedded quote survives;
-    * the launch targets the console session (-i $sid), never a bare -i;
-    * a guest answering 97 becomes "run virutil ui setup", with code 97;
+    * run renders the native launcher (payloads/win/ui.ps1) with the right
+      session, token kind and argv -- options stop at APP;
+    * the guest turns that argv into one command line by the MSVC rules,
+      run for real with the launch swapped for an echo;
+    * a guest answering 96 (no one logged on) names the fix, with code 96;
     * setup with a warm cache touches no network and hands push exactly
       the cached PsExec and C:\virutil\ -- and with no VM, no push at all.
 #>
@@ -28,6 +29,7 @@ $env:VIRUTILS_DIR = Join-Path ([IO.Path]::GetTempPath()) ("virutil-test-" + [Gui
 
 . (Join-Path $moduleDir 'parser.ps1')
 . (Join-Path $moduleDir 'paths.ps1')
+. (Join-Path $moduleDir 'payload.ps1')
 . (Join-Path $moduleDir 'guest.ps1')
 . (Join-Path $moduleDir 'exec.ps1')
 . (Join-Path $moduleDir 'ui.ps1')
@@ -87,7 +89,7 @@ function Invoke-GuestAgent {
                 exited = $true
                 exitcode = $script:GuestRc
                 'out-data' = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(
-                    'notepad.exe started on 1 with process ID 1234.'))
+                    'started PID 1234 in session 1 as WIN11\me'))
             })
         }
         default { throw "the test agent was asked for $Command" }
@@ -111,27 +113,75 @@ try {
     CheckTrue 'the usage names both verbs' `
         ((Dies { Ui-Main @() }).Msg -match 'ui setup' -and (Dies { Ui-Main @() }).Msg -match 'ui run')
 
+    Check 'run -h exits 0'                 0 (Dies { Ui-Main @('run', '-h') }).Code
+    Check 'run VM -i with no number exits 1' 1 (Dies { Ui-Main @('run', 'win11', '-i', 'notepad.exe') }).Code
+    Check 'run VM -i with no APP exits 1'  1 (Dies { Ui-Main @('run', 'win11', '-i', '2') }).Code
+    Check 'run VM -s with no APP exits 1'  1 (Dies { Ui-Main @('run', 'win11', '-s') }).Code
+    Check 'run VM with a bad option exits 1' 1 (Dies { Ui-Main @('run', 'win11', '--nope', 'notepad.exe') }).Code
+
     # --- run ----------------------------------------------------------------
+    #
+    # The launch is payloads/win/ui.ps1 -- the native PsExec-service recipe --
+    # and what is asserted is the values it was rendered with. Its text is
+    # pinned by tests/golden/payloads.txt.
+    $us = [string][char]0x1F
     $script:Sent = @(); $script:GuestRc = 0
     $out = Capture { Ui-Main @('run', 'win11', 'C:\Program Files\App\app.exe', "it's", '--flag') }
     Check 'run sends one script' 1 $script:Sent.Count
     $s = $script:Sent[0]
-    CheckTrue 'it runs the staged PsExec' ($s -match [regex]::Escape("`$exe = 'C:\virutil\PsExec.exe'"))
-    CheckTrue 'it resolves the console session in the guest' ($s -match 'WTSGetActiveConsoleSessionId')
-    CheckTrue 'and passes it to -i, never a bare -i' `
-        ($s -match [regex]::Escape("@('-accepteula','-i',`"`$sid`",'-d',"))
-    CheckTrue 'a space-path stays one argument' `
-        ($s -match [regex]::Escape("'C:\Program Files\App\app.exe'"))
-    CheckTrue 'an embedded single quote is doubled' ($s -match [regex]::Escape("'it''s'"))
-    CheckTrue 'a trailing flag is its own argument' ($s -match [regex]::Escape(",'--flag')"))
-    CheckTrue "PsExec's own line comes back" ($out -match 'process ID 1234')
+    CheckTrue 'it is the native launcher' ($s -match 'WTSQueryUserToken' -and $s -match 'CreateProcessAsUser')
+    CheckTrue 'and never PsExec' ($s -notmatch 'PsExec')
+    CheckTrue 'it targets the console session by default' ($s -match [regex]::Escape("`$session = ''"))
+    CheckTrue 'as the logged-on user by default' ($s -match [regex]::Escape("`$as = 'user'"))
+    CheckTrue 'unelevated by default' ($s -match [regex]::Escape("`$elevate = ''"))
+    CheckTrue 'on winsta0\default' ($s -match [regex]::Escape('winsta0\\default'))
+    CheckTrue 'each APP word is one argv element, quote doubled' `
+        ($s -match [regex]::Escape("`$argv = 'C:\Program Files\App\app.exe${us}it''s${us}--flag'"))
+    CheckTrue 'and no raw command line' ($s -match [regex]::Escape("`$cmdline = ''"))
+    CheckTrue "the guest's line comes back" ($out -match 'started PID 1234')
     Check 'run leaves exit 0' 0 $script:VirutilExit
 
-    # --- run, PsExec not staged ---------------------------------------------
-    $script:GuestRc = 97
+    # --- run, options -------------------------------------------------------
+    $script:Sent = @()
+    $null = Capture { Ui-Main @('run', 'win11', '-i', '2', '-s', '--elevated', 'notepad.exe') }
+    $s = $script:Sent[0]
+    CheckTrue '-i N picks session N' ($s -match [regex]::Escape("`$session = '2'"))
+    CheckTrue '-s runs as SYSTEM' ($s -match [regex]::Escape("`$as = 'system'"))
+    CheckTrue '--elevated asks for the linked token' ($s -match [regex]::Escape("`$elevate = '1'"))
+    CheckTrue 'and the options are not part of APP' ($s -match [regex]::Escape("`$argv = 'notepad.exe'"))
+
+    $script:Sent = @()
+    $null = Capture { Ui-Main @('run', 'win11', 'app.exe', '-s', '-i', '3') }
+    $s = $script:Sent[0]
+    CheckTrue "options stop at APP: APP's -s is APP's" ($s -match [regex]::Escape("`$as = 'user'"))
+    CheckTrue 'and travels in its argv' ($s -match [regex]::Escape("`$argv = 'app.exe${us}-s${us}-i${us}3'"))
+
+    $script:Sent = @()
+    $null = Capture { Ui-Main @('run', 'win11', '--session', '1', '--', '-dash.exe') }
+    $s = $script:Sent[0]
+    CheckTrue '-- ends the options' ($s -match [regex]::Escape("`$argv = '-dash.exe'") -and $s -match [regex]::Escape("`$session = '1'"))
+
+    # --- run, the guest-side quoting ----------------------------------------
+    #
+    # The argv becomes one command line in the guest, by the MSVC rules the
+    # started program parses with. Run for real in a child powershell with the
+    # launch swapped for an echo, so nothing is started.
+    $argv = @('C:\Program Files\App\app.exe', 'a b', 'q"x', 'tail\', 'c:\dir with\', '', 'plain', "it's") -join $us
+    $text = Invoke-Payload 'ui.ps1' @{ SESSION = ''; AS = 'user'; ELEVATE = ''; ARGV = $argv; CMDLINE = '' }
+    $call = '[Vu.Ui]::Run($want, $as -eq ''system'', $elevate -eq ''1'', $cmdline)'
+    CheckTrue 'the payload launches through Run' ($text.Contains($call))
+    $probe = Join-Path $env:VIRUTILS_DIR 'ui-probe.ps1'
+    New-Item -ItemType Directory -Force -Path $env:VIRUTILS_DIR | Out-Null
+    Set-Content -LiteralPath $probe -Encoding UTF8 -Value $text.Replace($call, '$cmdline')
+    $line = (& powershell.exe -NoProfile -NonInteractive -File $probe | Select-Object -First 1)
+    Check 'argv is quoted onto one command line' `
+        '"C:\Program Files\App\app.exe" "a b" "q\"x" tail\ "c:\dir with\\" "" plain it''s' $line
+
+    # --- run, no one logged on ----------------------------------------------
+    $script:GuestRc = 96
     $r = Dies { Capture { Ui-Main @('run', 'win11', 'notepad.exe') } }
-    CheckTrue 'a missing PsExec names the fix' ($r.Msg -match "virutil ui setup win11")
-    Check     'and exits 97, contract section 5' 97 $r.Code
+    CheckTrue 'no logged-on user names the fix' ($r.Msg -match 'log a user on' -and $r.Msg -match '-s')
+    Check     'and exits 96, contract section 5' 96 $r.Code
     $script:GuestRc = 0
 
     # --- run, some other guest failure passes through ------------------------
@@ -143,8 +193,9 @@ try {
     # --- the sync entry point -----------------------------------------------
     $script:Sent = @()
     $null = Capture { Invoke-UiRunCmdline 'win11' '"C:\Program Files\App\app.exe" --restored' }
-    CheckTrue 'a command line goes to PsExec as one raw string' `
-        ($script:Sent[0] -match [regex]::Escape("'-accepteula -i ' + `$sid + ' -d ' + '`"C:\Program Files\App\app.exe`" --restored'"))
+    CheckTrue 'a command line goes to the guest as one raw string' `
+        ($script:Sent[0] -match [regex]::Escape("`$cmdline = '`"C:\Program Files\App\app.exe`" --restored'"))
+    CheckTrue 'as the logged-on user' ($script:Sent[0] -match [regex]::Escape("`$as = 'user'"))
 
     # --- setup, with the cache already warm ---------------------------------
     #

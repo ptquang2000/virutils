@@ -69,9 +69,10 @@ and `@` means nothing at all to `sh`.
 | `linux/sync.sh` | Linux guest | rsync the whole export onto `/` |
 | `win/mount.ps1` | Windows guest | authenticate to a credentialled share (**Windows host only**) |
 | `win/unmount.ps1` | Windows guest | let go of it again (**Windows host only**) |
+| `win/ui.ps1` | Windows guest | start a process on a session's interactive desktop, as its user or SYSTEM |
 
-Each prints one space-separated line on stdout, which its caller parses; the
-shapes are documented at the head of each file.
+Each prints one space-separated line on stdout, which its caller parses (`ui.ps1`'s
+is for a human and passes through); the shapes are documented at the head of each file.
 
 `tests/linux/payloads.sh` and `tests/win/payloads.ps1` render every one of them
 with fixed inputs and diff the result against `tests/golden/payloads.txt`. A

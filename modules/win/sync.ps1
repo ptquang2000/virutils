@@ -32,8 +32,8 @@
 #     section 7 -- and a config that names one is refused before anything is
 #     fetched rather than minutes later at the delivery.
 #
-# >pre-ui and >post-ui used to be a third: they run through PsExec, which is
-# 'virutil ui', and this driver did not have it. It does now (modules/win/ui.ps1),
+# >pre-ui and >post-ui used to be a third: they run through 'virutil ui', and
+# this driver did not have it. It does now (modules/win/ui.ps1),
 # and they run exactly as they do there.
 #
 # Everything else -- the parse, the lookup rules, the staging layout, the map
@@ -120,7 +120,7 @@ function Get-SyncUsage {
         ''
         'This driver delivers to a Windows guest only: a config saying'
         '@guest=linux is refused; see docs/contract.md section 7. >pre-ui and'
-        ">post-ui run rules need PsExec in the guest first: 'virutil ui setup VM'."
+        '>post-ui run rules start as the user logged on to the guest console.'
     )
 }
 
@@ -308,7 +308,7 @@ function Add-SyncRunRule {
                 "${Where}: run rule needs 'pre', 'post', 'pre-ui' or 'post-ui': $Line"
                 '  >pre  COMMAND      before the files reach the guest (guest shell, as SYSTEM)'
                 '  >post COMMAND      after they have'
-                '  >pre-ui  COMMAND   same timing, launched on the interactive desktop (Windows guest, PsExec)'
+                '  >pre-ui  COMMAND   same timing, launched on the interactive desktop (Windows guest, as its user)'
                 '  >post-ui COMMAND   likewise -- e.g. relaunch a GUI app the sync replaced'
             )
         }
@@ -494,7 +494,7 @@ function Measure-SyncDelivery {
 
 # Invoke-SyncRun VM WHEN RULES -- run each rule in config order: an 'sh' rule
 # in the guest's powershell as SYSTEM, a 'ui' rule on the interactive desktop
-# through PsExec (modules/win/ui.ps1).
+# as the user logged on there (modules/win/ui.ps1).
 #
 # Fatal on the first failure: a run rule exists to make the copy land correctly
 # ("stop the service", "run the installer"), so carrying on past one that did
@@ -521,7 +521,7 @@ function Invoke-SyncRun {
             # No guest-OS check here, unlike the bash module's: a config that
             # reaches this far has already been held to @guest=windows by
             # Assert-SyncPortable, and the guest to Windows by Assert-XferReady.
-            # A missing PsExec dies inside with its own code and fix (97).
+            # No user logged on dies inside with its own code and fix (96).
             [Console]::Out.WriteLine("run ($When/ui): $($r.Cmd)")
             Invoke-UiRunCmdline $Vm $r.Cmd
             $label = "$When-ui"
