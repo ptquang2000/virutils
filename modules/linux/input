@@ -1,0 +1,370 @@
+# input -- drive a running domain's pointer and keyboard from this host.
+#
+# The input side of modules/linux/shot, and the counterpart of
+# modules/win/input.ps1 and modules/mac/input. All three hand the events to
+# qemu, which delivers them through the domain's emulated tablet and keyboard.
+# Nothing runs in the guest, so to Windows they are hardware input: they reach
+# whatever window has the focus at whatever integrity level, the UAC prompt and
+# the logon screen included, which a SendInput from a process in the guest
+# cannot do.
+#
+# Everything goes to qemu as QMP through `virsh qemu-monitor-command`:
+# input-send-event for the pointer, whose `abs` axes run 0..32767 across the
+# screen, and send-key for keys, which queues each press and release with a hold
+# time behind the one before. `virsh send-key` would do the keys without the
+# monitor, but the pointer has no virsh command, and one mechanism with one set
+# of key names (qemu's qcodes) is simpler than two. libvirt marks a domain that
+# has had a monitor command as tainted (custom-monitor) in its log; nothing
+# else changes.
+#
+# An abs event reaches the guest only through an absolute device -- a
+# usb-tablet or virtio-tablet; a PS/2 mouse takes relative motion alone, which
+# the guest's pointer acceleration then scales. virt-install gives a domain
+# with graphics a USB tablet by default. query-mice says whether there is one,
+# and a pointer verb without one is refused rather than sent.
+#
+# The screen size comes from a screenshot, the same frame a shot is: a pixel
+# there is a pixel here.
+
+input_usage() {
+    printf '%s\n' \
+        "usage: virutil input click VM X Y [-b BUTTON] [--double]" \
+        "       virutil input move  VM X Y" \
+        "       virutil input drag  VM X1 Y1 X2 Y2 [-b BUTTON]" \
+        "       virutil input wheel VM X Y N" \
+        "       virutil input key   VM COMBO..." \
+        "       virutil input type  VM TEXT..." \
+        "" \
+        "Drive VM's pointer and keyboard from this host: the input side of" \
+        "'virutil shot'. X and Y are pixels of the guest's screen, the same as in" \
+        "a shot PNG, with 0,0 its top-left corner." \
+        "" \
+        "  click   move to X,Y and click" \
+        "  move    move the pointer to X,Y" \
+        "  drag    press at X1,Y1, move to X2,Y2 and release there" \
+        "  wheel   scroll N notches at X,Y: positive up, negative down" \
+        "  key     press and release each COMBO in turn: ctrl+a, alt+f4, enter," \
+        "          win, ctrl+alt+delete, f5, shift+tab" \
+        "  type    type TEXT, its words joined by one space, as US-layout keys" \
+        "" \
+        "  -b, --button B  left (default), right or middle" \
+        "      --double    click twice, as a double-click" \
+        "  -h, --help      this message" \
+        "" \
+        "Key names: a-z 0-9 f1-f12 ctrl alt shift win enter esc tab space" \
+        "backspace delete insert home end pgup pgdn up down left right menu" \
+        "printscreen capslock, the punctuation keys by character" \
+        "(- = [ ] \\ ; ' \` , . /), and any qemu key name (qcode)." \
+        "" \
+        "type sends key presses, not characters: a guest on another layout gets" \
+        "that layout's characters, and caps lock inverts letters. It types" \
+        "printable ASCII, tab and newline, and refuses anything else before" \
+        "sending a key." \
+        "" \
+        "Nothing runs in the guest: qemu delivers the events through the" \
+        "domain's emulated tablet and keyboard, so Windows takes them as" \
+        "hardware input, elevated windows and the UAC prompt included. The" \
+        "pointer needs an absolute device (a USB or virtio tablet); key and" \
+        "type do not." >&2
+    exit "${1:-1}"
+}
+
+# --- what is sent, decided before anything is ---------------------------------
+
+# The US layout, and the names a COMBO may use. Kept as jq so that a character
+# with no key is named by its code point: this driver runs under LC_ALL=C, where
+# bash sees bytes.
+INPUT_JQ_KEYS='
+def plain: {"-":"minus","=":"equal","[":"bracket_left","]":"bracket_right",
+  "\\":"backslash",";":"semicolon","'"'"'":"apostrophe","`":"grave_accent",
+  ",":"comma",".":"dot","/":"slash"," ":"spc","\t":"tab","\n":"ret"};
+def shifted: {"!":"1","@":"2","#":"3","$":"4","%":"5","^":"6","&":"7","*":"8",
+  "(":"9",")":"0","_":"minus","+":"equal","{":"bracket_left","}":"bracket_right",
+  "|":"backslash",":":"semicolon","\"":"apostrophe","~":"grave_accent",
+  "<":"comma",">":"dot","?":"slash"};
+def alias: {"ctrl":"ctrl","control":"ctrl","rctrl":"ctrl_r","alt":"alt",
+  "ralt":"alt_r","altgr":"alt_r","shift":"shift","rshift":"shift_r",
+  "win":"meta_l","super":"meta_l","meta":"meta_l","cmd":"meta_l",
+  "enter":"ret","return":"ret","esc":"esc","escape":"esc","tab":"tab",
+  "space":"spc","backspace":"backspace","bksp":"backspace","delete":"delete",
+  "del":"delete","insert":"insert","ins":"insert","home":"home","end":"end",
+  "pgup":"pgup","pageup":"pgup","pgdn":"pgdn","pagedown":"pgdn","up":"up",
+  "down":"down","left":"left","right":"right","menu":"compose","apps":"compose",
+  "printscreen":"print","prtsc":"print","capslock":"caps_lock",
+  "numlock":"num_lock","scrolllock":"scroll_lock","pause":"pause",
+  "minus":"minus","equal":"equal","comma":"comma","dot":"dot","period":"dot",
+  "slash":"slash","backslash":"backslash","semicolon":"semicolon",
+  "apostrophe":"apostrophe","grave":"grave_accent",
+  "grave_accent":"grave_accent","bracket_left":"bracket_left",
+  "bracket_right":"bracket_right"};
+def qcodes: ["shift", "shift_r", "alt", "alt_r", "ctrl", "ctrl_r", "menu",
+  "esc", "minus", "equal", "backspace", "tab", "ret", "semicolon", "apostrophe",
+  "grave_accent", "backslash", "comma", "dot", "slash", "asterisk", "spc",
+  "caps_lock", "num_lock", "scroll_lock", "kp_divide", "kp_multiply",
+  "kp_subtract", "kp_add", "kp_enter", "kp_decimal", "sysrq", "kp_0", "kp_1",
+  "kp_2", "kp_3", "kp_4", "kp_5", "kp_6", "kp_7", "kp_8", "kp_9", "less",
+  "print", "home", "pgup", "pgdn", "end", "left", "up", "down", "right",
+  "insert", "delete", "stop", "again", "props", "undo", "front", "copy", "open",
+  "paste", "find", "cut", "lf", "help", "meta_l", "meta_r", "compose", "pause",
+  "ro", "hiragana", "henkan", "yen", "muhenkan", "katakanahiragana", "kp_comma",
+  "kp_equals", "power", "sleep", "wake", "audionext", "audioprev", "audiostop",
+  "audioplay", "audiomute", "volumeup", "volumedown", "mediaselect", "mail",
+  "calculator", "computer", "ac_home", "ac_back", "ac_forward", "ac_refresh",
+  "ac_bookmarks", "lang1", "lang2", "f13", "f14", "f15", "f16", "f17", "f18",
+  "f19", "f20", "f21", "f22", "f23", "f24"];
+def hex: if . < 16 then "0123456789ABCDEF"[.:.+1] else (./16 | floor | hex) + (. % 16 | hex) end;
+def u: hex as $h | "U+" + (if ($h | length) < 4 then ("000" + $h)[-4:] else $h end);
+'
+
+# input_combo COMBO -- its qcodes, space-separated, or a usage error naming the
+# key it does not know. '+' separates keys, and a '+' at the end is the key
+# itself, shift+equal on a US keyboard: ctrl++ is ctrl, shift, equal.
+input_combo() {
+    local out
+    out="$(jq -rn --arg c "$1" "$INPUT_JQ_KEYS"'
+        [$c | splits("\\+(?!$)")] | map(
+          ascii_downcase as $k
+          | if $k == "" then "!empty key"
+            elif alias[$k] then alias[$k]
+            elif ($k | test("^([a-z0-9]|f([1-9]|1[0-2]))$")) then $k
+            elif $k != " " and plain[$k] then plain[$k]
+            elif shifted[$k] then "shift " + shifted[$k]
+            elif (qcodes | index([$k])) then $k
+            else "!unknown key '"'"'\($k)'"'"'" end)
+        | (map(select(startswith("!"))) | first) // join(" ")')" ||
+        die "virutil input: could not read the combo '$1'"
+    [[ "$out" != '!'* ]] || die "virutil input: ${out#!} in '$1' (see: virutil input -h)"
+    printf '%s' "$out"
+}
+
+# input_text TEXT -- one combo per line (keys joined by spaces), a character at
+# a time on the US layout, or a usage error listing every character with none.
+input_text() {
+    local out
+    out="$(jq -rn --arg t "$1" "$INPUT_JQ_KEYS"'
+        [$t | gsub("\r\n"; "\n") | explode[] | . as $cp | [.] | implode
+          | if test("^[a-z0-9]$") then .
+            elif test("^[A-Z]$") then "shift " + ascii_downcase
+            elif plain[.] then plain[.]
+            elif shifted[.] then "shift " + shifted[.]
+            else {c: ., cp: $cp} end] as $all
+        | [$all[] | objects] as $bad
+        | if ($bad | length) > 0
+          then "!" + ([$bad | unique_by(.cp)[] | "'"'"'\(.c)'"'"' (\(.cp | u))"] | join(", "))
+          else $all[] end')" || die "virutil input: could not read the text to type"
+    if [[ "$out" == '!'* ]]; then
+        die "virutil input: cannot type ${out#!}." \
+            "type sends US-layout key presses and covers printable ASCII, tab and" \
+            "newline only. Nothing was sent."
+    fi
+    printf '%s\n' "$out"
+}
+
+# input_abs PIXEL SPAN -- the 0..32767 tablet value at the centre of PIXEL on a
+# screen SPAN pixels across. The guest maps the range back by scaling, so the
+# centre of the pixel's slice survives rounding either way where an edge would
+# not.
+input_abs() {
+    local v=$(( (2 * $1 + 1) * 32768 / (2 * $2) ))
+    (( v > 32767 )) && v=32767
+    printf '%d' "$v"
+}
+
+# --- talking to qemu ----------------------------------------------------------
+
+input_wait() { sleep "$(awk -v ms="$1" 'BEGIN { printf "%.3f", ms / 1000 }')"; }
+
+# input_qmp JSON -- one QMP command; its "return" on stdout. virsh exits non-zero
+# with qemu's refusal on stderr, which is passed on.
+input_qmp() {
+    local out
+    out="$("${VIRSH[@]}" qemu-monitor-command "$VM" "$1" 2>&1)" ||
+        die "$VM refused $(jq -r '.execute' <<<"$1" 2>/dev/null): $out"
+    jq -c '.return' <<<"$out" 2>/dev/null || die "$VM's monitor answered with something that is not JSON: $out"
+}
+
+input_send() {
+    input_qmp "$(jq -cn --argjson e "$1" '{execute: "input-send-event", arguments: {events: $e}}')" >/dev/null
+}
+
+input_move() {
+    input_send "$(jq -cn --argjson x "$(input_abs "$1" "$W")" --argjson y "$(input_abs "$2" "$H")" \
+        '[{type: "abs", data: {axis: "x", value: $x}}, {type: "abs", data: {axis: "y", value: $y}}]')"
+}
+
+input_button() {
+    input_send "$(jq -cn --arg b "$1" --argjson d "$2" '[{type: "btn", data: {down: $d, button: $b}}]')"
+}
+
+input_keys() {
+    input_qmp "$(jq -cn --arg k "$1" --argjson h "$2" \
+        '{execute: "send-key", arguments: {keys: [$k | splits(" ") | {type: "qcode", data: .}], "hold-time": $h}}')" >/dev/null
+}
+
+# input_screen_size -- sets W and H from a screenshot: PNG or PPM, whichever
+# libvirt hands back (see modules/linux/shot).
+input_screen_size() {
+    local raw magic size=""
+    mkdir -p -- "$VIRUTILS_TMP_DIR"
+    raw="$(mktemp "$VIRUTILS_TMP_DIR/input-XXXXXX")"
+    "${VIRSH[@]}" screenshot "$VM" --file "$raw" >/dev/null 2>&1 || { rm -f -- "$raw"; die "virsh could not take a screenshot of $VM to size its screen"; }
+    magic="$(od -An -tx1 -N8 -- "$raw" | tr -d ' \n')"
+    case "$magic" in
+        89504e470d0a1a0a) size="$(shot_png_size "$raw")" ;;
+        5036*)            size="$(head -c 200 -- "$raw" | sed -e 's/#.*//' | tr -s ' \t\n' ' ' | cut -d' ' -f2,3 | tr ' ' x)" ;;
+    esac
+    rm -f -- "$raw"
+    W="${size%x*}" H="${size#*x}"
+    [[ "${W:-}" =~ ^[0-9]+$ && "${H:-}" =~ ^[0-9]+$ && "$W" -gt 0 ]] ||
+        die "could not read the screen size of $VM from its screenshot (magic $magic)"
+}
+
+input_main() {
+    local verb="${1:-}" button=left double=0 a c state mice what n VM W H
+    local -a pos=()
+    [[ -n "$verb" ]] || input_usage 1
+    case "$verb" in
+        -h|--help) input_usage 0 ;;
+        click|move|drag|wheel|key|type) ;;
+        *) die "virutil input: unknown command: $verb (see: virutil input -h)" ;;
+    esac
+    shift
+    while (( $# )); do
+        a="$1"
+        # type's words and key's combos are taken as they are once VM is read,
+        # so a TEXT that starts with a dash is typed rather than refused.
+        if [[ "$verb" == key || "$verb" == type ]] && (( ${#pos[@]} >= 1 )); then
+            pos+=("$a")
+        else
+            case "$a" in
+                -h|--help) input_usage 0 ;;
+                -b|--button)
+                    [[ "$verb" == click || "$verb" == drag ]] ||
+                        die "virutil input: unknown flag for $verb: $a (see: virutil input -h)"
+                    [[ $# -ge 2 ]] || die "virutil input: $a needs a value"
+                    case "$2" in left|right|middle) button="$2" ;;
+                        *) die "virutil input: $a takes left, right or middle, not '$2'" ;; esac
+                    shift ;;
+                --double)
+                    [[ "$verb" == click ]] ||
+                        die "virutil input: unknown flag for $verb: $a (see: virutil input -h)"
+                    double=1 ;;
+                -[0-9]*) pos+=("$a") ;;
+                -*) die "virutil input: unknown flag for $verb: $a (see: virutil input -h)" ;;
+                *)  pos+=("$a") ;;
+            esac
+        fi
+        shift
+    done
+
+    local -A want=([click]=3 [move]=3 [drag]=5 [wheel]=4)
+    local -a nums=() combos=()
+    if [[ -n "${want[$verb]:-}" ]]; then
+        (( ${#pos[@]} == ${want[$verb]} )) || input_usage 1
+        for a in "${pos[@]:1}"; do
+            [[ "$a" =~ ^-?[0-9]+$ ]] || die "virutil input: expected a number, got '$a'"
+            nums+=("$a")
+        done
+    else
+        (( ${#pos[@]} >= 2 )) || input_usage 1
+    fi
+    VM="${pos[0]}"
+
+    # Everything that can be refused without the guest is refused first, so a
+    # combo with a typo or a character with no key sends nothing at all.
+    local text=""
+    if [[ "$verb" == key ]]; then
+        for a in "${pos[@]:1}"; do
+            c="$(input_combo "$a")" || exit 1
+            combos+=("$c")
+        done
+    elif [[ "$verb" == type ]]; then
+        text="${pos[*]:1}"
+        mapfile -t combos < <(input_text "$text"; echo "#$?")
+        [[ "${combos[-1]}" == '#0' ]] || exit 1
+        unset 'combos[-1]'
+    fi
+
+    state="$("${VIRSH[@]}" domstate "$VM" 2>/dev/null | head -1)" ||
+        die "no such VM: $VM (see: virsh -c qemu:///system list --all)"
+    # qemu drops input sent to a stopped guest without a word.
+    [[ "$state" == running ]] || die "$VM is not running ($state): there is nothing to send input to"
+
+    if [[ "$verb" == key || "$verb" == type ]]; then
+        local hold=100
+        # A shorter hold for text: it is many keys, and 30ms is still three
+        # frames of a 100Hz keyboard scan.
+        [[ "$verb" == type ]] && hold=30
+        for a in "${combos[@]}"; do input_keys "$a" "$hold"; done
+        # send-key returns as soon as the keys are queued. Waiting out the
+        # queue means the next virutil command -- a shot -- sees the result.
+        input_wait $(( ${#combos[@]} * (hold + 10) + 100 ))
+        if [[ "$verb" == type ]]; then say "$VM: typed ${#combos[@]} characters"
+        else say "$VM: key ${pos[*]:1}"; fi
+        return 0
+    fi
+
+    mice="$(input_qmp '{"execute":"query-mice"}')"
+    if [[ "$(jq '[.[] | select(.absolute)] | length' <<<"$mice")" == 0 ]]; then
+        die "$VM has no absolute pointer, so a screen position cannot be sent to it." \
+            "qemu lists: $(jq -r 'if length == 0 then "no mouse at all" else map(.name) | join("; ") end' <<<"$mice")" \
+            "Add one to the domain -- <input type='tablet' bus='usb'/> under" \
+            "<devices> in 'virsh edit $VM' -- and restart it. key and type work without one."
+    fi
+    input_screen_size
+    local k
+    for (( k = 0; k < ${#nums[@]}; k += 2 )); do
+        [[ "$verb" == wheel && $k -eq 2 ]] && break
+        if (( nums[k] < 0 || nums[k] >= W || nums[k+1] < 0 || nums[k+1] >= H )); then
+            die "${nums[k]},${nums[k+1]} is outside $VM's ${W}x$H screen"
+        fi
+    done
+
+    local x="${nums[0]}" y="${nums[1]}"
+    case "$verb" in
+        move)
+            input_move "$x" "$y"
+            what="move $x,$y" ;;
+        click)
+            input_move "$x" "$y"
+            input_wait 50
+            for (( n = 0; n <= double; n++ )); do
+                (( n > 0 )) && input_wait 80
+                input_button "$button" true
+                input_wait 50
+                input_button "$button" false
+            done
+            what="click $x,$y"
+            (( double )) && what="double-$what"
+            [[ "$button" == left ]] || what+=" ($button)" ;;
+        drag)
+            local x2="${nums[2]}" y2="${nums[3]}" steps=10
+            input_move "$x" "$y"
+            input_wait 100
+            input_button "$button" true
+            input_wait 100
+            # In steps, so the guest sees a drag rather than a jump: a window
+            # or a slider follows motion, not the end point alone.
+            for (( n = 1; n <= steps; n++ )); do
+                input_move $(( x + (x2 - x) * n / steps )) $(( y + (y2 - y) * n / steps ))
+                input_wait 25
+            done
+            input_wait 100
+            input_button "$button" false
+            what="drag $x,$y -> $x2,$y2"
+            [[ "$button" == left ]] || what+=" ($button)" ;;
+        wheel)
+            local notches="${nums[2]}" dir=wheel-up count
+            (( notches < 0 )) && dir=wheel-down
+            count=$(( notches < 0 ? -notches : notches ))
+            input_move "$x" "$y"
+            input_wait 50
+            for (( n = 0; n < count; n++ )); do
+                (( n > 0 )) && input_wait 40
+                input_button "$dir" true
+                input_button "$dir" false
+            done
+            what="wheel $notches at $x,$y" ;;
+    esac
+    say "$VM: $what on ${W}x$H"
+}

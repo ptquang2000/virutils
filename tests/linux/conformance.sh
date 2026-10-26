@@ -107,15 +107,20 @@ if [[ "$BASH_TREE" == mac ]]; then
     fi
 fi
 
-# shot with virsh substituted: grammar, refusals, and a PPM converted to PNG.
+# shot and input with virsh substituted: grammar, refusals, a PPM converted to
+# PNG, and the QMP each input verb sends. tests/mac/input.sh sources the macOS
+# module with qmp() substituted, so it runs here too, on any host.
 printf '\n-- bash unit tests --\n'
-if out="$(bash "$HERE/shot.sh" 2>&1)"; then
-    printf '%s\n' "$out" | sed 's/^/  /'
-    ok 'tests/linux/shot.sh'
-else
-    printf '%s\n' "$out" | sed 's/^/  /'
-    bad 'tests/linux/shot.sh'
-fi
+for t in "$HERE/shot.sh" "$HERE/input.sh" "$ROOT/tests/mac/input.sh"; do
+    name="tests/${t#"$ROOT/tests/"}"
+    if out="$(bash "$t" 2>&1)"; then
+        printf '%s\n' "$out" | sed 's/^/  /'
+        ok "$name"
+    else
+        printf '%s\n' "$out" | sed 's/^/  /'
+        bad "$name"
+    fi
+done
 
 printf '\n-- payloads (bash renderer) --\n'
 if diff -u "$GOLDEN" <(bash "$HERE/payloads.sh" 2>&1) > /tmp/vp.bash.diff; then
@@ -200,8 +205,11 @@ else
     #   shot.ps1    the screendump line the monitor is sent and what its reply
     #               means, then a real paused qemu with no guest -- skipped
     #               where no qemu is installed.
+    #   input.ps1   the monitor lines and barrier messages each verb sends,
+    #               then a real running qemu with its input trace on: the
+    #               events qemu took are the ones sent. Skipped likewise.
     printf '\n-- PowerShell unit tests --\n'
-    for t in domain exec usb xfer sync shot; do
+    for t in domain exec usb xfer sync shot input; do
         if out="$("$PWSH" -NoProfile -File "$ROOT/tests/win/$t.ps1" 2>&1)"; then
             printf '%s\n' "$out" | sed 's/^/  /'
             ok "tests/win/$t.ps1"

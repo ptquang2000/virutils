@@ -6,7 +6,7 @@
 # launchers in the image directory rather than libvirt.
 #
 # This completes the *bash* driver, so it offers every module in $MODULES:
-# domain, snapshot, sync, pull, push, exec, ui, shot, usb. The Windows driver carries
+# domain, snapshot, sync, pull, push, exec, ui, shot, input, usb. The Windows driver carries
 # domain, snapshot, exec and usb, and its completer says so; usb and snapshot
 # are on both, spelled the same way on each -- though a snapshot there is
 # disk-only and needs the domain shut off (docs/contract.md section 9).
@@ -28,6 +28,7 @@ _virutil() {
     'exec:run commands inside a guest via the QEMU guest agent'
     'ui:launch a process on a Windows guest interactive desktop'
     'shot:capture a guest screen to a PNG on this host'
+    'input:click, drag, scroll, press keys and type in a guest'
   )
   hardware=(
     'usb:pass a host USB device through to a guest'
@@ -40,7 +41,7 @@ _virutil() {
     # modules/mac/parser's MODULES; the rest are refused by name there.
     domains[2]='snapshot:qcow2 snapshots (disk and memory) for a domain'
     transfer=()
-    guest=(${guest[1]} ${guest[3]})
+    guest=(${guest[1]} ${guest[3]} ${guest[4]})
     hardware=()
   fi
 
@@ -62,6 +63,7 @@ _virutil() {
     exec)     _virutil_exec ;;
     ui)       _virutil_ui ;;
     shot)     _virutil_shot ;;
+    input)    _virutil_input ;;
     usb)      _virutil_usb ;;
   esac
 }
@@ -177,6 +179,42 @@ _virutil_shot() {
     '(-h --help)'{-h,--help}'[print usage and exit]' \
     '2:domain:->domain'
   [[ $state == domain ]] && _virutil_domains
+}
+
+# input VERB VM ...: coordinates and text are free-form, so after VM only the
+# flags, the buttons and some common key combos are worth offering.
+_virutil_input() {
+  local -a cmds=(
+    'click:move to X Y and click'
+    'move:move the pointer to X Y'
+    'drag:press at X1 Y1, move to X2 Y2, release'
+    'wheel:scroll N notches at X Y (positive up)'
+    'key:press and release each COMBO in turn'
+    'type:type TEXT as US-layout keys'
+  )
+  if [[ $words[CURRENT] == -* && $words[3] != (key|type) ]]; then
+    case $words[3] in
+      click) _values 'option' \
+               '(-b --button)'{-b,--button}'[left, right or middle]' \
+               '--double[click twice, as a double-click]' \
+               '-h[this message]' '--help[this message]' ;;
+      drag)  _values 'option' \
+               '(-b --button)'{-b,--button}'[left, right or middle]' \
+               '-h[this message]' '--help[this message]' ;;
+      *)     _virutil_help_flag ;;
+    esac
+    return
+  fi
+  case $words[CURRENT-1] in
+    -b|--button) _values 'button' left right middle; return ;;
+  esac
+  case $CURRENT in
+    3) _describe -t command 'command' cmds ;;
+    4) _virutil_domains ;;
+    *) [[ $words[3] == key ]] && _values -w 'key' ctrl+a ctrl+c ctrl+v alt+f4 \
+         alt+tab enter esc tab space backspace delete win win+r ctrl+alt+delete \
+         shift+tab f5 up down left right home end pgup pgdn ;;
+  esac
 }
 
 _virutil_sync() {

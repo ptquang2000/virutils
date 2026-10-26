@@ -68,6 +68,13 @@ virutil ui  run VM [-i N] [-s] [--elevated] [--] APP...
 
 virutil shot VM [-o FILE]
 
+virutil input click VM X Y [-b left|right|middle] [--double]
+virutil input move  VM X Y
+virutil input drag  VM X1 Y1 X2 Y2 [-b left|right|middle]
+virutil input wheel VM X Y N                      # N > 0 up, N < 0 down
+virutil input key   VM COMBO...                   # ctrl+a alt+f4 enter win
+virutil input type  VM TEXT...                    # US layout, printable ASCII
+
 virutil usb {list|show|attach|detach} [VM] [VENDOR:PRODUCT]
 
 virutil xfer {setup|remove|status}       # Windows host only
@@ -94,7 +101,7 @@ what a command line means should not have to find them somewhere else -- but a
 script using them is a script for one host. `snapshot` is marked the same way
 for the same reason, the other way round: it was on both drivers and was taken
 out of the Windows one (section 7). Everything else above is on the Linux and
-Windows drivers; the macOS driver carries `domain`, `snapshot`, `exec` and `shot` so far
+Windows drivers; the macOS driver carries `domain`, `snapshot`, `exec`, `shot` and `input` so far
 and refuses the rest by name (section 7). Section 9 says what each flag *does*
 where the drivers cannot agree.
 
@@ -143,6 +150,12 @@ Invariants that are contract, not implementation:
 - `shot` requires the domain **running**, takes the frame from the hypervisor
   with nothing run in the guest, and always writes PNG. The frame is the
   emulated console's; an RDP session is a separate desktop and is never in it.
+- `input` requires the domain **running**, sends its events through the
+  domain's emulated tablet and keyboard with nothing run in the guest, and
+  takes X,Y in the pixels of a `shot` PNG. It refuses, before sending anything,
+  a key name it does not know, a character the US layout cannot type, a
+  position off the screen and a pointer verb on a domain with no absolute
+  pointer.
 - The disk is always `<image dir>/VM.qcow2`.
 
 ## 3. State layout
@@ -366,7 +379,7 @@ an intention.
 
 Not every module ports. What the Windows driver ships today is:
 
-`domain`, `exec`, `push`, `pull`, `shot`, `sync`, `ui` and `usb`. That is the whole
+`domain`, `exec`, `input`, `push`, `pull`, `shot`, `sync`, `ui` and `usb`. That is the whole
 intended surface; `snapshot` is bash-only now. All of them are below. A module
 that works beats two half-ported.
 
@@ -414,8 +427,8 @@ qemu on PATH -- and `domain create` warns, by name, when it is about to write a
 launcher around stock qemu. With the patch, Windows Setup is on screen 30
 seconds after `domain create`.
 
-**What ships: `domain`, `snapshot`, `exec` and `shot`.** That is enough to build,
-run, script and roll back a guest, and to see its screen. `exec` is `modules/linux/exec` with the
+**What ships: `domain`, `snapshot`, `exec`, `shot` and `input`.** That is enough to build,
+run, script and roll back a guest, and to see and drive its screen. `exec` is `modules/linux/exec` with the
 agent reached over the socket and base64 spelled for BSD; `domain` and
 `snapshot` are new code over QMP and `qemu-img`.
 
@@ -660,6 +673,61 @@ paused qemu is what tests/win/shot.ps1 runs against. Against a live win11
 (WHPX, `-vga std`), one capture wrote a 1280x800 PNG of the console desktop
 in 7s end to end, pwsh start included, and nothing in the guest was touched.
 The macOS module has run only with QMP stubbed, never yet on a Mac.
+
+### `input`: on every host, through the emulated tablet and keyboard
+
+`input` is the other half of `shot`. qemu delivers its events through the
+domain's emulated devices, so nothing is staged in the guest, and Windows takes
+them as hardware input. UIPI therefore does not apply, and an elevated window
+or the UAC prompt takes them like any other. The grammar, the US-layout table
+and the pixel mapping are the same on every host:
+
+- A pixel P on a screen S pixels across is sent as `floor((2P+1) * 32768 /
+  (2S))`, which is the centre of that pixel's slice of the tablet's 0..32767
+  range. S is read from a screendump on every pointer command, so a guest
+  that changed resolution is followed.
+- `type` covers printable ASCII, tab and newline on the US layout and refuses
+  everything else, naming each character by code point, before sending any
+  key. A combo with an unknown key name is refused the same way.
+- A paused or shut-off domain, a position off the screen and a domain with no
+  absolute pointer (qemu's `query-mice` / `info mice` lists none) are refused
+  before any event is sent. `key` and `type` do not need the pointer.
+- One line on stderr and nothing on stdout. Exit 0 when sent, 1 otherwise.
+
+| | pointer | keys |
+| --- | --- | --- |
+| Linux | QMP `input-send-event` (`abs`, `btn`) through `virsh qemu-monitor-command` | QMP `send-key`, the same way |
+| Windows | an `input-barrier` object, `object_add`ed over the human monitor and pointed at a loopback listener `input` opens for the length of the command | `sendkey` on the human monitor |
+| macOS | QMP `input-send-event` on the domain's socket | QMP `send-key` |
+
+The Windows host needs the detour. Its launcher opens only the human monitor,
+and that monitor's `mouse_move` queues *relative* motion. Measured with qemu's
+`input_event_*` trace on, a `mouse_move 100 200` arrives as `input_event_rel ...
+axis x, value 100`. A relative event is routed to the PS/2 mouse, not the
+tablet, and the guest's acceleration then scales it. A QMP monitor cannot be
+added to a running qemu. `input-barrier` is in every qemu build. Its
+`width`/`height` properties are set to 32767, which makes qemu's scaling the
+identity, and a Barrier `DMMV 16384 8192` then arrives as `input_event_abs ...
+value 0x4000` and `... 0x2000`. The whole command is one monitor connection,
+because `Invoke-DomainMonitor` costs about 2s per line and the monitor serves
+one client at a time.
+
+On Linux, libvirt marks a domain that has received a monitor command as
+tainted (`custom-monitor`) in its log. Nothing else changes. `virsh send-key`
+could send the keys without that, but the pointer has no virsh command, and
+two mechanisms with two key-name sets are not worth that one log line.
+
+Measured on the Windows host (qemu v11.1.0-12130): tests/win/input.ps1 runs the
+driver against a throwaway running qemu with the input trace on, and asserts
+that qemu took exactly the absolute positions, buttons, wheel notches and key
+codes that were sent. Against winxp's disk booted read-only (`-snapshot`) in a
+throwaway qemu at 1024x768, `move` put the cursor's tip on the requested pixel
+at 0,0, 300,200, 517,383 and 1023,767. A right-click menu, a `drag` of a
+window by 200,200, `key win+r`, `ctrl+a` and `alt+f4`, and `type` of every
+ASCII punctuation character all did what they should. A Windows 11 guest, and
+with it the UIPI claim, is not measured yet. The macOS module has run only with
+QMP stubbed (tests/mac/input.sh).
+
 ### The transfer layer, and what is measured about it
 
 `sync`, `push` and `pull` all deliver the same way: **the host serves a tree and
@@ -914,6 +982,7 @@ drivers:
 | `tests/win/xfer.ps1` | `push` and `pull` on a Windows host with both seams substituted -- the guest agent and the share publisher -- so the guest path rules, credential generation, the free-space refusal, the sweep's liveness decision, the rendered payload and the teardown all run with no VM and no Administrator. Under the publisher, its own three seams (the task lookup, the task start, the UAC start) are substituted instead, so the choice between task and prompt, the request the helper is handed and the helper pid read back from the status file are asserted too; and the real helper is run unelevated against the requests it must refuse. Nothing registers a task or elevates. |
 | `tests/win/sync.ps1` | `sync` on a Windows host, over the same two seams, with a real staging tree and a real delivery tree built on the host: what each config directive parses to, that the two a Windows host cannot honour are refused **before anything is fetched**, the layout the map rules build, the payload the guest would have been sent, and that a failed delivery tears down as completely as a successful one. |
 | `tests/win/shot.ps1`, `tests/linux/shot.sh` | `shot`'s grammar, its refusals, and the PPM fallback with pixels checked, behind a substituted monitor (Windows) or `virsh` (Linux). The Windows half also captures from a real paused qemu with no disk and no guest, and skips that part where no qemu is installed. |
+| `tests/win/input.ps1`, `tests/linux/input.sh`, `tests/mac/input.sh` | `input`'s grammar, its refusals (before anything is sent), the pixel-to-tablet mapping, US-layout typing, and the events each verb sends, behind a substituted monitor and barrier (Windows), `virsh` (Linux) or `qmp()` (macOS, runnable on any host with bash and jq). The Windows half also drives a real running qemu with its `input_event_*` trace on and checks that qemu took exactly what was sent; it skips that part where no qemu is installed. |
 | `tests/win/transfer.ps1` | the guest tier: the transfer minimum below, plus the property that a completed transfer and a killed one both leave no account, no share and no staged tree. |
 
 On a Mac the bash half runs `modules/mac` -- the module list is read from

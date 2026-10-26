@@ -19,4 +19,6 @@ tests/golden/** text eol=lf
 virutil          text eol=lf
 install.sh       text eol=lf
 modules/linux/*  text eol=lf
+modules/mac/*    text eol=lf
 tests/linux/*.sh text eol=lf
+tests/mac/*.sh   text eol=lf

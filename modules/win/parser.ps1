@@ -51,8 +51,10 @@ $ErrorActionPreference = 'Stop'
 # carries it beside the transport it serves.
 #
 # `shot` is on every driver from the start: it asks the hypervisor for a frame
-# (`screendump` on the monitor here) and needs nothing from the guest.
-$script:MODULES = @('domain', 'exec', 'pull', 'push', 'shot', 'sync', 'ui', 'usb', 'xfer')
+# (`screendump` on the monitor here) and needs nothing from the guest. `input`
+# joined it the same way: the events go through the emulated tablet and
+# keyboard, over the same monitor.
+$script:MODULES = @('domain', 'exec', 'input', 'pull', 'push', 'shot', 'sync', 'ui', 'usb', 'xfer')
 
 # Names the bash driver answers to that this one does not, and why. A name here
 # is refused with its own reason instead of "unknown module", because each is in
@@ -138,6 +140,7 @@ function Get-TopUsage {
         '  ui         launch a process on a Windows guest''s interactive desktop,'
         '             as the logged-on user or SYSTEM'
         '  shot       capture a guest''s screen to a PNG on this host'
+        '  input      click, drag, scroll, press keys and type in a guest, from this host'
         ''
         'hardware'
         '  usb        pass a host USB device through to a guest'

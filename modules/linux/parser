@@ -1,6 +1,6 @@
 # parser -- top-level dispatch plus the helpers every module shares
 
-MODULES=(domain snapshot sync pull push exec ui shot usb)
+MODULES=(domain snapshot sync pull push exec ui shot input usb)
 
 die()  { printf '%s\n' "$@" >&2; exit 1; }
 warn() { printf '%s\n' "$@" >&2; }
@@ -30,6 +30,7 @@ guest
   ui         launch a process on a Windows guest's interactive desktop, as
              the logged-on user or SYSTEM
   shot       capture a guest's screen to a PNG on this host
+  input      click, drag, scroll, press keys and type in a guest, from this host
 
 hardware
   usb        pass a host USB device through to a guest: list, show, attach, detach

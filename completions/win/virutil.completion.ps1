@@ -9,11 +9,11 @@
 
   install.ps1 adds that line for you.
 
-  This completes the *Windows* driver, so it offers domain, exec, push, pull,
-  shot, sync, ui, usb and xfer and nothing else. snapshot is in the bash tree
+  This completes the *Windows* driver, so it offers domain, exec, input, push,
+  pull, shot, sync, ui, usb and xfer and nothing else. snapshot is in the bash tree
   only, and offering a name this driver would reject is worse than offering
   nothing -- $MODULES in modules\win\parser.ps1 is the list to keep this in step
-  with. usb and ui are on the Linux driver too and shot is on all three,
+  with. usb and ui are on the Linux driver too and shot and input are on all three,
   spelled the same way on each; xfer is on this one alone.
 
   Everything lives inside the scriptblock rather than in functions beside it:
@@ -52,7 +52,8 @@ $completer = {
     # Get-FlagValues' problem, and that one does look at the verb.
     $valueFlags = @(
         '-s', '--size', '-m', '--memory', '-c', '--vcpus', '-o', '--osinfo',
-        '-v', '--virtio', '-p', '--port', '--close', '--config', '--output'
+        '-v', '--virtio', '-p', '--port', '--close', '--config', '--output',
+        '-b', '--button'
     )
 
     # Flags do not consume a slot, so the positional index counts only the
@@ -191,6 +192,7 @@ $completer = {
         ui       = 'launch a process on a Windows guest''s interactive desktop'
         usb      = 'pass a host USB device through to a guest'
         shot     = "capture a guest's screen to a PNG on this host"
+        input    = 'click, drag, scroll, press keys and type in a guest, from this host'
         xfer     = 'set up the scheduled task that lets transfers elevate without a prompt'
         help     = 'the module list'
     }
@@ -221,6 +223,24 @@ $completer = {
         show   = 'what a domain passes through, live and persistent'
         attach = 'pass a host device through to a domain'
         detach = 'take one back from a domain'
+    }
+
+    $inputVerbs = [ordered]@{
+        click = 'move to X Y and click (-b right, --double)'
+        move  = 'move the pointer to X Y'
+        drag  = 'press at X1 Y1, move to X2 Y2, release'
+        wheel = 'scroll N notches at X Y: positive up, negative down'
+        key   = 'press and release each COMBO in turn: ctrl+a alt+f4 enter win'
+        type  = 'type TEXT as US-layout keys'
+    }
+
+    # A few combos worth a keypress; any other is typed out.
+    $inputCombos = [ordered]@{
+        'enter' = 'Enter'; 'esc' = 'Escape'; 'tab' = 'Tab'; 'shift+tab' = 'back a field'
+        'ctrl+a' = 'select all'; 'ctrl+c' = 'copy'; 'ctrl+v' = 'paste'; 'alt+f4' = 'close the window'
+        'alt+tab' = 'switch window'; 'win' = 'Start'; 'win+r' = 'Run'; 'win+d' = 'the desktop'
+        'ctrl+alt+delete' = 'the secure attention sequence'; 'space' = 'Space'; 'backspace' = 'Backspace'
+        'delete' = 'Delete'; 'f5' = 'refresh'
     }
 
     $execVerbs = [ordered]@{
@@ -267,6 +287,11 @@ $completer = {
             Add-Match '-s' 'as SYSTEM on that session''s desktop'
             Add-Match '--system' 'as SYSTEM on that session''s desktop'
             Add-Match '--elevated' 'the user''s full admin token, when UAC split it'
+        }
+        elseif ($module -eq 'input' -and $verb -in @('click', 'drag')) {
+            Add-Match '-b' 'left (default), right or middle'
+            Add-Match '--button' 'left (default), right or middle'
+            if ($verb -eq 'click') { Add-Match '--double' 'click twice, as a double-click' }
         }
         elseif ($module -eq 'shot') {
             Add-Match '-o' 'the PNG to write (default VM-YYYYMMDD-HHMMSS.png here)'
@@ -340,6 +365,9 @@ $completer = {
             { $_ -in @('-o', '--osinfo') -and $module -ne 'shot' } {
                 Add-Match 'win11' 'accepted and ignored here: there is no libosinfo on this host'
             }
+            { $_ -in @('-b', '--button') } {
+                foreach ($b in 'left', 'right', 'middle') { Add-Match $b 'button' }
+            }
             { $_ -in @('-p', '--port') } {
                 Add-Match '13389:3389' 'HOSTPORT:GUESTPORT (the default forward)'
             }
@@ -383,6 +411,7 @@ $completer = {
             elseif ($module -eq 'ui') { foreach ($k in $uiVerbs.Keys) { Add-Match $k $uiVerbs[$k] } }
             elseif ($module -eq 'usb') { foreach ($k in $usbVerbs.Keys) { Add-Match $k $usbVerbs[$k] } }
             elseif ($module -eq 'xfer') { foreach ($k in $xferVerbs.Keys) { Add-Match $k $xferVerbs[$k] } }
+            elseif ($module -eq 'input') { foreach ($k in $inputVerbs.Keys) { Add-Match $k $inputVerbs[$k] } }
         }
         2 {
             # `domain create` names a domain that does not exist yet, and
@@ -418,7 +447,7 @@ $completer = {
                 $hint = $noDomain
                 foreach ($d in $domains) { Add-Match $d 'domain' }
             }
-            elseif ($module -eq 'usb') {
+            elseif ($module -in @('usb', 'input')) {
                 $hint = $noDomain
                 foreach ($d in $domains) { Add-Match $d 'domain' }
             }
@@ -474,6 +503,18 @@ $completer = {
                 $hint = 'the program to launch: a guest path or a name on its PATH, then its arguments'
             }
         }
+    }
+
+    # input's words after VM: pixels, notches, combos or text. None is a path,
+    # so each claims the word rather than fall through to the file list.
+    if ($module -eq 'input' -and $pos -ge 3) {
+        $hint = switch ($verb) {
+            'key'   { 'a combo like ctrl+a, alt+f4, enter -- see virutil input -h' }
+            'type'  { 'the text to type: printable ASCII, tab and newline' }
+            'wheel' { if ($pos -eq 5) { 'N notches: positive up, negative down' } else { 'a pixel of the guest screen, as in a shot PNG' } }
+            default { 'a pixel of the guest screen, as in a shot PNG: X then Y' }
+        }
+        if ($verb -eq 'key') { foreach ($k in $inputCombos.Keys) { Add-Match $k $inputCombos[$k] } }
     }
 
     # The empty-but-owned answer, said rather than fallen through.

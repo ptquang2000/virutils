@@ -58,6 +58,7 @@ utilities it calls.
    - [port](#port)
    - [On a macOS host](#on-a-macos-host)
 - [virutil shot](#virutil-shot)
+- [virutil input](#virutil-input)
 - [virutil usb](#virutil-usb)
    - [USB passthrough under WSL, with usbipd](#usb-passthrough-under-wsl-with-usbipd)
 - [Requirements](#requirements)
@@ -213,6 +214,7 @@ way.
 | --- | --- | --- |
 | `exec` | Run commands inside a guest through the QEMU guest agent, with no guest networking required. `cmd` and `ps` address a Windows guest, `sh` a Linux one. | `virutil exec {ping\|cmd\|ps\|sh} VM [FLAGS] [ARGS]` |
 | `shot` | Capture a **running** guest's screen to a PNG on the host, from the hypervisor: nothing runs in the guest. Every host. See [virutil shot](#virutil-shot). | `virutil shot VM [-o FILE]` |
+| `input` | Click, drag, scroll, press keys and type in a **running** guest, at the pixel coordinates of a shot, through its emulated tablet and keyboard: nothing runs in the guest. Every host. See [virutil input](#virutil-input). | `virutil input {click\|move\|drag\|wheel\|key\|type} VM ...` |
 
 ### hardware
 
@@ -1927,6 +1929,100 @@ emulated display: what the domain's own window or virt-viewer shows. That is
 the console session, or the logon screen when no one is signed in there. An RDP
 connection is a separate session with its own desktop, and it never shows up
 in a shot.
+
+## virutil input
+
+Drive a running domain's pointer and keyboard from this host. This is the input
+side of `shot`: look with a shot, act with `input`, then look again.
+
+```
+virutil input click VM X Y [-b left|right|middle] [--double]
+virutil input move  VM X Y
+virutil input drag  VM X1 Y1 X2 Y2 [-b BUTTON]
+virutil input wheel VM X Y N
+virutil input key   VM COMBO...
+virutil input type  VM TEXT...
+```
+
+```sh
+$ virutil shot win11 -o s.png            # the button is at 640,412 in s.png
+$ virutil input click win11 640 412
+win11: click 640,412 on 1280x800
+$ virutil input key win11 ctrl+a
+$ virutil input type win11 'C:\uat\report.json'
+$ virutil input key win11 enter
+```
+
+**X and Y are pixels of the guest's screen, the same pixels as in a shot PNG**,
+with 0,0 at the top-left corner. Each pointer command reads the screen size
+from a fresh screendump and refuses a position outside it. It sends the
+position as an absolute one, aimed at the centre of the pixel, so the guest's
+own pointer speed and acceleration play no part in where the pointer lands.
+
+- `click` moves to X,Y and clicks. `-b right` or `-b middle` picks the button,
+   and `--double` clicks twice, fast enough to count as a double-click.
+- `drag` presses at X1,Y1, moves to X2,Y2 in ten steps, and releases there.
+- `wheel` scrolls N notches at X,Y. A positive N scrolls up and a negative N
+   scrolls down.
+- `key` presses and releases each COMBO in turn: `ctrl+a`, `alt+f4`,
+   `enter`, `win`, `win+r`, `ctrl+alt+delete`, `shift+tab`, `f5`. A key name
+   is a letter, a digit, `f1`-`f12`, one of `ctrl alt shift win enter esc tab
+   space backspace delete insert home end pgup pgdn up down left right menu
+   printscreen capslock`, a punctuation character, or any qemu key name
+   (qcode). An unknown name is refused before anything is sent.
+- `type` types TEXT, with its words joined by one space, on the **US layout**:
+   printable ASCII, tab and newline. It refuses any other character before it
+   sends a key, and names each one by code point (`'é' (U+00E9)`). It sends key
+   presses, not characters, so a guest on another layout gets that layout's
+   characters, and caps lock inverts the case of letters.
+
+The command prints one line on stderr saying what it did and nothing on
+stdout. It exits 0 when the events were sent, and 1 on any refusal or failure.
+A combo or text it cannot send, a domain that is paused or shut off (qemu
+drops input sent to a stopped guest), a position off the screen, and a domain
+with no absolute pointer are all refused before any event goes out.
+
+**Nothing runs in the guest.** qemu delivers the events through the domain's
+emulated tablet and keyboard, so Windows treats them as hardware input. They
+reach whichever window has the focus at any integrity level. That includes an
+elevated window, the UAC prompt and the logon screen, and neither the host nor
+the guest needs elevation for it. A guest-side agent that clicks with
+`SendInput` needs elevation to reach an elevated window, because UIPI blocks
+input from a lower integrity level. Hardware input is not subject to that
+check.
+
+How each host does it, and what it needs:
+
+| host | pointer | keys | needs |
+| --- | --- | --- | --- |
+| Linux | QMP `input-send-event`, `abs` axes, through `virsh qemu-monitor-command` | QMP `send-key`, the same way | `jq`, and a tablet: `virt-install` gives a domain with graphics a USB tablet. libvirt then logs the domain as tainted (`custom-monitor`); nothing else changes |
+| Windows | an `input-barrier` object hot-added over the QEMU monitor, which carries absolute positions to the tablet | `sendkey` on the monitor | the `usb-tablet` every `domain create` launcher has. No QMP socket, no launcher change, no restart |
+| macOS | QMP `input-send-event` on the domain's socket | QMP `send-key` | the `usb-tablet` every `domain create` launcher has |
+
+The Windows host takes the long way round because its only handle on a running
+domain is the human monitor, and that monitor's `mouse_move` sends *relative*
+motion. Relative motion goes to the PS/2 mouse, never to the tablet, and the
+guest scales it by its own acceleration. QMP could send absolute motion, but a
+monitor cannot be added to a running qemu. qemu's `input-barrier` object is the
+client half of the Barrier (Synergy) protocol. `object_add` creates it pointed
+at a listener that `input` opens on loopback for the length of the command,
+and `object_del` removes it at the end.
+
+A domain without an absolute pointer is refused by name, with what qemu lists
+and what to add. `key` and `type` still work on it. The monitor on a Windows
+host serves one client at a time, so run `shot` and `input` against the same
+domain one after the other, not at the same moment.
+
+Measured on the Windows host (qemu v11.1.0-12130), against a throwaway qemu
+that booted winxp's disk under `-snapshot`, at 1024x768: `move` put the cursor's
+tip on exactly the requested pixel at 0,0, 300,200, 517,383 and 1023,767. A
+right-click opened the desktop menu at the cursor. `key win+r`, `type notepad`
+and `key enter` opened Notepad. `type` then entered every shifted and unshifted
+punctuation character, the digits, a newline and a tab correctly. A `drag` of
+the title bar moved the window by exactly 200,200, and `ctrl+a` and `alt+f4`
+did what they should. A Windows 11 guest, and so the UIPI point above, has not
+been measured yet.
+
 ## virutil usb
 
 Pass a physical USB device from the host through to a guest. Both drivers have
@@ -2111,6 +2207,7 @@ Host, for `virutil domain`:
    check removed.
 - `python3`, for `virutil shot` only, and only when libvirt hands back a PPM
    rather than a PNG
+- `jq`, for `virutil exec` and `virutil input`
 - `acl`, optional: an install ISO under a `0700` home directory is unreachable
    by the qemu user, and `virutil domain create` prints the `setfacl` that fixes
    it
