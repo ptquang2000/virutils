@@ -60,6 +60,14 @@ function Get-ExecUsage {
 # pull parse ("copied total ms", "files dirs ms"), not something a person is
 # meant to read. stderr still goes to the console, because that half *is* for
 # the person -- the bash driver gets the same split for free from `$(...)`.
+#
+# -Emit writes the guest's stdout, or the detached pid, to the success stream a
+# line at a time instead of to the console, and is what `virutil exec` itself
+# runs under. virutil.ps1 runs in the caller's own PowerShell, where
+# [Console]::Out goes past the pipeline: `$x = virutil exec ...` got nothing and
+# the output landed on the screen. A line at a time is what a native command
+# gives, so $x is the lines. Not the default, because sync's run rules call this
+# from inside a scriptblock whose return value is the transfer's answer.
 function Invoke-GuestExec {
     param(
         [Parameter(Mandatory)][string]$Vm,
@@ -67,6 +75,7 @@ function Invoke-GuestExec {
         [string[]]$Argv = @(),
         [switch]$Detach,
         [switch]$Capture,
+        [switch]$Emit,
         [string]$InputB64 = ''
     )
 
@@ -78,7 +87,7 @@ function Invoke-GuestExec {
     $guestPid = (Invoke-GuestAgent $Vm 'guest-exec' $execArgs).pid
 
     if ($Detach) {
-        [Console]::Out.WriteLine($guestPid)
+        if ($Emit) { "$guestPid" } else { [Console]::Out.WriteLine($guestPid) }
         $script:VirutilExit = 0
         return
     }
@@ -97,8 +106,9 @@ function Invoke-GuestExec {
     $captured = ''
     $out = Get-AgentStream $st 'out-data'
     if ($out) {
-        if ($Capture) { $captured = (Format-GuestStream $out).TrimEnd("`n") }
-        else          { [Console]::Out.Write((Format-GuestStream $out)) }
+        if ($Capture)  { $captured = (Format-GuestStream $out).TrimEnd("`n") }
+        elseif ($Emit) { (Format-GuestStream $out).TrimEnd("`n").Split("`n") }
+        else           { [Console]::Out.Write((Format-GuestStream $out)) }
     }
 
     $err = Get-AgentStream $st 'err-data'
@@ -166,7 +176,7 @@ function ConvertFrom-Clixml {
 # Shared with the transports, exactly as the bash exec_ps_text is.
 function Invoke-GuestPsText {
     param([Parameter(Mandatory)][string]$Vm, [Parameter(Mandatory)][string]$Script,
-          [switch]$Detach, [switch]$Capture, [string]$InputB64 = '')
+          [switch]$Detach, [switch]$Capture, [switch]$Emit, [string]$InputB64 = '')
 
     # The catch writes to the console handle, not powershell's error stream,
     # which would be serialised as CLIXML; the explicit exit 1 restores the code
@@ -193,7 +203,7 @@ function Invoke-GuestPsText {
 
     Invoke-GuestExec $Vm 'powershell.exe' `
         @('-NoProfile', '-NonInteractive', '-OutputFormat', 'Text', '-EncodedCommand', $enc) `
-        -Detach:$Detach -Capture:$Capture -InputB64 $InputB64
+        -Detach:$Detach -Capture:$Capture -Emit:$Emit -InputB64 $InputB64
 }
 
 # Invoke-GuestShText VM SCRIPT -- run SCRIPT in the guest's /bin/sh.
@@ -211,7 +221,7 @@ function Invoke-GuestPsText {
 # the state the rule was meant to put it in.
 function Invoke-GuestShText {
     param([Parameter(Mandatory)][string]$Vm, [Parameter(Mandatory)][string]$Script,
-          [switch]$Detach, [string]$InputB64 = '')
+          [switch]$Detach, [switch]$Emit, [string]$InputB64 = '')
 
     $text = "set -e`n$Script"
 
@@ -224,7 +234,7 @@ function Invoke-GuestShText {
         )
     }
 
-    Invoke-GuestExec $Vm '/bin/sh' @('-c', $text) -Detach:$Detach -InputB64 $InputB64
+    Invoke-GuestExec $Vm '/bin/sh' @('-c', $text) -Detach:$Detach -Emit:$Emit -InputB64 $InputB64
 }
 
 # --- the command line -------------------------------------------------------
@@ -301,9 +311,9 @@ function Exec-Main {
                     'in the guest and run that'
                 )
             }
-            Invoke-GuestExec $vm 'cmd.exe' @('/c', $text) -Detach:$detach -InputB64 $inputB64
+            Invoke-GuestExec $vm 'cmd.exe' @('/c', $text) -Detach:$detach -Emit -InputB64 $inputB64
         }
-        'ps' { Invoke-GuestPsText $vm $text -Detach:$detach -InputB64 $inputB64 }
-        'sh' { Invoke-GuestShText $vm $text -Detach:$detach -InputB64 $inputB64 }
+        'ps' { Invoke-GuestPsText $vm $text -Detach:$detach -Emit -InputB64 $inputB64 }
+        'sh' { Invoke-GuestShText $vm $text -Detach:$detach -Emit -InputB64 $inputB64 }
     }
 }

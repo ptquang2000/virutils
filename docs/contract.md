@@ -1206,6 +1206,11 @@ thing neither driver may do, because it reports a change that was not made.
   caller's job object, and closing a terminal pane ends that job -- closing one
   psmux window killed three running guests. The launcher runs with the user's
   environment rather than the caller's, so it names everything by absolute path.
+- **`virutil exec` writes the guest's stdout to PowerShell's success stream** on
+  a Windows host, one string per line, and `-d` its pid. The driver runs in the
+  caller's own PowerShell, where a console write goes past the pipeline, so
+  `$x = virutil exec ...` used to get nothing. That makes it capture the way the
+  bash driver's `$(virutil exec ...)` always has. stderr stays on the console.
 - **A Windows host's `create` gives the guest a local-time RTC**
   (`-rtc base=localtime`), as libvirt's Windows profile and the macOS driver
   do. A launcher written before that has none, so its guest reads UTC as local

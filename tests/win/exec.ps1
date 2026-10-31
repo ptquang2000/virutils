@@ -79,6 +79,30 @@ try {
     Check 'neither member is zero, not an error' 0 `
         (RunWith ([pscustomobject]@{ exited = $true }))
 
+    # `virutil exec` runs in the caller's own PowerShell, so its stdout has to
+    # be on the success stream for `$x = virutil exec ...` to see it. It came out
+    # through [Console]::Out, which went straight to the screen and left $x empty.
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("one`r`n`r`ntwo  `r`n"))
+    $script:AgentStatus = [pscustomobject]@{ exited = $true; exitcode = 0; 'out-data' = $b64 }
+    $got = @(Invoke-GuestExec 'testvm' 'cmd.exe' @('/c', 'true') -Emit 2>$null)
+    Check 'emitted stdout is one object per line'  3            $got.Count
+    Check 'with \r and trailing blanks gone'       'one||two'   ($got -join '|')
+    $got = @(Invoke-GuestExec 'testvm' 'cmd.exe' @('/c', 'true') -Emit -Detach)
+    Check 'a detached pid is emitted too'          '4242'       ($got -join '|')
+    $script:AgentStatus = [pscustomobject]@{ exited = $true; exitcode = 0 }
+    $got = @(Invoke-GuestExec 'testvm' 'cmd.exe' @('/c', 'true') -Emit)
+    Check 'no output emits nothing'                0            $got.Count
+    # Without -Emit nothing reaches the pipeline: sync's run rules call this
+    # inside a scriptblock whose return value is the transfer's answer.
+    $script:AgentStatus = [pscustomobject]@{ exited = $true; exitcode = 0; 'out-data' = $b64 }
+    $console = [Console]::Out
+    $sw = New-Object IO.StringWriter
+    [Console]::SetOut($sw)
+    try { $got = @(Invoke-GuestExec 'testvm' 'cmd.exe' @('/c', 'true')) }
+    finally { [Console]::SetOut($console) }
+    Check 'without -Emit the pipeline stays empty' 0            $got.Count
+    Check 'and the console has it'                 "one`n`ntwo`n" $sw.ToString()
+
     # Get-RestArgs stands in for the shell's `shift`, and the slice it replaces
     # counts backwards from the end once the array is exhausted -- which would
     # hand a module its own arguments reversed rather than none.
