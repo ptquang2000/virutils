@@ -1206,6 +1206,11 @@ thing neither driver may do, because it reports a change that was not made.
   caller's job object, and closing a terminal pane ends that job -- closing one
   psmux window killed three running guests. The launcher runs with the user's
   environment rather than the caller's, so it names everything by absolute path.
+- **A Windows host's `create` gives the guest a local-time RTC**
+  (`-rtc base=localtime`), as libvirt's Windows profile and the macOS driver
+  do. A launcher written before that has none, so its guest reads UTC as local
+  time; it is not retrofitted, because a guest set to `RealTimeIsUniversal=1`
+  to cope would then run off by its UTC offset the other way.
 - **`domain start -G` is accepted, warned about and not honoured**: qemu under
   WHPX has no headless console to detach from, and `-display none` would leave
   the guest with no way in at all. `-s`, `-m` and `-c` used to be listed here

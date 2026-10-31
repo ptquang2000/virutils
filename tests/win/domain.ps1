@@ -66,6 +66,9 @@ try {
     # is the whole reason the pipe chardev was replaced.
     Check 'the agent chardev is wait=off' $true ($line -match 'socket,id=qga0,.*server=on,wait=off')
     Check 'virtio-serial is present'     $true ($line -match '-device virtio-serial')
+    # Without it the RTC is UTC, Windows reads it as local time, and the guest
+    # runs off by its zone's UTC offset.
+    Check 'a local-time RTC'             $true ($line -match '-rtc base=localtime')
 
     $fwd = Get-DomainForwards $vm
     Check 'both forwards read back'      2     $fwd.Count

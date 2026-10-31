@@ -1597,6 +1597,16 @@ function Get-DomainQemuArgs {
         '-cpu', $script:DomainCpu
         '-smp', "$Vcpus,sockets=1,cores=$Vcpus,threads=1"
         '-m', "$Memory"
+        # Windows keeps the RTC in local time, as the legacy profile below, the
+        # macOS driver and libvirt's Windows default all say. Without this the
+        # RTC is UTC and Windows reads it as its own local time, so a guest is
+        # off by its zone's UTC offset: three win11 guests ran 7 h off. Setting
+        # RealTimeIsUniversal=1 in the guest did not hold on Fast Startup's
+        # resume path. base=localtime is the host's local time, so a guest set
+        # to the host's zone reads it right on every path. A launcher written
+        # before this has no -rtc, and its guest may have been set to
+        # RealTimeIsUniversal=1 to cope: do not add the flag to one by hand.
+        '-rtc', 'base=localtime'
         '-drive', "if=pflash,format=raw,readonly=on,file=$($Qemu.Code)"
         '-drive', "if=pflash,format=raw,file=$Nvram"
         # The disk boots first and the install ISO second, which is the other
