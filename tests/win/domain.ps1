@@ -351,6 +351,47 @@ try {
         [Console]::Out.WriteLine('skip     removed through an 8.3 short path (no short %TEMP% here)')
     }
 
+    # --- the launcher runs outside the caller's process tree -------------------
+    #
+    # A child of this process would share its job object, and a terminal that
+    # closes a pane ends that job: closing one psmux window killed three running
+    # guests. The launcher here stands in for a real one -- no qemu -- and sits
+    # in a directory with a space in it, which the cmd /c quoting has to carry.
+    $savedImageDir = $script:VirutilsImageDir
+    $script:VirutilsImageDir = Join-Path $savedImageDir 'with space'
+    New-VirutilsDir $script:VirutilsImageDir | Out-Null
+    $sv = 'startvm'
+    $marker = Join-Path $script:VirutilsImageDir 'started.txt'
+    Set-Content -LiteralPath (Get-DomainLauncher $sv) -Encoding ASCII -Value @"
+@echo off
+echo ran> "$marker"
+ping.exe -n 30 127.0.0.1 > nul
+"@
+    try {
+        Start-DomainProcess $sv
+        $cmd = $null
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while (-not $cmd -and $sw.ElapsedMilliseconds -lt 15000) {
+            Start-Sleep -Milliseconds 250
+            $cmd = Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" |
+                Where-Object { $_.CommandLine -and $_.CommandLine.Contains((Get-DomainLauncher $sv)) } |
+                Select-Object -First 1
+        }
+        Check 'start runs the launcher'             $true ($null -ne $cmd -and (Test-Path -LiteralPath $marker))
+        $parent = if ($cmd) { Get-CimInstance Win32_Process -Filter "ProcessId=$($cmd.ParentProcessId)" }
+        Check 'and not as this process''s child'    'WmiPrvSE.exe' $(if ($parent) { $parent.Name })
+        Check 'in this user''s session'             (Get-Process -Id $PID).SessionId $(if ($cmd) { $cmd.SessionId })
+    } finally {
+        Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" |
+            Where-Object { $_.CommandLine -and $_.CommandLine.Contains((Get-DomainLauncher $sv)) } |
+            ForEach-Object {
+                Get-CimInstance Win32_Process -Filter "ParentProcessId=$($_.ProcessId)" |
+                    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+        $script:VirutilsImageDir = $savedImageDir
+    }
+
     [Console]::Out.WriteLine("")
     [Console]::Out.WriteLine("$($script:Pass) passed, $($script:Fail) failed")
 } finally {

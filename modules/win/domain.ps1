@@ -792,14 +792,33 @@ function Wait-DomainStart {
 }
 
 # The launcher is the domain, so running one is the only way to start a guest
-# and this is the only place that does it. -WindowStyle Hidden is for cmd's own
-# window: the launcher's `start /b` returns immediately and cmd exits with it,
-# so this is a flash at most, but a flash per start is still a flash. qemu
-# itself has no window to hide -- that is the GUI build's whole point.
+# and this is the only place that does it. ShowWindow 0 is for cmd's own window:
+# the launcher's `start /b` returns immediately and cmd exits with it, so this
+# is a flash at most, but a flash per start is still a flash. qemu itself has no
+# window to hide -- that is the GUI build's whole point.
+#
+# Through WMI's Win32_Process.Create, not Start-Process, so qemu is not the
+# caller's child. A Start-Process child joins the caller's job object, and a
+# terminal that closes a pane ends that pane's job: closing a psmux window that
+# had run `domain start` killed all three of this host's guests mid-run
+# (2026-10-29). Measured with a stand-in for qemu: the Start-Process copy died
+# with its pane, the WMI copy outlived it. WmiPrvSE creates the process as the
+# calling user, in the calling user's session, so the guest's window still
+# shows on that user's desktop -- but with the user's environment rather than
+# the caller's, which the launcher does not read: every path in it is absolute.
 function Start-DomainProcess {
     param([string]$Vm)
-    Start-Process -FilePath $env:ComSpec `
-        -ArgumentList '/c', (Get-DomainLauncher $Vm) -WindowStyle Hidden | Out-Null
+    $launcher = Get-DomainLauncher $Vm
+    $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly `
+        -Property @{ ShowWindow = [uint16]0 }
+    $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+        CommandLine               = "`"$env:ComSpec`" /c `"`"$launcher`"`""
+        CurrentDirectory          = (Split-Path -Parent $launcher)
+        ProcessStartupInformation = $startup
+    }
+    if ($r.ReturnValue -ne 0) {
+        Die "could not run $launcher`: Win32_Process.Create returned $($r.ReturnValue)"
+    }
 }
 
 function Stop-Domain {

@@ -1200,6 +1200,12 @@ thing neither driver may do, because it reports a change that was not made.
   Linux-host command and why, rather than "unknown module", because the verbs
   are published in section 2 and were on this driver until recently. A name that
   used to work must not come back as a typo.
+- **A domain outlives the terminal that started it**, on a Windows host as under
+  libvirt. `domain start` and `create` run the launcher through WMI's
+  `Win32_Process.Create`, not as the caller's child: a child shares the
+  caller's job object, and closing a terminal pane ends that job -- closing one
+  psmux window killed three running guests. The launcher runs with the user's
+  environment rather than the caller's, so it names everything by absolute path.
 - **`domain start -G` is accepted, warned about and not honoured**: qemu under
   WHPX has no headless console to detach from, and `-display none` would leave
   the guest with no way in at all. `-s`, `-m` and `-c` used to be listed here
