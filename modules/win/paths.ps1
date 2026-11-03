@@ -64,6 +64,11 @@ $script:VirutilsPortDir     = Get-VirutilsEnv 'PORT_DIR'     (Join-Path $script:
 $script:VirutilsMntRoot     = Get-VirutilsEnv 'MNT_ROOT'     (Join-Path $script:VirutilsRoot 'mnt')
 $script:VirutilsTmpDir      = Get-VirutilsEnv 'TMP_DIR'      (Join-Path $script:VirutilsRoot 'tmp')
 $script:VirutilsCacheDir    = Get-VirutilsEnv 'CACHE_DIR'    (Join-Path $script:VirutilsRoot 'cache')
+# Where `domain start` looks for an install or virtio ISO a launcher names but
+# that is no longer at its path (Repair-DomainMedia): `;`-separated, searched in
+# order, before the root's iso dir and the dirs other launchers' ISOs are in.
+$script:VirutilsIsoDirs     = @((Get-VirutilsEnv 'ISO_DIR' '') -split ';' | Where-Object { $_ }) +
+                              (Join-Path $script:VirutilsRoot 'iso')
 
 # The knobs domain reads. Same two spellings, same preference.
 #

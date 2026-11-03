@@ -338,6 +338,11 @@ function Get-DomainUsage {
         "  VIRUTILS_IMAGE_DIR     $($script:VirutilsImageDir)"
         '  VIRUTILS_VIRTIO        (auto)       virtio-win ISO path, or "none"'
         ''
+        'start reads VIRUTILS_ISO_DIR (dirs, ;-separated): a cdrom ISO the'
+        'launcher names but that is gone from its path is looked for by file'
+        "name there, then in $(Join-Path $script:VirutilsRoot 'iso'), then where"
+        "other domains' ISOs are, and the launcher is pointed at the one found."
+        ''
         'VIRUTILS_OSINFO, VIRUTILS_NETWORK and VIRUTILS_FIRMWARE are in the'
         'contract but have no meaning on this host: there is no libosinfo, no'
         'libvirt network, and WHPX will not boot Windows 11 without UEFI.'
@@ -686,6 +691,7 @@ function Start-Domain {
     }
 
     Repair-DomainPorts $vm
+    Repair-DomainMedia $vm
     Start-DomainProcess $vm
     Wait-DomainStart $vm
     Say "$vm started"
@@ -1086,6 +1092,64 @@ function Repair-DomainPorts {
         )
     }
 
+    if ($new -ne $text) {
+        Set-Content -LiteralPath $path -Value $new -Encoding ASCII -NoNewline
+    }
+}
+
+# Repair-DomainMedia VM -- point each cdrom the launcher names at a file that
+# exists, before qemu dies on a missing one.
+#
+# create freezes the install and virtio-win ISO paths it was given, and those
+# often sit in a work tree that moves: RNDLB's win11, win11-2 and win11-3 named
+# C:\Users\opswat\mde-v6\*.iso after the clone moved to ...\work\mde-v6, and
+# none of them would start until someone edited the launcher by hand. A missing
+# ISO is looked for by its file name in $VirutilsIsoDirs (VIRUTILS_ISO_DIR, then
+# <root>\iso), then in the dirs other launchers' cdroms resolve to; the first
+# match is written into the launcher, as Repair-DomainPorts writes a port.
+# Nothing found is a stop that names the file and where it looked: qemu's own
+# word for it is one line in the log and a domain that is off a moment later.
+function Repair-DomainMedia {
+    param([string]$Vm)
+    $path = Get-DomainLauncher $Vm
+    $text = Get-Content -LiteralPath $path -Raw
+    # Group 2 is the path: the drive value is quoted (it holds commas), and a
+    # cdrom is the drive whose options say media=cdrom.
+    $pattern = '(-drive\s+"?file=)([^,"\r\n]+)(,[^"\r\n]*media=cdrom)'
+    $missing = @([regex]::Matches($text, $pattern) |
+                 Where-Object { -not (Test-Path -LiteralPath $_.Groups[2].Value -PathType Leaf) })
+    if ($missing.Count -eq 0) { return }
+
+    $dirs = @($script:VirutilsIsoDirs)
+    foreach ($other in Get-DomainNames) {
+        if ($other -eq $Vm) { continue }
+        $t = Get-Content -LiteralPath (Get-DomainLauncher $other) -Raw
+        foreach ($m in [regex]::Matches($t, $pattern)) {
+            $f = $m.Groups[2].Value
+            if (Test-Path -LiteralPath $f -PathType Leaf) { $dirs += (Split-Path -Parent $f) }
+        }
+    }
+    $dirs = @($dirs | Select-Object -Unique)
+
+    $new = $text
+    foreach ($m in $missing) {
+        $old  = $m.Groups[2].Value
+        $leaf = Split-Path -Leaf $old
+        $found = $dirs | ForEach-Object { Join-Path $_ $leaf } |
+                 Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+                 Select-Object -First 1
+        if (-not $found) {
+            Die @(
+                "$Vm's launcher names the ISO $old, which is not there, and no"
+                "$leaf was found in: $($dirs -join '; ')."
+                'Put the ISO in one of those (or set VIRUTILS_ISO_DIR to its dir)'
+                "and start again, or fix the path in $path by hand."
+            )
+        }
+        $new = $new.Replace($m.Groups[1].Value + $old + $m.Groups[3].Value,
+                            $m.Groups[1].Value + $found + $m.Groups[3].Value)
+        Warn "$Vm's ISO $old is gone; $path now names $found."
+    }
     if ($new -ne $text) {
         Set-Content -LiteralPath $path -Value $new -Encoding ASCII -NoNewline
     }
