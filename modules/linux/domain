@@ -78,6 +78,9 @@ domain_main() {
         shutdown) domain_need_vm shutdown "$@"; "${VIRSH[@]}" shutdown  "$1" ;;
         addr)     domain_need_vm addr     "$@"; "${VIRSH[@]}" domifaddr "$1" --full ;;
         port)     domain_port   "$@" ;;
+        setup)    die "virutil domain setup is a Windows-host command: it registers the" \
+                      "scheduled task a Windows host starts qemu through. libvirt runs" \
+                      "the guest here, so there is nothing to set up." ;;
         *)        die "virutil domain: unknown command: $CMD (see: virutil domain -h)" ;;
     esac
 }

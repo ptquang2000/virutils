@@ -117,6 +117,9 @@ domain_main() {
         shutdown) domain_shutdown "$@" ;;
         addr)     domain_addr     "$@" ;;
         port)     domain_port     "$@" ;;
+        setup)    die "virutil domain setup is a Windows-host command: it registers the" \
+                      "scheduled task a Windows host starts qemu through. Nothing here" \
+                      "needs it." ;;
         *)        die "virutil domain: unknown command: $CMD (see: virutil domain -h)" ;;
     esac
 }

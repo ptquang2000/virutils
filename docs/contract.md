@@ -52,6 +52,7 @@ virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]
 virutil domain shutdown VM
 virutil domain addr     VM
 virutil domain port     VM [PORT | HOSTPORT:GUESTPORT] [-c PORT]
+virutil domain setup    [--remove | --status]   # Windows host only
 
 virutil snapshot create VM [SNAP]        # Linux and macOS hosts; default snap-<timestamp>
 virutil snapshot list   VM               # Linux and macOS hosts
@@ -1201,11 +1202,19 @@ thing neither driver may do, because it reports a change that was not made.
   are published in section 2 and were on this driver until recently. A name that
   used to work must not come back as a typo.
 - **A domain outlives the terminal that started it**, on a Windows host as under
-  libvirt. `domain start` and `create` run the launcher through WMI's
-  `Win32_Process.Create`, not as the caller's child: a child shares the
-  caller's job object, and closing a terminal pane ends that job -- closing one
-  psmux window killed three running guests. The launcher runs with the user's
-  environment rather than the caller's, so it names everything by absolute path.
+  libvirt. `domain start` and `create` never run the launcher as the caller's
+  child: a child shares the caller's job object, and closing a terminal pane
+  ends that job -- closing one psmux window killed three running guests. They
+  start the per-user scheduled task `virutil domain setup` registers
+  (`virutil-domain-start`, unelevated, no trigger), which runs the launcher in
+  the user's desktop session; without it, WMI's `Win32_Process.Create`. WMI is
+  the fallback and not the rule because Defender's attack surface reduction
+  rule "Block process creations originating from PSExec and WMI commands"
+  refuses it outright on a managed host (Create returns 2, event 1121), and
+  because an ssh logon's token cannot follow the junction qemu's path runs
+  through. Either way the launcher runs with the user's environment rather
+  than the caller's, so it names everything by absolute path. `domain setup`
+  is a Windows-host command; the bash driver refuses it by name.
 - **`virutil exec` writes the guest's stdout to PowerShell's success stream** on
   a Windows host, one string per line, and `-d` its pid. The driver runs in the
   caller's own PowerShell, where a console write goes past the pipeline, so

@@ -354,45 +354,161 @@ try {
         [Console]::Out.WriteLine('skip     removed through an 8.3 short path (no short %TEMP% here)')
     }
 
+    # --- which launcher a start takes ----------------------------------------
+    #
+    # Get-DomainStartLaunch is the whole decision, and it is pure: the task as
+    # read, and this user's SID.
+    $sid  = Get-DomainStartUserSid
+    $want = Get-DomainStartTaskAction
+    $good = @{ Enabled = $true; Path = $want.Path; Arguments = $want.Arguments; User = 'me'; Sid = $sid; Priority = 4 }
+    Check 'no task: WMI, nothing to say'       'wmi|'   ((Get-DomainStartLaunch $null $sid).Via + '|' + (Get-DomainStartLaunch $null $sid).Why)
+    Check 'a usable task: the task'            'task'   (Get-DomainStartLaunch $good $sid).Via
+    $t = $good.Clone(); $t.Enabled = $false
+    Check 'a disabled task: WMI'               'wmi'    (Get-DomainStartLaunch $t $sid).Via
+    Check 'and it says so'                     $true    (((Get-DomainStartLaunch $t $sid).Why -join ' ') -match 'disabled')
+    $t = $good.Clone(); $t.Sid = 'S-1-5-21-0-0-0-1'; $t.User = 'someone'
+    Check 'another user''s task: WMI'          'wmi'    (Get-DomainStartLaunch $t $sid).Via
+    $t = $good.Clone(); $t.Arguments = $want.Arguments.Replace($script:VirutilsImageDir, 'C:\elsewhere')
+    Check 'a task for another image dir: WMI'  'wmi'    (Get-DomainStartLaunch $t $sid).Via
+    Check 'and it says to set up again'        $true    (((Get-DomainStartLaunch $t $sid).Why -join ' ') -match 'virutil domain setup')
+
+    # The action runs launchers from the image dir, named by $(Arg0), and
+    # nothing else; cmd under conhost --headless, with AutoRun off.
+    Check 'the action is conhost'              (Join-Path $env:WINDIR 'System32\conhost.exe') $want.Path
+    Check 'headless, cmd /d /c'                $true    ($want.Arguments -match '^--headless ".*\\cmd\.exe" /d /c ')
+    Check 'the launcher is $(Arg0) in the image dir' $true ($want.Arguments.EndsWith("`"`"$(Join-Path $script:VirutilsImageDir '$(Arg0).cmd')`"`""))
+
+    # A name that could leave the image dir or the quotes never reaches the
+    # scheduler.
+    foreach ($bad in @('..\x', 'a"b', 'a&b', 'a/b', 'a%b')) {
+        $threw = $false
+        try { Start-DomainStartTask $bad } catch { $threw = $_.Exception.Message -match 'cannot go through the task' }
+        Check "the task refuses the name $bad"  $true $threw
+    }
+
+    # What a start says when WMI is refused and there is no task: the ASR rule
+    # by id, and the one command that fixes it.
+    $msg = (Get-DomainStartFailure -Vm 'nosuch' -ReturnValue 2 -Launch @{ Via = 'wmi'; Why = '' } -TaskError $null) -join "`n"
+    Check 'access denied is named'             $true ($msg -match 'returned 2 \(access denied\)')
+    Check 'the ASR rule is named'              $true ($msg -match 'D1E49AAC-8F56-4280-B9BA-993A6D77406C')
+    Check 'and the fix'                        $true ($msg -match '(?m)^  virutil domain setup$')
+    $msg = (Get-DomainStartFailure -Vm 'nosuch' -ReturnValue 2 -Launch @{ Via = 'task'; Why = '' } -TaskError 'starting the scheduled task failed: no desktop') -join "`n"
+    Check 'a failed task start is said too'    $true ($msg -match 'no desktop')
+    Check 'without telling a set-up host to set up' $false ($msg -match '(?m)^  virutil domain setup$')
+
     # --- the launcher runs outside the caller's process tree -------------------
     #
     # A child of this process would share its job object, and a terminal that
     # closes a pane ends that job: closing one psmux window killed three running
-    # guests. The launcher here stands in for a real one -- no qemu -- and sits
-    # in a directory with a space in it, which the cmd /c quoting has to carry.
+    # guests. The launchers here stand in for real ones -- no qemu: each writes
+    # a marker and leaves a ping running behind it the way a real one leaves
+    # qemu behind its `start /b`, then exits. Each launcher is checked on its own,
+    # where this host lets it run at all.
+
+    # The stand-in's ping, found by an address no other ping on this host uses.
+    function New-StandIn {
+        param([string]$Launcher, [string]$Marker)
+        $n = Get-Random -Minimum 2 -Maximum 254
+        Set-Content -LiteralPath $Launcher -Encoding ASCII -Value @"
+@echo off
+echo ran> "$Marker"
+start "" /b "%SystemRoot%\System32\PING.EXE" -n 60 127.0.0.$n
+"@
+        return "127.0.0.$n"
+    }
+    function Get-StandIn {
+        param([string]$Addr)
+        @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" |
+            Where-Object { $_.CommandLine -and $_.CommandLine.EndsWith(" $Addr") })
+    }
+    function Wait-StandIn {
+        param([string]$Addr, [string]$Marker)
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($sw.ElapsedMilliseconds -lt 15000) {
+            if ((Test-Path -LiteralPath $Marker) -and (Get-StandIn $Addr)) { return (Get-StandIn $Addr)[0] }
+            Start-Sleep -Milliseconds 250
+        }
+        return $null
+    }
+    # Is PID one of this process's descendants? Walk up from it.
+    function Test-OurDescendant {
+        param([int]$ProcessId)
+        $seen = @{}
+        $p = $ProcessId
+        while ($p -and -not $seen.ContainsKey($p)) {
+            if ($p -eq $PID) { return $true }
+            $seen[$p] = $true
+            $x = Get-CimInstance Win32_Process -Filter "ProcessId=$p"
+            if (-not $x) { return $false }
+            $p = [int]$x.ParentProcessId
+        }
+        return $false
+    }
+    function Stop-StandIn {
+        param([string]$Addr)
+        Get-StandIn $Addr | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    }
+
+    # WMI, from a directory with a space in it, which the cmd /c quoting has to
+    # carry. Where Defender's ASR rule blocks WMI process creation, Create
+    # returns 2 and there is nothing to run; that is said and skipped, since
+    # the failure message above is what such a host gets.
     $savedImageDir = $script:VirutilsImageDir
     $script:VirutilsImageDir = Join-Path $savedImageDir 'with space'
     New-VirutilsDir $script:VirutilsImageDir | Out-Null
     $sv = 'startvm'
     $marker = Join-Path $script:VirutilsImageDir 'started.txt'
-    Set-Content -LiteralPath (Get-DomainLauncher $sv) -Encoding ASCII -Value @"
-@echo off
-echo ran> "$marker"
-ping.exe -n 30 127.0.0.1 > nul
-"@
+    $addr = New-StandIn (Get-DomainLauncher $sv) $marker
     try {
-        Start-DomainProcess $sv
-        $cmd = $null
-        $sw = [Diagnostics.Stopwatch]::StartNew()
-        while (-not $cmd -and $sw.ElapsedMilliseconds -lt 15000) {
-            Start-Sleep -Milliseconds 250
-            $cmd = Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" |
-                Where-Object { $_.CommandLine -and $_.CommandLine.Contains((Get-DomainLauncher $sv)) } |
-                Select-Object -First 1
+        $rv = Start-DomainProcessWmi $sv
+        if ($rv -eq 2) {
+            [Console]::Out.WriteLine('skip     the WMI launcher (Create returned 2: WMI process creation is blocked here)')
+        } else {
+            Check 'WMI: Create returns 0'           0     $rv
+            $ping = Wait-StandIn $addr $marker
+            Check 'WMI: the launcher ran'           $true ($null -ne $ping)
+            Check 'WMI: not under this process'     $false $(if ($ping) { Test-OurDescendant $ping.ProcessId } else { $true })
+            Check 'WMI: in this user''s session'    (Get-Process -Id $PID).SessionId $(if ($ping) { $ping.SessionId })
         }
-        Check 'start runs the launcher'             $true ($null -ne $cmd -and (Test-Path -LiteralPath $marker))
-        $parent = if ($cmd) { Get-CimInstance Win32_Process -Filter "ProcessId=$($cmd.ParentProcessId)" }
-        Check 'and not as this process''s child'    'WmiPrvSE.exe' $(if ($parent) { $parent.Name })
-        Check 'in this user''s session'             (Get-Process -Id $PID).SessionId $(if ($cmd) { $cmd.SessionId })
     } finally {
-        Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" |
-            Where-Object { $_.CommandLine -and $_.CommandLine.Contains((Get-DomainLauncher $sv)) } |
-            ForEach-Object {
-                Get-CimInstance Win32_Process -Filter "ParentProcessId=$($_.ProcessId)" |
-                    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-                Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-            }
+        Stop-StandIn $addr
         $script:VirutilsImageDir = $savedImageDir
+    }
+
+    # The task, when this user has registered it. Its image dir is fixed at
+    # setup, so the stand-in goes there -- the real one -- under a name no
+    # domain has, and is removed again. What matters beyond "it ran": the
+    # stand-in's ping outlives the task instance, whose cmd exits right after
+    # `start /b`, as a real launcher's does.
+    $task = Get-DomainStartTask
+    $taskDir = $null
+    if ($task -and $task.Enabled -and $task.Sid -eq $sid -and
+        $task.Arguments -match '/c ""(?<dir>.+)\\\$\(Arg0\)\.cmd""$') {
+        $taskDir = $Matches['dir']
+    }
+    if (-not $taskDir) {
+        [Console]::Out.WriteLine('skip     the task launcher (virutil domain setup has not run for this user)')
+    } else {
+        $tv = 'virutil-test-' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+        $launcher = Join-Path $taskDir "$tv.cmd"
+        $marker = Join-Path $env:VIRUTILS_DIR "$tv.txt"
+        $addr = New-StandIn $launcher $marker
+        try {
+            Start-DomainStartTask $tv
+            $ping = Wait-StandIn $addr $marker
+            Check 'task: the launcher ran'          $true  ($null -ne $ping)
+            Check 'task: not under this process'    $false $(if ($ping) { Test-OurDescendant $ping.ProcessId } else { $true })
+            Check 'task: in this user''s session'   (Get-Process -Id $PID).SessionId $(if ($ping) { $ping.SessionId })
+            # The launcher's cmd is gone by now, and with it the task instance.
+            Start-Sleep -Seconds 3
+            $cmdLeft = @(Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" |
+                Where-Object { $_.CommandLine -and $_.CommandLine.Contains($launcher) })
+            Check 'task: the launcher''s cmd exited' 0 $cmdLeft.Count
+            Check 'task: what it started outlives it' $true ((Get-StandIn $addr).Count -gt 0)
+        } finally {
+            Stop-StandIn $addr
+            [IO.File]::Delete($launcher)
+        }
     }
 
     [Console]::Out.WriteLine("")

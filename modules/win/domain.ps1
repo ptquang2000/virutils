@@ -279,6 +279,7 @@ function Get-DomainUsage {
         '       virutil domain shutdown VM'
         '       virutil domain addr     VM'
         '       virutil domain port     VM [SPEC] [-c PORT]'
+        '       virutil domain setup    [--remove | --status]'
         ''
         'port options (SPEC is PORT, or HOSTPORT:GUESTPORT when the two differ;'
         'with no SPEC it lists the open forwards for VM):'
@@ -331,6 +332,14 @@ function Get-DomainUsage {
         'a snapshot left behind: this driver has no snapshot command at all'
         '(docs/contract.md section 7), so the disk is the whole of it.'
         ''
+        'setup (Windows host only; once per user, no elevation) registers the'
+        'scheduled task virutil-domain-start, which start and create then use'
+        'to launch qemu outside the caller''s terminal and job. Without it they'
+        'go through WMI, which Defender''s ASR rule "Block process creations'
+        'originating from PSExec and WMI commands" refuses where it is on.'
+        '  --remove          unregister the task'
+        '  --status          say which way a start would go (exit 1: not the task)'
+        ''
         '  -h, --help        this message'
         ''
         'create reads these from the environment:'
@@ -369,6 +378,7 @@ function Domain-Main {
         'shutdown' { Stop-Domain     $rest }
         'addr'     { Show-DomainAddr $rest }
         'port'     { Set-DomainPort  $rest }
+        'setup'    { Invoke-DomainSetupCommand $rest }
         default    { Die "virutil domain: unknown command: $cmd (see: virutil domain -h)" }
     }
 }
@@ -798,21 +808,64 @@ function Wait-DomainStart {
 }
 
 # The launcher is the domain, so running one is the only way to start a guest
-# and this is the only place that does it. ShowWindow 0 is for cmd's own window:
-# the launcher's `start /b` returns immediately and cmd exits with it, so this
-# is a flash at most, but a flash per start is still a flash. qemu itself has no
-# window to hide -- that is the GUI build's whole point.
+# and this is the only place that does it. qemu must not be the caller's child:
+# a child joins the caller's job object, and a terminal that closes a pane ends
+# that pane's job -- closing a psmux window that had run `domain start` killed
+# all three of this host's guests mid-run (2026-10-29). A psmux pane's job is
+# KILL_ON_JOB_CLOSE (measured: LimitFlags 0x2800).
 #
-# Through WMI's Win32_Process.Create, not Start-Process, so qemu is not the
-# caller's child. A Start-Process child joins the caller's job object, and a
-# terminal that closes a pane ends that pane's job: closing a psmux window that
-# had run `domain start` killed all three of this host's guests mid-run
-# (2026-10-29). Measured with a stand-in for qemu: the Start-Process copy died
-# with its pane, the WMI copy outlived it. WmiPrvSE creates the process as the
-# calling user, in the calling user's session, so the guest's window still
-# shows on that user's desktop -- but with the user's environment rather than
-# the caller's, which the launcher does not read: every path in it is absolute.
+# So it goes through one of two launchers that are not the caller, in order:
+#
+#   the scheduled task   `virutil domain setup` registered virutil-domain-start,
+#                        once, as this user, unelevated. The Task Scheduler
+#                        starts the launcher in this user's desktop session with
+#                        their interactive token, whoever asked: a psmux pane,
+#                        a Claude session's shell, an ssh logon.
+#   WMI                  Win32_Process.Create, which is what every start did
+#                        before the task existed.
+#
+# WMI alone stopped being enough on 2026-11-04. Defender's attack surface
+# reduction rule "Block process creations originating from PSExec and WMI
+# commands" (D1E49AAC-8F56-4280-B9BA-993A6D77406C), in block mode on a managed
+# host, refuses every process WmiPrvSE would create: Create returns 2 and
+# Defender logs event 1121 naming WmiPrvSE.exe and the launcher. Nothing the
+# caller's token, sandbox or job can change. The task is not WMI, so the rule
+# does not apply to it.
+#
+# The task also answers what WMI never could over ssh: an ssh logon's token
+# cannot follow junctions, and qemu's own path runs through scoop's `current`
+# junction. A task instance runs with the desktop logon's token instead.
 function Start-DomainProcess {
+    param([string]$Vm)
+    $launch = Get-DomainStartLaunch (Get-DomainStartTask) (Get-DomainStartUserSid)
+    $taskError = $null
+    if ($launch.Via -eq 'task') {
+        try {
+            Start-DomainStartTask $Vm
+            return
+        } catch {
+            $taskError = "starting the scheduled task $($script:DomainStartTaskName) failed: $($_.Exception.Message)"
+        }
+    }
+    $since = (Get-Date).AddSeconds(-1)
+    $rv = Start-DomainProcessWmi $Vm
+    if ($rv -eq 0) {
+        if ($taskError) { Warn @($taskError, 'so it was started through WMI instead.') }
+        elseif ($launch.Why) { Warn $launch.Why }
+        return
+    }
+    Die (Get-DomainStartFailure -Vm $Vm -ReturnValue $rv -Launch $launch -TaskError $taskError -Since $since)
+}
+
+# Start-DomainProcessWmi VM -- the WMI launch; returns Create's ReturnValue.
+#
+# ShowWindow 0 is for cmd's own window: the launcher's `start /b` returns
+# immediately and cmd exits with it, so this is a flash at most, but a flash
+# per start is still a flash. qemu itself has no window to hide -- that is the
+# GUI build's whole point. WmiPrvSE creates the process as the calling user, in
+# the calling user's session, with the user's environment rather than the
+# caller's, which the launcher does not read: every path in it is absolute.
+function Start-DomainProcessWmi {
     param([string]$Vm)
     $launcher = Get-DomainLauncher $Vm
     $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly `
@@ -822,8 +875,294 @@ function Start-DomainProcess {
         CurrentDirectory          = (Split-Path -Parent $launcher)
         ProcessStartupInformation = $startup
     }
-    if ($r.ReturnValue -ne 0) {
-        Die "could not run $launcher`: Win32_Process.Create returned $($r.ReturnValue)"
+    return [int]$r.ReturnValue
+}
+
+# Get-DomainStartFailure -- what `domain start` says when neither launcher ran
+# the launcher: which one failed, how, and the one command that fixes the
+# common case. Return value 2 is "access denied", and on a host whose Defender
+# blocks WMI process creation that is all WMI ever says; the event log says
+# which rule, so it is named when it is there to be read.
+function Get-DomainStartFailure {
+    param([string]$Vm, [int]$ReturnValue, [hashtable]$Launch, [AllowNull()][string]$TaskError,
+          [datetime]$Since = (Get-Date).AddSeconds(-10))
+    $launcher = Get-DomainLauncher $Vm
+    $out = @("could not run $launcher`: Win32_Process.Create returned $ReturnValue$(if ($ReturnValue -eq 2) { ' (access denied)' })")
+    if ($TaskError) { $out += $TaskError }
+    if ($ReturnValue -eq 2) {
+        $asr = Get-DomainStartAsrBlock $launcher $Since
+        if ($asr) {
+            $out += @(
+                "Defender blocked it at $asr`: the attack surface reduction rule"
+                '"Block process creations originating from PSExec and WMI commands"'
+                '(D1E49AAC-8F56-4280-B9BA-993A6D77406C), event 1121 in'
+                'Microsoft-Windows-Windows Defender/Operational.'
+            )
+        } else {
+            $out += @(
+                'One known cause is the Defender attack surface reduction rule'
+                '"Block process creations originating from PSExec and WMI commands"'
+                '(D1E49AAC-8F56-4280-B9BA-993A6D77406C); it logs event 1121 in'
+                'Microsoft-Windows-Windows Defender/Operational.'
+            )
+        }
+    }
+    if ($Launch.Via -eq 'task' -and -not $TaskError) { return $out }
+    if ($Launch.Why) { $out += @($Launch.Why) }
+    if ($Launch.Via -ne 'task' -and -not $Launch.Why) {
+        $out += @(
+            'The scheduled task that starts a domain without WMI is not registered.'
+            'Run this once, as this user, from any PowerShell (no elevation):'
+            '  virutil domain setup'
+        )
+    }
+    return $out
+}
+
+# Get-DomainStartAsrBlock LAUNCHER SINCE -- when Defender's ASR rule blocked a
+# WMI launch of LAUNCHER after SINCE, the time it says it did; else $null.
+# Reading the Defender log needs no privilege. Anything that goes wrong reading
+# it is "not known", never a second failure.
+#
+# Defender may write the event a moment after Create has already returned 2,
+# so this looks for a few seconds; only a start that has already failed pays
+# for it. It does not write one for every block -- two blocks in the minute
+# after a logged one were not logged at all (measured) -- so no event is not
+# evidence against the rule, and the message then names it as a likely cause.
+function Get-DomainStartAsrBlock {
+    param([string]$Launcher, [datetime]$Since, [int]$WaitMs = 3000)
+    $leaf  = Split-Path -Leaf $Launcher
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        try {
+            $events = @(Get-WinEvent -ErrorAction Stop -MaxEvents 20 -FilterHashtable @{
+                LogName   = 'Microsoft-Windows-Windows Defender/Operational'
+                Id        = 1121
+                StartTime = $Since
+            })
+        } catch [Exception] {
+            # No events matching is an exception too; anything else (no such
+            # log, no access) will not change by waiting.
+            if ($_.FullyQualifiedErrorId -notmatch 'NoMatchingEventsFound') { return $null }
+            $events = @()
+        }
+        foreach ($e in $events) {
+            $m = [string]$e.Message
+            if ($m -match 'D1E49AAC' -and $m.Contains($leaf)) {
+                return $e.TimeCreated.ToString('HH:mm:ss')
+            }
+        }
+        Start-Sleep -Milliseconds 500
+    } while ($sw.ElapsedMilliseconds -lt $WaitMs)
+    return $null
+}
+
+# --- the start task -----------------------------------------------------------
+#
+# virutil-domain-start: one per-user scheduled task with no trigger, started by
+# `domain start` with the domain's name as its $(Arg0) (IRegisteredTask.Run;
+# the scheduler substitutes it into the action's arguments, inside a path too --
+# measured for virutil-xfer-helper, which takes its token the same way).
+#
+# The action runs `cmd /c "<image dir>\$(Arg0).cmd"` and nothing else, so the
+# task starts launchers in this user's image directory and not arbitrary
+# commands; the image directory is fixed at setup, and a run whose
+# VIRUTILS_IMAGE_DIR has moved since does not use it (Get-DomainStartLaunch).
+# cmd sits under conhost --headless, as the xfer helper's pwsh does: a console
+# with no window, so a start flashes nothing on the desktop.
+#
+# Unelevated (TASK_RUNLEVEL_LUA), because qemu under WHPX needs nothing more
+# and the WMI path never gave it more. Interactive token: it runs only while
+# this user is logged on to the desktop, in that session, which is where the
+# guest's window belongs. Normal priority: the scheduler's default of 7 is
+# below-normal CPU with low I/O and memory priority, and qemu would inherit it.
+# No time limit: the instance ends when cmd does, a moment after `start /b`,
+# and a limit that fired on a slow one would end qemu with it.
+$script:DomainStartTaskName     = 'virutil-domain-start'
+$script:DomainStartTaskPriority = 4
+
+# Get-DomainStartTaskAction -- the action setup registers for this image dir.
+function Get-DomainStartTaskAction {
+    $launcher = Join-Path $script:VirutilsImageDir '$(Arg0).cmd'
+    $cmd      = Join-Path $env:WINDIR 'System32\cmd.exe'
+    return @{
+        Path      = Join-Path $env:WINDIR 'System32\conhost.exe'
+        Arguments = "--headless `"$cmd`" /d /c `"`"$launcher`"`""
+    }
+}
+
+function Get-DomainStartUserSid {
+    return [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+}
+
+# Get-DomainStartTask -- the registered task as a start needs to know it, or
+# $null when there is none this user can see.
+function Get-DomainStartTask {
+    try {
+        $svc = New-Object -ComObject Schedule.Service
+        $svc.Connect()
+        $task = $svc.GetFolder('\').GetTask($script:DomainStartTaskName)
+    } catch { return $null }
+
+    $path = ''; $taskArgs = ''
+    foreach ($a in $task.Definition.Actions) { $path = [string]$a.Path; $taskArgs = [string]$a.Arguments; break }
+    $user = [string]$task.Definition.Principal.UserId
+    $sid = $null
+    try { $sid = ([Security.Principal.NTAccount]$user).Translate([Security.Principal.SecurityIdentifier]).Value } catch { }
+    return @{
+        Enabled   = [bool]$task.Enabled
+        Path      = $path
+        Arguments = $taskArgs
+        User      = $user
+        Sid       = $sid
+        Priority  = [int]$task.Definition.Settings.Priority
+    }
+}
+
+# Get-DomainStartLaunch TASK SID -- which launcher a start takes: @{ Via =
+# 'task'|'wmi'; Why = lines when the task is there but cannot be used }.
+#
+# The task only when it is enabled, this user's, and runs launchers out of the
+# image directory this run uses. No task at all says nothing here: that is a
+# host where setup never ran, and Get-DomainStartFailure says what to type if
+# WMI then fails too.
+function Get-DomainStartLaunch {
+    param([AllowNull()][hashtable]$Task, [string]$Sid)
+    if ($null -eq $Task) { return @{ Via = 'wmi'; Why = '' } }
+    $name = $script:DomainStartTaskName
+    if (-not $Task.Enabled) {
+        return @{ Via = 'wmi'; Why = @(
+            "the scheduled task $name is disabled, so this start went through WMI."
+            "Enable it, or run 'virutil domain setup' again."
+        ) }
+    }
+    if ($Task.Sid -ne $Sid) {
+        return @{ Via = 'wmi'; Why = @(
+            "the scheduled task $name runs as $($Task.User), not as you, so this"
+            "start went through WMI. Run 'virutil domain setup' as yourself."
+        ) }
+    }
+    $want = Get-DomainStartTaskAction
+    if ($Task.Path -ne $want.Path -or $Task.Arguments -ne $want.Arguments) {
+        return @{ Via = 'wmi'; Why = @(
+            "the scheduled task $name starts launchers from somewhere other than"
+            "$($script:VirutilsImageDir) (VIRUTILS_IMAGE_DIR moved, or virutil changed"
+            "since setup), so this start went through WMI. Run 'virutil domain setup' again."
+        ) }
+    }
+    return @{ Via = 'task'; Why = '' }
+}
+
+# Start-DomainStartTask VM -- one instance of the task, for VM. Throws what the
+# scheduler said when it will not run one (no desktop logon, disabled since).
+#
+# The name goes into a path in a cmd line, so it is held to what a launcher's
+# file name can be and nothing that would leave the image directory or the
+# quotes: Assert-Domain has already found VM.cmd there.
+function Start-DomainStartTask {
+    param([Parameter(Mandatory)][string]$Vm)
+    if ($Vm -match '["\\/%^&|<>]' -or $Vm -match '\.\.') {
+        throw "a domain name with any of \ / `" % ^ & | < > or .. cannot go through the task: $Vm"
+    }
+    $svc = New-Object -ComObject Schedule.Service
+    $svc.Connect()
+    $task = $svc.GetFolder('\').GetTask($script:DomainStartTaskName)
+    $null = $task.Run($Vm)
+}
+
+# Invoke-DomainSetup -- register (or replace) the task. Unelevated: a user may
+# register a task that runs as themselves, at their own level. Idempotent.
+function Invoke-DomainSetup {
+    $id  = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $svc = New-Object -ComObject Schedule.Service
+    $svc.Connect()
+    $def = $svc.NewTask(0)
+    $def.RegistrationInfo.Author      = $id.Name
+    $def.RegistrationInfo.Description = @(
+        'Starts a virutil domain''s launcher (<image dir>\<domain>.cmd) outside the'
+        'caller''s process tree and job, so a guest outlives the terminal that'
+        'started it, without WMI. Started on demand by `virutil domain start`;'
+        'registered by `virutil domain setup`, removed by `virutil domain setup --remove`.'
+    ) -join ' '
+
+    $def.Principal.UserId    = $id.Name
+    $def.Principal.LogonType = 3        # TASK_LOGON_INTERACTIVE_TOKEN
+    $def.Principal.RunLevel  = 0        # TASK_RUNLEVEL_LUA
+
+    $set = $def.Settings
+    $set.Enabled                    = $true
+    $set.AllowDemandStart           = $true
+    $set.MultipleInstances          = 0     # TASK_INSTANCES_PARALLEL
+    $set.ExecutionTimeLimit         = 'PT0S'
+    $set.DisallowStartIfOnBatteries = $false
+    $set.StopIfGoingOnBatteries     = $false
+    $set.Priority                   = $script:DomainStartTaskPriority
+
+    $spec = Get-DomainStartTaskAction
+    $action = $def.Actions.Create(0)        # TASK_ACTION_EXEC
+    $action.Path             = $spec.Path
+    $action.Arguments        = $spec.Arguments
+    $action.WorkingDirectory = $script:VirutilsImageDir
+
+    # TASK_CREATE_OR_UPDATE, as this user, with the interactive token.
+    $svc.GetFolder('\').RegisterTaskDefinition(
+        $script:DomainStartTaskName, $def, 6, $id.Name, $null, 3) | Out-Null
+
+    Say @(
+        "registered the scheduled task $($script:DomainStartTaskName), for $($id.Name)"
+        "  runs     $($spec.Path) $($spec.Arguments)"
+        'domain start and create will start it instead of going through WMI.'
+    )
+}
+
+function Invoke-DomainSetupRemove {
+    $svc = New-Object -ComObject Schedule.Service
+    $svc.Connect()
+    try {
+        $svc.GetFolder('\').DeleteTask($script:DomainStartTaskName, 0)
+        Say "removed the scheduled task $($script:DomainStartTaskName); domain start goes through WMI again."
+    } catch {
+        Say "no scheduled task $($script:DomainStartTaskName) was registered (or it is not this user's to remove)."
+    }
+}
+
+# Invoke-DomainSetupStatus -- the decision Start-DomainProcess would make, said
+# out loud; exit 0 when a start would use the task.
+function Invoke-DomainSetupStatus {
+    $task   = Get-DomainStartTask
+    $launch = Get-DomainStartLaunch $task (Get-DomainStartUserSid)
+    $out = @()
+    if ($null -eq $task) {
+        $out += "task   $($script:DomainStartTaskName): not registered (or not visible to this user)"
+    } else {
+        $out += "task   $($script:DomainStartTaskName): registered for $($task.User), $(if ($task.Enabled) { 'enabled' } else { 'disabled' }), priority $($task.Priority)"
+        $out += "runs   $($task.Path) $($task.Arguments)"
+    }
+    if ($launch.Via -eq 'task') {
+        $out += 'domain start goes through the task.'
+    } else {
+        $out += 'domain start goes through WMI.'
+        if ($launch.Why) { $out += @($launch.Why) } else { $out += "Run 'virutil domain setup' once to use the task." }
+        $script:VirutilExit = 1
+    }
+    $out | ForEach-Object { [Console]::Out.WriteLine($_) }
+}
+
+function Invoke-DomainSetupCommand {
+    param([string[]]$Arguments)
+    $mode = 'setup'
+    foreach ($a in @($Arguments | Where-Object { $_ })) {
+        switch ($a) {
+            '--remove' { $mode = 'remove' }
+            '--status' { $mode = 'status' }
+            { $_ -in @('-h', '--help') } { Usage (Get-DomainUsage) 0 }
+            default    { Die "virutil domain setup: unknown argument: $a (see: virutil domain -h)" }
+        }
+    }
+    switch ($mode) {
+        'setup'  { Invoke-DomainSetup }
+        'remove' { Invoke-DomainSetupRemove }
+        'status' { Invoke-DomainSetupStatus }
     }
 }
 

@@ -126,7 +126,7 @@ function Get-TopUsage {
         'usage: virutil MODULE [ARGS]'
         ''
         'domains'
-        '  domain     the domain lifecycle: create, delete, list, start, shutdown, addr, port'
+        '  domain     the domain lifecycle: create, delete, list, start, shutdown, addr, port, setup'
         ''
         'transfer'
         '  push       copy a file or directory from this host into a guest'

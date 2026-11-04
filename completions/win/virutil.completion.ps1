@@ -184,7 +184,7 @@ $completer = {
     # --- the grammar ---------------------------------------------------------
 
     $modules = [ordered]@{
-        domain   = 'the domain lifecycle: create, delete, list, start, shutdown, addr, port'
+        domain   = 'the domain lifecycle: create, delete, list, start, shutdown, addr, port, setup'
         exec     = 'run commands inside a guest via the QEMU guest agent'
         push     = 'copy a file or directory from this host into a guest'
         pull     = 'copy files out of a guest onto this host'
@@ -205,6 +205,7 @@ $completer = {
         shutdown = 'ask the guest to shut itself down over ACPI'
         addr     = "the guest's address"
         port     = 'list, open or close a host->guest port forward'
+        setup    = 'register the per-user task start launches qemu through, once (no elevation)'
     }
 
 
@@ -266,6 +267,10 @@ $completer = {
             Add-Match '-v' 'virtio-win ISO, or "none"';               Add-Match '--virtio' 'virtio-win ISO, or "none"'
             Add-Match '-p' 'a port forward, repeatable (default 13389:3389, or the next free port)'; Add-Match '--port' 'a port forward, repeatable'
             Add-Match '-N' 'create it without starting it';            Add-Match '--no-start' 'create it without starting it'
+        }
+        elseif ($module -eq 'domain' -and $verb -eq 'setup') {
+            Add-Match '--remove' 'unregister the task'
+            Add-Match '--status' 'which way a start would go: the task or WMI'
         }
         elseif ($module -eq 'domain' -and $verb -eq 'start') {
             Add-Match '-s' 'grow the disk image, then start (needs it shut off)'

@@ -121,6 +121,23 @@ fix UTM's qemu carries (`patches/qemu/`) into `~/.virutils/cache/qemu` — a few
 minutes, 360 MB — and the driver uses that build in preference to Homebrew's,
 which stays installed for its libraries.
 
+On a Windows host, run this once per user, from any PowerShell (no elevation):
+
+```powershell
+virutil domain setup            # registers the scheduled task virutil-domain-start
+virutil domain setup --status   # exits 0 when domain start will use it
+```
+
+`domain start` and `create` must not start qemu as the caller's child, because
+closing the terminal pane would end the guest with it. Without the task they
+use WMI instead, and that has two problems. Defender's attack surface reduction
+rule *Block process creations originating from PSExec and WMI commands* blocks
+WMI on managed hosts, so the start fails with `Win32_Process.Create returned 2`.
+And under ssh, the logon cannot follow scoop's `current` junction, which qemu's
+path goes through. The task has no trigger and runs unelevated, as you. Each
+start runs one instance, which runs the domain's launcher in your desktop
+session and exits. `virutil domain setup --remove` takes the task away again.
+
 ## Artifacts and state
 
 Everything `virutil` leaves on the host lives under one root, `~/.virutils/`,
