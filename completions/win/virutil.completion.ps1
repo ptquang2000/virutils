@@ -53,7 +53,10 @@ $completer = {
     $valueFlags = @(
         '-s', '--size', '-m', '--memory', '-c', '--vcpus', '-o', '--osinfo',
         '-v', '--virtio', '-p', '--port', '--close', '--config', '--output',
-        '-b', '--button'
+        '-b', '--button',
+        # usb's emulated sticks
+        '--image', '--dir', '--id', '--serial', '--label', '--vendor', '--product',
+        '--rev', '--fs', '-n', '--count', '--off', '--on'
     )
 
     # Flags do not consume a slot, so the positional index counts only the
@@ -149,6 +152,17 @@ $completer = {
             }
     }
 
+    # The emulated sticks a domain's launcher plugs at boot, by qemu id. A stick
+    # plugged live only is in the running qemu, and asking it means a monitor
+    # connection, which is too much for a keypress: type that id out.
+    function Get-DomainStickIds([string]$Vm) {
+        $path = Join-Path $imageDir "$Vm.cmd"
+        if (-not (Test-Path -LiteralPath $path)) { return @() }
+        $text = Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue
+        [regex]::Matches([string]$text, '-device\s+"?usb-(?:storage|bot),[^"\r\n]*?\bid=([A-Za-z][\w-]*)') |
+            ForEach-Object { $_.Groups[1].Value }
+    }
+
     # --- emitting ------------------------------------------------------------
 
     $out = [Collections.Generic.List[Management.Automation.CompletionResult]]::new()
@@ -190,7 +204,7 @@ $completer = {
         pull     = 'copy files out of a guest onto this host'
         sync     = "deliver a project's build output into a running guest"
         ui       = 'launch a process on a Windows guest''s interactive desktop'
-        usb      = 'pass a host USB device through to a guest'
+        usb      = 'pass a host USB device through to a guest, or plug an emulated USB stick'
         shot     = "capture a guest's screen to a PNG on this host"
         input    = 'click, drag, scroll, press keys and type in a guest, from this host'
         xfer     = 'set up the scheduled task that lets transfers elevate without a prompt'
@@ -224,6 +238,11 @@ $completer = {
         show   = 'what a domain passes through, live and persistent'
         attach = 'pass a host device through to a domain'
         detach = 'take one back from a domain'
+        plug   = 'plug an emulated USB stick into a running domain: --image or --dir'
+        unplug = 'pull an emulated stick out (--persist: out of the launcher too)'
+        cycle  = 'unplug and replug an emulated stick N times'
+        ports  = "show or set the launcher's xHCI root ports (15 keeps hot plugs off the hub)"
+        image  = 'write a blank, sparse stick image (--fs fat32 to format it)'
     }
 
     $inputVerbs = [ordered]@{
@@ -306,6 +325,30 @@ $completer = {
             Add-Match '-c' 'config to use (default sync.conf)'
             Add-Match '--config' 'config to use (default sync.conf)'
         }
+        elseif ($module -eq 'usb' -and $verb -eq 'plug') {
+            Add-Match '--image' 'the stick is this image file (raw, qcow2, vhdx, vmdk)'
+            Add-Match '--dir' 'the stick is this host folder, read-only FAT16 (no threat samples)'
+            Add-Match '--id' 'its qemu id (default stick0, stick1, ...)'
+            Add-Match '--serial' 'USB and disk serial (default: the id in capitals)'
+            Add-Match '--label' '--dir only: the volume label'
+            Add-Match '--vendor' 'SCSI vendor, 8 chars: makes it usb-bot + scsi-hd'
+            Add-Match '--product' 'SCSI product, 16 chars'
+            Add-Match '--rev' 'SCSI revision, 4 chars'
+            Add-Match '--ro' '--image only: read-only'
+            Add-Match '--persist' 'also write it into the launcher, for every boot'
+        }
+        elseif ($module -eq 'usb' -and $verb -eq 'unplug') {
+            Add-Match '--persist' 'take it out of the launcher too'
+        }
+        elseif ($module -eq 'usb' -and $verb -eq 'cycle') {
+            Add-Match '-n' 'cycles (default 1)';  Add-Match '--count' 'cycles (default 1)'
+            Add-Match '--off' 'seconds unplugged (default 2)'
+            Add-Match '--on' 'seconds plugged between cycles (default 5)'
+        }
+        elseif ($module -eq 'usb' -and $verb -eq 'image') {
+            Add-Match '--fs' 'fat32: partition and format it (else the guest does)'
+            Add-Match '--label' 'the FAT32 volume label'
+        }
         elseif ($module -eq 'exec' -and $verb -in @('cmd', 'ps', 'sh')) {
             Add-Match '-d' 'fire and forget: print the guest pid and exit 0'
             Add-Match '--detach' 'fire and forget: print the guest pid and exit 0'
@@ -339,7 +382,8 @@ $completer = {
         # -v/--virtio is the one that wants the fallback, so it is the one that
         # leaves $hint null.
         # So does shot's -o, whose value is the host file to write.
-        $hint = if ($prev -in @('-v', '--virtio') -or $module -eq 'shot') { $null }
+        # So do usb plug's --image and --dir: a host file and a host folder.
+        $hint = if ($prev -in @('-v', '--virtio', '--image', '--dir') -or $module -eq 'shot') { $null }
                 elseif ($module -eq 'domain' -and $verb -eq 'port') { "$($positional[2]) has no forwards open" }
                 elseif ($module -eq 'sync') { "no config in $confDir starts with '$wordToComplete'" }
                 else { "$prev takes a value, and it is not a path" }
@@ -376,6 +420,9 @@ $completer = {
             { $_ -in @('-p', '--port') } {
                 Add-Match '13389:3389' 'HOSTPORT:GUESTPORT (the default forward)'
             }
+            { $_ -eq '--fs' } { Add-Match 'fat32' 'one MBR partition, FAT32' }
+            { $_ -in @('-n', '--count') } { foreach ($n in 1, 5, 10, 20) { Add-Match "$n" 'cycles' } }
+            { $_ -in @('--off', '--on') } { foreach ($n in 1, 2, 3, 5) { Add-Match "$n" 'seconds' } }
             { $_ -in @('-v', '--virtio') } {
                 # Only once there is a prefix to match it on: offering `none`
                 # for an empty word would return a non-empty list and so
@@ -452,6 +499,10 @@ $completer = {
                 $hint = $noDomain
                 foreach ($d in $domains) { Add-Match $d 'domain' }
             }
+            # `usb image FILE` is a new file on this host: the file fallback.
+            elseif ($module -eq 'usb' -and $verb -eq 'image') {
+                $hint = $null
+            }
             elseif ($module -in @('usb', 'input')) {
                 $hint = $noDomain
                 foreach ($d in $domains) { Add-Match $d 'domain' }
@@ -495,6 +546,21 @@ $completer = {
             elseif ($module -eq 'usb' -and $verb -eq 'detach') {
                 $hint = "$($positional[2]) passes through no USB devices"
                 foreach ($u in Get-DomainUsbIds $positional[2]) { Add-Match $u 'attached' }
+            }
+            elseif ($module -eq 'usb' -and $verb -in @('unplug', 'cycle')) {
+                $hint = "a stick's qemu id (virutil usb show $($positional[2])); only persisted ones are offered"
+                foreach ($s in Get-DomainStickIds $positional[2]) { Add-Match $s 'in the launcher' }
+            }
+            elseif ($module -eq 'usb' -and $verb -eq 'ports') {
+                $hint = 'root ports, 1 to 15'
+                Add-Match '15' "qemu-xhci's maximum: 14 devices before qemu's hub"
+            }
+            elseif ($module -eq 'usb' -and $verb -eq 'image') {
+                $hint = 'SIZE: a number and M or G'
+                foreach ($s in '64M', '256M', '1G', '4G', '16G') { Add-Match $s 'image size' }
+            }
+            elseif ($module -eq 'usb' -and $verb -eq 'plug') {
+                $hint = 'plug takes flags: --image FILE or --dir DIR, then the rest'
             }
             # The mirror of the pair above: `push VM SRC DST` is the guest
             # path, and `pull VM SRC DST` is the host directory that takes the
