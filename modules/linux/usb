@@ -211,6 +211,14 @@ usb_main() {
         [ "$REMOVED" = 1 ] ||
             die "$VM does not pass through $ID, live or persistent (see: virutil usb show $VM)"
         ;;
+    plug|unplug|cycle|ports|image)
+        # Emulated sticks are in the grammar (contract section 2) and on the
+        # Windows driver only so far, so they are refused by name rather than
+        # answered with a usage that does not list them. Section 7 says what a
+        # port here takes: the same HMP lines through qemu-monitor-command.
+        die "virutil usb $CMD (emulated USB sticks) is on the Windows-host driver only so far;" \
+            "see docs/contract.md section 7"
+        ;;
     *)
         usb_usage
         ;;
