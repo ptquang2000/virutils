@@ -229,6 +229,29 @@ try {
     $r = Dies { Quiet { New-UsbStickImage @($fat, '64M') } }
     CheckTrue 'image never overwrites'      ($r.Msg -match 'already exists')
 
+    # --- emulated sticks: the monitor seam -------------------------------------
+
+    # Measured on win11: a vvfat drive was still in `info block` after its
+    # device left the bus, and gone by the drive_del that followed. That
+    # "not found" is the unplug having worked, not a failure.
+    $realMonitor = ${function:Invoke-UsbMonitor}
+    $script:Sent = @()
+    function Invoke-UsbMonitor {
+        param([string]$Vm, [string]$Command, [int]$TimeoutMs = 5000)
+        $script:Sent += $Command
+        switch -Wildcard ($Command) {
+            'info block' { return "(qemu) info block`r`nseed-drv (#block1): json:{} (vvfat, read-only)`r`n(qemu) " }
+            'drive_del*' { return "(qemu) $Command`r`nError: Device 'seed-drv' not found`r`n(qemu) " }
+            default      { return "(qemu) $Command`r`n(qemu) " }
+        }
+    }
+    $seedSpec = New-UsbStorageSpec
+    $seedSpec.Id = 'seed'; $seedSpec.Drive = 'seed-drv'
+    $r = Dies { Invoke-UsbStorageUnplug 'anyvm' $seedSpec }
+    Check 'a drive qemu already freed is not an error' '' $r.Msg
+    Check '  and drive_del was still tried' 'drive_del seed-drv' $script:Sent[-1]
+    Set-Item function:Invoke-UsbMonitor $realMonitor
+
     # --- emulated sticks: a real qemu -----------------------------------------
 
     $qemuDir = @(

@@ -740,9 +740,15 @@ function Invoke-UsbStorageUnplug {
         Start-Sleep -Milliseconds 50
     }
     $ms = $sw.ElapsedMilliseconds
+    # qemu deletes the drive itself, but not always by the time the device is
+    # off the bus: measured on win11, a vvfat drive was still in `info block`
+    # and gone by the drive_del that followed. "not found" there is the
+    # outcome this wants, not a failure.
     if ($Spec.Drive -and (Invoke-UsbMonitor $Vm 'info block') -match "(?m)^$([regex]::Escape($Spec.Drive)) \(") {
         $r = Invoke-UsbMonitor $Vm "drive_del $($Spec.Drive)"
-        Assert-MonitorOk $r "free $($Spec.Id)'s backend $($Spec.Drive)"
+        if ((Get-MonitorAnswer $r) -notmatch "not found") {
+            Assert-MonitorOk $r "free $($Spec.Id)'s backend $($Spec.Drive)"
+        }
     }
     return $ms
 }
