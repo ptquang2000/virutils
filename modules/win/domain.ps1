@@ -518,8 +518,15 @@ function Get-DomainForwards {
 
 # Invoke-DomainMonitor VM COMMAND -- send one line, return what came back, or
 # $null when nothing is listening (which is how "not running" is told).
+#
+# -UntilPrompt returns as soon as the monitor has answered rather than at the
+# end of the timeout, which then only caps a command that never comes back. The
+# answer is over at the third prompt: the banner's, the one after the command's
+# output, and the one the LF of WriteLine's CRLF earns as an empty second line.
+# A `usb cycle` sends a handful of commands per plug, and 2 s apiece would be
+# most of the cycle.
 function Invoke-DomainMonitor {
-    param([string]$Vm, [string]$Command, [int]$TimeoutMs = 2000)
+    param([string]$Vm, [string]$Command, [int]$TimeoutMs = 2000, [switch]$UntilPrompt)
 
     $port = Get-DomainMonitorPort $Vm
     $tcp = New-Object Net.Sockets.TcpClient
@@ -547,6 +554,11 @@ function Invoke-DomainMonitor {
                 $n = $stream.Read($buf, 0, $buf.Length)
                 if ($n -le 0) { break }
                 [void]$sb.Append([Text.Encoding]::ASCII.GetString($buf, 0, $n))
+                if ($UntilPrompt) {
+                    $text = $sb.ToString()
+                    if ($text.EndsWith('(qemu) ') -and
+                        [regex]::Matches($text, '(?m)^\(qemu\) ').Count -ge 3) { break }
+                }
             }
         } catch { }
         return $sb.ToString()
