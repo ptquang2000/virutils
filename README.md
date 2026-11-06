@@ -262,7 +262,7 @@ channel works this way.
 
 | Module | Purpose | Usage |
 | --- | --- | --- |
-| `usb` | Pass a physical host USB device through to a guest, hot-plugged: a libvirt `<hostdev>` here, `device_add` over the QEMU monitor on the Windows driver. | `virutil usb {list\|show\|attach\|detach} [VM] [VENDOR:PRODUCT]` |
+| `usb` | Pass a physical host USB device through to a guest, hot-plugged: a libvirt `<hostdev>` here, `device_add` over the QEMU monitor on the Windows driver. On the Windows driver also plug and pull emulated USB sticks at runtime (image, host folder, or a disk with its own SCSI identity). | `virutil usb {list\|show\|attach\|detach} [VM] [VENDOR:PRODUCT]`<br>`virutil usb {plug\|unplug\|cycle\|ports} VM ...`, `virutil usb image FILE SIZE` (Windows host) |
 
 `virutil` alone, or `virutil help`, prints the module list. `modules/linux/parser`
 handles the top-level dispatch plus the helpers every module shares; each
@@ -2179,6 +2179,114 @@ device instead, so the Windows driver has nothing equivalent to set.
 The guest side needs no preparation on either driver: a libvirt domain gets a
 USB controller by default, and every domain `virutil domain create` makes on
 Windows already carries `-device qemu-xhci`.
+
+### Emulated USB sticks (Windows host)
+
+The Windows driver can also be the stick. qemu emulates a USB mass-storage
+device and plugs it into the running guest's xHCI bus over the monitor the
+launcher already opens: no host device, no libusb, no restart. The guest sees a
+real arrival, and `unplug` is a real surprise removal that nothing in the guest
+can veto. That is not what `Disable-PnpDevice` in the guest does: it goes
+through query-remove, which an endpoint agent holding the volume can veto.
+
+```
+virutil usb plug   VM (--image FILE | --dir DIR) [--id ID] [--serial S]
+                      [--label L] [--vendor V --product P --rev R] [--ro] [--persist]
+virutil usb unplug VM ID [--persist]
+virutil usb cycle  VM ID [-n N] [--off S] [--on S]
+virutil usb ports  VM [N]
+virutil usb image  FILE SIZE [--fs fat32] [--label L]
+```
+
+Three kinds of stick:
+
+| plug with | qemu device | the guest sees |
+| --- | --- | --- |
+| `--image FILE` | `usb-storage` on FILE (raw, qcow2, vhdx, vmdk) | `QEMU QEMU HARDDISK`, read-write |
+| `--dir DIR [--label L]` | `usb-storage` on a vvfat view of DIR | a read-only FAT16 volume holding DIR's files (keep it under ~500 MB) |
+| `--image FILE --vendor V --product P --rev R` | `usb-bot` + `scsi-hd` with that SCSI identity, then `qom-set attached true` | a disk named `V P` (`USBSTOR\DISK&VEN_V&PROD_P&REV_R\SERIAL&0`) |
+
+Each gets a qemu id, `stick0`, `stick1`, ... or `--id`. `unplug` and `cycle` go
+by that id, and `plug` prints it, so `$id = virutil usb plug win11 --image x.img`
+works. `--serial` (default: the id in capitals) is the USB serial and the disk
+serial. Windows keys the device instance on it, so reuse a serial where it
+matters: on a guest with no snapshots, every new serial leaves one more
+non-present device behind. The VID:PID is always qemu's `46f4:0001`; no
+qemu-emulated device can change it.
+
+```
+$ virutil usb image C:\sticks\a.img 1G --fs fat32 --label VUSB1
+$ virutil usb plug win11 --image C:\sticks\a.img --serial VUSB0001
+win11: plugged stick0 on port 3, serial VUSB0001, C:\sticks\a.img (raw)
+stick0
+$ virutil usb plug win11 --image C:\sticks\e.img --id evil --vendor OPSWAT --product 'EVIL STICK' --rev 6.66
+$ virutil usb cycle win11 stick0 -n 10 --off 3 --on 5
+win11: cycle 1/10 -- stick0 unplugged (18 ms), plugged on port 7
+...
+$ virutil usb unplug win11 stick0
+win11: unplugged stick0 (gone from the bus in 13 ms)
+```
+
+**`plug` is live; `--persist` also writes it into the launcher**, so it is
+there at every boot. On a shut-off domain, `--persist` writes the launcher
+alone. `unplug` takes it off the bus. A stick that is also in the launcher
+comes back at the next boot unless `unplug --persist` takes it out of there
+too. These are verbs of their own rather than more ways to `attach`, because
+an attach is always live and persistent at once. A test that plugs and pulls a
+stick a hundred times should leave nothing in the launcher, and a stick that has
+to be there at boot asks for it.
+
+`unplug` waits until qemu no longer lists the device, then frees its backend.
+`cycle` unplugs and replugs a plugged stick N times on the same backend and
+leaves it plugged. `show` lists the sticks, live and persistent, by id, kind,
+port, serial and backing file, beside the passthrough devices. It includes a
+stick someone wrote into a launcher by hand, such as win11's `usbstick0`.
+
+**Root ports.** qemu chains a full-speed hub onto the last free xHCI root port
+and puts every later device behind it. Hot plugs behind that hub went missing in
+the guest: 3 of 10, then 4 of 8, against 20 of 20 on root ports. `domain create`
+gives a domain 15 root ports (`qemu-xhci,p2=15,p3=15`, qemu's maximum: one port
+carries USB2 and USB3, so that is 15, not 30), so 14 devices fit on root ports.
+A launcher from before that has 4. With a tablet and one stick on it, the next
+stick already lands behind the hub, and `plug`, `cycle` and `show` say so.
+`virutil usb ports VM` shows the count; `virutil usb ports VM 15` sets it, on a
+shut-off domain, from its next start. The guest enumerates the new ports once.
+
+**`image`** writes a blank raw image, sparse, so a 16G stick costs what is
+written to it. The guest partitions and formats it any way it likes. With
+`--fs fat32` it gets one MBR partition formatted FAT32 (34M at least), which a
+Windows guest mounts on arrival and chkdsk passes. `image` never writes over an
+existing file.
+
+**Threat samples go in an image, never in a `--dir` folder.** The folder is on
+the host, where Defender acts on what is in it. Put the samples into an image
+from inside the guest (`push` them in, copy them onto the plugged stick), and
+the image file on the host is only bytes.
+
+**An image is one stick's.** qemu on Windows takes no lock on an image: the
+same file plugged twice was accepted twice, two disks over one file. So `plug`
+refuses an image that this domain already has plugged or that any domain's
+launcher names. That covers another domain's disk and its persisted sticks. It
+does not cover a stick hot-plugged into another running domain, because asking
+would take that domain's monitor from whoever is using it.
+
+Measured on win11 (qemu 11.1.0, WHPX), all on root ports with 15 of them:
+
+| what | result |
+| --- | --- |
+| image stick, `--fs fat32` from `image` | arrives as a disk with its serial and a FAT32 volume labelled as given; chkdsk: no problems; a file the guest wrote is there at the next plug and after a restart |
+| folder stick | the host's file reads in the guest; a write is refused, "The media is write protected" |
+| disk with its own identity | `Get-Disk`: `OPSWAT EVIL STICK`, serial `EVILDISK01`; cold-plugged from the launcher it attaches by itself |
+| `cycle` | image stick 12/12 and 12/12 in two runs (3 s off, 5 s on, then 2 s off, 3 s on); disk 10/10; folder 10/10. Counted from the guest's Partition/Diagnostic 1006 events and a guest-side poll; no System warnings |
+| `unplug` | off qemu's bus in 6–34 ms |
+| `--persist` | all three kinds back after a guest shutdown and `domain start` |
+
+One run is not in that table. It was the first one after the launcher went from
+4 root ports to 15, and 4 of its 12 plugs arrived late: the guest's first read
+of the new disk stalled and was retried about 20 s later (System log `disk` 153,
+LBA 0). By then the cycle had already pulled the stick. The next three runs,
+including the same ports, had none of it. The cause is not established. When a
+test depends on every plug arriving, check the guest side.
 
 ### USB passthrough under WSL, with usbipd
 

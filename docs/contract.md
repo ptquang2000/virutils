@@ -77,6 +77,13 @@ virutil input key   VM COMBO...                   # ctrl+a alt+f4 enter win
 virutil input type  VM TEXT...                    # US layout, printable ASCII
 
 virutil usb {list|show|attach|detach} [VM] [VENDOR:PRODUCT]
+virutil usb plug   VM (--image FILE | --dir DIR) [--id ID] [--serial S] [--label L]
+                      [--vendor V] [--product P] [--rev R] [--ro] [--persist]
+                                                  # plug .. image: Windows host only so far
+virutil usb unplug VM ID [--persist]
+virutil usb cycle  VM ID [-n N] [--off S] [--on S]
+virutil usb ports  VM [N]
+virutil usb image  FILE SIZE [--fs fat32] [--label L]
 
 virutil xfer {setup|remove|status}       # Windows host only
 ```
@@ -92,7 +99,9 @@ driver refuses `virutil xfer` by name on both, with that reason.
 libvirt `<hostdev>` on the bash side, `device_add` over the QEMU monitor on the
 Windows one. What is on neither is the WSL case, where the device is plugged
 into Windows and the domain is inside the Linux kernel's view: getting it across
-is a `usbipd` recipe in the README rather than a command. See section 7.
+is a `usbipd` recipe in the README rather than a command. See section 7. Its
+emulated-stick verbs, `plug` to `image`, are on the Windows driver only so far;
+the bash driver refuses each by name (section 9).
 
 `domain create -p SPEC` (a port forward, repeatable) and `-N` (create without
 starting) exist on the Windows and macOS drivers, and are marked as such above:
@@ -1005,6 +1014,51 @@ One asymmetry is real and is in the XML: the bash driver writes
 refuses to start a domain whose passed-through device is unplugged. qemu just
 waits for the device, so the Windows driver has nothing to set.
 
+**Emulated sticks are `usb`'s other half, and the Windows driver has them
+first.** `plug`, `unplug`, `cycle`, `ports` and `image` put a USB stick that
+qemu emulates into a running guest -- an image, a read-only vvfat view of a host
+folder, or a usb-bot disk with its own SCSI vendor, product and revision -- and
+take it out again as a surprise removal the guest cannot veto. They are verbs
+of their own, not more ways to `attach`, because of the rule above: an attach
+is live and persistent at once, and a plug is a cable, persistent only when
+`--persist` asks. A stick is named by its qemu id, since there is no host device
+to name it by and every qemu stick is `46f4:0001`.
+
+On the Windows driver all of it is HMP on the monitor the launcher already
+opens: `drive_add` (HMP has no `blockdev-add`), `device_add`, `qom-set ...
+attached true` for a usb-bot, `device_del` and a poll of `info usb`, then
+`drive_del` for whatever qemu has not freed itself; `info qtree` and `info
+block` for `show` and for what `cycle` replugs. Measured on that host's qemu
+(11.1.0): `device_del` takes a `drive_add`ed drive with it, but not always by
+the time the device is off the bus; usb-storage's `attached` is not writable,
+so a cycle is a real `device_del` and `device_add`; and **qemu on Windows takes
+no lock on an image**, so the driver refuses an image already plugged or named
+in a launcher. `ports` and `domain create` give xHCI 15 root ports, because qemu
+chains a full-speed hub onto the last free one and the guest dropped hot plugs
+behind it. The README's "Emulated USB sticks" has what was measured on win11.
+
+What each other driver would need for the same verbs, none of it written:
+
+- **Linux (libvirt).** The same HMP lines through `virsh qemu-monitor-command
+  VM --hmp '...'`, which libvirt allows on any domain and marks tainted. The
+  native route is cleaner and is what a port should take: a `<disk
+  type='file' device='disk'><target bus='usb' removable='on'/><serial>` attached
+  with `virsh attach-device --live` (and `--config` for `--persist`) is
+  usb-storage; a folder is `<source dir=.../>` with `type='dir'` (libvirt's
+  vvfat); and `detach-device` waits for the device-removed event itself. A disk
+  with its own SCSI identity has no libvirt XML for `usb-bot` plus a vendored
+  `scsi-hd`, so that kind needs `qemu-monitor-command` or a
+  `<qemu:commandline>` override. `ports` is `<controller type='usb'
+  model='qemu-xhci' ports='15'/>`. `image` is a sparse file and mtools'
+  `mformat` at the partition's offset (no loop device, no root), or the Windows
+  driver's FAT32 writer ported.
+- **macOS.** The driver already speaks QMP over `VM.qmp`, so it is the
+  `blockdev-add`/`device_add`/`device_del`/`blockdev-del` sequence the Windows
+  driver spells in HMP, with `DEVICE_DELETED` to wait on instead of a poll. Its
+  launcher already carries a `qemu-xhci`; whether hvf's guest (Windows 11 on
+  Arm) shows the same hub trouble is unmeasured. `usb` as a whole is refused
+  there today.
+
 ## 8. Conformance
 
 A test that drives both drivers against a real guest and diffs the observable
@@ -1022,6 +1076,7 @@ drivers:
 | `tests/linux/conformance.sh` | the runner. Every `--help` exits 0, every usage error exits 1, in both drivers; drives the two below. |
 | `tests/linux/payloads.sh`, `tests/win/payloads.ps1` | render all eleven payloads under each driver and diff both against `tests/golden/payloads.txt`. This is what makes section 6's "byte-identical" checkable. |
 | `tests/win/domain.ps1` | the launcher round trip: monitor port, agent channel and port forwards written, read back, edited and read again. |
+| `tests/win/usb.ps1` | a passed-through device and an emulated stick of each kind written into a launcher, read back beside a hand-written one, and taken out leaving the file as it was; `ports` rewriting the controller; `image`'s FAT32 layout and bytes. Then a real paused qemu with the default 4 root ports, plugged into over its monitor: the third stick behind the hub and said so, `cycle` without a leaked drive, `unplug` freeing the backend, a refused plug leaving nothing behind. Skips that half with no qemu. |
 | `tests/mac/domain.sh` | the macOS driver against a real hvf domain with no OS: create's files, start, port forwards live and in the launcher, every snapshot verb with the domain running and shut off, the launcher edits, delete. Driven from the runner on a Mac; skips anywhere else. |
 | `tests/win/xfer.ps1` | `push` and `pull` on a Windows host with both seams substituted -- the guest agent and the share publisher -- so the guest path rules, credential generation, the free-space refusal, the sweep's liveness decision, the rendered payload and the teardown all run with no VM and no Administrator. Under the publisher, its own three seams (the task lookup, the task start, the UAC start) are substituted instead, so the choice between task and prompt, the request the helper is handed and the helper pid read back from the status file are asserted too; and the real helper is run unelevated against the requests it must refuse. Nothing registers a task or elevates. |
 | `tests/win/sync.ps1` | `sync` on a Windows host, over the same two seams, with a real staging tree and a real delivery tree built on the host: what each config directive parses to, that the two a Windows host cannot honour are refused **before anything is fetched**, the layout the map rules build, the payload the guest would have been sent, and that a failed delivery tears down as completely as a successful one. |
@@ -1215,6 +1270,11 @@ thing neither driver may do, because it reports a change that was not made.
   through. Either way the launcher runs with the user's environment rather
   than the caller's, so it names everything by absolute path. `domain setup`
   is a Windows-host command; the bash driver refuses it by name.
+- **`usb plug`, `unplug`, `cycle`, `ports` and `image` are Windows-host only so
+  far**, and the bash driver refuses each by name, pointing at section 7, rather
+  than answering with a usage that does not list them. That is a gap in the
+  port, not a host's nature: section 7 says what the Linux and macOS drivers
+  would need.
 - **`virutil exec` writes the guest's stdout to PowerShell's success stream** on
   a Windows host, one string per line, and `-d` its pid. The driver runs in the
   caller's own PowerShell, where a console write goes past the pipeline, so
