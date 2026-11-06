@@ -202,6 +202,11 @@
 
 $script:DomainCpu = 'Skylake-Client'
 
+# xHCI root ports a new domain gets: qemu-xhci's maximum. Why it is not the
+# default 4 is at the -device line in Get-DomainQemuArgs; `virutil usb ports`
+# gives an older launcher the same.
+$script:UsbRootPorts = 15
+
 # The legacy profile, `domain create -o winxp`: a machine 32-bit Windows XP has
 # inbox drivers for, because XP has none for anything the default profile
 # builds. winxp is libosinfo's own id for XP, so a command line written for the
@@ -1308,7 +1313,10 @@ function Assert-MonitorOk {
     if ($null -eq $Reply) {
         Die "could not reach the QEMU monitor to $What"
     }
-    if ($Reply -match '(?im)^\s*(Could not|could not|error|Error|invalid)') {
+    # `Failed to` is a drive_add that cannot open or lock its file, and `Try
+    # "help` is the line under a command the monitor could not even parse
+    # ("device_add: extraneous characters at the end of line").
+    if ($Reply -match '(?im)^\s*(Could not|could not|error|Error|invalid|Failed to)|^Try "help') {
         Die @("the QEMU monitor refused to $What`:", $Reply.Trim())
     }
 }
@@ -2067,7 +2075,15 @@ function Get-DomainQemuArgs {
         '-netdev', "user,id=net0,$hostfwd"
         '-device', 'virtio-net-pci,netdev=net0'
         '-vga', 'std'
-        '-device', 'qemu-xhci,id=xhci'
+        # 15 root ports rather than qemu-xhci's 4. qemu chains a full-speed
+        # usb-hub onto the last free root port and puts every later device
+        # behind it, and hot plugs behind that hub went missing in the guest:
+        # 3 of 10 and 4 of 8 storage plugs never arrived, against 20 of 20 on
+        # root ports (`virutil usb ports` and the README's usb section). Each
+        # uport is a USB2 and a USB3 port at once, so p2=15,p3=15 is 15 ports,
+        # 14 devices before the hub. `virutil usb ports VM 15` does the same to
+        # a launcher written before this.
+        '-device', "qemu-xhci,id=xhci,p2=$($script:UsbRootPorts),p3=$($script:UsbRootPorts)"
         '-device', 'usb-tablet'
         '-display', 'gtk'
         '-audiodev', 'none,id=snd0'
