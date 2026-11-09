@@ -198,7 +198,7 @@ $completer = {
     # --- the grammar ---------------------------------------------------------
 
     $modules = [ordered]@{
-        domain   = 'the domain lifecycle: create, delete, list, start, shutdown, addr, port, setup'
+        domain   = 'the domain lifecycle: create, delete, list, start, shutdown, destroy, addr, port, setup'
         exec     = 'run commands inside a guest via the QEMU guest agent'
         push     = 'copy a file or directory from this host into a guest'
         pull     = 'copy files out of a guest onto this host'
@@ -217,6 +217,7 @@ $completer = {
         list     = 'the domains on this host and their state'
         start    = 'boot an existing domain'
         shutdown = 'ask the guest to shut itself down over ACPI'
+        destroy  = 'power the guest off now, unasked (quit over the monitor, else kill qemu)'
         addr     = "the guest's address"
         port     = 'list, open or close a host->guest port forward'
         setup    = 'register the per-user task start launches qemu through, once (no elevation)'

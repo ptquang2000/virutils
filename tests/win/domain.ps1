@@ -511,6 +511,85 @@ start "" /b "%SystemRoot%\System32\PING.EXE" -n 60 127.0.0.$n
         }
     }
 
+    # --- destroy ----------------------------------------------------------------
+    #
+    # No qemu here either. A stand-in "qemu" is a process of its own: one that
+    # answers on the domain's monitor port and exits on `quit`, as qemu does,
+    # and one that holds no monitor at all and has to be killed. The process
+    # table is read through Get-DomainProcess, which matches qemu's own image
+    # name, so it is pointed at the stand-ins for this section.
+    $script:StandInQemu = @{}
+    function Get-DomainProcess {
+        param([string]$Vm)
+        $id = $script:StandInQemu[$Vm]
+        if ($id) { Get-CimInstance Win32_Process -Filter "ProcessId=$id" }
+    }
+    function New-DestroyDomain {
+        param([string]$Vm, [int]$Monitor)
+        $dargs = Get-DomainQemuArgs -Vm $Vm `
+            -Qemu @{ Code = 'C:\q\share\edk2-x86_64-code.fd' } `
+            -Disk (Get-DomainDisk $Vm) -Nvram (Get-DomainNvram $Vm) `
+            -Iso 'C:\iso\win.iso' -Virtio '' -Memory 4096 -Vcpus 1 `
+            -Ports @() -MonitorPort $Monitor -AgentPort ($Monitor + 1)
+        Write-DomainLauncher (Get-DomainLauncher $Vm) 'C:\q\qemu-system-x86_64.exe' $dargs $Vm
+    }
+    function Get-UnusedLoopbackPort {
+        $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+        $l.Start(); $p = ([Net.IPEndPoint]$l.LocalEndpoint).Port; $l.Stop()
+        return $p
+    }
+    $monitorStandIn = Join-Path $env:VIRUTILS_DIR 'monitor-stand-in.ps1'
+    Set-Content -LiteralPath $monitorStandIn -Encoding ASCII -Value @'
+param([int]$Port)
+$l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, $Port)
+$l.Start()
+while ($true) {
+    $c = $l.AcceptTcpClient()
+    $s = $c.GetStream()
+    $w = New-Object IO.StreamWriter($s); $w.AutoFlush = $true
+    $w.Write("QEMU stand-in monitor`r`n(qemu) ")
+    $line = $null
+    try { $line = (New-Object IO.StreamReader($s)).ReadLine() } catch { }
+    $c.Close()
+    if ($line -eq 'quit') { $l.Stop(); exit 0 }
+}
+'@
+    $self = (Get-Process -Id $PID).Path
+    $quitter = $null; $deaf = $null
+    try {
+        # A guest that answers its monitor: `quit` ends it.
+        $qp = Get-UnusedLoopbackPort
+        New-DestroyDomain 'quitter' $qp
+        $quitter = Start-Process -FilePath $self -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $monitorStandIn, $qp) -WindowStyle Hidden -PassThru
+        $script:StandInQemu['quitter'] = $quitter.Id
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while (-not (Test-DomainRunning 'quitter') -and $sw.ElapsedMilliseconds -lt 15000) { Start-Sleep -Milliseconds 200 }
+        Check 'destroy: the stand-in answers its monitor' $true (Test-DomainRunning 'quitter')
+        $said = ''
+        try { Stop-DomainNow @('quitter') } catch { $said = $_.Exception.Message }
+        Check 'destroy: quit over the monitor ends it'  ''     $said
+        Check 'destroy: and the process is gone'        $true  ($quitter.WaitForExit(2000))
+        Check 'destroy: the domain reads shut off'      $false (Test-DomainRunning 'quitter')
+
+        # A guest with no monitor answering, only a process: it is killed.
+        $deaf = Start-Process -FilePath "$env:SystemRoot\System32\PING.EXE" -ArgumentList @('-n', '120', '127.0.0.1') -WindowStyle Hidden -PassThru
+        New-DestroyDomain 'deaf' (Get-UnusedLoopbackPort)
+        $script:StandInQemu['deaf'] = $deaf.Id
+        $said = ''
+        try { Stop-DomainNow @('deaf') } catch { $said = $_.Exception.Message }
+        Check 'destroy: a qemu with no monitor is killed' ''    $said
+        Check 'destroy: and that process is gone too'     $true ($deaf.WaitForExit(2000))
+
+        # Nothing running: said, as shutdown says it.
+        $said = ''
+        try { Stop-DomainNow @('deaf') } catch { $said = $_.Exception.Message }
+        Check 'destroy: a domain that is off is refused' $true ($said -match 'deaf is not running')
+    } finally {
+        foreach ($p in @($quitter, $deaf)) {
+            if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
     [Console]::Out.WriteLine("")
     [Console]::Out.WriteLine("$($script:Pass) passed, $($script:Fail) failed")
 } finally {

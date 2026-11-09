@@ -50,6 +50,7 @@ virutil domain delete   VM
 virutil domain list
 virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]
 virutil domain shutdown VM
+virutil domain destroy  VM
 virutil domain addr     VM
 virutil domain port     VM [PORT | HOSTPORT:GUESTPORT] [-c PORT]
 virutil domain setup    [--remove | --status]   # Windows host only

@@ -282,6 +282,7 @@ function Get-DomainUsage {
         '       virutil domain list'
         '       virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]'
         '       virutil domain shutdown VM'
+        '       virutil domain destroy  VM'
         '       virutil domain addr     VM'
         '       virutil domain port     VM [SPEC] [-c PORT]'
         '       virutil domain setup    [--remove | --status]'
@@ -332,6 +333,11 @@ function Get-DomainUsage {
         '                    console to detach from, and -display none would'
         '                    leave the guest with no way in at all'
         ''
+        'shutdown asks the guest (ACPI) and returns at once; destroy powers it'
+        'off now (`quit` over the monitor, else the qemu process is killed),'
+        'unasked, and returns once qemu is gone. destroy is for a guest that'
+        'shutdown cannot reach: it loses what it had not written.'
+        ''
         'delete takes no options. It never asks, and it removes the disk, the'
         'nvram and the launcher. There is no backing chain to walk and nothing'
         'a snapshot left behind: this driver has no snapshot command at all'
@@ -381,6 +387,7 @@ function Domain-Main {
         'list'     { Show-DomainList $rest }
         'start'    { Start-Domain    $rest }
         'shutdown' { Stop-Domain     $rest }
+        'destroy'  { Stop-DomainNow  $rest }
         'addr'     { Show-DomainAddr $rest }
         'port'     { Set-DomainPort  $rest }
         'setup'    { Invoke-DomainSetupCommand $rest }
@@ -1195,6 +1202,60 @@ function Stop-Domain {
     # the other driver and for the same reason.
     Invoke-DomainMonitor $vm 'system_powerdown' | Out-Null
     Say "$vm is being shut down"
+}
+
+# destroy -- off now, as `virsh destroy` is: the guest is not asked.
+#
+# For the guest that shutdown cannot reach. A WHPX guest hung at `Unexpected VP
+# exit code 4` (the vcpu defect in this file's header) still answers its
+# monitor and still reads as `running`, but ACPI goes nowhere; that happened to
+# winxp on LE11-DBM0MPB4 (2026-11-09), and only `quit` over the monitor ended
+# it. So `quit` first, the way the header prefers it: qemu exits and closes the
+# qcow2 itself. A qemu whose monitor does not answer at all (bound late, or
+# wedged past answering) is killed instead, which costs the qcow2 its lazy
+# refcounts and nothing more (the header again). Either way the guest loses
+# what it had not written, as at a power cut: that is what destroy is for.
+#
+# Returns once the process is gone, so `domain list` says `shut off` straight
+# after; a shutdown, by contrast, returns while the guest is still on its way.
+function Stop-DomainNow {
+    param([string[]]$Arguments)
+    $vm = if ($Arguments.Count -ge 1) { $Arguments[0] } else { $null }
+    Assert-Domain $vm
+
+    $proc = Get-DomainProcess $vm
+    $monitor = Test-DomainRunning $vm
+    if (-not $proc -and -not $monitor) { Die "$vm is not running" }
+
+    if ($monitor) {
+        Invoke-DomainMonitor $vm 'quit' | Out-Null
+        if (Wait-DomainGone $vm 10) { Say "$vm is destroyed (qemu quit)"; return }
+    }
+
+    # Still there: no monitor, or a quit that did not take.
+    $proc = Get-DomainProcess $vm
+    if ($proc) {
+        try {
+            Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+        } catch {
+            Die @("could not stop $vm's qemu (pid $($proc.ProcessId)):", $_.Exception.Message)
+        }
+    }
+    if (Wait-DomainGone $vm 10) { Say "$vm is destroyed (qemu killed)"; return }
+    $left = Get-DomainProcess $vm
+    Die "$vm did not stop: $(if ($left) { "qemu pid $($left.ProcessId) is still there" } else { 'its monitor still answers' })"
+}
+
+# Wait-DomainGone VM SECONDS -- true once neither the process nor the monitor is
+# there; false when the time is up first.
+function Wait-DomainGone {
+    param([string]$Vm, [int]$Seconds)
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    while ($true) {
+        if (-not (Get-DomainProcess $Vm) -and -not (Test-DomainRunning $Vm)) { return $true }
+        if ([DateTime]::UtcNow -ge $deadline) { return $false }
+        Start-Sleep -Milliseconds 250
+    }
 }
 
 # --- addr -------------------------------------------------------------------

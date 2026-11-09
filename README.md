@@ -1620,6 +1620,7 @@ virutil domain delete VM
 virutil domain list
 virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]
 virutil domain shutdown VM
+virutil domain destroy  VM
 virutil domain addr     VM
 ```
 
@@ -1843,6 +1844,7 @@ Four rules follow from what these actually do:
 ```
 virutil domain list
 virutil domain shutdown VM
+virutil domain destroy  VM
 virutil domain addr     VM
 ```
 
@@ -1852,6 +1854,13 @@ connection URI (`qemu:///system`, so they match what every other module talks
 to), and they live here so the whole lifecycle is one module rather than a
 separate junk drawer. `shutdown` is the graceful ACPI request — for the
 guest-agent path that `sync` and `push` use, see `modules/linux/guest`.
+
+`destroy` is `virsh destroy`: off now, the guest unasked, for a guest that
+`shutdown` cannot reach (a hung one, or one that ignores ACPI). On a Windows
+host it sends `quit` over the QEMU monitor (the only thing that ended a WHPX
+guest hung at `Unexpected VP exit code 4`) and kills the qemu process when the
+monitor does not answer; on a Mac, QMP `quit`, then the same. It returns once
+qemu is gone. The guest loses what it had not written, as at a power cut.
 
 Note that `addr` is `virsh domifaddr`; the shorter name is deliberate, since the
 `dom` prefix is redundant under a module already called `domain`.

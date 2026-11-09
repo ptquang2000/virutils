@@ -16,7 +16,7 @@ _virutil() {
   # as separate blocks.
   local -a domains transfer guest hardware other
   domains=(
-    'domain:the domain lifecycle: create, delete, list, start, shutdown, addr, port'
+    'domain:the domain lifecycle: create, delete, list, start, shutdown, destroy, addr, port'
     'snapshot:external snapshots (disk and memory) for libvirt domains'
   )
   transfer=(
@@ -384,7 +384,7 @@ _virutil_domain() {
     'port:forward a host port into a running guest'
   )
   case $words[3] in
-    shutdown|addr)
+    shutdown|destroy|addr)
       (( CURRENT == 4 )) && _virutil_domains
       ;;
     port)

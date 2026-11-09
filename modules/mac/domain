@@ -47,6 +47,7 @@ domain_usage() {
         "       virutil domain list" \
         "       virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]" \
         "       virutil domain shutdown VM" \
+        "       virutil domain destroy  VM" \
         "       virutil domain addr     VM" \
         "       virutil domain port     VM [SPEC] [-c PORT]" \
         "" \
@@ -115,6 +116,7 @@ domain_main() {
         start)    domain_start    "$@" ;;
         list)     domain_list     "$@" ;;
         shutdown) domain_shutdown "$@" ;;
+        destroy)  domain_destroy  "$@" ;;
         addr)     domain_addr     "$@" ;;
         port)     domain_port     "$@" ;;
         setup)    die "virutil domain setup is a Windows-host command: it registers the" \
@@ -561,6 +563,34 @@ domain_shutdown() {
     qmp system_powerdown >/dev/null
     qmp_close
     say "$VM is being shut down (ACPI power button)"
+}
+
+# Off now, as `virsh destroy` is: the guest is not asked. For a guest shutdown
+# cannot reach (no agent, and ACPI ignored: a live Alpine with no acpid sat
+# through `domain shutdown`, 2026-11-09). QMP `quit` first, so qemu closes the
+# qcow2 itself; a qemu whose QMP does not answer is killed. swtpm goes with it
+# either way (--terminate). Returns once qemu is gone.
+domain_destroy() {
+    local VM="${1:-}" pid i
+    case "$VM" in -h|--help) domain_usage 0 ;; esac
+    domain_need "$VM" || die "usage: virutil domain destroy VM"
+    pid="$(domain_pid "$VM")" || die "$VM is not running"
+
+    if qmp_open "$VM"; then
+        # quit's reply may or may not arrive before the socket closes: not waited on.
+        chan_send '{"execute":"quit"}' || true
+        qmp_close
+        for ((i = 0; i < 40; i++)); do
+            domain_running "$VM" || { say "$VM is destroyed (qemu quit)"; return 0; }
+            sleep 0.25
+        done
+    fi
+    kill -9 "$pid" 2>/dev/null || true
+    for ((i = 0; i < 40; i++)); do
+        domain_running "$VM" || { say "$VM is destroyed (qemu killed)"; return 0; }
+        sleep 0.25
+    done
+    die "$VM did not stop: qemu pid $pid is still there"
 }
 
 # --- list / addr --------------------------------------------------------------
