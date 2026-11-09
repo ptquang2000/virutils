@@ -105,16 +105,24 @@ domain_disks() {
                    sub(/^[[:space:]]*([^[:space:]]+[[:space:]]+){3}/, ""); print }'
 }
 
-# domain_media NAME -- "TARGET<TAB>SOURCE" for every removable drive in the
-# running domain that has media in it. An empty drive prints nothing: there is
-# no file, so there is nothing for a caller to take out or put back.
+# domain_media NAME [--inactive] -- "TARGET<TAB>SOURCE" for every removable
+# drive in the running domain (or, with --inactive, in its definition) that has
+# media in it. An empty drive prints nothing: there is no file, so there is
+# nothing for a caller to take out or put back.
+domain_media() {
+    "${VIRSH[@]}" dumpxml "$1" ${2:+"$2"} 2>/dev/null | domain_media_xml
+}
+
+# domain_media_xml -- domain_media over domain XML on stdin; the first <domain>
+# only, so a snapshot record's inner config can be fed whole.
 #
 # Read from the XML rather than domblklist, which cannot be split on whitespace
 # when a path has spaces in it -- and an ISO under /mnt/c usually does. libvirt
 # writes <source> before <target> within a device, so the pair completes at the
 # target line.
-domain_media() {
-    "${VIRSH[@]}" dumpxml "$1" 2>/dev/null | awk '
+domain_media_xml() {
+    awk '
+        /<\/domain>/ { exit }
         /<disk / { removable = ($0 ~ /device=.(cdrom|floppy)./); src = ""; next }
         !removable { next }
         match($0, /file='"'"'[^'"'"']*'"'"'/) {
@@ -137,7 +145,24 @@ domain_media_eject() {
 }
 
 # domain_media_insert NAME TARGET SOURCE -- put the media back.
+#
+# After a snapshot revert libvirt's insert fails on its own: the record was
+# written with the tray open (snapshot_devices_off), the guest comes back with it
+# closed and empty, and libvirt goes straight to removing a medium from a tray
+# QEMU says is shut ("Tray of device 'sata0-0-1' is not open"; libvirt 12.9,
+# LE11, 2026-11-09). Opening it over QMP first, by the drive's alias, is what
+# lets the same insert through.
 domain_media_insert() {
+    "${VIRSH[@]}" change-media "$1" "$2" --insert "$3" --live >/dev/null 2>&1 && return 0
+    local alias
+    alias="$("${VIRSH[@]}" dumpxml "$1" 2>/dev/null | awk -v want="$2" '
+        /<disk /   { a = ""; t = ""; next }
+        match($0, /<target dev='"'"'[^'"'"']*'"'"'/) { t = substr($0, RSTART + 13, RLENGTH - 14) }
+        match($0, /<alias name='"'"'[^'"'"']*'"'"'/) { a = substr($0, RSTART + 13, RLENGTH - 14) }
+        /<\/disk>/ { if (t == want && a != "") { print a; exit } }')"
+    [[ -n "$alias" ]] || return 1
+    "${VIRSH[@]}" qemu-monitor-command "$1" \
+        "{\"execute\":\"blockdev-open-tray\",\"arguments\":{\"id\":\"$alias\",\"force\":true}}" >/dev/null || return 1
     "${VIRSH[@]}" change-media "$1" "$2" --insert "$3" --live >/dev/null
 }
 

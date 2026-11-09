@@ -558,11 +558,30 @@ restored, disk switched back to the base image, no new overlay over it, guest
 left paused. Unpause it and the guest writes straight into the image the
 snapshot is defined against.
 
-Naming the drives is the fix, and it is the same fix whichever state the domain
-is in. Ejecting them was not: a shut-off domain has no tray to open, so a create
-against one snapshotted the ISOs anyway — and a record written with the drives
-empty is a revert that takes the media away from the guest, out of a memory
-image that was captured with it present.
+Naming the drives fixes the **create**. It does not fix the **revert**: on
+libvirt 12.9 a revert builds a fresh `<source>.<epoch>` overlay for every drive
+with media in the record's guest config, `snapshot=no` or not (LE11, WSL
+archlinux, 2026-11-09). From a running record with the virtio-win ISO on
+`/mnt/c`, it stopped half-done with the guest paused (“Setting different DAC
+user or group on …/virtio-win-0.1.285.<epoch> which is already in use”); from a
+shut-off one it went through and left a qcow2 beside the ISO on the Windows
+drive, which the cdrom then read instead of the ISO.
+
+So the trays are open for the create:
+
+- **A running domain**: its loaded drives are ejected live just before the
+  snapshot and loaded again just after (also on any failure in between). The
+  definition keeps naming the media, so the record's guest config has the drives
+  empty while its definition still has them. A **revert** then loads again, live,
+  what the definition names and the guest came back without. libvirt's own
+  insert fails there (the tray is shut and libvirt goes straight to removing a
+  medium), so the tray is opened over QMP first.
+- **A shut-off domain** has no tray to open. Under WSL, with a drive loaded from
+  `/mnt/<drive>`, the create is refused with what to do (start it first, or eject
+  the drive for good); elsewhere it goes ahead as before.
+- **A record taken with a drive loaded** (by an earlier virutil) is refused at
+  revert under WSL when that drive's media is on `/mnt/<drive>`, before anything
+  is touched.
 
 ### A shut-off domain gets a disk-only snapshot
 
