@@ -186,6 +186,16 @@ usb_main() {
             die "$VM already passes through $ID (see: virutil usb show $VM)"
         fi
 
+        # A domain made before domain create gave WSL guests WSL_XHCI: said
+        # before the attach, because what fails is the guest's driver, after
+        # libvirt has reported success.
+        if on_wsl && ! "${VIRSH[@]}" dumpxml --inactive "$VM" | grep -qF "${WSL_XHCI#-global }"; then
+            warn "$VM's USB controller offers streams, which usbip cannot carry: a" \
+                 "USB 3 stick may come up in a Windows guest as 'This device cannot" \
+                 "start' (Code 10). Turn them off, then restart $VM:" \
+                 "  virt-xml --connect qemu:///system $VM --edit --qemu-commandline=\"$WSL_XHCI\""
+        fi
+
         if [ "$(domstate)" = running ]; then
             say "libvirt: attaching $ID to $VM (live)"
             hostdev_xml "$ID" | "${VIRSH[@]}" attach-device "$VM" --live /dev/stdin

@@ -10,6 +10,42 @@ SUDO=()
 
 DOMAIN=""
 
+# --- WSL ------------------------------------------------------------------------
+#
+# on_wsl -- true inside a WSL2 distribution, whose kernel says so in its release
+# string (6.18.33.2-microsoft-standard-WSL2). What it decides: every USB device
+# there arrives over usbip, which carries no USB streams (see domain create).
+on_wsl() { [[ "$(</proc/sys/kernel/osrelease)" == *[Mm]icrosoft* ]]; }
+
+# WSL_XHCI -- the qemu argument that tells a guest's xHCI it has no streams. A
+# UAS stick (most USB 3 sticks) imported over usbip otherwise comes up in a
+# Windows guest as UASPStor "This device cannot start" (Code 10): its UAS driver
+# asks for bulk streams the controller advertises and vhci_hcd cannot carry.
+# With streams off Windows binds USB Mass Storage and the stick works (LE11,
+# SanDisk 0781:55ab, 2026-11-09).
+WSL_XHCI="-global qemu-xhci.streams=off"
+
+# --- the domain's networks --------------------------------------------------------
+#
+# networks_up VM -- start each libvirt network VM's interfaces use that is not
+# active, before anything starts the guest. libvirt autostarts a network once
+# per boot (/run/libvirt/network/autostarted) and never again, so one that goes
+# down later stays down and the start fails with "network 'default' is not
+# active". Under WSL libvirtd idle-exits (--timeout 120) and comes back by
+# socket activation without its networks (LE11, 2026-11-09).
+networks_up() {
+    local net
+    while read -r net; do
+        [[ -n "$net" ]] || continue
+        [[ "$("${VIRSH[@]}" net-info "$net" 2>/dev/null | awk '$1 == "Active:" {print $2}')" == yes ]] \
+            && continue
+        "${VIRSH[@]}" net-start "$net" >/dev/null \
+            || die "network '$net', which $1 uses, is down and would not start" \
+                   "  virsh --connect qemu:///system net-start $net"
+        say "network $net was down: started"
+    done < <("${VIRSH[@]}" domiflist "$1" 2>/dev/null | awk '$2 == "network" {print $3}')
+}
+
 # '.' spells "the root of this tree", but must not reach rsync: --mkpath takes
 # the EEXIST on a literal '.' as fatal ("mkdir ..././ failed: File exists").
 root_rel() { local s="$1"; [[ "$s" == "." ]] && s=""; printf '%s' "$s"; }

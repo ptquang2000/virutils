@@ -474,6 +474,7 @@ snapshot_main() {
             done < <(snapshot_domain_chain "$xml" "$targets")
         fi
 
+        networks_up "$VM"
         "${VIRSH[@]}" snapshot-revert --domain "$VM" --snapshotname "$SNAP" --running
         echo "reverted: $SNAP"
 

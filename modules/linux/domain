@@ -340,6 +340,10 @@ domain_create() {
             "and recreate the domain if you need one."
     fi
 
+    # Under WSL a passed-through USB device comes over usbip, which has no
+    # streams; see WSL_XHCI in guest.
+    on_wsl && ARGS+=(--qemu-commandline="$WSL_XHCI")
+
     if [[ "$OSINFO" == win* ]]; then
         # Without synic/stimer the guest's timer interrupts round-trip through
         # the hypervisor and an idle desktop burns host CPU. evmcs and avic are
@@ -495,6 +499,7 @@ domain_start() {
     if [[ "$state" == running ]]; then
         say "$VM is already running"
     else
+        networks_up "$VM"
         "${VIRSH[@]}" start "$VM"
     fi
 

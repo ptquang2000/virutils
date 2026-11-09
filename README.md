@@ -2370,6 +2370,17 @@ usbipd unbind -b 3-3          # Administrator; stops sharing altogether
   `lsusb` in WSL is.
 - A busid names a *port*, so it changes when you move the device between
   sockets. Vendor:product names the device.
+- A USB 3 stick that shows in a Windows guest as *"This device cannot start
+  (Code 10)"* under UASPStor: its UAS driver asks for USB streams, which usbip
+  cannot carry. The guest's xHCI has to say it has none — `-global
+  qemu-xhci.streams=off` — and Windows then binds USB Mass Storage instead.
+  `virutil domain create` adds it under WSL; `virutil usb attach` warns on a
+  domain made before that, with the `virt-xml` line that adds it (restart the
+  domain after).
+- Every model of device can be shared without a UAC prompt per stick: one
+  elevated `usbipd policy add --effect Allow --operation AutoBind
+  --hardware-id VID:PID` lets `usbipd attach --wsl --hardware-id VID:PID` bind
+  it on the fly, as a normal user.
 
 ## Requirements
 
