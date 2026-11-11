@@ -167,10 +167,11 @@ function Move-PullResult {
 function Write-PullReport {
     param([string]$Vm, [string]$Reported, [double]$Ms)
 
-    $f     = @("$Reported".Trim() -split '\s+')
-    $files = if ($f.Count -ge 1 -and $f[0]) { [int]($f[0]) } else { 0 }
-    $dirs  = if ($f.Count -ge 2) { [int]($f[1]) } else { 0 }
-    $gms   = if ($f.Count -ge 3) { [double]($f[2]) } else { $Ms }
+    # A line that is missing or malformed is a stop, never "0 files pulled".
+    $f     = @((Assert-XferReported $Vm $Reported '^\d+ \d+ \d+$') -split '\s+')
+    $files = [int]($f[0])
+    $dirs  = [int]($f[1])
+    $gms   = [double]($f[2])
 
     $what = ''
     if ($files -or -not $dirs) {

@@ -69,6 +69,16 @@ $script:Sent     = @()
 $script:GuestRc  = 0
 $script:UiRc     = 0
 $script:GuestOut = '1 1234'
+# The wrapper's first line is a per-call nonce (modules/win/exec.ps1, "qemu-ga's
+# exec records"), and a real guest prints it before anything else. A stand-in
+# answer has to as well, or it reads as another process's record.
+function Add-TestNonce {
+    param([string]$Sent, [string]$Out)
+    $m = [regex]::Match("$Sent", 'virutil-call ([0-9a-f]{32})')
+    if (-not $m.Success) { return $Out }
+    return "virutil-call $($m.Groups[1].Value)`n$Out"
+}
+
 function Invoke-GuestAgent {
     param([string]$Vm, [string]$Command, $Arguments = $null, [int]$TimeoutMs = 10000)
     switch ($Command) {
@@ -94,7 +104,7 @@ function Invoke-GuestAgent {
             return ([pscustomobject]@{
                 exited = $true
                 exitcode = $rc
-                'out-data' = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($out))
+                'out-data' = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Add-TestNonce $last $out)))
             })
         }
         default { throw "the test agent was asked for $Command" }
@@ -351,6 +361,25 @@ try {
     CheckTrue 'an unchanged tree reports as current' ($out -match 'all already current in the guest')
     CheckTrue 'and still says it completed'          ($out -match 'copy complete')
     $script:GuestOut = '1 1234'
+
+    # --- the guest copier's line never came ---------------------------------
+    #
+    # MDE-6273 r1-4: the answer to the delivery's status came from another
+    # process's qemu-ga record, carrying no output, and the report read the
+    # missing line as "nothing copied" -- "all already current in the guest"
+    # for a delivery that never ran (docs/qga-exec-records.md). No line, or a
+    # line that is not "<0|1> <ms>", has to stop the run instead.
+    foreach ($bad in @('', '1', 'robocopy said something')) {
+        $script:GuestOut = $bad
+        $before = $script:Unpublished
+        $why = Dies { Capture { Sync-Main @('win11', '-c', $confPath) } }
+        CheckTrue "a guest line of [$bad] stops the sync" ($why -match 'guest copier sent no result; delivery unverified')
+        CheckTrue "and never reads as current"            (-not ($why -match 'already current'))
+        Check     "and the share was still taken down"     ($before + 1) $script:Unpublished
+    }
+    $script:GuestOut = '1 1234'
+    Check 'Write-SyncReport alone refuses an empty line' $true `
+        ((Dies { Write-SyncReport 'win11' '' 44700 }) -match 'delivery unverified')
 
     # --- the guest went away mid-run ----------------------------------------
     #

@@ -89,6 +89,16 @@ $script:Sent      = @()
 $script:GuestWrites = $null
 $script:GuestRc   = 0
 $script:GuestOut  = ''
+# The wrapper's first line is a per-call nonce (modules/win/exec.ps1, "qemu-ga's
+# exec records"), and a real guest prints it before anything else. A stand-in
+# answer has to as well, or it reads as another process's record.
+function Add-TestNonce {
+    param([string]$Sent, [string]$Out)
+    $m = [regex]::Match("$Sent", 'virutil-call ([0-9a-f]{32})')
+    if (-not $m.Success) { return $Out }
+    return "virutil-call $($m.Groups[1].Value)`n$Out"
+}
+
 function Invoke-GuestAgent {
     param([string]$Vm, [string]$Command, $Arguments = $null, [int]$TimeoutMs = 10000)
     switch ($Command) {
@@ -111,7 +121,7 @@ function Invoke-GuestAgent {
             return ([pscustomobject]@{
                 exited = $true
                 exitcode = $rc
-                'out-data' = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($out))
+                'out-data' = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Add-TestNonce $last $out)))
             })
         }
         default { throw "the test agent was asked for $Command" }
@@ -667,6 +677,17 @@ try {
     Check     'and its share was retired too' ($script:Published - $before) 1
     $script:GuestRc = 0
 
+    # No line from the guest copier is not "all up to date": the answer came
+    # from somewhere other than the copy (docs/qga-exec-records.md), so the
+    # push stops, and still tears down.
+    foreach ($case in @(@($tree, 'opt\app', ''), @($tree, 'opt\app', '1 2'), @($one, 'opt\app\', ''))) {
+        $script:GuestOut = $case[2]
+        $before = $script:Unpublished
+        $why = Dies { Capture { Push-Main @('testvm', $case[0], $case[1]) } }
+        CheckTrue "a push answered [$($case[2])] stops unverified" ($why -match 'guest copier sent no result; delivery unverified')
+        Check     'and its share was retired'                      ($before + 1) $script:Unpublished
+    }
+
     # --- pull --------------------------------------------------------------
     $dest = Join-Path $scratch 'out'
     $script:GuestOut = '2 1 30'
@@ -684,6 +705,10 @@ try {
     $rc = ExitCodeOf { Capture { Pull-Main @('testvm', 'nothing\here\*', $dest) } }
     Check 'no match in the guest is exit 94' 94 $rc
     $script:GuestRc = 0
+
+    $script:GuestOut = ''
+    $why = Dies { Capture { Pull-Main @('testvm', 'C:\Users\me\out\*.log', $dest) } }
+    CheckTrue 'a pull with no guest line stops unverified' ($why -match 'guest copier sent no result; delivery unverified')
 
     # --- pull: is DST the file, or the directory it goes in? ----------------
     #

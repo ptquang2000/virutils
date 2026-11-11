@@ -265,6 +265,28 @@ function Invoke-XferRobocopy {
     if ($rc -ge 8) { Die "$What (robocopy exit $rc)" }
 }
 
+# Assert-XferReported VM REPORTED SHAPE -- the guest copier's one line, or a stop.
+#
+# Each payload ends by printing a fixed line of numbers (sync "<copied> <ms>",
+# push-dir "<copied> <total> <ms>", push-file "<bytes> <ms>", pull "<files>
+# <dirs> <ms>"), and the reports used to read a missing field as zero. A
+# missing line is not a zero: it means this host never got the copier's result
+# -- the case docs/qga-exec-records.md describes, where a sync printed "all
+# already current" for a delivery that never ran. So anything that is not
+# exactly the expected line stops the command, before a report can claim
+# anything.
+function Assert-XferReported {
+    param([Parameter(Mandatory)][string]$Vm, [string]$Reported, [Parameter(Mandatory)][string]$Shape)
+    $line = "$Reported".Trim()
+    if ($line -match $Shape) { return $line }
+    $got = if ($line) { "[$line]" } else { 'nothing' }
+    Die @(
+        "${Vm}: guest copier sent no result; delivery unverified (got $got)."
+        'Nothing here says the guest is current: compare hashes in the guest, or'
+        'run the command again.'
+    )
+}
+
 # --- strays -----------------------------------------------------------------
 #
 # Reaped on the next run rather than hunted for on this one. The prefix makes

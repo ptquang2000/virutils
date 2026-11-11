@@ -192,11 +192,13 @@ function Test-PushReadable {
 function Write-PushReport {
     param([string]$Vm, [bool]$IsDir, [string]$Reported, [double]$Ms)
 
-    $f = @("$Reported".Trim() -split '\s+')
+    # A line that is missing or malformed is a stop, never "all up to date".
+    $shape = if ($IsDir) { '^\d+ \d+ \d+$' } else { '^\d+ \d+$' }
+    $f = @((Assert-XferReported $Vm $Reported $shape) -split '\s+')
     if ($IsDir) {
-        $copied = if ($f.Count -ge 1 -and $f[0]) { [int]($f[0]) } else { 0 }
-        $total  = if ($f.Count -ge 2) { [int]($f[1]) } else { 0 }
-        $gms    = if ($f.Count -ge 3) { [double]($f[2]) } else { $Ms }
+        $copied = [int]($f[0])
+        $total  = [int]($f[1])
+        $gms    = [double]($f[2])
         $what = "$total file"
         if ($total -ne 1) { $what += 's' }
         if ($copied) { $what += ' present (some copied)' }
@@ -205,8 +207,8 @@ function Write-PushReport {
         return
     }
 
-    $bytes = if ($f.Count -ge 1 -and $f[0]) { [double]($f[0]) } else { 0 }
-    $gms   = if ($f.Count -ge 2) { [double]($f[1]) } else { $Ms }
+    $bytes = [double]($f[0])
+    $gms   = [double]($f[1])
     $rate  = Format-Rate $bytes $gms
     $line  = "$Vm`: done ($(Format-Bytes $bytes)) in $(Format-Duration $gms)"
     if ($rate) { $line += " ($rate on the wire)" }

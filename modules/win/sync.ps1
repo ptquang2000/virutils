@@ -638,9 +638,10 @@ function Write-SyncCleanupReport {
 function Write-SyncReport {
     param([string]$Vm, [string]$Reported, [double]$Ms)
 
-    $f      = @("$Reported".Trim() -split '\s+')
-    $copied = if ($f.Count -ge 1 -and $f[0]) { [int]($f[0]) } else { 0 }
-    $gms    = if ($f.Count -ge 2 -and $f[1]) { [double]($f[1]) } else { $Ms }
+    # A line that is missing or malformed is a stop, never "nothing copied".
+    $f      = @((Assert-XferReported $Vm $Reported '^[01] \d+$') -split '\s+')
+    $copied = [int]($f[0])
+    $gms    = [double]($f[1])
 
     $what = "$($script:SyncFiles) file"
     if ($script:SyncFiles -ne 1) { $what += 's' }
