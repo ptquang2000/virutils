@@ -41,6 +41,8 @@ function Check {
     }
 }
 
+function CheckTrue { param([string]$Name, $Got) Check $Name $true ([bool]$Got) }
+
 # The agent's replies, scripted. $script:AgentStatus is what guest-exec-status
 # hands back; everything else answers the way a live agent would.
 $script:AgentStatus = $null
@@ -102,6 +104,164 @@ try {
     finally { [Console]::SetOut($console) }
     Check 'without -Emit the pipeline stays empty' 0            $got.Count
     Check 'and the console has it'                 "one`n`ntwo`n" $sw.ToString()
+
+    # --- qemu-ga's exec records ----------------------------------------------
+    #
+    # From here the agent is a model of qemu-ga's guest-exec bookkeeping
+    # (qga/commands.c): a record per guest-exec, appended; guest-exec-status
+    # answers from the *first* record with that pid and drops it once it reports
+    # it exited; a pid the guest freed can be handed to the next process while
+    # an old record for it is still there. MDE-6273 r1-4 is the case: a sync's
+    # first status was answered by a detached run's leftover record -- exited,
+    # exit 0, no output -- and the sync reported "all already current" for a
+    # delivery that never ran (docs/qga-exec-records.md).
+    $script:Recs      = New-Object Collections.Generic.List[object]
+    $script:Execs     = New-Object Collections.Generic.List[object]
+    $script:NextPid   = 0
+    $script:NextOut   = ''
+    $script:NextRc    = 0
+    $script:NextPolls = 1
+    $script:NextQuiet = $false
+    function Add-Rec {
+        param([long]$GuestPid, [bool]$Finished, [bool]$HasOutput, [int]$Status = 0, [string]$Out = '', [int]$Polls = 0)
+        $script:Recs.Add([pscustomobject]@{
+            Pid = $GuestPid; Finished = $Finished; HasOutput = $HasOutput
+            Status = $Status; Out = $Out; PollsLeft = $Polls })
+    }
+    function Invoke-GuestAgent {
+        param([string]$Vm, [string]$Command, $Arguments = $null, [int]$TimeoutMs = 10000)
+        switch ($Command) {
+            'guest-exec' {
+                $argv = @($Arguments['arg'])
+                $text = ''
+                try { $text = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($argv[$argv.Count - 1])) } catch { }
+                if (-not $text) { $text = $argv -join ' ' }
+                $in = if ($Arguments.ContainsKey('input-data')) {
+                    [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Arguments['input-data'])) } else { '' }
+                $capture = [bool]$Arguments['capture-output']
+                $script:Execs.Add([pscustomobject]@{ Pid = $script:NextPid; Text = $text; Capture = $capture; Input = $in })
+                # A real guest prints the wrapper's nonce first, unless the
+                # process died before its script ran.
+                $out = $script:NextOut
+                $n = [regex]::Match($text, 'virutil-call ([0-9a-f]{32})')
+                if ($n.Success -and -not $script:NextQuiet) { $out = "virutil-call $($n.Groups[1].Value)`n$out" }
+                Add-Rec $script:NextPid $false $capture $script:NextRc $out $script:NextPolls
+                return ([pscustomobject]@{ pid = $script:NextPid })
+            }
+            'guest-exec-status' {
+                $p = [long]$Arguments['pid']
+                $rec = $null
+                foreach ($r in $script:Recs) { if ($r.Pid -eq $p) { $rec = $r; break } }
+                if ($null -eq $rec) { Die "$Vm's guest agent refused guest-exec-status: PID $p does not exist" }
+                if (-not $rec.Finished) {
+                    if ($rec.PollsLeft -gt 0) { $rec.PollsLeft--; return ([pscustomobject]@{ exited = $false }) }
+                    $rec.Finished = $true
+                }
+                $r = [ordered]@{ exited = $true; exitcode = $rec.Status }
+                if ($rec.HasOutput -and $rec.Out) {
+                    $r['out-data'] = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($rec.Out))
+                }
+                [void]$script:Recs.Remove($rec)
+                return ([pscustomobject]$r)
+            }
+            default { throw "the model agent was asked for $Command" }
+        }
+    }
+    function Reset-Model {
+        param([long]$GuestPid = 5512, [string]$Out = '', [int]$Rc = 0, [int]$Polls = 1, [switch]$Quiet)
+        $script:Recs.Clear(); $script:Execs.Clear()
+        $script:NextPid = $GuestPid; $script:NextOut = $Out; $script:NextRc = $Rc
+        $script:NextPolls = $Polls; $script:NextQuiet = [bool]$Quiet
+        $dir = Get-GuestExecLedgerDir 'testvm'
+        if (Test-Path -LiteralPath $dir) { [IO.Directory]::Delete($dir, $true) }
+    }
+    function Ledger { return @(Get-ChildItem -LiteralPath (Get-GuestExecLedgerDir 'testvm') -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name } | Sort-Object) }
+
+    # The reused pid, as on win11-2: a detached run's record, finished, no
+    # output, exit 0, sitting ahead of the sync payload's.
+    Reset-Model -GuestPid 5512 -Out '1 6400'
+    Add-Rec 5512 $true $false 0
+    $script:VirutilExit = -1
+    $got = Invoke-GuestPsText 'testvm' "'payload'" -Capture 2>$null
+    Check 'a reused pid still returns this call''s own output' '1 6400' $got
+    Check 'with this call''s own exit code'                    0        $script:VirutilExit
+    Check 'and both records are consumed'                      0        $script:Recs.Count
+    Check 'and nothing is left in the ledger'                  0        (@(Ledger).Count)
+
+    # The same, behind an abandoned captured call: a record with output and a
+    # non-zero code, and some other call's nonce.
+    Reset-Model -GuestPid 5512 -Out 'mine' -Rc 0
+    Add-Rec 5512 $true $true 7 "virutil-call $('0' * 32)`nold output"
+    $script:VirutilExit = -1
+    $got = Invoke-GuestPsText 'testvm' "'payload'" -Capture 2>$null
+    Check 'another call''s record is not taken for this one'  'mine' $got
+    Check 'nor its exit code'                                 0      $script:VirutilExit
+
+    # No older record, and this call's process died before printing anything:
+    # its own answer is the only one there is, and it must not hang the poll.
+    Reset-Model -GuestPid 6000 -Out '' -Rc 5 -Quiet
+    $script:VirutilExit = -1
+    $got = Invoke-GuestPsText 'testvm' "'payload'" -Capture 2>$null
+    Check 'a silent process of our own is still ours'  5  $script:VirutilExit
+    Check 'and its (empty) output is returned'         '' $got
+
+    # The nonce is stripped wherever the output goes, -Emit included.
+    Reset-Model -GuestPid 6001 -Out "a`nb"
+    $got = @(Invoke-GuestPsText 'testvm' "'payload'" -Emit 2>$null)
+    Check 'the nonce never reaches the caller' 'a|b' ($got -join '|')
+
+    # The ledger: an entry whose owner is gone is polled once and dropped with
+    # its record; a live owner's entry is left to it; a detached process still
+    # running keeps its entry for the next reap.
+    Reset-Model
+    Add-Rec 777 $true $false 0
+    Add-Rec 778 $true $false 0
+    Add-Rec 779 $false $false 0 '' 1000
+    [void](Add-GuestExecLedger 'testvm' 777 999999999)
+    # 4 is the System process: alive on every Windows host, and never us.
+    [void](Add-GuestExecLedger 'testvm' 778 4)
+    [void](Add-GuestExecLedger 'testvm' 779 0)
+    Invoke-GuestExecReap 'testvm'
+    Check 'a dead owner''s record is reaped'          '778.4|779.0' ((Ledger) -join '|')
+    Check 'and only that record was consumed'          '778|779'     (($script:Recs | ForEach-Object { $_.Pid }) -join '|')
+
+    # An entry for a pid qemu-ga no longer knows is just dropped.
+    Reset-Model
+    [void](Add-GuestExecLedger 'testvm' 4321 0)
+    Invoke-GuestExecReap 'testvm'
+    Check 'an entry for an unknown pid is dropped' 0 (@(Ledger).Count)
+
+    # Every call reaps first, so a record left behind cannot answer for it.
+    Reset-Model -GuestPid 5512 -Out 'fresh'
+    Add-Rec 5512 $true $false 0
+    [void](Add-GuestExecLedger 'testvm' 5512 0)
+    $got = Invoke-GuestPsText 'testvm' "'payload'" -Capture 2>$null
+    Check 'a ledgered record is reaped before the next call' 'fresh' $got
+    Check 'and its entry with it'                            0 (@(Ledger).Count)
+
+    # cmd -d stays a plain detached guest-exec (XP has no powershell for a
+    # launcher), so the host writes it down for the reaper.
+    Reset-Model -GuestPid 3100
+    $got = @(Invoke-GuestExec 'testvm' 'cmd.exe' @('/c', 'shutdown') -Detach -Emit)
+    Check 'cmd -d still prints the guest pid'  '3100'   ($got -join '|')
+    Check 'and leaves a ledger entry for it'   '3100.0' ((Ledger) -join '|')
+
+    # ps -d goes through a launcher that is polled to its end: the only
+    # guest-exec is captured, the script is handed over on stdin, the pid
+    # printed is the one the launcher started, and no record or entry is left.
+    Reset-Model -GuestPid 6100 -Out '7777'
+    $got = @(Invoke-GuestPsText 'testvm' "'long job'" -Detach -Emit 2>$null)
+    Check 'ps -d prints the started process''s pid' '7777' ($got -join '|')
+    Check 'through one guest-exec'                  1      $script:Execs.Count
+    Check 'which is captured, so it gets polled'    $true  $script:Execs[0].Capture
+    $handed = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($script:Execs[0].Input.Trim()))
+    CheckTrue 'the script reaches the launcher on stdin' ($handed -match "'long job'")
+    CheckTrue 'and the launcher starts it shell-executed' ($script:Execs[0].Text -match 'UseShellExecute = \$true')
+    Check 'no record is left in qemu-ga'            0      $script:Recs.Count
+    Check 'and nothing in the ledger'               0      (@(Ledger).Count)
+    $why = ''
+    try { Invoke-GuestPsText 'testvm' "'x'" -Detach -Emit -InputB64 'eA==' | Out-Null } catch { $why = $_.Exception.Message }
+    CheckTrue 'ps -d with stdin is refused, not dropped' ($why -match 'cannot hand stdin')
 
     # Get-RestArgs stands in for the shell's `shift`, and the slice it replaces
     # counts backwards from the end once the array is exhausted -- which would

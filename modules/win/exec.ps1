@@ -43,10 +43,142 @@ function Get-ExecUsage {
         '  -d, --detach   fire and forget: print the guest pid and exit 0.'
         '                 No output and no exit code, but the command survives'
         '                 the channel dropping -- the only way to run a reboot'
-        '                 or a long installer.'
+        '                 or a long installer. ps starts it through a launcher,'
+        '                 so it cannot be handed stdin.'
         '  --             end of flags'
         '  -              read the command from stdin'
     )
+}
+
+# --- qemu-ga's exec records -------------------------------------------------
+#
+# qemu-ga keeps one record per guest-exec and drops it only when a
+# guest-exec-status call finds that process finished. It looks a record up by
+# pid and answers from the *first* match (qga/commands.c,
+# guest_exec_info_find), and it closes the process handle as soon as the process
+# exits, so the guest is free to hand that pid to a new process while the
+# record is still there. A record nobody polled -- an `exec -d`, or a poll that
+# was killed or gave up -- therefore answers the next guest-exec that is given
+# the same pid: "exited", its own exit code, no output. Windows reuses pids
+# quickly. That made a sync report "all already current" while its delivery
+# never ran (docs/qga-exec-records.md). Three defences, here:
+#
+#   * every call this host does not poll to the end is written down, per VM,
+#     and reaped -- polled once more -- before the next exec on that VM;
+#   * ps and sh calls print a per-call nonce as their first line, so an answer
+#     from someone else's record is recognised and the poll goes on;
+#   * `exec ps -d` starts its script through a launcher that is itself polled
+#     to its end (Start-GuestPsDetached), so it leaves no record at all.
+
+$script:GuestNoncePrefix = 'virutil-call '
+
+function New-GuestNonce { return [Guid]::NewGuid().ToString('N') }
+
+# The ledger: one empty file per guest pid this host may have left a record
+# for, named <guest pid>.<owner>. The owner is the host process polling it, or
+# 0 for a detached call nobody will poll. Files rather than one list so that
+# concurrent runs never rewrite each other's entries. Beside the agent lock,
+# because it is per domain in the same way.
+function Get-GuestExecLedgerDir {
+    param([Parameter(Mandatory)][string]$Vm)
+    return (Join-Path $script:VirutilsImageDir "$Vm.exec")
+}
+
+# Best effort, both ways: a ledger that cannot be written costs the reaping,
+# not the call.
+function Add-GuestExecLedger {
+    param([Parameter(Mandatory)][string]$Vm, [long]$GuestPid, [int]$Owner)
+    try {
+        $dir = New-VirutilsDir (Get-GuestExecLedgerDir $Vm)
+        $file = Join-Path $dir "$GuestPid.$Owner"
+        [IO.File]::WriteAllText($file, '')
+        return $file
+    } catch { return '' }
+}
+
+function Remove-GuestExecLedger {
+    param([string]$File)
+    if ($File) { try { Remove-VirutilsFile $File | Out-Null } catch { } }
+}
+
+# Is OWNER still a live poller? No for 0 (detached), and no for this process
+# itself: a run is single-threaded, so nothing of its own is mid-poll while it
+# reaps, and an entry it still holds is one an earlier call abandoned.
+function Test-GuestExecOwnerAlive {
+    param([int]$Owner)
+    if ($Owner -le 0 -or $Owner -eq $PID) { return $false }
+    try { return ($null -ne (Get-Process -Id $Owner -ErrorAction Stop)) }
+    catch { return $false }
+}
+
+function Test-GuestExecExited {
+    param($Status)
+    if ($null -eq $Status) { return $false }
+    return ($Status.PSObject.Properties.Name -contains 'exited' -and [bool]$Status.exited)
+}
+
+# Get-GuestExecStatus VM PID -- one guest-exec-status, or $null when the agent
+# has no record for PID any more. Every other refusal stays fatal.
+function Get-GuestExecStatus {
+    param([Parameter(Mandatory)][string]$Vm, [long]$GuestPid)
+    try {
+        return (Invoke-GuestAgent $Vm 'guest-exec-status' @{ pid = $GuestPid })
+    } catch {
+        if ($_.Exception.Message -match 'refused guest-exec-status: .*does not exist') { return $null }
+        throw
+    }
+}
+
+# Invoke-GuestExecReap VM -- poll each ledger entry whose owner is gone, once.
+# A finished record is dropped by that poll and its entry with it; a process
+# still running keeps its entry for the next reap. Quiet and never fatal: the
+# call that follows reports any trouble with the agent itself.
+function Invoke-GuestExecReap {
+    param([Parameter(Mandatory)][string]$Vm)
+    $dir = Get-GuestExecLedgerDir $Vm
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return }
+    foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue)) {
+        $m = [regex]::Match($f.Name, '^(\d+)\.(\d+)$')
+        if (-not $m.Success) { continue }
+        if (Test-GuestExecOwnerAlive ([int]$m.Groups[2].Value)) { continue }
+        try { $st = Get-GuestExecStatus $Vm ([long]$m.Groups[1].Value) } catch { return }
+        if ($null -eq $st -or (Test-GuestExecExited $st)) {
+            try { Remove-VirutilsFile $f.FullName | Out-Null } catch { }
+        }
+    }
+}
+
+# Wait-GuestExecExit VM PID [FIRST] -- poll until a status says exited, starting
+# from FIRST when one is already in hand. Backoff: a one-liner returns at once,
+# an installer runs for minutes.
+function Wait-GuestExecExit {
+    param([Parameter(Mandatory)][string]$Vm, [long]$GuestPid, $First = $null)
+    $ms = 50
+    $st = $First
+    while ($true) {
+        if ($null -eq $st) { $st = Invoke-GuestAgent $Vm 'guest-exec-status' @{ pid = $GuestPid } }
+        if (Test-GuestExecExited $st) { return $st }
+        Start-Sleep -Milliseconds $ms
+        $ms = [Math]::Min(1000, [int]($ms * 3 / 2))
+        $st = $null
+    }
+}
+
+# Test-GuestExecNonce STATUS NONCE -- does this answer's stdout start with the
+# line this call's wrapper prints first?
+function Test-GuestExecNonce {
+    param($Status, [string]$Nonce)
+    $out = Get-AgentStream $Status 'out-data'
+    $first = ($out.Replace("`r", '') -split "`n", 2)[0]
+    return ($first.Trim().TrimStart([char]0xFEFF) -eq "$($script:GuestNoncePrefix)$Nonce")
+}
+
+# Remove-GuestNonceLine TEXT -- TEXT without its first line.
+function Remove-GuestNonceLine {
+    param([string]$Text)
+    $i = $Text.IndexOf("`n")
+    if ($i -lt 0) { return '' }
+    return $Text.Substring($i + 1)
 }
 
 # --- running one thing ------------------------------------------------------
@@ -76,8 +208,13 @@ function Invoke-GuestExec {
         [switch]$Detach,
         [switch]$Capture,
         [switch]$Emit,
-        [string]$InputB64 = ''
+        [string]$InputB64 = '',
+        [string]$Nonce = ''
     )
+
+    # Before this call's own guest-exec, so a record an earlier call left can
+    # no longer answer for this one's pid. See "qemu-ga's exec records" above.
+    Invoke-GuestExecReap $Vm
 
     # Not $args: that is an automatic variable and assigning to it is a quiet
     # way to lose the caller's own arguments.
@@ -87,24 +224,38 @@ function Invoke-GuestExec {
     $guestPid = (Invoke-GuestAgent $Vm 'guest-exec' $execArgs).pid
 
     if ($Detach) {
+        # Nobody polls a detached call, so its record would outlive it.
+        Add-GuestExecLedger $Vm $guestPid 0 | Out-Null
         if ($Emit) { "$guestPid" } else { [Console]::Out.WriteLine($guestPid) }
         $script:VirutilExit = 0
         return
     }
 
-    # Backoff: a one-liner returns at once, an installer runs for minutes.
-    $ms = 50
-    while ($true) {
-        $st = Invoke-GuestAgent $Vm 'guest-exec-status' @{ pid = $guestPid }
-        if ($st.PSObject.Properties.Name -contains 'exited' -and $st.exited) { break }
-        Start-Sleep -Milliseconds $ms
-        $ms = [Math]::Min(1000, [int]($ms * 3 / 2))
+    # Written before the first poll and removed only once the record has been
+    # consumed -- not in a finally: a call that is killed or gives up has left
+    # the record behind, and that is exactly what the entry is for.
+    $ledger = Add-GuestExecLedger $Vm $guestPid $PID
+    $st = Wait-GuestExecExit $Vm $guestPid
+
+    # A finished answer without this call's nonce is either an older record
+    # with the same pid, which that answer has just dropped, or this call's own
+    # process having exited before its wrapper printed anything. The next
+    # status tells them apart: no record left means it was ours.
+    if ($Nonce) {
+        while (-not (Test-GuestExecNonce $st $Nonce)) {
+            $next = Get-GuestExecStatus $Vm $guestPid
+            if ($null -eq $next) { break }
+            Warn "$Vm`: pid $guestPid first answered for an earlier process with the same pid; waiting for this one"
+            $st = Wait-GuestExecExit $Vm $guestPid $next
+        }
     }
+    Remove-GuestExecLedger $ledger
 
     # \r stripped so Windows output pipes cleanly into unix tools, and trailing
     # whitespace trimmed off each line, exactly as the bash driver does.
     $captured = ''
     $out = Get-AgentStream $st 'out-data'
+    if ($Nonce -and (Test-GuestExecNonce $st $Nonce)) { $out = Remove-GuestNonceLine $out }
     if ($out) {
         if ($Capture)  { $captured = (Format-GuestStream $out).TrimEnd("`n") }
         elseif ($Emit) { (Format-GuestStream $out).TrimEnd("`n").Split("`n") }
@@ -174,20 +325,41 @@ function ConvertFrom-Clixml {
 
 # Invoke-GuestPsText VM SCRIPT -- run SCRIPT in the guest's powershell.
 # Shared with the transports, exactly as the bash exec_ps_text is.
+#
+# The wrapper's first line prints this call's nonce, which Invoke-GuestExec
+# checks for and strips: an answer without it came from another process's
+# record. See "qemu-ga's exec records" above.
 function Invoke-GuestPsText {
     param([Parameter(Mandatory)][string]$Vm, [Parameter(Mandatory)][string]$Script,
           [switch]$Detach, [switch]$Capture, [switch]$Emit, [string]$InputB64 = '')
 
+    if ($Detach) { return (Start-GuestPsDetached $Vm $Script -Emit:$Emit -InputB64 $InputB64) }
+
+    $nonce = New-GuestNonce
+    $enc = Get-GuestPsEncoded $Script $nonce
+    Invoke-GuestExec $Vm 'powershell.exe' `
+        @('-NoProfile', '-NonInteractive', '-OutputFormat', 'Text', '-EncodedCommand', $enc) `
+        -Capture:$Capture -Emit:$Emit -InputB64 $InputB64 -Nonce $nonce
+}
+
+# Get-GuestPsEncoded SCRIPT [NONCE] -- SCRIPT wrapped and encoded for
+# powershell.exe -EncodedCommand, refused here when it would not fit.
+function Get-GuestPsEncoded {
+    param([Parameter(Mandatory)][string]$Script, [string]$Nonce = '')
+
     # The catch writes to the console handle, not powershell's error stream,
     # which would be serialised as CLIXML; the explicit exit 1 restores the code
     # an uncaught terminating error would have returned.
-    $wrapped = @(
+    $lines = @()
+    if ($Nonce) { $lines += "[Console]::Out.WriteLine('$($script:GuestNoncePrefix)$Nonce');" }
+    $lines += @(
         '$ProgressPreference="SilentlyContinue";'
         'try { $Host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size(4096, 2000) } catch {}'
         'try {'
         $Script
         '} catch { [Console]::Error.WriteLine(($_ | Out-String)); exit 1 }'
-    ) -join "`n"
+    )
+    $wrapped = $lines -join "`n"
 
     # UTF-16LE base64 sidesteps every quoting layer between here and the guest.
     $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($wrapped))
@@ -200,10 +372,54 @@ function Invoke-GuestPsText {
             'shorten it, or stage a .ps1 in the guest and run that'
         )
     }
+    return $enc
+}
 
-    Invoke-GuestExec $Vm 'powershell.exe' `
-        @('-NoProfile', '-NonInteractive', '-OutputFormat', 'Text', '-EncodedCommand', $enc) `
-        -Detach:$Detach -Capture:$Capture -Emit:$Emit -InputB64 $InputB64
+# The launcher behind `exec ps -d`. It reads the encoded script from its stdin
+# and starts it through ShellExecuteEx (UseShellExecute), which hands the child
+# no inherited handles: a child that inherited the launcher's stdout and stderr
+# pipes would hold them open, and qemu-ga calls a process exited only once both
+# have closed. The child runs as the launcher does -- SYSTEM, the agent's
+# environment -- and outlives it, as a detached guest-exec did.
+$script:GuestPsDetachLauncher = @'
+$e = [Console]::In.ReadToEnd().Trim()
+$si = New-Object System.Diagnostics.ProcessStartInfo
+$si.FileName = Join-Path $PSHOME 'powershell.exe'
+$si.Arguments = '-NoProfile -NonInteractive -OutputFormat Text -EncodedCommand ' + $e
+$si.UseShellExecute = $true
+$si.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+$p = [System.Diagnostics.Process]::Start($si)
+[Console]::Out.WriteLine([string]$p.Id)
+'@
+
+# Start-GuestPsDetached VM SCRIPT -- `exec ps -d`: start SCRIPT and print its
+# pid, leaving no qemu-ga record behind. The launcher is an ordinary captured
+# call, polled to its end, so its record is consumed like any other; the script
+# itself is never a guest-exec of its own.
+#
+# stdin is the launcher's channel for the script, so it cannot also be the
+# script's. That is refused rather than dropped.
+function Start-GuestPsDetached {
+    param([Parameter(Mandatory)][string]$Vm, [Parameter(Mandatory)][string]$Script,
+          [switch]$Emit, [string]$InputB64 = '')
+
+    if ($InputB64) {
+        Die @('virutil exec ps -d cannot hand stdin to a detached script: the'
+              'launcher that starts it reads the script from its own stdin. Put'
+              'the input in a file in the guest and read it from there.')
+    }
+
+    $enc = Get-GuestPsEncoded $Script
+    $out = Invoke-GuestPsText $Vm $script:GuestPsDetachLauncher -Capture `
+        -InputB64 ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($enc)))
+    $guestPid = "$out".Trim()
+    if ($script:VirutilExit -ne 0 -or $guestPid -notmatch '^\d+$') {
+        Die @("$Vm could not start the detached script (launcher exit $($script:VirutilExit));"
+              "it printed: [$guestPid]")
+    }
+
+    if ($Emit) { $guestPid } else { [Console]::Out.WriteLine($guestPid) }
+    $script:VirutilExit = 0
 }
 
 # Invoke-GuestShText VM SCRIPT -- run SCRIPT in the guest's /bin/sh.
@@ -219,11 +435,19 @@ function Invoke-GuestPsText {
 # exists to make the copy land correctly, so the first failing statement in one
 # has to end it rather than let the rest carry on against a guest that is not in
 # the state the rule was meant to put it in.
+#
+# A waited-for call prints its nonce first, as the ps wrapper does. A detached
+# one is left a plain guest-exec, and the ledger reaps its record.
 function Invoke-GuestShText {
     param([Parameter(Mandatory)][string]$Vm, [Parameter(Mandatory)][string]$Script,
           [switch]$Detach, [switch]$Emit, [string]$InputB64 = '')
 
+    $nonce = ''
     $text = "set -e`n$Script"
+    if (-not $Detach) {
+        $nonce = New-GuestNonce
+        $text = "printf '%s\n' '$($script:GuestNoncePrefix)$nonce'`n$text"
+    }
 
     # + "-c" and the argv overhead around it
     if (($text.Length + 64) -gt $script:ShArgMax) {
@@ -234,7 +458,7 @@ function Invoke-GuestShText {
         )
     }
 
-    Invoke-GuestExec $Vm '/bin/sh' @('-c', $text) -Detach:$Detach -Emit:$Emit -InputB64 $InputB64
+    Invoke-GuestExec $Vm '/bin/sh' @('-c', $text) -Detach:$Detach -Emit:$Emit -InputB64 $InputB64 -Nonce $nonce
 }
 
 # --- the command line -------------------------------------------------------

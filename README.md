@@ -258,6 +258,18 @@ reply that is not coming, or is waiting for the guest to boot; ending it frees
 the agent. See [docs/qga-multi-client.md](docs/qga-multi-client.md) for why the
 channel works this way.
 
+qemu-ga answers `guest-exec-status` from the first record with that pid, and
+keeps a record until someone polls it to the end. A detached run (`exec -d`), or a
+poll that was stopped early, leaves a finished record whose pid the guest can hand
+to a new process. On a Windows host virutil guards against that answering for
+the wrong process. It writes such pids down in `images/VM.exec\` and reaps them
+before the next exec. Each `ps` and `sh` call checks a per-call nonce in its
+output. `exec ps -d` starts its script through a launcher that leaves no record,
+so it cannot be given stdin. A `sync`, `push` or `pull` whose guest copier sent no
+result stops with "guest copier sent no result; delivery unverified", and never
+reports the guest as current. See
+[docs/qga-exec-records.md](docs/qga-exec-records.md).
+
 ### hardware
 
 | Module | Purpose | Usage |

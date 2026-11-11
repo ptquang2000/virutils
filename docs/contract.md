@@ -1281,6 +1281,13 @@ thing neither driver may do, because it reports a change that was not made.
   caller's own PowerShell, where a console write goes past the pipeline, so
   `$x = virutil exec ...` used to get nothing. That makes it capture the way the
   bash driver's `$(virutil exec ...)` always has. stderr stays on the console.
+- **`virutil exec ps -d` refuses stdin on a Windows host.** It starts the script
+  through a launcher that reads the script from its own stdin. That way no
+  qemu-ga exec record is left behind for a reused pid to answer from
+  (docs/qga-exec-records.md). The bash driver still hands stdin to a detached
+  process. On the same host, a `sync`, `push` or `pull` whose guest copier
+  printed no result line exits 1 ("delivery unverified"), and does not report
+  the guest as current.
 - **A Windows host's `create` gives the guest a local-time RTC**
   (`-rtc base=localtime`), as libvirt's Windows profile and the macOS driver
   do. A launcher written before that has none, so its guest reads UTC as local

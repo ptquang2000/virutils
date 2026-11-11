@@ -73,6 +73,16 @@ function Capture {
 
 $script:Sent    = @()
 $script:GuestRc = 0
+# The wrapper's first line is a per-call nonce (modules/win/exec.ps1, "qemu-ga's
+# exec records"), and a real guest prints it before anything else. A stand-in
+# answer has to as well, or it reads as another process's record.
+function Add-TestNonce {
+    param([string]$Sent, [string]$Out)
+    $m = [regex]::Match("$Sent", 'virutil-call ([0-9a-f]{32})')
+    if (-not $m.Success) { return $Out }
+    return "virutil-call $($m.Groups[1].Value)`n$Out"
+}
+
 function Invoke-GuestAgent {
     param([string]$Vm, [string]$Command, $Arguments = $null, [int]$TimeoutMs = 10000)
     switch ($Command) {
@@ -86,8 +96,8 @@ function Invoke-GuestAgent {
             return ([pscustomobject]@{
                 exited = $true
                 exitcode = $script:GuestRc
-                'out-data' = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(
-                    'started PID 1234 in session 1 as WIN11\me'))
+                'out-data' = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Add-TestNonce `
+                    $script:Sent[$script:Sent.Count - 1] 'started PID 1234 in session 1 as WIN11\me')))
             })
         }
         default { throw "the test agent was asked for $Command" }
