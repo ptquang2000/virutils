@@ -246,8 +246,9 @@ pull_smb_fetch() {
 # starting up, which for a small payload is nearly all of it.
 pull_smb_report() {
     local reported="$1" ms="$2" files dirs gms what
-    read -r files dirs gms <<<"$reported"
-    files="${files:-0}"; dirs="${dirs:-0}"
+    # A line that is missing or malformed is a stop, never "0 files pulled".
+    xfer_reported "$reported" '^[0-9]+ [0-9]+ [0-9]+$'
+    read -r files dirs gms <<<"$XFER_REPORTED"
 
     what=""
     if (( files )) || (( ! dirs )); then
@@ -257,7 +258,7 @@ pull_smb_report() {
         [[ -n "$what" ]] && what+=" and "
         what+="$dirs director"; (( dirs == 1 )) && what+="y" || what+="ies"
     fi
-    echo "$DOMAIN: $what pulled in $(fmt_duration "${gms:-$ms}")"
+    echo "$DOMAIN: $what pulled in $(fmt_duration "$gms")"
 }
 
 # pull_smb_die RC SRC HOST -- name what went wrong; the guest has already

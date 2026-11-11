@@ -63,6 +63,41 @@ xfer_check() {
     esac
 }
 
+# xfer_reported REPORTED SHAPE -- the guest copier's one line into
+# XFER_REPORTED, or a stop. The bash side of the Windows driver's
+# Assert-XferReported (modules/win/xfer.ps1), with the same message.
+#
+# Each payload ends by printing a fixed line of numbers (sync "<copied> <ms>",
+# push-dir "<copied> <total> <ms>", push-file "<bytes> <ms>" or, from a Linux
+# guest, "<copied> <bytes> <ms>", pull "<files> <dirs> <ms>"), and the reports
+# used to read a missing field as zero. A missing line is not a zero: it means
+# this host never got the copier's result -- the case docs/qga-exec-records.md
+# describes, where a sync printed "all already current" for a delivery that
+# never ran. So anything that is not exactly the expected line stops the
+# command, before a report can claim anything.
+#
+# Answers in a variable, not on stdout: called in a $(...), the die would end
+# the substitution and not the run.
+XFER_REPORTED=""
+xfer_reported() {
+    local line="$1" shape="$2" got
+    # Surrounding whitespace off, and a run of blanks between fields read as
+    # one: a guest's wc may pad its count.
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    if [[ "$line" != *$'\n'* ]]; then
+        line="$(tr -s ' \t' '  ' <<<"$line")"
+        if [[ "$line" =~ $shape ]]; then
+            XFER_REPORTED="$line"
+            return 0
+        fi
+    fi
+    got="nothing"; [[ -z "$line" ]] || got="[$line]"
+    die "$DOMAIN: guest copier sent no result; delivery unverified (got $got)." \
+        "Nothing here says the guest is current: compare hashes in the guest, or" \
+        "run the command again."
+}
+
 # --- host-side primitives ---------------------------------------------------
 
 # xfer_host_addr GUEST_IP -- the address the guest reaches this host at, which

@@ -311,30 +311,34 @@ push_smb_fetch() {
 # rate computed from it would describe the overhead rather than the transfer.
 push_smb_report() {
     local SRC="$1" reported="$2" ms="$3" rate what
+    # A line that is missing or malformed is a stop, never "all up to date".
     if [[ -d "$SRC" ]]; then
         local copied total gms
-        read -r copied total gms <<<"$reported"
+        xfer_reported "$reported" '^[0-9]+ [0-9]+ [0-9]+$'
+        read -r copied total gms <<<"$XFER_REPORTED"
         what="$total file"; (( total == 1 )) || what+="s"
         if (( copied )); then what+=" present (some copied)"; else what+=" present (all up to date)"; fi
-        echo "$DOMAIN: $what in $(fmt_duration "${gms:-$ms}")"
+        echo "$DOMAIN: $what in $(fmt_duration "$gms")"
     else
-        push_report_bytes "$reported" "$ms"
+        xfer_reported "$reported" '^[0-9]+ [0-9]+$'
+        push_report_bytes "$XFER_REPORTED" "$ms"
     fi
 }
 
 # push_report_bytes REPORTED MS -- a single file's landing, reported the same
-# way whatever copied it: "bytes ms" from the guest. The rate comes from the
-# guest's stopwatch rather than from MS, which is this host's wall clock and
-# holds an agent round trip -- for a small payload, nearly all of it.
+# way whatever copied it: "bytes ms" from the guest, already checked by
+# xfer_reported. The rate comes from the guest's stopwatch rather than from MS,
+# which is this host's wall clock and holds an agent round trip -- for a small
+# payload, nearly all of it.
 push_report_bytes() {
     local reported="$1" ms="$2" note="${3:-}" bytes gms rate
     read -r bytes gms <<<"$reported"
-    rate="$(fmt_rate "$bytes" "${gms:-0}")"
+    rate="$(fmt_rate "$bytes" "$gms")"
     # No rate when nothing crossed: a throughput figure for a transfer that did
     # not happen describes the round trip, not the wire.
     [[ -n "$note" ]] && rate=""
-    echo "$DOMAIN: done ($(fmt_bytes "${bytes:-0}")$note) in" \
-         "$(fmt_duration "${gms:-$ms}")${rate:+ ($rate on the wire)}"
+    echo "$DOMAIN: done ($(fmt_bytes "$bytes")$note) in" \
+         "$(fmt_duration "$gms")${rate:+ ($rate on the wire)}"
 }
 
 # --- the Linux guest side ---------------------------------------------------
@@ -382,19 +386,23 @@ push_lin_report() {
     # does, which the Windows side cannot: there a file push is Copy-Item and
     # always copies, so there would be nothing to report. Worth the extra field
     # -- "already current" is the answer a re-push is asked for.
+    #
+    # Both forms are three numbers, and a line that is missing or malformed is
+    # a stop, never "already current" or "all up to date".
+    xfer_reported "$reported" '^[0-9]+ [0-9]+ [0-9]+$'
     if [[ ! -d "$SRC" ]]; then
-        read -r copied _ _ <<<"$reported"
-        push_report_bytes "${reported#* }" "$ms" \
-            "$( (( ${copied:-0} > 0 )) || printf ' (already current)' )"
+        read -r copied _ _ <<<"$XFER_REPORTED"
+        push_report_bytes "${XFER_REPORTED#* }" "$ms" \
+            "$( (( copied > 0 )) || printf ' (already current)' )"
         return 0
     fi
 
-    read -r copied total gms <<<"$reported"
-    what="$total file"; (( ${total:-0} == 1 )) || what+="s"
-    if (( ${copied:-0} > 0 )); then what+=" present, $copied copied"
-    else                            what+=" present (all up to date)"
+    read -r copied total gms <<<"$XFER_REPORTED"
+    what="$total file"; (( total == 1 )) || what+="s"
+    if (( copied > 0 )); then what+=" present, $copied copied"
+    else                      what+=" present (all up to date)"
     fi
-    echo "$DOMAIN: $what in $(fmt_duration "${gms:-$ms}")"
+    echo "$DOMAIN: $what in $(fmt_duration "$gms")"
 }
 
 # push_smb_die RC HOST -- name what went wrong; the guest has already printed

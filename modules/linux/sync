@@ -577,15 +577,17 @@ sync_win_fetch() {
 # side has no such problem and does report a count.
 sync_win_report() {
     local files="$1" reported="$2" ms="$3" copied gms what
-    read -r copied gms <<<"$reported"
+    # A line that is missing or malformed is a stop, never "nothing copied".
+    xfer_reported "$reported" '^[01] [0-9]+$'
+    read -r copied gms <<<"$XFER_REPORTED"
 
     what="$files file"; (( files == 1 )) || what+="s"
-    if (( ${copied:-0} )); then
+    if (( copied )); then
         what+=" offered, the ones that differed copied"
     else
         what+=" offered, all already current in the guest"
     fi
-    echo "$DOMAIN: $what in $(fmt_duration "${gms:-$ms}")"
+    echo "$DOMAIN: $what in $(fmt_duration "$gms")"
 }
 
 # sync_win_cleanup -- the cleanup rules, run in the guest: each pattern is
@@ -689,15 +691,17 @@ sync_lin_fetch() {
 # folds in.
 sync_lin_report() {
     local files="$1" reported="$2" ms="$3" copied gms what
-    read -r copied gms <<<"$reported"
+    # A line that is missing or malformed is a stop, never "nothing copied".
+    xfer_reported "$reported" '^[0-9]+ [0-9]+$'
+    read -r copied gms <<<"$XFER_REPORTED"
 
     what="$files file"; (( files == 1 )) || what+="s"
-    if (( ${copied:-0} > 0 )); then
+    if (( copied > 0 )); then
         what+=" offered, $copied copied"
     else
         what+=" offered, all already current in the guest"
     fi
-    echo "$DOMAIN: $what in $(fmt_duration "${gms:-$ms}")"
+    echo "$DOMAIN: $what in $(fmt_duration "$gms")"
 }
 
 # The guest-side sh for the cleanup rules: one shell function, called once per
