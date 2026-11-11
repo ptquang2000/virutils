@@ -4,9 +4,9 @@ A `virutil sync` once printed `1153 files offered, all already current in the
 guest` while nothing had been delivered: nine files that differed stayed stale
 in the guest (an MDE-6273 run on win11-2, 2026-11-10). The copy never ran, and
 the report read the missing result as "nothing to copy". This note records why,
-and the three defences the Windows driver now has. Read it before changing how
-`modules/win/exec.ps1` waits for a guest process, or how a transport reads the
-guest copier's line.
+and the defences both drivers now have. Read it before changing how
+`modules/win/exec.ps1` or `modules/linux/exec` (and `modules/mac/exec`) waits
+for a guest process, or how a transport reads the guest copier's line.
 
 Source: QEMU v10.1.0, `qga/commands.c`. Line numbers below refer to it.
 
@@ -96,10 +96,28 @@ the last.
    its normal teardown. It no longer reports "all already current", "all up to
    date" or "0 files".
 
+## The bash driver
+
+`modules/linux/exec` and `modules/mac/exec` (`gexec`, under "qemu-ga's exec
+records") have the same defences, and `xfer_reported` in `modules/linux/xfer`
+is `Assert-XferReported`. Windows guests driven from a Linux or macOS host
+reuse pids as quickly as on RNDLB; Linux guests hand them out in sequence up to
+`pid_max`, so the risk there is real but much lower. Where they differ:
+
+- The ledger is `$VIRUTILS_IMAGE_DIR/VM.exec/<guest pid>.<owner>`, and the
+  owner is the run's `$$`, which every `$(...)` inside it shares. Owner-alive
+  is `kill -0`, with `ps -p` behind it so another user's live process is not
+  read as gone.
+- An unknown pid reads as "no record left" when the agent says "PID N does
+  not exist" (QEMU 8.2 and 9.0 say this; checked against those tags), and also
+  when it says the generic "Invalid parameter 'pid'". Which older agents still
+  say the second has not been checked. The Windows driver matches only the
+  first.
+- A status with neither `exitcode` nor `signal` is exit 1 with a warning, not
+  0. A signal is 128 + the signal, as on Windows.
+
 ## What is left
 
-- The bash driver (`modules/linux/exec`, Linux and macOS hosts) has the same
-  exposure through libvirt and `qmp()`, and none of these defences yet.
 - A reaper can still consume a record that a live caller on *another host* is
   about to read, if that caller's pid was reused. Each domain is driven from one
   host, so this needs two hosts sharing a guest's agent, which virutil does not

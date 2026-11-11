@@ -161,7 +161,15 @@ Invariants that are contract, not implementation:
   only ever be a disk is not worth the name. `virutil snapshot` on a Windows
   host is refused by name with that reason, never silently.
 - `exec` runs as SYSTEM (Windows) / root (Linux) and the guest's exit code
-  becomes virutil's.
+  becomes virutil's; a guest process killed by a signal is 128 + the signal, as
+  a shell reports it. `exec ps -d` starts its script through a launcher that
+  reads the script from its own stdin, so it refuses stdin rather than drop it.
+  That way no qemu-ga exec record is left for a reused pid to answer from
+  (docs/qga-exec-records.md).
+- A `sync`, `push` or `pull` whose guest copier printed no result line, or one
+  that is not the payload's numbers, exits 1 ("guest copier sent no result;
+  delivery unverified") after its teardown, and never reports the guest as
+  current.
 - `shot` requires the domain **running**, takes the frame from the hypervisor
   with nothing run in the guest, and always writes PNG. The frame is the
   emulated console's; an RDP session is a separate desktop and is never in it.
@@ -1080,6 +1088,8 @@ drivers:
 | `tests/win/usb.ps1` | a passed-through device and an emulated stick of each kind written into a launcher, read back beside a hand-written one, and taken out leaving the file as it was; `ports` rewriting the controller; `image`'s FAT32 layout and bytes. Then a real paused qemu with the default 4 root ports, plugged into over its monitor: the third stick behind the hub and said so, `cycle` without a leaked drive, `unplug` freeing the backend, a refused plug leaving nothing behind. Skips that half with no qemu. |
 | `tests/mac/domain.sh` | the macOS driver against a real hvf domain with no OS: create's files, start, port forwards live and in the launcher, every snapshot verb with the domain running and shut off, the launcher edits, delete. Driven from the runner on a Mac; skips anywhere else. |
 | `tests/win/xfer.ps1` | `push` and `pull` on a Windows host with both seams substituted -- the guest agent and the share publisher -- so the guest path rules, credential generation, the free-space refusal, the sweep's liveness decision, the rendered payload and the teardown all run with no VM and no Administrator. Under the publisher, its own three seams (the task lookup, the task start, the UAC start) are substituted instead, so the choice between task and prompt, the request the helper is handed and the helper pid read back from the status file are asserted too; and the real helper is run unelevated against the requests it must refuse. Nothing registers a task or elevates. |
+| `tests/linux/exec.sh`, `tests/mac/exec.sh` | qemu-ga's exec records (docs/qga-exec-records.md) against each bash tree's `gexec`: a reused pid's leftover record never answers for the call, its nonce is checked and stripped, a silent process of the call's own is still its own, the ledger is reaped before every exec, `cmd -d` and `sh -d` are written down for the reaper, `exec ps -d` goes through the launcher and leaves no record, and refuses stdin. The cases are shared (`tests/linux/exec-records.sh`); the agent is `tests/mac/fake-qga.pl` started with `model`, reached through a stand-in `virsh` (libvirt tree) or the real agent socket (macOS tree). The Windows driver's cases are in `tests/win/exec.ps1`. |
+| `tests/linux/xfer.sh` | `sync`, `push` and `pull` on the libvirt driver with the transport substituted, the way `tests/linux/pull.sh` does it: a guest copier line that is missing or not the payload's numbers stops the command after its teardown, and never reports the guest as current; a good line reports as before. `tests/win/sync.ps1` and `tests/win/xfer.ps1` hold the Windows driver to the same. |
 | `tests/win/sync.ps1` | `sync` on a Windows host, over the same two seams, with a real staging tree and a real delivery tree built on the host: what each config directive parses to, that the two a Windows host cannot honour are refused **before anything is fetched**, the layout the map rules build, the payload the guest would have been sent, and that a failed delivery tears down as completely as a successful one. |
 | `tests/win/shot.ps1`, `tests/linux/shot.sh` | `shot`'s grammar, its refusals, and the PPM fallback with pixels checked, behind a substituted monitor (Windows) or `virsh` (Linux). The Windows half also captures from a real paused qemu with no disk and no guest, and skips that part where no qemu is installed. |
 | `tests/win/input.ps1`, `tests/linux/input.sh`, `tests/mac/input.sh` | `input`'s grammar, its refusals (before anything is sent), the pixel-to-tablet mapping, US-layout typing, and the events each verb sends, behind a substituted monitor and barrier (Windows), `virsh` (Linux) or `qmp()` (macOS, runnable on any host with bash and jq). The Windows half also drives a real running qemu with its `input_event_*` trace on and checks that qemu took exactly what was sent; it skips that part where no qemu is installed. |
@@ -1281,13 +1291,6 @@ thing neither driver may do, because it reports a change that was not made.
   caller's own PowerShell, where a console write goes past the pipeline, so
   `$x = virutil exec ...` used to get nothing. That makes it capture the way the
   bash driver's `$(virutil exec ...)` always has. stderr stays on the console.
-- **`virutil exec ps -d` refuses stdin on a Windows host.** It starts the script
-  through a launcher that reads the script from its own stdin. That way no
-  qemu-ga exec record is left behind for a reused pid to answer from
-  (docs/qga-exec-records.md). The bash driver still hands stdin to a detached
-  process. On the same host, a `sync`, `push` or `pull` whose guest copier
-  printed no result line exits 1 ("delivery unverified"), and does not report
-  the guest as current.
 - **A Windows host's `create` gives the guest a local-time RTC**
   (`-rtc base=localtime`), as libvirt's Windows profile and the macOS driver
   do. A launcher written before that has none, so its guest reads UTC as local

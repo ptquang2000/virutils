@@ -111,9 +111,12 @@ fi
 # PNG, and the QMP each input verb sends. pull with its transport substituted:
 # whether DST is the file or the directory it goes in. tests/mac/input.sh
 # sources the macOS module with qmp() substituted, so it runs here too, on any
-# host.
+# host. exec.sh and tests/mac/exec.sh put each tree's gexec against a model of
+# qemu-ga's exec records (docs/qga-exec-records.md); xfer.sh checks that sync,
+# push and pull stop when the guest copier's line never came.
 printf '\n-- bash unit tests --\n'
-for t in "$HERE/shot.sh" "$HERE/input.sh" "$HERE/pull.sh" "$ROOT/tests/mac/input.sh"; do
+for t in "$HERE/shot.sh" "$HERE/input.sh" "$HERE/pull.sh" "$HERE/exec.sh" "$HERE/xfer.sh" \
+         "$ROOT/tests/mac/input.sh" "$ROOT/tests/mac/exec.sh"; do
     name="tests/${t#"$ROOT/tests/"}"
     if out="$(bash "$t" 2>&1)"; then
         printf '%s\n' "$out" | sed 's/^/  /'

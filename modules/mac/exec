@@ -51,7 +51,8 @@ exec_usage() {
         "  -d, --detach   fire and forget: print the guest pid and exit 0." \
         "                 No output and no exit code, but the command survives" \
         "                 the channel dropping -- the only way to run a reboot" \
-        "                 or a long installer." \
+        "                 or a long installer. ps starts it through a launcher," \
+        "                 so it cannot be handed stdin." \
         "  --             end of flags" \
         "  -              read the command from stdin" \
         "  -h, --help     this message" >&2
@@ -106,37 +107,208 @@ sys.stdout.write(re.sub(r"_x([0-9A-Fa-f]{4})_", lambda m: chr(int(m.group(1), 16
 '
 }
 
-# gexec PATH ARGS_JSON -- wait for completion, print out/err, return guest exit
-# code; honours DETACH and INPUT_B64
+# --- qemu-ga's exec records -------------------------------------------------
+#
+# qemu-ga keeps one record per guest-exec and drops it only when a
+# guest-exec-status call finds that process finished. It looks a record up by
+# pid and answers from the *first* match (qga/commands.c,
+# guest_exec_info_find), and it closes the process handle as soon as the process
+# exits, so the guest is free to hand that pid to a new process while the
+# record is still there. A record nobody polled -- an `exec -d`, or a poll that
+# was killed or gave up -- therefore answers the next guest-exec that is given
+# the same pid: "exited", its own exit code, no output. Windows reuses pids
+# quickly, whichever host drives it; Linux hands them out in sequence and reuses
+# them far more slowly. That made a sync report "all already current" while its
+# delivery never ran (docs/qga-exec-records.md). The same three defences as the
+# Windows driver's (modules/win/exec.ps1), here:
+#
+#   * every call this host does not poll to the end is written down, per VM,
+#     and reaped -- polled once more -- before the next exec on that VM;
+#   * ps and sh calls print a per-call nonce as their first line, so an answer
+#     from someone else's record is recognised and the poll goes on;
+#   * `exec ps -d` starts its script through a launcher that is itself polled
+#     to its end (exec_ps_detached), so it leaves no record at all.
+
+GEXEC_NONCE_PREFIX='virutil-call '
+
+# gexec_nonce -- 32 hex characters, fresh per call.
+gexec_nonce() { od -An -N16 -tx1 /dev/urandom | tr -d ' \n'; }
+
+# The ledger: one empty file per guest pid this host may have left a record
+# for, named <guest pid>.<owner>. The owner is the host process polling it --
+# the run's $$, which a $(...) inside it shares -- or 0 for a detached call
+# nobody will poll. Files rather than one list so that concurrent runs never
+# rewrite each other's entries. The same directory the Windows driver uses.
+gexec_ledger_dir() { printf '%s/%s.exec' "$VIRUTILS_IMAGE_DIR" "$VM"; }
+
+# gexec_ledger_add PID OWNER -- write the entry, its path on stdout. Best
+# effort: a ledger that cannot be written costs the reaping, not the call.
+gexec_ledger_add() {
+    local dir file
+    dir="$(gexec_ledger_dir)"
+    file="$dir/$1.$2"
+    if mkdir -p -- "$dir" 2>/dev/null && : 2>/dev/null >"$file"; then
+        printf '%s' "$file"
+    fi
+    return 0
+}
+
+# gexec_owner_alive OWNER -- is OWNER still a live poller? No for 0
+# (detached), and no for this run itself: a run polls one call at a time, so
+# nothing of its own is mid-poll while it reaps, and an entry it still holds is
+# one an earlier call abandoned.
+gexec_owner_alive() {
+    local o=$(( 10#$1 ))
+    (( o > 0 && o != $$ )) || return 1
+    kill -0 "$o" 2>/dev/null && return 0
+    # kill -0 fails on another user's live process too; ps tells that apart
+    # from one that is gone.
+    ps -p "$o" >/dev/null 2>&1
+}
+
+# gexec_status PID -- one guest-exec-status. The reply on stdout and 0; 3 when
+# the agent has no record for PID any more ("PID N does not exist", or the
+# generic "Invalid parameter 'pid'", QERR_INVALID_PARAMETER, which an older
+# agent may answer with); 1 for every other refusal, which is reported.
+gexec_status() {
+    local req err rc=0
+    req="$(jq -nc --argjson pid "$1" '{execute:"guest-exec-status",arguments:{pid:$pid}}')"
+    # stdout passes straight through; stderr is caught to be read.
+    { err="$(agent "$req" 2>&1 1>&3 3>&-)"; } 3>&1 || rc=$?
+    if (( rc == 0 )); then
+        if [[ -n "$err" ]]; then printf '%s\n' "$err" >&2; fi
+        return 0
+    fi
+    case "$err" in
+        *'does not exist'*|*"Invalid parameter 'pid'"*) return 3 ;;
+    esac
+    printf '%s\n' "$err" >&2
+    return 1
+}
+
+# gexec_exited STATUS -- does this answer say the process has finished?
+gexec_exited() { [ "$(jq -r '.return.exited' <<<"$1" 2>/dev/null)" = true ]; }
+
+# gexec_reap -- poll each of $VM's ledger entries whose owner is gone, once. A
+# finished record is dropped by that poll and its entry with it; a process
+# still running keeps its entry for the next reap. Quiet and never fatal: the
+# call that follows reports any trouble with the agent itself.
+gexec_reap() {
+    local dir f name st rc
+    dir="$(gexec_ledger_dir)"
+    [ -d "$dir" ] || return 0
+    for f in "$dir"/*; do
+        name="${f##*/}"
+        [[ "$name" =~ ^([0-9]+)\.([0-9]+)$ ]] || continue
+        if gexec_owner_alive "${BASH_REMATCH[2]}"; then continue; fi
+        rc=0
+        st="$(gexec_status "${BASH_REMATCH[1]}" 2>/dev/null)" || rc=$?
+        case "$rc" in
+            0) gexec_exited "$st" || continue ;;
+            3) ;;
+            *) return 0 ;;
+        esac
+        rm -f -- "$f" 2>/dev/null || true
+    done
+    return 0
+}
+
+# gexec_wait PID [FIRST] -- poll until a status says exited, and print that
+# one; starts from FIRST when one is already in hand. Backoff: a one-liner
+# returns at once, an installer runs for minutes.
+gexec_wait() {
+    local pid="$1" st="${2:-}" ms=50 rc
+    while :; do
+        if [ -z "$st" ]; then
+            rc=0; st="$(gexec_status "$pid")" || rc=$?
+            if (( rc == 3 )); then
+                echo "virutil: $VM's guest agent dropped pid $pid before it was seen to finish" >&2
+            fi
+            (( rc == 0 )) || return 1
+        fi
+        if gexec_exited "$st"; then printf '%s\n' "$st"; return 0; fi
+        sleep "$(printf '%d.%03d' $((ms / 1000)) $((ms % 1000)))"
+        ms=$(( ms * 3 / 2 < 1000 ? ms * 3 / 2 : 1000 ))
+        st=""
+    done
+}
+
+# gexec_has_nonce STATUS NONCE -- does this answer's stdout start with the line
+# this call's wrapper prints first?
+gexec_has_nonce() {
+    local out first
+    out="$(jq -r '.return["out-data"] // empty' <<<"$1")"
+    [ -n "$out" ] || return 1
+    first="$(base64 -d <<<"$out" | sed -n 1p | tr -d '\r')"
+    first="${first#$'\xef\xbb\xbf'}"
+    first="${first#"${first%%[![:space:]]*}"}"
+    first="${first%"${first##*[![:space:]]}"}"
+    [ "$first" = "$GEXEC_NONCE_PREFIX$2" ]
+}
+
+# --- running one thing ------------------------------------------------------
+
+# gexec PATH ARGS_JSON [NONCE] -- wait for completion, print out/err, return
+# the guest exit code; honours DETACH and INPUT_B64. With NONCE, the answer
+# has to start with that call's nonce line, which is stripped (see "qemu-ga's
+# exec records" above).
 gexec() {
-    local pid st out err errtext ec ms args
-    args=$(jq -nc --arg p "$1" --argjson a "$2" \
+    local path="$1" argv="$2" nonce="${3:-}" pid st next rc ledger strip=0
+    local out err errtext ec sig args
+
+    # Before this call's own guest-exec, so a record an earlier call left can
+    # no longer answer for this one's pid.
+    gexec_reap
+
+    args=$(jq -nc --arg p "$path" --argjson a "$argv" \
         --argjson cap "$([ "$DETACH" = 1 ] && echo false || echo true)" \
         --arg i "$INPUT_B64" \
         '{execute:"guest-exec",arguments:
             ({path:$p,arg:$a,"capture-output":$cap}
              + (if $i == "" then {} else {"input-data":$i} end))}')
-    pid=$(agent "$args" | jq -r '.return.pid')
+    pid="$(agent "$args" | jq -r '.return.pid // empty')" || true
+    [[ "$pid" =~ ^[0-9]+$ ]] || exit 1
 
     if [ "$DETACH" = 1 ]; then
+        # Nobody polls a detached call, so its record would outlive it.
+        gexec_ledger_add "$pid" 0 >/dev/null
         echo "$pid"
         return 0
     fi
 
-    # backoff: a one-liner returns at once, an installer runs for minutes
-    ms=50
-    while :; do
-        st=$(agent "$(jq -nc --argjson pid "$pid" \
-            '{execute:"guest-exec-status",arguments:{pid:$pid}}')")
-        [ "$(jq -r '.return.exited' <<<"$st")" = true ] && break
-        sleep "$(printf '%d.%03d' $((ms / 1000)) $((ms % 1000)))"
-        ms=$(( ms * 3 / 2 < 1000 ? ms * 3 / 2 : 1000 ))
-    done
+    # Written before the first poll and removed only once the record has been
+    # consumed -- not in a trap: a call that is killed or gives up has left the
+    # record behind, and that is exactly what the entry is for.
+    ledger="$(gexec_ledger_add "$pid" "$$")"
+    st="$(gexec_wait "$pid")" || exit 1
+
+    # A finished answer without this call's nonce is either an older record
+    # with the same pid, which that answer has just dropped, or this call's own
+    # process having exited before its wrapper printed anything. The next
+    # status tells them apart: no record left means it was ours.
+    if [ -n "$nonce" ]; then
+        while :; do
+            if gexec_has_nonce "$st" "$nonce"; then strip=1; break; fi
+            rc=0; next="$(gexec_status "$pid")" || rc=$?
+            if (( rc == 3 )); then break; fi
+            (( rc == 0 )) || exit 1
+            echo "virutil: $VM: pid $pid first answered for an earlier process" \
+                 "with the same pid; waiting for this one" >&2
+            st="$(gexec_wait "$pid" "$next")" || exit 1
+        done
+    fi
+    if [ -n "$ledger" ]; then rm -f -- "$ledger" 2>/dev/null || true; fi
 
     # \r stripped so windows output pipes cleanly into unix tools
     out=$(jq -r '.return["out-data"] // empty' <<<"$st")
     err=$(jq -r '.return["err-data"] // empty' <<<"$st")
-    if [ -n "$out" ]; then base64 -d <<<"$out" | tr -d '\r' | sed 's/[[:space:]]*$//'; fi
+    if [ -n "$out" ]; then
+        if (( strip )); then
+            base64 -d <<<"$out" | sed 1d | tr -d '\r' | sed 's/[[:space:]]*$//'
+        else
+            base64 -d <<<"$out" | tr -d '\r' | sed 's/[[:space:]]*$//'
+        fi
+    fi
     if [ -n "$err" ]; then
         errtext=$(base64 -d <<<"$err")
         case "$errtext" in
@@ -145,14 +317,27 @@ gexec() {
         esac
     fi
 
-    ec=$(jq -r '.return.exitcode // 0' <<<"$st")
-    return "$ec"
+    # guest-exec-status carries `signal` instead of `exitcode` when the guest
+    # process was killed by one. Reported as a shell reports a signalled child,
+    # so a caller branching on the code sees what `bash -c` would give it. An
+    # answer with neither is not a success.
+    ec=$(jq -r '.return.exitcode // empty' <<<"$st")
+    if [ -n "$ec" ]; then return "$ec"; fi
+    sig=$(jq -r '.return.signal // empty' <<<"$st")
+    if [ -n "$sig" ]; then
+        echo "virutil: $VM: the guest process was killed by signal $sig" >&2
+        return $(( 128 + sig ))
+    fi
+    echo "virutil: $VM's guest agent said pid $pid exited, with no exit code" >&2
+    return 1
 }
 
-# exec_ps_text SCRIPT -- run SCRIPT in $VM's powershell, return its exit code.
-# Shared with the transports, once this host has them.
-exec_ps_text() {
-    local SCRIPT ENC
+# exec_ps_encode SCRIPT [NONCE] -- SCRIPT wrapped and encoded for
+# powershell.exe -EncodedCommand into EXEC_PS_ENC, refused here when it would
+# not fit. With NONCE, the wrapper's first line prints it.
+EXEC_PS_ENC=""
+exec_ps_encode() {
+    local SCRIPT
     # The catch writes to the console handle, not powershell's error stream,
     # which would be serialised as CLIXML; the explicit exit 1 restores the code
     # an uncaught terminating error would have returned.
@@ -162,19 +347,82 @@ exec_ps_text() {
         'try {' \
         "$1" \
         '} catch { [Console]::Error.WriteLine(($_ | Out-String)); exit 1 }')
+    if [ -n "${2:-}" ]; then
+        SCRIPT="[Console]::Out.WriteLine('$GEXEC_NONCE_PREFIX$2');
+$SCRIPT"
+    fi
 
     # UTF-16LE base64 sidesteps every quoting layer between here and the guest
-    ENC=$(printf '%s' "$SCRIPT" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\n')
+    EXEC_PS_ENC=$(printf '%s' "$SCRIPT" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\n')
     # + the powershell.exe flags that precede it on the command line
-    if [ $(( ${#ENC} + 128 )) -gt "$CMDLINE_MAX" ]; then
-        echo "virutil: script encodes to ${#ENC} chars, over Windows's $CMDLINE_MAX" \
+    if [ $(( ${#EXEC_PS_ENC} + 128 )) -gt "$CMDLINE_MAX" ]; then
+        echo "virutil: script encodes to ${#EXEC_PS_ENC} chars, over Windows's $CMDLINE_MAX" \
              "command-line limit (~12000 chars of source); shorten it, or stage" \
              "a .ps1 in the guest and run that" >&2
         exit 1
     fi
+}
 
-    gexec powershell.exe "$(jq -nc --arg e "$ENC" \
-        '["-NoProfile","-NonInteractive","-OutputFormat","Text","-EncodedCommand",$e]')"
+# exec_ps_text SCRIPT -- run SCRIPT in $VM's powershell, return its exit code.
+# Shared with the transports, once this host has them.
+#
+# The wrapper's first line prints this call's nonce, which gexec checks for
+# and strips: an answer without it came from another process's record. See
+# "qemu-ga's exec records" above. A detached call goes through the launcher.
+exec_ps_text() {
+    local nonce
+    if [ "$DETACH" = 1 ]; then
+        exec_ps_detached "$1"
+        return
+    fi
+    nonce="$(gexec_nonce)"
+    exec_ps_encode "$1" "$nonce"
+    gexec powershell.exe "$(jq -nc --arg e "$EXEC_PS_ENC" \
+        '["-NoProfile","-NonInteractive","-OutputFormat","Text","-EncodedCommand",$e]')" "$nonce"
+}
+
+# The launcher behind `exec ps -d`, byte for byte the Windows driver's
+# ($script:GuestPsDetachLauncher in modules/win/exec.ps1). It reads the encoded
+# script from its stdin and starts it through ShellExecuteEx (UseShellExecute),
+# which hands the child no inherited handles: a child that inherited the
+# launcher's stdout and stderr pipes would hold them open, and qemu-ga calls a
+# process exited only once both have closed. The child runs as the launcher
+# does -- SYSTEM, the agent's environment -- and outlives it, as a detached
+# guest-exec did.
+GEXEC_PS_DETACH_LAUNCHER='$e = [Console]::In.ReadToEnd().Trim()
+$si = New-Object System.Diagnostics.ProcessStartInfo
+$si.FileName = Join-Path $PSHOME '"'"'powershell.exe'"'"'
+$si.Arguments = '"'"'-NoProfile -NonInteractive -OutputFormat Text -EncodedCommand '"'"' + $e
+$si.UseShellExecute = $true
+$si.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+$p = [System.Diagnostics.Process]::Start($si)
+[Console]::Out.WriteLine([string]$p.Id)'
+
+# exec_ps_detached SCRIPT -- `exec ps -d`: start SCRIPT and print its pid,
+# leaving no qemu-ga record behind. The launcher is an ordinary captured call,
+# polled to its end, so its record is consumed like any other; the script
+# itself is never a guest-exec of its own.
+#
+# stdin is the launcher's channel for the script, so it cannot also be the
+# script's. That is refused rather than dropped.
+exec_ps_detached() {
+    local enc out rc=0
+    if [ -n "$INPUT_B64" ]; then
+        die "virutil exec ps -d cannot hand stdin to a detached script: the" \
+            "launcher that starts it reads the script from its own stdin. Put" \
+            "the input in a file in the guest and read it from there."
+    fi
+    exec_ps_encode "$1"
+    enc="$EXEC_PS_ENC"
+    out="$(DETACH=0
+           INPUT_B64="$(printf '%s' "$enc" | base64 | tr -d '\n')"
+           exec_ps_text "$GEXEC_PS_DETACH_LAUNCHER")" || rc=$?
+    out="${out//[[:space:]]/}"
+    if (( rc != 0 )) || [[ ! "$out" =~ ^[0-9]+$ ]]; then
+        die "$VM could not start the detached script (launcher exit $rc);" \
+            "it printed: [$out]"
+    fi
+    echo "$out"
 }
 
 # sh_quote STR -- STR as a single-quoted /bin/sh word. The sh counterpart of
@@ -200,10 +448,19 @@ sh_quote() {
 # exists to make the copy land correctly, so the first failing statement in one
 # has to end it rather than let the rest carry on against a guest that is not in
 # the state the rule was meant to put it in.
+#
+# A waited-for call prints its nonce first, as the ps wrapper does. A detached
+# one is left a plain guest-exec, and the ledger reaps its record: Linux hands
+# out pids in sequence and reuses them slowly, so it needs no launcher.
 exec_sh_text() {
-    local SCRIPT
+    local SCRIPT nonce=""
     SCRIPT="set -e
 $1"
+    if [ "$DETACH" != 1 ]; then
+        nonce="$(gexec_nonce)"
+        SCRIPT="printf '%s\\n' '$GEXEC_NONCE_PREFIX$nonce'
+$SCRIPT"
+    fi
 
     # + "-c" and the argv overhead around it
     if [ $(( ${#SCRIPT} + 64 )) -gt "$SH_ARG_MAX" ]; then
@@ -213,7 +470,7 @@ $1"
         exit 1
     fi
 
-    gexec /bin/sh "$(jq -nc --arg c "$SCRIPT" '["-c",$c]')"
+    gexec /bin/sh "$(jq -nc --arg c "$SCRIPT" '["-c",$c]')" "$nonce"
 }
 
 exec_main() {
