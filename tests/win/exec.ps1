@@ -122,6 +122,7 @@ try {
     $script:NextRc    = 0
     $script:NextPolls = 1
     $script:NextQuiet = $false
+    $script:OldMsg    = $false
     function Add-Rec {
         param([long]$GuestPid, [bool]$Finished, [bool]$HasOutput, [int]$Status = 0, [string]$Out = '', [int]$Polls = 0)
         $script:Recs.Add([pscustomobject]@{
@@ -152,7 +153,10 @@ try {
                 $p = [long]$Arguments['pid']
                 $rec = $null
                 foreach ($r in $script:Recs) { if ($r.Pid -eq $p) { $rec = $r; break } }
-                if ($null -eq $rec) { Die "$Vm's guest agent refused guest-exec-status: PID $p does not exist" }
+                if ($null -eq $rec) {
+                    if ($script:OldMsg) { Die "$Vm's guest agent refused guest-exec-status: Invalid parameter 'pid'" }
+                    Die "$Vm's guest agent refused guest-exec-status: PID $p does not exist"
+                }
                 if (-not $rec.Finished) {
                     if ($rec.PollsLeft -gt 0) { $rec.PollsLeft--; return ([pscustomobject]@{ exited = $false }) }
                     $rec.Finished = $true
@@ -168,10 +172,10 @@ try {
         }
     }
     function Reset-Model {
-        param([long]$GuestPid = 5512, [string]$Out = '', [int]$Rc = 0, [int]$Polls = 1, [switch]$Quiet)
+        param([long]$GuestPid = 5512, [string]$Out = '', [int]$Rc = 0, [int]$Polls = 1, [switch]$Quiet, [switch]$OldMsg)
         $script:Recs.Clear(); $script:Execs.Clear()
         $script:NextPid = $GuestPid; $script:NextOut = $Out; $script:NextRc = $Rc
-        $script:NextPolls = $Polls; $script:NextQuiet = [bool]$Quiet
+        $script:NextPolls = $Polls; $script:NextQuiet = [bool]$Quiet; $script:OldMsg = [bool]$OldMsg
         $dir = Get-GuestExecLedgerDir 'testvm'
         if (Test-Path -LiteralPath $dir) { [IO.Directory]::Delete($dir, $true) }
     }
@@ -230,6 +234,21 @@ try {
     [void](Add-GuestExecLedger 'testvm' 4321 0)
     Invoke-GuestExecReap 'testvm'
     Check 'an entry for an unknown pid is dropped' 0 (@(Ledger).Count)
+
+    # The qemu-ga 7.6.2 an XP guest runs says "Invalid parameter 'pid'" for a
+    # pid it has no record of (LE11 winxp, 2026-11-11). That is "gone" too:
+    # the entry is dropped, the reap goes on to the next one, and a silent
+    # process of the call's own is still its own.
+    Reset-Model -OldMsg
+    Add-Rec 4322 $true $false 0
+    [void](Add-GuestExecLedger 'testvm' 4321 0)
+    [void](Add-GuestExecLedger 'testvm' 4322 0)
+    Invoke-GuestExecReap 'testvm'
+    Check 'an older agent''s unknown pid is dropped, and the reap goes on' 0 (@(Ledger).Count)
+    Reset-Model -GuestPid 6002 -Rc 4 -Quiet -OldMsg
+    $script:VirutilExit = -1
+    $got = Invoke-GuestPsText 'testvm' "'payload'" -Capture 2>$null
+    Check 'and a silent process of our own is ours on it too' 4 $script:VirutilExit
 
     # Every call reaps first, so a record left behind cannot answer for it.
     Reset-Model -GuestPid 5512 -Out 'fresh'

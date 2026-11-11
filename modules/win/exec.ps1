@@ -119,12 +119,17 @@ function Test-GuestExecExited {
 
 # Get-GuestExecStatus VM PID -- one guest-exec-status, or $null when the agent
 # has no record for PID any more. Every other refusal stays fatal.
+#
+# Two wordings mean "no record": "PID N does not exist" (virtio-win's 110.2.3
+# on win11, literally "PID lld does not exist"), and the generic "Invalid
+# parameter 'pid'" (QERR_INVALID_PARAMETER) from the 7.6.2 an XP guest runs,
+# measured on LE11's winxp, 2026-11-11.
 function Get-GuestExecStatus {
     param([Parameter(Mandatory)][string]$Vm, [long]$GuestPid)
     try {
         return (Invoke-GuestAgent $Vm 'guest-exec-status' @{ pid = $GuestPid })
     } catch {
-        if ($_.Exception.Message -match 'refused guest-exec-status: .*does not exist') { return $null }
+        if ($_.Exception.Message -match "refused guest-exec-status: .*(does not exist|Invalid parameter 'pid')") { return $null }
         throw
     }
 }

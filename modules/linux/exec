@@ -171,8 +171,8 @@ gexec_owner_alive() {
 
 # gexec_status PID -- one guest-exec-status. The reply on stdout and 0; 3 when
 # the agent has no record for PID any more ("PID N does not exist", or the
-# generic "Invalid parameter 'pid'", QERR_INVALID_PARAMETER, which an older
-# agent may answer with); 1 for every other refusal, which is reported.
+# generic "Invalid parameter 'pid'", QERR_INVALID_PARAMETER, which the 7.6.2
+# an XP guest runs answers with); 1 for every other refusal, which is reported.
 gexec_status() {
     local req err rc=0
     req="$(jq -nc --argjson pid "$1" '{execute:"guest-exec-status",arguments:{pid:$pid}}')"

@@ -108,11 +108,13 @@ reuse pids as quickly as on RNDLB; Linux guests hand them out in sequence up to
   owner is the run's `$$`, which every `$(...)` inside it shares. Owner-alive
   is `kill -0`, with `ps -p` behind it so another user's live process is not
   read as gone.
-- An unknown pid reads as "no record left" when the agent says "PID N does
-  not exist" (QEMU 8.2 and 9.0 say this; checked against those tags), and also
-  when it says the generic "Invalid parameter 'pid'". Which older agents still
-  say the second has not been checked. The Windows driver matches only the
-  first.
+- An unknown pid reads as "no record left" in both drivers whether the agent
+  says "PID N does not exist" or the generic "Invalid parameter 'pid'"
+  (QERR_INVALID_PARAMETER). Measured 2026-11-11: virtio-win's qemu-ga 110.2.3
+  (RNDLB win11, win11-2, win11-3) says "PID lld does not exist", Ubuntu 24.04's
+  8.2.2 (LE11 qv-r14u) "PID ld does not exist" -- the format string carries no
+  argument -- and the 7.6.2 an XP guest runs (LE11 winxp) "Invalid parameter
+  'pid'".
 - A status with neither `exitcode` nor `signal` is exit 1 with a warning, not
   0. A signal is 128 + the signal, as on Windows.
 
