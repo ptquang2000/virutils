@@ -314,7 +314,49 @@ try {
     # after parsing, before the ISO is looked at.
     $said = ''
     try { New-Domain @('w11', 'C:\nonexistent.iso', '-u', 'C:\x.sif') } catch { $said = $_.Exception.Message }
-    Check '-u without -o winxp is refused'     $true  ($said -match '-u is for -o winxp only')
+    Check '-u without -o winxp is refused'     $true  ($said -match '-u is for -o winxp \(a winnt\.sif')
+
+    # --- the Linux profile --------------------------------------------------
+    #
+    # Any id that is not a Windows one. The machine is the default one with
+    # what is Windows' own left out, and the seed is a second disk.
+    Check 'ubuntu26.04 is a Linux id'  $true  (Test-OsinfoLinux 'ubuntu26.04')
+    Check 'linux2024 is a Linux id'    $true  (Test-OsinfoLinux 'linux2024')
+    Check 'win11 is not'               $false (Test-OsinfoLinux 'win11')
+    Check 'winxp is not'               $false (Test-OsinfoLinux 'winxp')
+    Check 'no id is not'               $false (Test-OsinfoLinux '')
+    $largs = Get-DomainQemuArgs -Vm 'lin' -Qemu @{ Code = 'code.fd' } `
+        -Disk 'd.qcow2' -Nvram 'n.fd' -Iso 'i.iso' -Virtio $null `
+        -Memory 4096 -Vcpus 2 -Ports @('10022:22') `
+        -MonitorPort 24000 -AgentPort 24001 -Linux -Seed 'lin-seed.img'
+    $lline = ($largs -join ' ')
+    Check 'linux: an even argument list'       0      ($largs.Count % 2)
+    Check 'linux: the RTC is left in UTC'      $false ($lline -match '-rtc')
+    Check 'linux: the same q35 machine'        $true  ($lline -match '-machine q35,smm=off,vmport=off')
+    Check 'linux: the disk still boots first'  $true  ($lline -match 'virtio-blk-pci,drive=hd0[^ ]*bootindex=0')
+    Check 'linux: the ISO second'              $true  ($lline -match 'ide-cd,bus=ide\.0,drive=cd0,bootindex=1')
+    Check 'linux: the seed is a read-only raw disk' $true ($lline -match 'file=lin-seed\.img,if=none,id=seed0,format=raw,readonly=on')
+    Check 'linux: on virtio'                   $true  ($lline -match 'virtio-blk-pci,drive=seed0')
+    Check 'linux: the agent channel is there'  $true  ($lline -match 'org\.qemu\.guest_agent\.0')
+    $iargs = Get-DomainQemuArgs -Vm 'img' -Qemu @{ Code = 'code.fd' } `
+        -Disk 'd.qcow2' -Nvram 'n.fd' -Iso '' -Virtio $null `
+        -Memory 4096 -Vcpus 2 -Ports @('10022:22') `
+        -MonitorPort 24000 -AgentPort 24001 -Linux
+    Check 'linux: a disk image leaves no cdrom' $false (($iargs -join ' ') -match 'media=cdrom')
+    $wargs = Get-DomainQemuArgs -Vm 'win' -Qemu @{ Code = 'code.fd' } `
+        -Disk 'd.qcow2' -Nvram 'n.fd' -Iso 'i.iso' -Virtio $null `
+        -Memory 4096 -Vcpus 2 -Ports @('13389:3389') `
+        -MonitorPort 24000 -AgentPort 24001
+    Check 'windows: the RTC is still local time' $true (($wargs -join ' ') -match '-rtc base=localtime')
+    Check 'windows: an even argument list'     0      ($wargs.Count % 2)
+    $said = ''
+    try { New-Domain @('lin', 'C:\nonexistent.iso', '-o', 'ubuntu26.04', '-u', 'C:\nonexistent.yaml') } catch { $said = $_.Exception.Message }
+    Check 'linux: a missing user-data is named' $true ($said -match 'answer file not found')
+    # An empty value is a variable that expanded to nothing. It used to read as
+    # "no -u" and build a cloud image nobody could sign in to.
+    $said = ''
+    try { New-Domain @('lin', 'C:\nonexistent.iso', '-o', 'ubuntu26.04', '-u', '') } catch { $said = $_.Exception.Message }
+    Check 'linux: an empty -u is refused'      $true  ($said -match '-u needs a file, got an empty value')
     $said = ''
     try { New-Domain @('xp', 'C:\nonexistent.iso', '-o', 'winxp', '--unattend', 'C:\nonexistent.sif') } catch { $said = $_.Exception.Message }
     Check 'a missing answer file is named'     $true  ($said -match 'answer file not found')

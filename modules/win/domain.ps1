@@ -248,6 +248,48 @@ $script:UsbRootPorts = 15
 # About 25 minutes end to end.
 $script:LegacyOsinfo = 'winxp'
 
+# The Linux profile, `domain create -o ID` with any id that is not a Windows
+# one (ubuntu26.04, debian12, linux2024: libosinfo's own, so a command line
+# written for the bash driver names the same guest here). It is the default
+# profile's machine -- q35, OVMF, virtio-blk, virtio-net, std VGA, the xHCI
+# tablet, the agent on virtio-serial, every one of which a distribution kernel
+# drives as shipped -- with what is Windows' own taken out:
+#
+#   no -rtc base=localtime  Linux keeps the RTC in UTC, which is qemu's default.
+#                           With localtime a guest is off by the host's offset.
+#   no virtio-win cdrom     the drivers are in the kernel.
+#   no boot prompt          Send-BootPrompt answers Windows Setup's "Press any
+#                           key"; an installer ISO's GRUB boots by itself, and
+#                           forty Enters would walk into whatever comes next.
+#   ssh, not RDP            the default forward is 10022:22, or the next free.
+#   -u FILE                 FILE is cloud-init user-data, written beside a
+#                           generated meta-data onto a FAT image labelled
+#                           cidata (VM-seed.img), which cloud-init's NoCloud
+#                           source finds by that label. An autoinstall file
+#                           answers Ubuntu's installer; a plain #cloud-config
+#                           configures a cloud image on its first boot.
+#   a disk image for ISO    a qcow2 (a distribution's cloud image) is not
+#                           install media: it is copied into VM.qcow2, grown to
+#                           -s, and booted. The copy is the domain's own disk,
+#                           never an overlay, so the image given is not held.
+#
+# Measured on this host, qemu v11.1.0-12130: Ubuntu 26.04 (kernel 7.0) installs
+# from its ISO and runs on this machine as written. Ubuntu 18.04's cloud image
+# (kernel 4.15, glibc 2.27) does not boot on $DomainCpu -- "init[1]: segfault at
+# 0 ip 0000000000000000", then "Attempted to kill init" -- nor on any named
+# model from SandyBridge up; it boots on Westmere and Nehalem. Taking mpx, or
+# xsave, or xsavec+xsaves+xgetbv1 off Skylake-Client changes nothing, so which
+# feature it is stays unknown. Such a guest is created with -N and its
+# launcher's -cpu line edited before the first start.
+#
+# Anything that is not Windows is Linux here, as Get-GuestOs has it for a
+# running guest and for the same reason: an allow-list of distribution ids
+# would refuse a guest that would have been fine.
+function Test-OsinfoLinux {
+    param([string]$Id)
+    return [bool]($Id -and $Id -ne $script:LegacyOsinfo -and $Id -notmatch '^(ms)?win')
+}
+
 # The band `domain create` allocates the monitor and guest agent ports from,
 # and it is deliberately *below* the ephemeral range rather than inside it.
 #
@@ -277,7 +319,7 @@ $script:DomainPortBandEnd   = 24999
 
 function Get-DomainUsage {
     @(
-        'usage: virutil domain create VM ISO [OPTIONS]'
+        'usage: virutil domain create VM ISO|IMAGE [OPTIONS]'
         '       virutil domain delete VM'
         '       virutil domain list'
         '       virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]'
@@ -303,16 +345,27 @@ function Get-DomainUsage {
         '  -o, --osinfo ID   winxp builds a legacy PC for 32-bit Windows XP:'
         '                    SeaBIOS, i440fx, IDE disk, rtl8139, cirrus, UHCI'
         '                    tablet, the guest agent on COM1, 1 vcpu, 1024 MiB,'
-        '                    24 GiB, no virtio. Any other id is ignored: there'
-        '                    is no libosinfo here.'
-        '  -u, --unattend F  winxp only: F is a winnt.sif, written to a FAT12'
+        '                    24 GiB, no virtio. An id that is not a Windows'
+        '                    one (ubuntu26.04, debian12, linux2024) builds the'
+        '                    default machine for a Linux guest: RTC in UTC, no'
+        '                    virtio-win, no boot key press, and ssh (10022:22)'
+        '                    as the default forward. A qcow2 given for ISO (a'
+        '                    cloud image) is then copied to be the disk and'
+        '                    grown to -s. A Windows id other than winxp is'
+        '                    ignored: there is no libosinfo here.'
+        '  -u, --unattend F  winxp: F is a winnt.sif, written to a FAT12'
         '                    floppy (VM-a.img) that XP Setup reads as A:.'
         '                    Never put a product key in it -- leave it out and'
         '                    Setup stops at the key page for you to type it.'
+        '                    A Linux id: F is cloud-init user-data, written'
+        '                    with a meta-data to a FAT disk labelled cidata'
+        '                    (VM-seed.img): an autoinstall file for Ubuntu''s'
+        '                    installer, or #cloud-config for a cloud image.'
         '  -v, --virtio ISO  virtio-win ISO to attach as a second cdrom, or'
         '                    "none" (default: found beside ISO; never for winxp)'
         '  -p, --port SPEC   a port forward, repeatable (default 13389:3389, or'
-        '                    the next free host port when another domain has it)'
+        '                    the next free host port when another domain has it;'
+        '                    10022:22 for a Linux id)'
         '  -N, --no-start    create it without starting it'
         ''
         "The disk is always $($script:VirutilsImageDir)\VM.qcow2;"
@@ -339,7 +392,7 @@ function Get-DomainUsage {
         'shutdown cannot reach: it loses what it had not written.'
         ''
         'delete takes no options. It never asks, and it removes the disk, the'
-        'nvram and the launcher. There is no backing chain to walk and nothing'
+        'nvram, the seed and the launcher. There is no backing chain to walk and nothing'
         'a snapshot left behind: this driver has no snapshot command at all'
         '(docs/contract.md section 7), so the disk is the whole of it.'
         ''
@@ -460,6 +513,7 @@ function Get-DomainLauncher { param([string]$Vm) Join-Path $script:VirutilsImage
 function Get-DomainOvmfLog  { param([string]$Vm) Join-Path $script:VirutilsImageDir "$Vm-ovmf.log" }
 function Get-DomainQemuLog  { param([string]$Vm) Join-Path $script:VirutilsImageDir "$Vm-qemu.log" }
 function Get-DomainFloppy   { param([string]$Vm) Join-Path $script:VirutilsImageDir "$Vm-a.img" }
+function Get-DomainSeed     { param([string]$Vm) Join-Path $script:VirutilsImageDir "$Vm-seed.img" }
 
 function Test-Domain {
     param([string]$Vm)
@@ -1602,7 +1656,7 @@ function Remove-Domain {
     # win11, and delete never asks.
     foreach ($f in @((Get-DomainDisk $vm), (Get-DomainNvram $vm), (Get-DomainLauncher $vm),
                      (Get-DomainOvmfLog $vm), (Get-DomainQemuLog $vm), (Get-DomainFloppy $vm),
-                     (Get-GuestAgentLockPath $vm))) {
+                     (Get-DomainSeed $vm), (Get-GuestAgentLockPath $vm))) {
         if (Remove-VirutilsFile $f) { Say "removed $f" }
     }
 }
@@ -1648,21 +1702,27 @@ function New-Domain {
     # any other is accepted and ignored and says so, as contract section 9
     # requires of a flag a host cannot honour.
     $legacy = ($osinfo -eq $script:LegacyOsinfo)
-    if ($osinfo -and -not $legacy) {
+    $linux  = Test-OsinfoLinux $osinfo
+    if ($osinfo -and -not $legacy -and -not $linux) {
         Warn @(
             "-o $osinfo is accepted and ignored: there is no libosinfo on this"
-            "host, and the only id it acts on is $($script:LegacyOsinfo). It is in"
-            'the grammar so a command line written for one driver parses under'
-            'the other.'
+            "host, and the only Windows id it acts on is $($script:LegacyOsinfo). It is"
+            'in the grammar so a command line written for one driver parses'
+            'under the other.'
         )
     }
-    if ($unattend -and -not $legacy) {
+    if ($unattend -and -not $legacy -and -not $linux) {
         Die @(
-            "-u is for -o $($script:LegacyOsinfo) only: it writes a winnt.sif floppy,"
-            'which is how XP Setup is answered. Windows 11 Setup reads'
-            'autounattend.xml, and this driver does not build one.'
+            "-u is for -o $($script:LegacyOsinfo) (a winnt.sif floppy, which is how XP"
+            'Setup is answered) or a Linux id (cloud-init user-data on a cidata'
+            'disk). Windows 11 Setup reads autounattend.xml, and this driver'
+            'does not build one.'
         )
     }
+    # An empty value is a variable that expanded to nothing in the caller's
+    # shell. Taken as "no -u", it built a cloud image with no seed and so no
+    # user, and said nothing.
+    if ($null -ne $unattend -and $unattend -eq '') { Die 'virutil domain create: -u needs a file, got an empty value' }
     if ($unattend -and -not (Test-Path -LiteralPath $unattend -PathType Leaf)) {
         Die "answer file not found: $unattend"
     }
@@ -1677,12 +1737,22 @@ function New-Domain {
     } else {
         if (-not $size)  { $size  = 64 }
         if (-not $vcpus) { $vcpus = 2 }
+        if ($linux) {
+            if ($virtio -and $virtio -ne 'none') {
+                Warn "-v $virtio is ignored for -o $osinfo`: a Linux kernel has the virtio drivers."
+            }
+            $virtio = 'none'
+        }
     }
 
     # RDP on 13389, or the next port up that is free. This was a fixed 13389,
     # so every domain created without -p asked for the same host port, and
     # whichever started second died on it -- see Assert-DomainForwardsFree.
-    if ($ports.Count -eq 0) { $ports = @("$(Get-FreeForwardPort 13389):3389") }
+    # ssh on 10022 for a Linux guest, picked the same way.
+    if ($ports.Count -eq 0) {
+        if ($linux) { $ports = @("$(Get-FreeForwardPort 10022):22") }
+        else        { $ports = @("$(Get-FreeForwardPort 13389):3389") }
+    }
     if ($vcpus -lt 1) { Die "--vcpus wants a whole number, got '$vcpus'" }
     if ($legacy -and $vcpus -gt 1) {
         Warn @(
@@ -1696,7 +1766,7 @@ function New-Domain {
     # legitimate machine for a guest that is already installed, and refusing it
     # here would be the same mistake create made in the other direction. What
     # it is not is a machine an install can start on.
-    if (-not $legacy -and $vcpus -lt 2) {
+    if (-not $legacy -and -not $linux -and $vcpus -lt 2) {
         Warn @(
             "-c 1 creates a domain Windows 11 Setup will not install on. It"
             'stops at "This PC can''t run Windows 11" before the disk step, and'
@@ -1713,6 +1783,25 @@ function New-Domain {
     $qemu = Get-QemuTools
     if (-not (Test-Path -LiteralPath $iso -PathType Leaf)) { Die "install ISO not found: $iso" }
     $iso = (Resolve-Path -LiteralPath $iso).Path
+
+    # A disk image where the ISO goes: qemu-img names an ISO's format raw, and
+    # a cloud image's qcow2. It becomes the disk rather than a cdrom, below.
+    $image = $null
+    $fmt = $null
+    try {
+        $fmt = ((& $qemu.Img info --output=json -- $iso 2>$null) -join "`n" | ConvertFrom-Json).format
+    } catch { $fmt = $null }
+    if ($fmt -and $fmt -ne 'raw') {
+        if (-not $linux) {
+            Die @(
+                "$iso is a $fmt disk image, not install media. With a Linux id"
+                '(-o ubuntu26.04) it is copied to be the domain''s disk and'
+                'booted; this driver has no such path for a Windows image.'
+            )
+        }
+        $image = $iso
+        $iso = $null
+    }
 
     $disk     = Get-DomainDisk $vm
     $nvram    = Get-DomainNvram $vm
@@ -1751,25 +1840,50 @@ function New-Domain {
     $agentPort   = Get-FreeLoopbackPort $monitorPort
     New-VirutilsDir $script:VirutilsImageDir | Out-Null
 
-    $machine = if ($legacy) { "$($script:LegacyOsinfo): pc, SeaBIOS" } else { 'q35, OVMF' }
+    $machine = if ($legacy) { "$($script:LegacyOsinfo): pc, SeaBIOS" }
+               elseif ($linux) { "$osinfo`: q35, OVMF, RTC in UTC" }
+               else { 'q35, OVMF' }
+    $after = if ($linux) { 'the install' } else { 'OOBE' }
     Say ('{0,-10}{1}' -f 'domain:',   "$vm (whpx, $($script:DomainCpu), $machine)")
-    Say ('{0,-10}{1}' -f 'cpu:',      "$vcpus vcpu (1 socket x $vcpus core x 1 thread) -- set the real count after OOBE")
+    Say ('{0,-10}{1}' -f 'cpu:',      "$vcpus vcpu (1 socket x $vcpus core x 1 thread) -- set the real count after $after")
     Say ('{0,-10}{1}' -f 'memory:',   "$memory MiB")
     Say ('{0,-10}{1}' -f 'disk:',     "$disk ($size GiB)")
-    Say ('{0,-10}{1}' -f 'iso:',      $iso)
+    if ($iso)    { Say ('{0,-10}{1}' -f 'iso:',    $iso) }
+    if ($image)  { Say ('{0,-10}{1}' -f 'image:',  "$image (copied to be the disk)") }
     if ($virtio) { Say ('{0,-10}{1}' -f 'virtio:', $virtio) }
 
     # cluster_size=1M keeps a large image's L2 metadata small enough to stay
     # cached; lazy_refcounts trades a `qemu-img check -r all` after an unclean
     # shutdown for faster writes. No preallocation=metadata: on NTFS it writes
     # the whole image out up front.
-    & $qemu.Img create -f qcow2 -o cluster_size=1M,lazy_refcounts=on -- $disk "${size}G" | Out-Null
-    if ($LASTEXITCODE -ne 0) { Die "could not create $disk" }
+    if ($image) {
+        # A copy, never an overlay: a backing file would be a second image this
+        # domain depends on and anyone may move, and qemu on Windows takes no
+        # lock on either. Grown, not shrunk: a cloud image is a few GiB and its
+        # first boot grows the root partition into whatever the disk has.
+        & $qemu.Img convert -O qcow2 -o cluster_size=1M,lazy_refcounts=on -- $image $disk | Out-Null
+        if ($LASTEXITCODE -ne 0) { Die "could not copy $image to $disk" }
+        $have = [long]((& $qemu.Img info --output=json -- $disk) -join "`n" | ConvertFrom-Json).'virtual-size'
+        if ($have -lt [long]$size * 1GB) {
+            & $qemu.Img resize -- $disk "${size}G" | Out-Null
+            if ($LASTEXITCODE -ne 0) { Die "could not grow $disk to $size GiB" }
+        } elseif ($have -gt [long]$size * 1GB) {
+            Warn "$image is $([int]($have / 1GB)) GiB, more than -s $size`: the disk keeps the image's size."
+        }
+    } else {
+        & $qemu.Img create -f qcow2 -o cluster_size=1M,lazy_refcounts=on -- $disk "${size}G" | Out-Null
+        if ($LASTEXITCODE -ne 0) { Die "could not create $disk" }
+    }
     # SeaBIOS keeps no variables, so a legacy domain has no nvram at all.
     if (-not $legacy) { Copy-Item -LiteralPath $qemu.VarsTemplate -Destination $nvram -Force }
 
     $floppy = $null
-    if ($unattend) {
+    $seed = $null
+    if ($unattend -and $linux) {
+        $seed = Get-DomainSeed $vm
+        New-SeedDisk $qemu $unattend $vm $seed
+        Say ('{0,-10}{1}' -f 'seed:', "$seed (cidata: user-data, meta-data)")
+    } elseif ($unattend) {
         $floppy = Get-DomainFloppy $vm
         New-UnattendFloppy $qemu $unattend $floppy
         Say ('{0,-10}{1}' -f 'unattend:', "$floppy (A:\WINNT.SIF)")
@@ -1778,7 +1892,7 @@ function New-Domain {
     $qemuArgs = Get-DomainQemuArgs -Vm $vm -Qemu $qemu -Disk $disk -Nvram $nvram `
         -Iso $iso -Virtio $virtio -Memory $memory -Vcpus $vcpus `
         -Ports $ports -MonitorPort $monitorPort -AgentPort $agentPort `
-        -Legacy:$legacy -Floppy $floppy
+        -Legacy:$legacy -Floppy $floppy -Linux:$linux -Seed $seed
 
     Write-DomainLauncher $launcher $qemu.Display $qemuArgs $vm
     Say ('{0,-10}{1}' -f 'launcher:', $launcher)
@@ -1813,6 +1927,38 @@ function New-Domain {
             'README: A Windows XP guest on a Windows host.'
         )
         Say "RDP once it is up (XP Professional only): mstsc /v:localhost:$(($ports[0] -split ':')[0])"
+        return
+    }
+
+    if ($linux) {
+        # No Send-BootPrompt: see the Linux profile at the head of this file.
+        Start-DomainProcess $vm
+        $first = if ($image) { 'The image is booting.' } else { 'The installer should be on screen.' }
+        $seedNote = if ($seed -and $image) {
+            @('cloud-init reads the seed on this first boot and never again.')
+        } elseif ($seed) {
+            @('An autoinstall seed is attached. Ubuntu''s installer asks before it'
+              'acts on one unless the kernel was started with the word'
+              'autoinstall: at GRUB press e, add it to the linux line, press F10'
+              '(virutil input key and type do it from here).')
+        } elseif ($image) {
+            @('No seed: a cloud image has no user and no password until cloud-init'
+              'is given one, so nothing can sign in to this guest. Delete it and'
+              'create it again with -u user-data.')
+        } else {
+            @('No seed: the installer asks everything. -u user-data answers it.')
+        }
+        Say (@('', "$first Boot it again later with:", "  virutil domain start $vm", '') + $seedNote + @(
+            ''
+            'A guest that reboots itself may not come back on this host (the'
+            'header of modules/win/domain.ps1: the firmware wedges, or a guest'
+            'with more than one vcpu dies). Have the install power off instead'
+            '(autoinstall: shutdown: poweroff), then start the domain again.'
+            ''
+            'For exec, push, pull and sync the guest needs qemu-guest-agent'
+            'running; for the three transfers also rsync and cifs-utils.'
+        ))
+        Say "ssh once it is up: ssh -p $(($ports[0] -split ':')[0]) USER@localhost"
         return
     }
 
@@ -1888,6 +2034,40 @@ function New-UnattendFloppy {
         if ($LASTEXITCODE -ne 0) { Die "could not write the answer file floppy $Out" }
     } finally {
         # [IO.Directory]::Delete, not Remove-Item -- see Remove-VirutilsFile.
+        [IO.Directory]::Delete($src, $true)
+    }
+}
+
+# New-SeedDisk QEMU USERDATA VM OUT -- a FAT image at OUT, labelled cidata,
+# holding USERDATA as user-data beside a meta-data naming the instance. That
+# label and those two names are the whole of cloud-init's NoCloud contract: it
+# looks for a vfat or iso9660 filesystem so labelled on any block device.
+#
+# vvfat again, as for the XP floppy, and for the same reasons; --image-opts
+# rather than the fat: spelling because the label is an option only that form
+# has (the default is "QEMU VVFAT"). floppy=on leaves out the partition table,
+# so the image is 2.88 MB of bare filesystem rather than a 504 MB disk, and a
+# Linux guest reads the label off a whole disk as readily as off a partition.
+# A comma in an option value is spelled twice.
+#
+# The instance id is new on every create. cloud-init acts on user-data once per
+# instance id, so a domain created again from the same image is configured
+# again, and one that merely boots again is left alone.
+function New-SeedDisk {
+    param($Qemu, [string]$UserData, [string]$Vm, [string]$Out)
+    $src = Join-Path $script:VirutilsTmpDir ("seed-" + [Guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($src)
+    try {
+        # Bytes, not text: a rewrite through a PowerShell string would be free
+        # to change the newlines or add a BOM, and cloud-init reads either as
+        # "not cloud-config" and skips the file without a word on the console.
+        [IO.File]::WriteAllBytes((Join-Path $src 'user-data'), [IO.File]::ReadAllBytes($UserData))
+        $meta = "instance-id: $Vm-$([Guid]::NewGuid().ToString('N').Substring(0, 12))`nlocal-hostname: $Vm`n"
+        [IO.File]::WriteAllText((Join-Path $src 'meta-data'), $meta, [Text.UTF8Encoding]::new($false))
+        $opts = "driver=vvfat,dir=$($src.Replace(',', ',,')),label=cidata,floppy=on"
+        & $Qemu.Img convert --image-opts -O raw $opts $Out | Out-Null
+        if ($LASTEXITCODE -ne 0) { Die "could not write the cloud-init seed $Out" }
+    } finally {
         [IO.Directory]::Delete($src, $true)
     }
 }
@@ -2057,7 +2237,8 @@ function Get-DomainQemuArgs {
     param(
         [string]$Vm, $Qemu, [string]$Disk, [string]$Nvram, [string]$Iso,
         [string]$Virtio, [int]$Memory, [int]$Vcpus, [string[]]$Ports, [int]$MonitorPort,
-        [int]$AgentPort, [switch]$Legacy, [string]$Floppy
+        [int]$AgentPort, [switch]$Legacy, [string]$Floppy,
+        [switch]$Linux, [string]$Seed
     )
 
     $hostfwd = ($Ports | ForEach-Object {
@@ -2081,6 +2262,10 @@ function Get-DomainQemuArgs {
         '-cpu', $script:DomainCpu
         '-smp', "$Vcpus,sockets=1,cores=$Vcpus,threads=1"
         '-m', "$Memory"
+    )
+    # Windows only: a Linux guest takes qemu's default, UTC.
+    if (-not $Linux) {
+        $qemuArgs += @(
         # Windows keeps the RTC in local time, as the legacy profile below, the
         # macOS driver and libvirt's Windows default all say. Without this the
         # RTC is UTC and Windows reads it as its own local time, so a guest is
@@ -2091,6 +2276,9 @@ function Get-DomainQemuArgs {
         # before this has no -rtc, and its guest may have been set to
         # RealTimeIsUniversal=1 to cope: do not add the flag to one by hand.
         '-rtc', 'base=localtime'
+        )
+    }
+    $qemuArgs += @(
         '-drive', "if=pflash,format=raw,readonly=on,file=$($Qemu.Code)"
         '-drive', "if=pflash,format=raw,file=$Nvram"
         # The disk boots first and the install ISO second, which is the other
@@ -2125,9 +2313,17 @@ function Get-DomainQemuArgs {
         # preferred the moment there is something on the disk to boot instead.
         '-drive', "file=$Disk,if=none,id=hd0,format=qcow2,cache=writeback,discard=unmap"
         '-device', "virtio-blk-pci,drive=hd0,num-queues=$Vcpus,bootindex=0"
-        '-drive', "file=$Iso,if=none,id=cd0,media=cdrom,readonly=on"
-        '-device', 'ide-cd,bus=ide.0,drive=cd0,bootindex=1'
     )
+    # No ISO when a disk image was given for it: the disk already boots.
+    if ($Iso) {
+        $qemuArgs += '-drive', "file=$Iso,if=none,id=cd0,media=cdrom,readonly=on"
+        $qemuArgs += '-device', 'ide-cd,bus=ide.0,drive=cd0,bootindex=1'
+    }
+    # The cloud-init seed: a second virtio disk, which the guest only reads.
+    if ($Seed) {
+        $qemuArgs += '-drive', "file=$Seed,if=none,id=seed0,format=raw,readonly=on"
+        $qemuArgs += '-device', 'virtio-blk-pci,drive=seed0'
+    }
     if ($Virtio) {
         $qemuArgs += '-drive', "file=$Virtio,if=none,id=cd1,media=cdrom,readonly=on"
         $qemuArgs += '-device', 'ide-cd,bus=ide.1,drive=cd1'
