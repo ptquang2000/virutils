@@ -35,9 +35,11 @@ shot_usage() {
 }
 
 # shot_png_size PNG -- "WxH" from the IHDR chunk, big-endian at 16 and 20.
+# Only od's line of eight bytes counts: macOS 27's od ends -An output with a
+# line of blanks, which read as a second size of 0x0 ("800x6000x0").
 shot_png_size() {
     od -An -tu1 -j16 -N8 -- "$1" |
-        awk '{ printf "%dx%d", (($1*256+$2)*256+$3)*256+$4, (($5*256+$6)*256+$7)*256+$8 }'
+        awk 'NF >= 8 { printf "%dx%d", (($1*256+$2)*256+$3)*256+$4, (($5*256+$6)*256+$7)*256+$8; exit }'
 }
 
 shot_main() {

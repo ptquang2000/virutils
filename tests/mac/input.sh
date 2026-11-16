@@ -68,6 +68,11 @@ check '  and nothing was sent'         '' "$(events)"
 out="$(run click vm 640 400)"
 check 'click: mice, then move, press, release' 'query-mice|x=16396,y=16404|left:down|left:up' "$(events)"
 check '  sized by the screendump'      'vm: click 640,400 on 1280x800' "$out"
+# macOS 27's od ends -An output with a line of blanks; it must not read as a size.
+od() { command od "$@"; printf '%72s\n\n' ''; }
+out="$(run click vm 640 400)"; events >/dev/null
+unset -f od
+check '  and by an od that ends with a blank line' 'vm: click 640,400 on 1280x800' "$out"
 run click vm 0 799 --double -b right >/dev/null
 check 'double right click'  'query-mice|x=12,y=32747|right:down|right:up|right:down|right:up' "$(events)"
 run wheel vm 10 10 -2 >/dev/null
