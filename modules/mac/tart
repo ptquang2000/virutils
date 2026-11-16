@@ -23,7 +23,8 @@
 # that name wins, then a tart VM. Nothing is flagged and no module is told.
 #
 # What tart gives each verb, measured on an M5 Max, macOS 27.2, tart 2.41.1,
-# against a macOS 27 guest (docs/contract.md section 7 has the numbers):
+# against macOS 27 and macOS 12 guests (docs/contract.md section 7 has the
+# numbers):
 #
 #   start     `tart run --vnc-experimental`, detached. Always with the VNC
 #             console, because that is the only way in to the screen from the

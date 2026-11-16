@@ -23,7 +23,8 @@
 #           which has no --old-args and no --mkpath, so it is refused by name.
 #   guest   whatever /usr/bin/rsync the guest has: rsync 2.6.9 up to macOS 14,
 #           openrsync from macOS 15. Both speak protocol 29, and the host's
-#           rsync talks down to it.
+#           rsync talks down to it: measured against 2.6.9 on macOS 12.7.6
+#           and openrsync on macOS 27.2.
 #
 # So: -rlt and nothing newer than 2.6.9 knew. No -p, which would lay the
 # source's modes over directories the guest already has (rsync applies the

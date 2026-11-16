@@ -814,6 +814,18 @@ Protection and Gatekeeper's assessments disabled, and carry the tart guest
 agent. Everything below was measured against one, macOS 27.2, on an M5 Max
 running macOS 27.2.1 and tart 2.41.1.
 
+**macOS 12 was measured too**, on `ghcr.io/cirruslabs/macos-monterey-vanilla:12.7.6`:
+`exec`, `ui run`, `push`, `pull` (no match is 94), `sync` with its run rules,
+`shot`, `input` and the agent's `shutdown` behave as below, against the guest's
+own rsync 2.6.9. A *vanilla* image differs from a base one in what it leaves
+out: it has Remote Login on and `admin`/`admin` logged in, but no tart guest
+agent, no Homebrew, and SIP and Gatekeeper left **on**. With no agent nothing
+but `domain`, `snapshot`, `shot` and `input` reaches it, so the agent goes in
+first, over ssh: the binary from tart-guest-agent's releases, and the two
+launchd jobs a base image runs (a root daemon, `--run-daemon`, and one in the
+user's session, `--run-agent`). It answers 15 s later and again after every
+boot. Current Chrome does not run there: Chrome 157 needs macOS 13.
+
 **The guest agent is tart's own**, and `exec`, `ui`, `sync`, `push` and `pull`
 all go through `tart exec`. It runs as the logged-in user, so `exec sh` goes
 through `sudo -n` to be root, as the contract says it is; a guest whose user
