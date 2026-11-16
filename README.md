@@ -418,11 +418,26 @@ Two consequences worth knowing:
   the account away. Anything an earlier bad day did leave behind is swept up by
   the next transfer, which never touches a transfer that is still running.
 
-A Linux guest from a Windows host is not supported yet; `push`, `pull` and
-`sync` say so by name rather than failing partway — `sync` by refusing
-`@guest=linux` out of the config, before it fetches anything. See
-[`sync` on a Windows host](#sync-on-a-windows-host) for the rest of what differs
-there.
+**A Linux guest mounts the same share.** There is no rsync daemon on a Windows
+host, so the guest runs `mount -t cifs` on the share the throwaway account was
+granted, under `/run/virutil/<token>`, and the same `rsync` payloads the Linux
+host sends are handed the mount point where that host hands them a daemon URL.
+The guest needs `cifs-utils` beside `rsync` (exit 91 names it when it is
+missing), and three things follow from the share being NTFS:
+
+- **Every delivered file arrives mode 0755.** NTFS carries no mode and the
+  copier preserves the source's, so the mount presents one for everything. 0644
+  would deliver a build whose binaries do not run.
+- **A symlink does not cross.** A pulled tree that holds one would leave a stub
+  file on the host; `pull` removes the stubs and prints each `link -> target`,
+  and a symlink named as SRC is refused, saying to pull its target.
+- **A device, a socket or an owner does not cross either**: rsync exits 23 and
+  names the path.
+
+`push` and `pull` ask the guest which it is; `sync` is told by `@guest=linux`.
+See [A Linux guest on a Windows host](#a-linux-guest-on-a-windows-host) for
+making one, and [`sync` on a Windows host](#sync-on-a-windows-host) for the
+rest of what differs there.
 
 ### Which guest is on the other side
 
@@ -739,6 +754,7 @@ Two things, and both are usually a package away:
 | --- | --- | --- |
 | **QEMU guest agent** (`qemu-ga`) | `apt install qemu-guest-agent`, `dnf install qemu-guest-agent` | `virutil sync`, `virutil exec sh` |
 | **rsync** | `apt install rsync`, `dnf install rsync` | `virutil sync`, `push` and `pull` — it is the guest-side copier for all three |
+| **cifs-utils** | `apt install cifs-utils`, `dnf install cifs-utils` | the same three, **from a Windows host only**: the guest mounts the host's SMB share ([A Linux guest on a Windows host](#a-linux-guest-on-a-windows-host)) |
 
 No drivers to install: virtio storage and net are in every distribution kernel,
 so a Linux guest boots on them as shipped. Nothing else is needed — the delivery
@@ -800,6 +816,65 @@ makes, so nothing has to be added on the host side. Confirm it from the host:
 ```
 virutil exec ping VM        # the agent answers
 ```
+
+### A Linux guest on a Windows host
+
+`virutil domain create VM ISO -o ID`, with an id that is not a Windows one
+(`ubuntu26.04`, `debian12`), builds the default q35/OVMF machine with what is
+Windows' own taken out: the RTC is in UTC, no virtio-win cdrom is attached, no
+key is pressed at boot, and the default forward is ssh (`10022:22`, or the next
+free host port). Every device is one a distribution kernel drives as shipped.
+
+**The install media is an ISO or a cloud image.** A qcow2 given where the ISO
+goes is copied to be the domain's disk, grown to `-s`, and booted; the image
+itself is not held.
+
+**`-u FILE` is cloud-init user-data.** It is written, beside a generated
+meta-data, to a FAT disk labelled `cidata` (`VM-seed.img`), which cloud-init's
+NoCloud source finds by that label:
+
+- For Ubuntu's installer ISO, FILE is an autoinstall file. The installer asks
+  before it acts on one unless the kernel line carries the word `autoinstall`:
+  at GRUB press `e`, add it to the `linux` line, press F10
+  (`virutil input key VM e`, `input type VM ' autoinstall'`, `input key VM f10`).
+  Have it end with `shutdown: poweroff` and start the domain again, for the
+  reason below.
+- For a cloud image, FILE is `#cloud-config`, read on the first boot and never
+  again. A cloud image has no user and no password without it, so one created
+  with no `-u` cannot be signed in to: delete it and create it again.
+
+In the guest, `qemu-guest-agent` for `exec` and everything that stands on it,
+and `rsync` and `cifs-utils` for the three transfers
+([On a Windows host](#on-a-windows-host) says how they move).
+
+What a Linux guest does differently on this host, measured on Ubuntu 26.04
+(kernel 7.0) and Ubuntu 18.04 (kernel 4.15):
+
+- **Restart it by shutting it down and starting it.** A guest-initiated reboot
+  at two vcpus kills the domain exactly as it does a Windows guest's (`failed
+  to get xsave state`, `WHPX: Unexpected VP exit code 4`, the monitor says
+  paused). `domain shutdown` is ACPI and a Linux guest honours it in seconds.
+- **No snapshot**, as for every guest here: `savevm` meets the same WHPX
+  refusal. Copy `VM.qcow2` while the domain is shut off.
+- **`exec sh` runs as root** with no display. `virutil ui run VM -- APP` starts
+  APP on the graphical logind session, as the user signed in there, through
+  that user's own systemd; `-s` runs it as root on the same display. A guest at
+  its login screen has no such session (exit 96): give it automatic login.
+- **An old kernel needs an older CPU model.** Ubuntu 18.04 panics at boot on
+  the default `-cpu Skylake-Client` (`init[1]: segfault at 0 ip
+  0000000000000000`, then `Attempted to kill init`), and on every named model
+  from `SandyBridge` up. It boots on `Westmere` and on `Nehalem`; Ubuntu 26.04
+  boots on the default. The cause is not known: taking `mpx`, `xsave`, or
+  `xsavec`, `xsaves` and `xgetbv1` off Skylake-Client did not help. Create such
+  a guest with `-N`, change the `-cpu` line of `VM.cmd` to `Westmere`, and
+  `domain start` it: the launcher is the domain, and virutil follows the edit.
+- **A cloud image's kernel may lack the display driver.** Ubuntu's
+  `linux-image-virtual` keeps `bochs-drm` in `linux-modules-extra-$(uname -r)`.
+  Without it a desktop installed on the image never shows: the display manager
+  restarts several times a second on a text console.
+- **`exec`'s children inherit the agent's umask**, 077 on Ubuntu 18.04: a
+  directory `push` creates there is `drwx------ root`, and a file a script
+  writes is 0600.
 
 ## virutil sync
 
@@ -911,7 +986,7 @@ unknown setting or an unrecognised directive is reported with its line number.
 | `-path` | Delete this guest path after copying — a directory is emptied and kept, a file is removed. |
 | `>pre CMD` | Run `CMD` in the guest's shell before the files reach it — PowerShell, or `/bin/sh` when `@guest=linux`. |
 | `>post CMD` | Run `CMD` in the guest's shell after they have. |
-| `>pre-ui CMD` | Like `>pre`, but launch `CMD` on the guest's *interactive desktop*, as the logged-on user (see `virutil ui`). Windows guest only. |
+| `>pre-ui CMD` | Like `>pre`, but launch `CMD` on the guest's *interactive desktop*, as the logged-on user (see `virutil ui`). A Windows guest; a Linux guest too from a Windows host. |
 | `>post-ui CMD` | Like `>post`, on the interactive desktop — e.g. relaunch a GUI app the sync replaced. |
 
 Map rules are the only unsigilled form. A line starting with punctuation that is
@@ -1035,10 +1110,13 @@ replaced. It is fire-and-forget: the rule returns as soon as the process
 starts. With no one logged on the rule fails with exit 96.
 
 The command is a command line, not a bare exe, so quote a path that contains
-spaces exactly as you would at a prompt. These rules are Windows-*guest*-only —
-a `@guest=linux` config that carries one is refused.
+spaces exactly as you would at a prompt.
 
-They work the same from a Windows host: `virutil ui` is on both drivers.
+They work the same from a Windows host: `virutil ui` is on both drivers. With
+`@guest=linux` the two drivers differ. The Windows driver launches the command
+on the guest's graphical session, through `/bin/sh`, as the user signed in
+there. The bash driver's `ui` reaches a Windows guest only, so it refuses a
+`@guest=linux` config that carries one of these rules.
 
 ### Example
 
@@ -1138,16 +1216,17 @@ mints a throwaway local account for the length of it. See
 transport. Declining the prompt is exit 98; a share that could not be published
 is 99.
 
-**A Windows guest only.** A config saying `@guest=linux` is refused by name,
-before anything is fetched. That is the same limit `push` and `pull` have on
-this host, not a limit of `sync`.
-
-The refusal comes before the fetch on purpose: an elevation prompt, a
-multi-gigabyte copy and then a refusal would be the worst available ordering.
+**A `@guest=linux` config delivers over the same share.** The guest mounts it
+and runs the `rsync` payload the Linux host sends, so the fetch rules, the map,
+the excludes, the cleanup rules and `>pre`/`>post` (run by `/bin/sh`, as root)
+read as they do there. The guest needs `cifs-utils`; every file arrives mode
+0755, and so does every directory on a map path, so keep a map destination out
+of `/tmp` and out of a 0700 home. See
+[On a Windows host](#on-a-windows-host) above.
 
 **`>pre-ui` and `>post-ui` work**, as they do on a Linux host: they launch
 through `virutil ui`, which is on this driver too, and need nothing staged in
-the guest first.
+the guest first. Here they reach a Linux guest as well.
 
 **Configs are looked up in `%USERPROFILE%\.virutils\conf\` and nowhere else.**
 The bash driver also falls back to `~/.config/virutils` so an install predating
@@ -1647,6 +1726,7 @@ covers the everyday operations in between.
 
 ```
 virutil domain create VM ISO [-s GiB] [-m MiB] [-c N] [-o ID] [-v ISO|none]
+virutil domain create VM ISO|IMAGE -o LINUX-ID [-u USER-DATA]   (Windows host)
 virutil domain delete VM
 virutil domain list
 virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]
@@ -1671,8 +1751,8 @@ The flags are what you vary per domain. Everything else is a property of the
 | `-s`, `--size GiB` | `64` | Disk size. |
 | `-m`, `--memory MiB` | half the host's | Guest RAM, rounded down to 512 MiB, floor 2048. |
 | `-c`, `--vcpus N` | half the host's, max 8 | Virtual CPUs. **Linux host only** — a Windows host creates the domain at 1 vcpu and refuses this flag, because a guest with more than one dies at its own reboot there and that is what Setup does twice. Set the count afterwards with `domain start VM -c N`. |
-| `-o`, `--osinfo ID` | **detected from the ISO** | libosinfo id; see `osinfo-query os`. On a Windows host only `winxp` means anything: it builds the legacy XP machine ([A Windows XP guest on a Windows host](#a-windows-xp-guest-on-a-windows-host)); any other id is ignored and says so. |
-| `-u`, `--unattend FILE` | none | **Windows host, `-o winxp` only.** A `winnt.sif`, written to a 1.44 MB floppy (`VM-a.img`) that XP Setup reads as A:. Leave the product key out of it. |
+| `-o`, `--osinfo ID` | **detected from the ISO** | libosinfo id; see `osinfo-query os`. On a Windows host there is no detection and the id picks one of three machines: `winxp` builds the legacy XP machine ([A Windows XP guest on a Windows host](#a-windows-xp-guest-on-a-windows-host)); an id that is not a Windows one (`ubuntu26.04`, `debian12`, `linux2024`) builds the default machine for a Linux guest ([A Linux guest on a Windows host](#a-linux-guest-on-a-windows-host)); any other Windows id is ignored and says so. |
+| `-u`, `--unattend FILE` | none | **Windows host only.** With `-o winxp`, a `winnt.sif`, written to a 1.44 MB floppy (`VM-a.img`) that XP Setup reads as A:. Leave the product key out of it. With a Linux id, cloud-init user-data, written beside a generated meta-data to a FAT disk labelled `cidata` (`VM-seed.img`). |
 | `-v`, `--virtio ISO` | `virtio-win*.iso` beside the install ISO | Driver ISO to attach as a second cdrom. `none` attaches none. |
 
 The disk image is always `$VIRUTILS_IMAGE_DIR/VM.qcow2` (default

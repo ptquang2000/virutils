@@ -43,7 +43,8 @@ every module, exit 0 for an asked-for help and 1 for a usage error.
 ```
 virutil domain create   VM ISO [-s GiB] [-m MiB] [-c N] [-o ID] [-v ISO|none]
                                [-p SPEC] [-N]            # Windows and macOS hosts
-                               [-u FILE]                 # Windows host, -o winxp only
+                               [-u FILE]                 # Windows host: -o winxp, or a Linux id
+                               # ISO may be a qcow2 cloud image: Windows host, a Linux id
                                # -c N: Linux and macOS hosts; a Windows host creates
                                #       at 1 vcpu and refuses it (section 9)
 virutil domain delete   VM
@@ -129,21 +130,22 @@ Invariants that are contract, not implementation:
   tests/win/xfer.ps1 and tests/linux/pull.sh hold `pull` to it.
 - `pull` wildcards match with the *guest's* own matching: case-insensitive on
   Windows, case-sensitive on Linux.
-- **On a Windows host, `push`, `pull` and `sync` reach a Windows guest only**,
-  and say so by name when asked for any other kind -- `sync` by refusing
-  `@guest=linux` out of the config, before it fetches anything. That is a gap in
-  the port rather than in the grammar -- the Linux-guest side is payload
-  selection against payloads that already exist -- and section 7 says what is
-  still unmeasured about it. The same host also needs Administrator per
-  transfer and mints a throwaway local account, because the share comes from
-  its own SMB server -- from the scheduled task `virutil xfer setup` registers,
-  or as one UAC prompt per transfer where setup never ran. The grammar, the
-  guest-side behaviour and the exit codes are unchanged by either.
+- **On a Windows host, `push`, `pull` and `sync` reach a Windows guest and a
+  Linux one over the same share.** The host needs Administrator per transfer
+  and mints a throwaway local account, because the share comes from its own SMB
+  server -- from the scheduled task `virutil xfer setup` registers, or as one
+  UAC prompt per transfer where setup never ran. A Linux guest mounts that
+  share (`mount -t cifs`, so it needs cifs-utils: exit 91 without) and runs the
+  payloads/linux copiers against the mount point. The grammar and the copier
+  payloads are unchanged by either. What the share changes for a Linux guest is
+  in section 7: every file arrives mode 0755, and a symlink does not cross.
 - **`sync`'s `>pre-ui` and `>post-ui` run rules are on both hosts**, because
   they are `virutil ui` and `ui` is on both (section 7). They were refused on
   the Windows driver while it had no `ui`; they now launch through the same
   guest script there as here. Every directive in a config means the same thing
-  on both hosts, except that the Windows one still refuses `@guest=linux`.
+  on both hosts, with one exception: a `@guest=linux` config that carries a ui
+  rule runs on the Windows driver and is refused by the bash one, whose `ui`
+  reaches a Windows guest only (section 7).
 - **On a macOS host, `sync`, `push`, `pull`, `ui` and `usb` are not there yet**,
   and each is refused by name with the reason rather than as an unknown module
   (section 7).
@@ -332,6 +334,7 @@ match on:
 | code | meaning |
 |---|---|
 | 90 | the guest has no rsync |
+| 91 | the guest has no mount.cifs (Windows host, Linux guest, push/pull/sync) |
 | 92 | mkdir failed in the guest (push) |
 | 93 | robocopy failed, exit >= 8 (push, sync) |
 | 94 | SRC matched nothing in the guest (pull) |
@@ -343,7 +346,8 @@ match on:
 
 Otherwise the guest's own exit code passes through (`exec`).
 
-90 through 95 are the guest's, and are the same on both hosts. 98 and 99 are
+90 through 95 are the guest's, and are the same on both hosts, except 91, which
+only a Windows host's mount payload raises. 98 and 99 are
 the Windows host's alone: a transfer there publishes a share on the host's own
 SMB server, which needs Administrator, and neither failure has any counterpart
 on a Linux host. They are two codes rather than one because declining the
@@ -378,27 +382,36 @@ payloads/linux/sync.sh       Linux guest    rsync the whole export onto /
 payloads/win/mount.ps1       Windows guest  authenticate to a credentialled share
 payloads/win/unmount.ps1     Windows guest  let go of it again
 payloads/win/ui.ps1          Windows guest  start a process on a session's desktop
+payloads/linux/mount.sh      Linux guest    mount a credentialled share (cifs)
+payloads/linux/unmount.sh    Linux guest    let go of it again
+payloads/linux/ui.sh         Linux guest    start a process on the graphical session
 ```
 
 Nine of them rather than the five this section first guessed at, because push
 needs two shapes on each side: robocopy cannot rename onto a new name, so a
 single file goes through Copy-Item, and the rsync side is split to match rather
 than to differ. The mount pair came later and is a different kind of thing;
-`ui.ps1` came last, when `ui` stopped wrapping PsExec.
+`ui.ps1` came when `ui` stopped wrapping PsExec, and the three Linux ones last,
+with a Linux guest on a Windows host.
 
-**The mount pair is keyed on the host, and it is the only pair that is.** Every
-other payload is keyed on the guest, because what a guest can run is the guest's
-business. These two exist because only one *host* has to authenticate: a Linux
-host serves an anonymous share and sends neither of them, and a Windows host
-cannot serve an anonymous one at all (section 7), so it sends them as their own
-agent calls around the copier payload. `mount.ps1` drops the guest's existing
+**The mount pairs are keyed on the host, and they are the only ones that are.**
+Every other payload is keyed on the guest, because what a guest can run is the
+guest's business. These exist because only one *host* has to authenticate: a
+Linux host serves an anonymous share, or an rsync daemon, and sends none of
+them, and a Windows host cannot serve an anonymous share at all (section 7), so
+it sends a pair as their own agent calls around the copier payload: the `.ps1`
+pair to a Windows guest, the `.sh` pair to a Linux one. `mount.sh` hands the
+Linux copiers a mount point where a Linux host hands them a daemon URL, which
+is why those copiers did not change. `ui.sh` is sent by the Windows driver
+only: the bash driver renders it for the golden file and has no Linux-guest
+`ui` yet. `mount.ps1` drops the guest's existing
 sessions to the host before mounting -- see the `1219` measurement in section 7
 -- and maps no drive letter, so the copier payloads keep addressing the bare UNC
 they are written and documented around.
 
 Adding a credential hole to the three Windows payloads instead was rejected: a
 hole left unfilled is refused by both renderers, so the bash driver would have
-to carry forever a hole it can never fill. Both drivers render all eleven and
+to carry forever a hole it can never fill. Both drivers render every payload and
 diff them against the one golden file, so this pair is held to the same identity
 as everything else even though only one driver ever sends it.
 
@@ -428,7 +441,7 @@ This is the only code the two implementations share, and it is the most
 carefully bisected code in the repo -- robocopy's exit code is a bitmap, not an
 error level; robocopy always takes a source *directory*, so a file is named as
 a filter on its parent. Keep it in one place. `tests/linux/payloads.sh` and
-`tests/win/payloads.ps1` render all eleven under both drivers and diff the result
+`tests/win/payloads.ps1` render every one under both drivers and diff the result
 against one golden file, which is what makes "byte-identical" a fact rather than
 an intention.
 
@@ -444,11 +457,10 @@ that works beats two half-ported.
 channel they both stand on is in place. `usb` is on both drivers. `snapshot` was
 ported and has been taken back out -- the question this section used to leave
 open was measured, the answer was no, and the answer took the command with it,
-below. `push`, `pull` and `sync` are ported, against a **Windows guest**: the
-question `push` and `pull` were blocked on was measured and decided, and what was
-decided is recorded below. What remains unported is a Linux guest from a Windows
-host, which is a later pass on the transport that now exists rather than a new
-question. `ui` is ported, below.
+below. `push`, `pull` and `sync` are ported, against a Windows guest and a Linux
+one: the question `push` and `pull` were blocked on was measured and decided,
+and what was decided is recorded below, with the Linux guest's half of it.
+`ui` is ported, below, and reaches a Linux guest from this driver only.
 
 ### The macOS host: `domain`, `snapshot` and `exec`
 
@@ -565,12 +577,12 @@ every pattern is given to both. What does not survive the mapping is an anchored
 pattern -- rsync reads a leading or embedded `/` as a position in the tree, and
 `/XF` matches on the name alone.
 
-**One thing in a config is refused by name, before the fetch:** `@guest=linux`,
-because this host reaches a Windows guest only. The obstacle is a property of
-the *host*, known before the config is opened, so there is no reason to spend a
-fetch, an elevation prompt and a delivery first. `>pre-ui`/`>post-ui` were
-refused the same way while this driver had no `ui`; they run now, as they do on
-the bash driver.
+**Nothing in a config is refused for the host's sake any more.** `@guest=linux`
+was, while this host reached a Windows guest only, and `>pre-ui`/`>post-ui`
+were while this driver had no `ui`. A `@guest=linux` config now delivers over
+the same share: the guest mounts it and `payloads/linux/sync.sh` copies the
+mount onto `/`, its `>pre`/`>post` rules run under `/bin/sh` as root, and its
+ui rules go to `payloads/linux/ui.sh`.
 
 ### `snapshot`: ported, measured, and taken back out
 
@@ -701,6 +713,20 @@ guest and no transfer, so it costs no more than `exec`. docs/ui-psexec.md
 records the PsExec reading this came from. `ui setup`, which used to deliver
 PsExec over `push`, is retired: it exits 0 and says so, and exit 97 is no
 longer raised.
+
+**A Linux guest, from the Windows driver.** The wall is the same one in another
+place: qemu-ga is a root service with no display. `payloads/linux/ui.sh` finds
+the graphical logind session (class user, type wayland or x11, active unless
+`-i N` names one) and has that user's own systemd start the process as a
+transient unit, because that manager holds the display and bus environment the
+session published. `-s` runs it as root with that environment. `--elevated`
+has no effect and says so. A guest at its login screen has no such session:
+exit 96, as on Windows. Measured on Ubuntu 26.04 (GNOME on Wayland, systemd
+259) and on Ubuntu 18.04 (GNOME on X11, systemd 237, where the unit is
+Type=simple because Type=exec arrived in 240). A process gone before its pid
+is read is reported as started and already exited, not as PID 0. The bash
+driver does not send `ui.sh`: its `ui` is still Windows-guest only, and porting
+it is that driver's work to measure.
 
 ### `shot`: on every host, from the hypervisor
 
@@ -881,10 +907,32 @@ nothing to do with authentication.
 The invoking user's own credential in the payload was deliberately **not**
 measured: the throwaway account proves the mechanism, and running it would put a
 real password on a virtio channel and into a guest's command history to learn
-nothing new. The Linux-guest side of the same share -- whether `mount -t cifs`
-will take an anonymous mount a Windows client refuses -- is unmeasured, and it
-matters, because the guest axis is where the two would differ. It is the one
-fact a Linux guest from a Windows host still waits on.
+nothing new.
+
+**The Linux-guest side of the same share is measured too**, and it did not need
+the anonymous mount this section used to ask about: `mount -t cifs` with the
+throwaway account's credential works (Ubuntu 26.04, kernel 7.0, and Ubuntu
+18.04, kernel 4.15, against this host's SMB server), so a Linux guest takes
+the same share, account and teardown as a Windows one and only the mount pair
+differs. The guest's rsync then reads or writes the mount point. Three things
+are properties of that mount rather than of the copier:
+
+- **Mode.** NTFS carries none, so the mount presents 0755 for every file and
+  directory and `rsync -p` delivers that. 0644 would deliver binaries that do
+  not run, and would rewrite a 0755 file already in the guest.
+- **Symlinks.** The mount is `mfsymlinks`, so a pull of a tree holding a link
+  writes a stub file rather than failing; the host removes the stubs and prints
+  each `link -> target`. A symlink named as SRC is refused, naming its target.
+- **Devices, sockets, owners** do not cross: rsync exits 23 and names the path.
+
+`sync` copies the mount onto `/`, so `rsync -p` also sets every directory on
+the way to a map destination to 0755 (measured: a 1777 directory above `@dest`
+came back 0755; `/` itself is put back). A destination under `/tmp` would take
+`/tmp`'s sticky bit with it.
+
+A stale mount is let go before a new one is made, lazily, for the reason
+`mount.ps1` drops stale sessions: a run that died between its mount and its
+unmount leaves a mount of a share the host has since retired.
 
 **Decided, on those measurements: a throwaway local account, minted per
 transfer.** `modules/win/xfer.ps1` is what that became, and these are the parts of
@@ -1083,7 +1131,7 @@ drivers:
 | | |
 |---|---|
 | `tests/linux/conformance.sh` | the runner. Every `--help` exits 0, every usage error exits 1, in both drivers; drives the two below. |
-| `tests/linux/payloads.sh`, `tests/win/payloads.ps1` | render all eleven payloads under each driver and diff both against `tests/golden/payloads.txt`. This is what makes section 6's "byte-identical" checkable. |
+| `tests/linux/payloads.sh`, `tests/win/payloads.ps1` | render every payload under each driver and diff both against `tests/golden/payloads.txt`. This is what makes section 6's "byte-identical" checkable. |
 | `tests/win/domain.ps1` | the launcher round trip: monitor port, agent channel and port forwards written, read back, edited and read again. |
 | `tests/win/usb.ps1` | a passed-through device and an emulated stick of each kind written into a launcher, read back beside a hand-written one, and taken out leaving the file as it was; `ports` rewriting the controller; `image`'s FAT32 layout and bytes. Then a real paused qemu with the default 4 root ports, plugged into over its monitor: the third stick behind the hub and said so, `cycle` without a leaked drive, `unplug` freeing the backend, a refused plug leaving nothing behind. Skips that half with no qemu. |
 | `tests/mac/domain.sh` | the macOS driver against a real hvf domain with no OS: create's files, start, port forwards live and in the launcher, every snapshot verb with the domain running and shut off, the launcher edits, delete. Driven from the runner on a Mac; skips anywhere else. |
@@ -1231,18 +1279,26 @@ thing neither driver may do, because it reports a change that was not made.
   are the only way in -- and says plainly that the guest address is not
   reachable, rather than printing 10.0.2.15 and letting someone spend an
   afternoon pinging it. It exits 0: the question has an answer, and that is it.
-- **`domain create -o ID` honours one id there, `winxp`, and ignores the
-  rest.** There is no libosinfo, so no other id is consulted; it stays in the
-  grammar so a command line written for one driver parses under the other, and
-  says so when used. `winxp` -- libosinfo's own id, so it names the same guest
+- **`domain create -o ID` picks one of three machines there.** There is no
+  libosinfo, so the id is read by its spelling alone. An id that is not a
+  Windows one (`ubuntu26.04`, `debian12`) builds the default machine for a
+  Linux guest: RTC in UTC, no virtio-win, no boot key press, ssh as the default
+  forward, and a qcow2 given where the ISO goes is copied to be the disk. A
+  Windows id other than `winxp` is ignored and says so; it stays in the
+  grammar so a command line written for one driver parses under the other.
+  `winxp` -- libosinfo's own id, so it names the same guest
   on both drivers -- builds a legacy PC that 32-bit Windows XP has inbox drivers
   for: SeaBIOS, i440fx, IDE, rtl8139, cirrus, UHCI, the guest agent on an ISA
   serial port, one vcpu. The header of `modules/win/domain.ps1` has the table
   and what was measured. `VIRUTILS_OSINFO` is still ignored on that host: with
   no ISO detection there is nothing for a fallback to fall back from.
-- **`domain create -u FILE` is a Windows-only addition, and `-o winxp` only.**
-  It writes FILE, a `winnt.sif`, to a 1.44 MB floppy that XP Setup reads as A:.
-  Without `-o winxp` it is refused by name: Windows 11 Setup reads
+- **`domain create -u FILE` is a Windows-only addition, for `-o winxp` and for
+  a Linux id.** With `winxp` it writes FILE, a `winnt.sif`, to a 1.44 MB floppy
+  that XP Setup reads as A:. With a Linux id FILE is cloud-init user-data,
+  written beside a generated meta-data to a FAT disk labelled `cidata`: an
+  autoinstall file for Ubuntu's installer, `#cloud-config` for a cloud image.
+  An empty FILE is refused rather than read as no `-u`. With any other id it is
+  refused by name: Windows 11 Setup reads
   `autounattend.xml`, which neither driver builds. The bash driver has no `-u`;
   virt-install's own `--unattend` is libosinfo's and is not wired through.
 - **`domain create -c N` is refused on a Windows host.** A domain is created

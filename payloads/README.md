@@ -12,10 +12,12 @@ filename: the renderer settles the half from the extension, which is what
 already settles the quoting. See `payload_render` in `modules/linux/payload` and
 `Invoke-Payload` in `modules/win/payload.ps1`.
 
-`mount.ps1` and `unmount.ps1` are the one exception, and §6 names them as such:
-they are keyed on the **host**, because only one host has to authenticate the
-share it is serving. A Linux host serves an anonymous share and sends neither of
-them. Both drivers still render both, and both are in the golden file, because
+The mount pairs (`mount.ps1`/`unmount.ps1`, `mount.sh`/`unmount.sh`) are the
+one exception, and §6 names them as such: they are keyed on the **host**,
+because only one host has to authenticate the share it is serving. A Linux host
+serves an anonymous share, or an rsync daemon, and sends none of them. `ui.sh`
+is sent by the Windows driver only so far. Both drivers still render all of
+them, and all are in the golden file, because
 that is what keeps "byte-identical" a fact rather than an intention -- the two
 renderers have to agree on text only one of them is obliged to use.
 
@@ -70,9 +72,17 @@ and `@` means nothing at all to `sh`.
 | `win/mount.ps1` | Windows guest | authenticate to a credentialled share (**Windows host only**) |
 | `win/unmount.ps1` | Windows guest | let go of it again (**Windows host only**) |
 | `win/ui.ps1` | Windows guest | start a process on a session's interactive desktop, as its user or SYSTEM |
+| `linux/mount.sh` | Linux guest | `mount -t cifs` a credentialled share under `/run/virutil` (**Windows host only**) |
+| `linux/unmount.sh` | Linux guest | let go of it again (**Windows host only**) |
+| `linux/ui.sh` | Linux guest | start a process on the graphical logind session, as its user or root (**Windows host only so far**) |
 
 Each prints one space-separated line on stdout, which its caller parses (`ui.ps1`'s
-is for a human and passes through); the shapes are documented at the head of each file.
+and `ui.sh`'s are for a human and pass through); the shapes are documented at the
+head of each file.
+
+From a Windows host the Linux copiers (`push-*.sh`, `pull.sh`, `sync.sh`) are
+handed `mount.sh`'s mount point where a Linux host hands them an rsync daemon's
+URL. They are the same text either way: rsync takes a path as readily as a URL.
 
 `tests/linux/payloads.sh` and `tests/win/payloads.ps1` render every one of them
 with fixed inputs and diff the result against `tests/golden/payloads.txt`. A
