@@ -58,7 +58,22 @@ for (( i = 0; i < 100; i++ )); do grep -qx ready "$WORK/fake.log" 2>/dev/null &&
 agent_need "$VM"
 
 # shellcheck source=../linux/exec-records.sh
+PS_DETACH_STARTS='Win32_Process -MethodName Create'
 source "$ROOT/tests/linux/exec-records.sh"
+
+# A captured ps call runs its script natively: the agent's x64 powershell gets
+# the launcher, and the script and the call's stdin reach it on its stdin.
+reset_model '{"pid":6200,"out":"ok"}'
+got="$(INPUT_B64="$(printf 'line one\nline two' | base64)"; exec_ps_text "'native job'" 2>/dev/null)"; rc=$?
+check 'ps runs through the native launcher' 'ok 0' "$got $rc"
+launcher="$(state | jq -r '.execs[0].text')"
+has '  which has WMI start the runner' 'Win32_Process -MethodName Create' "$launcher"
+has '  and prints the nonce first' 'virutil-call ' "$(sed -n 1p <<<"$launcher")"
+fed="$(state | jq -r '.execs[0].input')"
+handed="$(sed -n 1p <<<"$fed" | base64 -d | iconv -f UTF-16LE -t UTF-8)"
+has '  the script is the first line of its stdin' "'native job'" "$handed"
+check '  and the call'"'"'s stdin follows, byte for byte' $'line one\nline two' "$(sed 1d <<<"$fed")"
+check '  through one guest-exec' 1 "$(state | jq '.execs | length')"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

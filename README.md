@@ -757,10 +757,26 @@ virtio-win CD. Two consequences:
   ```
 
   One consequence worth knowing before testing anything architecture-sensitive:
-  **what `exec` runs, runs as x64 under emulation**, because its parent is the
-  x64 agent — PowerShell started through it reports `ProcessArchitecture` X64.
-  For x64 user-mode software that is the point; for anything that has to be
-  native ARM64, start it some other way (RDP, or a scheduled task).
+  **what the x64 agent starts runs as x64 under emulation**, and so does what
+  that starts: PowerShell under the agent reports `PROCESSOR_ARCHITECTURE` AMD64
+  and `ProcessArchitecture` X64. So on this host `exec ps` and `exec ps -d` do
+  not run their script under the agent: a launcher has WMI start it
+  (`Win32_Process.Create`), and it runs native, ARM64 / Arm64 (measured on
+  26H2 26300.9457). Output, exit code and stdin come back as before; it is
+  still SYSTEM in session 0, with the machine's environment. `exec cmd` is the
+  agent's own cmd.exe and still reports AMD64.
+
+  **During first-run setup the agent's MSI fails** (1603): it registers a VSS
+  provider through COM+, which is not ready yet (error 1722, 80110401), and
+  rolls everything back; `qemu-ga -s install` fails the same way. Unpack it
+  and make the service by hand instead:
+
+  ```
+  start /wait msiexec /a D:\guest-agent\qemu-ga-x86_64.msi /qn TARGETDIR=C:\qga
+  xcopy /e /i /y "C:\qga\QEMU Guest Agent\Qemu-ga" "C:\Program Files\Qemu-ga"
+  sc create QEMU-GA binPath= "\"C:\Program Files\Qemu-ga\qemu-ga.exe\" -d --retry-path" start= auto DisplayName= "QEMU Guest Agent"
+  net start qemu-ga
+  ```
 
   The same `w11\ARM64` folders also carry `viogpudo` (a virtio-gpu display
   driver) and `vioinput`; the domain uses ramfb and USB input today, so neither

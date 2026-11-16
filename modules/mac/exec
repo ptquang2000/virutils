@@ -363,40 +363,125 @@ $SCRIPT"
     fi
 }
 
-# exec_ps_text SCRIPT -- run SCRIPT in $VM's powershell, return its exit code.
-# Shared with the transports, once this host has them.
+# --- native, not emulated -----------------------------------------------------
 #
-# The wrapper's first line prints this call's nonce, which gexec checks for
+# A Windows guest here is Windows on Arm, and the agent is virtio-win's x64
+# qemu-ga: virtio-win ships no other. Everything the agent starts runs as x64
+# under emulation, and so does everything that starts -- powershell.exe and
+# cmd.exe are ARM64X, and take the architecture of the process that starts
+# them. Measured on win11-arm64 (26H2 26300.9457): powershell under the agent
+# says PROCESSOR_ARCHITECTURE AMD64 and ProcessArchitecture X64, and so does a
+# cmd.exe it starts with ShellExecute. A process Win32_Process.Create starts is
+# WMI's child, a native service, and says ARM64 / Arm64. An ARM64 driver or
+# build under test needs that, so `exec ps` runs its script there:
+#
+#   the agent runs GEXEC_PS_NATIVE_LAUNCHER (x64), which writes a runner
+#   .ps1 into a fresh folder under %SystemRoot%\Temp and starts it through
+#   Win32_Process.Create; the runner (ARM64) runs the encoded script with
+#   stdin, stdout and stderr on files there and writes its exit code last; the
+#   launcher waits for it, copies out and err to its own streams, removes the
+#   folder and exits with that code.
+#
+# The script reaches the launcher on its stdin, as the first line, and the
+# call's own stdin follows it byte for byte, so the command-line limit is the
+# one a direct call had. Still SYSTEM in session 0, as a direct call was, with
+# the machine's environment rather than the agent's. x64 software started from
+# the script runs emulated as it would for any ARM64 caller. `exec cmd` is
+# still the agent's x64 cmd.exe.
+GEXEC_PS_NATIVE_LAUNCHER=$(cat <<'PS'
+$ErrorActionPreference = 'Stop'
+$s = [Console]::OpenStandardInput(); $m = New-Object IO.MemoryStream; $s.CopyTo($m); $b = $m.ToArray()
+$n = [Array]::IndexOf($b, [byte]10); if ($n -lt 0) { $n = $b.Length }
+$d = Join-Path $env:SystemRoot ('Temp\virutil-' + [guid]::NewGuid().ToString('N'))
+$null = New-Item -ItemType Directory -Path $d
+$rc = 125
+try {
+    $in = New-Object byte[] ([Math]::Max(0, $b.Length - $n - 1))
+    if ($in.Length) { [Array]::Copy($b, $n + 1, $in, 0, $in.Length) }
+    [IO.File]::WriteAllBytes("$d\in", $in)
+    [IO.File]::WriteAllText("$d\enc", [Text.Encoding]::ASCII.GetString($b, 0, $n).Trim())
+    $ps = Join-Path $PSHOME 'powershell.exe'
+    [IO.File]::WriteAllText("$d\run.ps1", @"
+try {
+    `$p = Start-Process -FilePath '$ps' -ArgumentList ('-NoProfile -NonInteractive -OutputFormat Text -EncodedCommand ' + [IO.File]::ReadAllText('$d\enc')) -RedirectStandardInput '$d\in' -RedirectStandardOutput '$d\out' -RedirectStandardError '$d\err' -NoNewWindow -PassThru
+    `$null = `$p.Handle
+    `$p.WaitForExit()
+    `$c = `$p.ExitCode
+} catch { [IO.File]::AppendAllText('$d\err', (`$_ | Out-String)); `$c = 125 }
+[IO.File]::WriteAllText('$d\rc.tmp', [string]`$c)
+Move-Item -LiteralPath '$d\rc.tmp' -Destination '$d\rc'
+"@)
+    $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+        CommandLine = "`"$ps`" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$d\run.ps1`"" }
+    if ($r.ReturnValue -ne 0) { throw "Win32_Process.Create returned $($r.ReturnValue)" }
+    while (-not (Test-Path -LiteralPath "$d\rc")) {
+        if (-not (Get-Process -Id $r.ProcessId -ErrorAction SilentlyContinue)) {
+            Start-Sleep -Milliseconds 200
+            if (Test-Path -LiteralPath "$d\rc") { break }
+            throw "the native runner (pid $($r.ProcessId)) ended without an exit code"
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    foreach ($f in @(@('out', [Console]::OpenStandardOutput()), @('err', [Console]::OpenStandardError()))) {
+        if (Test-Path -LiteralPath "$d\$($f[0])") {
+            $x = [IO.File]::ReadAllBytes("$d\$($f[0])"); $f[1].Write($x, 0, $x.Length); $f[1].Flush()
+        }
+    }
+    $rc = [int][IO.File]::ReadAllText("$d\rc").Trim()
+} finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+exit $rc
+PS
+)
+
+# exec_ps_text SCRIPT -- run SCRIPT in $VM's powershell, natively (above),
+# return its exit code. Shared with the transports, once this host has them.
+#
+# The launcher's first line prints this call's nonce, which gexec checks for
 # and strips: an answer without it came from another process's record. See
-# "qemu-ga's exec records" above. A detached call goes through the launcher.
+# "qemu-ga's exec records" above. A detached call goes through the detach
+# launcher instead.
 exec_ps_text() {
-    local nonce
+    local enc
     if [ "$DETACH" = 1 ]; then
         exec_ps_detached "$1"
         return
     fi
+    exec_ps_encode "$1"
+    enc="$EXEC_PS_ENC"
+    # local, so gexec sees the launcher's stdin and the caller's is untouched
+    local stdin_b64="$INPUT_B64"
+    local INPUT_B64
+    INPUT_B64="$( { printf '%s\n' "$enc"
+                    [ -z "$stdin_b64" ] || base64 -d <<<"$stdin_b64"
+                  } | base64 | tr -d '\n')"
+    exec_ps_agent "$GEXEC_PS_NATIVE_LAUNCHER"
+}
+
+# exec_ps_agent SCRIPT -- run SCRIPT in the agent's own (x64) powershell, with
+# INPUT_B64 as its stdin, and return its exit code. The two launchers run here.
+exec_ps_agent() {
+    local nonce
     nonce="$(gexec_nonce)"
     exec_ps_encode "$1" "$nonce"
     gexec powershell.exe "$(jq -nc --arg e "$EXEC_PS_ENC" \
         '["-NoProfile","-NonInteractive","-OutputFormat","Text","-EncodedCommand",$e]')" "$nonce"
 }
 
-# The launcher behind `exec ps -d`, byte for byte the Windows driver's
-# ($script:GuestPsDetachLauncher in modules/win/exec.ps1). It reads the encoded
-# script from its stdin and starts it through ShellExecuteEx (UseShellExecute),
-# which hands the child no inherited handles: a child that inherited the
+# The launcher behind `exec ps -d`. It reads the encoded script from its stdin
+# and has WMI start it (Win32_Process.Create), so the script runs natively, as
+# a captured one does (see "native, not emulated" above); the Windows driver's
+# ($script:GuestPsDetachLauncher in modules/win/exec.ps1) uses ShellExecuteEx.
+# Either way the child inherits no handles: a child that inherited the
 # launcher's stdout and stderr pipes would hold them open, and qemu-ga calls a
-# process exited only once both have closed. The child runs as the launcher
-# does -- SYSTEM, the agent's environment -- and outlives it, as a detached
-# guest-exec did.
+# process exited only once both have closed. The child runs as SYSTEM, with the
+# machine's environment, and outlives the launcher, as a detached guest-exec
+# did.
 GEXEC_PS_DETACH_LAUNCHER='$e = [Console]::In.ReadToEnd().Trim()
-$si = New-Object System.Diagnostics.ProcessStartInfo
-$si.FileName = Join-Path $PSHOME '"'"'powershell.exe'"'"'
-$si.Arguments = '"'"'-NoProfile -NonInteractive -OutputFormat Text -EncodedCommand '"'"' + $e
-$si.UseShellExecute = $true
-$si.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
-$p = [System.Diagnostics.Process]::Start($si)
-[Console]::Out.WriteLine([string]$p.Id)'
+$ps = Join-Path $PSHOME '"'"'powershell.exe'"'"'
+$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+    CommandLine = "`"$ps`" -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand $e" }
+if ($r.ReturnValue -ne 0) { throw "Win32_Process.Create returned $($r.ReturnValue)" }
+[Console]::Out.WriteLine([string]$r.ProcessId)'
 
 # exec_ps_detached SCRIPT -- `exec ps -d`: start SCRIPT and print its pid,
 # leaving no qemu-ga record behind. The launcher is an ordinary captured call,
@@ -416,7 +501,7 @@ exec_ps_detached() {
     enc="$EXEC_PS_ENC"
     out="$(DETACH=0
            INPUT_B64="$(printf '%s' "$enc" | base64 | tr -d '\n')"
-           exec_ps_text "$GEXEC_PS_DETACH_LAUNCHER")" || rc=$?
+           exec_ps_agent "$GEXEC_PS_DETACH_LAUNCHER")" || rc=$?
     out="${out//[[:space:]]/}"
     if (( rc != 0 )) || [[ ! "$out" =~ ^[0-9]+$ ]]; then
         die "$VM could not start the detached script (launcher exit $rc);" \

@@ -135,7 +135,10 @@ check '  through one guest-exec' 1 "$(state | jq '.execs | length')"
 check '  which is captured, so it gets polled' true "$(state | jq -r '.execs[0].capture')"
 handed="$(state | jq -r '.execs[0].input' | tr -d '[:space:]' | base64 -d | iconv -f UTF-16LE -t UTF-8)"
 has '  the script reaches the launcher on stdin' "'long job'" "$handed"
-has '  and the launcher starts it shell-executed' 'UseShellExecute = $true' "$(state | jq -r '.execs[0].text')"
+# PS_DETACH_STARTS: how the driver's launcher starts the script, so that it
+# inherits none of the launcher's pipes. The macOS driver sets its own.
+has '  and the launcher starts it holding none of its pipes' "${PS_DETACH_STARTS:-UseShellExecute = \$true}" \
+    "$(state | jq -r '.execs[0].text')"
 check '  no record is left in qemu-ga' '' "$(recs)"
 check '  and nothing in the ledger' '' "$(ledger)"
 reset_model
