@@ -27,10 +27,9 @@
 #     host-to-host, so the copier is the host's; robocopy is on every Windows
 #     machine and is the same copier the guest runs. Get-SyncRobocopyExcludes
 #     is where an rsync exclude pattern becomes robocopy's /XF and /XD.
-#   * **@guest=linux is refused**, by name and up front. Assert-XferReady
-#     already refuses a Linux guest for push and pull -- see docs/contract.md
-#     section 7 -- and a config that names one is refused before anything is
-#     fetched rather than minutes later at the delivery.
+#   * **@guest=linux mounts the share** where the bash driver serves an rsync
+#     daemon: the same payloads/linux/sync.sh, handed the mount point for its
+#     source. NTFS carries no mode, so every delivered file arrives 0755.
 #
 # >pre-ui and >post-ui used to be a third: they run through 'virutil ui', and
 # this driver did not have it. It does now (modules/win/ui.ps1),
@@ -118,9 +117,10 @@ function Get-SyncUsage {
         'task with no prompt; without it the delivery prompts once. See'
         'README.md, "On a Windows host".'
         ''
-        'This driver delivers to a Windows guest only: a config saying'
-        '@guest=linux is refused; see docs/contract.md section 7. >pre-ui and'
-        '>post-ui run rules start as the user logged on to the guest console.'
+        'A config saying @guest=linux delivers onto / with rsync, from the'
+        'same share mounted in the guest (it needs cifs-utils beside rsync),'
+        'and its run rules are /bin/sh. >pre-ui and >post-ui run rules start'
+        'as the user logged on to the guest''s desktop.'
     )
 }
 
@@ -167,6 +167,7 @@ function Join-SyncDest {
 # for the lines a person reads. Cosmetic: nothing is addressed through it.
 function Get-SyncGuestShow {
     param([string]$Rel)
+    if ($script:SyncGuestOs -eq 'linux') { return '/' + $Rel }
     if (-not $Rel) { return 'C:\' }
     return 'C:\' + $Rel.Replace('/', '\')
 }
@@ -315,27 +316,13 @@ function Add-SyncRunRule {
     }
 }
 
-# Assert-SyncPortable CONF -- the one thing a config can ask for that this
-# driver has no way to do, refused before anything is fetched.
-#
-# Up front, rather than where it would be reached: the obstacle is a property
-# of the host, known before the config is even opened, so there is no reason to
-# spend a fetch, an elevation prompt and a delivery before saying so.
-#
-# >pre-ui and >post-ui were refused here too, as a group, while this driver had
-# no `ui`. They are not any more: Invoke-SyncRun hands them to
-# Invoke-UiRunCmdline, as the bash module hands them to ui_run_cmdline.
+# Assert-SyncPortable CONF -- what a config can ask for that this driver has
+# no way to do, refused before anything is fetched. Nothing, now: @guest=linux
+# was the last of it, and >pre-ui and >post-ui before that. Kept as the place
+# the next one goes, up front rather than where it would be reached, so a
+# fetch, an elevation prompt and a delivery are not spent before saying so.
 function Assert-SyncPortable {
     param([string]$Conf)
-
-    if ($script:SyncGuestOs -ne 'windows') {
-        Die @(
-            "$Conf says @guest=$($script:SyncGuestOs), and this host can only"
-            'deliver to a Windows guest so far -- the same limit push and pull'
-            'have here. The bash driver has the Linux side today; see'
-            'docs/contract.md section 7. Nothing was fetched.'
-        )
-    }
 }
 
 # --- copying, host-side -----------------------------------------------------
@@ -527,7 +514,8 @@ function Invoke-SyncRun {
             $label = "$When-ui"
         } else {
             [Console]::Out.WriteLine("run ($When): $($r.Cmd)")
-            Invoke-GuestPsText $Vm $r.Cmd
+            if ($script:SyncGuestOs -eq 'linux') { Invoke-GuestShText $Vm $r.Cmd }
+            else                                 { Invoke-GuestPsText $Vm $r.Cmd }
             $label = $When
         }
         if ($script:VirutilExit -ne 0) {
@@ -550,6 +538,8 @@ function Invoke-SyncRun {
 # one-line-per-outcome answer back.
 function Invoke-SyncCleanup {
     param([string]$Vm)
+
+    if ($script:SyncGuestOs -eq 'linux') { Invoke-SyncCleanupLinux $Vm; return }
 
     $pats = @()
     foreach ($raw in @($script:SyncCleanup)) {
@@ -599,6 +589,65 @@ function Invoke-SyncCleanup {
     Write-SyncCleanupReport $out
 }
 
+# Invoke-SyncCleanupLinux VM -- the same rules in a Linux guest, and the bash
+# module's sync_lin_cleanup_fn line for line: one shell function, called once
+# per pattern with the pattern as its argument.
+#
+# The globbing is the whole design problem. A pattern has to be expanded by the
+# guest, and writing it into the script as source would make every pattern
+# shell source. Field splitting and pathname expansion are separate steps and
+# only the first reads IFS: with IFS empty, `set -- $pat` splits into no fields
+# and the glob still expands to one field per match. So the pattern travels as
+# data in a single-quoted word, whatever is in it, and still globs. Existence
+# is tested rather than left to the glob, since sh has no nullglob.
+function Invoke-SyncCleanupLinux {
+    param([string]$Vm)
+
+    $pats = @()
+    foreach ($raw in @($script:SyncCleanup)) {
+        $pat = ConvertTo-GuestPosixPath $raw 'cleanup path'
+        if ($pat -notmatch '/') {
+            Warn "refusing unsafe cleanup pattern: /$pat"
+            continue
+        }
+        $pats += '/' + $pat
+    }
+    if ($pats.Count -eq 0) { return }
+
+    $lines = @(
+        'clean() {'
+        '  pat=$1 hit=0 oldifs=$IFS'
+        '  IFS=""; set -- $pat; IFS=$oldifs'
+        '  for f do'
+        '    [ -e "$f" ] || [ -L "$f" ] || continue'
+        '    hit=1'
+        '    rel=${f#/}'
+        '    case $rel in */*) ;; *) echo "unsafe $f"; continue ;; esac'
+        '    if [ -d "$f" ] && [ ! -L "$f" ]; then'
+        '      n=0'
+        '      for k in "$f"/* "$f"/.[!.]* "$f"/..?*; do'
+        '        [ -e "$k" ] || [ -L "$k" ] || continue'
+        '        if rm -rf -- "$k" 2>/dev/null; then n=$((n+1))'
+        '        else echo "locked $k"; fi'
+        '      done'
+        '      echo "emptied $n $f"'
+        '    elif rm -f -- "$f" 2>/dev/null; then echo "deleted $f"'
+        '    else echo "locked $f"'
+        '    fi'
+        '  done'
+        '  [ "$hit" = 1 ] || echo "absent $pat"'
+        '}'
+    )
+    foreach ($pat in $pats) { $lines += "clean $(ConvertTo-ShLiteral $pat)" }
+
+    $out = Invoke-GuestShText $Vm ($lines -join "`n") -Capture
+    if ($script:VirutilExit -ne 0) {
+        Die @('the guest could not run the cleanup rules; its own error is above.'
+              'What was delivered is already in place.')
+    }
+    Write-SyncCleanupReport $out
+}
+
 # Write-SyncCleanupReport OUT -- print what the guest reported. The protocol is
 # one line per outcome: 'absent PATH', 'unsafe PATH', 'locked PATH',
 # 'deleted PATH', 'emptied N PATH'.
@@ -639,14 +688,19 @@ function Write-SyncReport {
     param([string]$Vm, [string]$Reported, [double]$Ms)
 
     # A line that is missing or malformed is a stop, never "nothing copied".
-    $f      = @((Assert-XferReported $Vm $Reported '^[01] \d+$') -split '\s+')
+    # A Linux guest's first number is a count rather than a flag: rsync's
+    # itemised lines are not localised, so they can be counted.
+    $linux  = ($script:SyncGuestOs -eq 'linux')
+    $shape  = if ($linux) { '^\d+ \d+$' } else { '^[01] \d+$' }
+    $f      = @((Assert-XferReported $Vm $Reported $shape) -split '\s+')
     $copied = [int]($f[0])
     $gms    = [double]($f[1])
 
     $what = "$($script:SyncFiles) file"
     if ($script:SyncFiles -ne 1) { $what += 's' }
-    if ($copied) { $what += ' offered, the ones that differed copied' }
-    else         { $what += ' offered, all already current in the guest' }
+    if ($copied -and $linux) { $what += " offered, $copied copied" }
+    elseif ($copied)         { $what += ' offered, the ones that differed copied' }
+    else                     { $what += ' offered, all already current in the guest' }
     [Console]::Out.WriteLine("$Vm`: $what in $(Format-Duration $gms)")
 }
 
@@ -655,6 +709,7 @@ function Write-SyncReport {
 # reads the same table push does.
 function Sync-Die {
     param([int]$Rc)
+    if ($script:SyncGuestOs -eq 'linux') { Stop-XferRsync $Rc 'the delivery' }
     if ($Rc -eq 93) {
         DieWith $Rc @('robocopy could not deliver the tree in the guest (its exit'
                       'code is above). Anything it did copy is left where it'
@@ -733,9 +788,22 @@ function Sync-Main {
 
     # Before the fetch: a guest in the wrong state is worth saying so before
     # spending minutes copying a build tree, and before the elevation prompt.
-    # Assert-XferReady is also what asks the guest what it is, so a config
-    # saying @guest=windows against a Linux guest is caught by the same call.
     Assert-XferReady $vm
+
+    # @guest against what the guest says it is, which Assert-XferReady has just
+    # asked. A warning and not a correction, as on the bash driver: @guest
+    # decides which copier is sent and which shell the run rules were written
+    # for, so silently switching would run a config's powershell through
+    # /bin/sh -- and the config is the thing a person can fix.
+    if ($script:XferGuestOs -ne $script:SyncGuestOs) {
+        Warn @(
+            "   warning: $conf says @guest=$($script:SyncGuestOs), but $vm reports"
+            "$($script:XferGuestOs). The delivery and the run rules are about to be"
+            "$($script:SyncGuestOs)-shaped. If that is wrong, fix @guest rather than"
+            'reading past this -- the copier and the shell both come from it.'
+        )
+        $script:XferGuestOs = $script:SyncGuestOs
+    }
 
     # --- fetch: build tree -> staging ---------------------------------------
     if (@($script:SyncFetch).Count -eq 0) { Die "no fetch rules in $conf" }
@@ -800,17 +868,23 @@ function Invoke-SyncDelivery {
             # is the number that says how long to wait. It is the whole tree,
             # though, and the guest will move only part of it -- so the line
             # after the transfer is the one that says what actually crossed.
+            $guestRoot = if ($script:SyncGuestOs -eq 'linux') { '/' } else { 'C:\' }
             [Console]::Out.WriteLine(
                 "deliver: $($script:SyncFiles) file(s), " +
-                "$(Format-Bytes $script:SyncBytes) -> $Vm C:\")
+                "$(Format-Bytes $script:SyncBytes) -> $Vm $guestRoot")
 
             # Here, and no sooner: the delivery tree is built and served, so a
             # rule that frees a locked file ("stop the service") is not holding
             # the guest open across the build above, which can take minutes.
             Invoke-SyncRun $Vm 'pre' $script:SyncRunPre
 
-            $text = Invoke-Payload 'sync.ps1' @{ SRC = $Session.Unc }
-            $out  = Invoke-GuestPsText $Vm $text -Capture
+            if ($script:SyncGuestOs -eq 'linux') {
+                $text = Invoke-Payload 'sync.sh' @{ SRC = "$($Session.Mount)/" }
+                $out  = Invoke-GuestShText $Vm $text -Capture
+            } else {
+                $text = Invoke-Payload 'sync.ps1' @{ SRC = $Session.Unc }
+                $out  = Invoke-GuestPsText $Vm $text -Capture
+            }
             if ($script:VirutilExit -ne 0) { Sync-Die $script:VirutilExit }
             return $out
         }

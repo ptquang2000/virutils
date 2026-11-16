@@ -50,6 +50,7 @@ function ConvertTo-ShLiteral {
 # are the same in both drivers by definition.
 $script:PayloadCodes = @{
     RC_NO_RSYNC     = 90
+    RC_NO_CIFS      = 91
     RC_PUSH_MKDIR   = 92
     RC_PUSH_ROBO    = 93
     RC_PULL_NOMATCH = 94

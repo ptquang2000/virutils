@@ -37,6 +37,11 @@ $munc = '\\10.0.2.2\k7m3qp9wr2xz'
 $muser = 'vxp-k7m3qp9wr2xz'
 $mpass = 'Pa55w0rdPa55w0rdPa55w0rd'
 
+# The same share as a Linux guest is given it: mount.sh and unmount.sh are the
+# mount pair's other half, sent to a Linux guest by this driver alone.
+$mposix = '//10.0.2.2/k7m3qp9wr2xz'
+$mmnt   = '/run/virutil/k7m3qp9wr2xz'
+
 # LF throughout and written to the raw stdout stream: the golden file is the
 # bash harness's output, and a CRLF here would fail a comparison that is about
 # the payloads rather than about line endings.
@@ -66,3 +71,8 @@ Section 'unmount.ps1'           (Invoke-Payload 'unmount.ps1' @{ UNC = $munc })
 Section 'ui.ps1 argv'           (Invoke-Payload 'ui.ps1' @{ SESSION = '2'; AS = 'user'; ELEVATE = '1'; ARGV = (@('C:\Program Files\App\app.exe', "it's", '--flag') -join [char]0x1F); CMDLINE = '' })
 Section 'ui.ps1 cmdline'        (Invoke-Payload 'ui.ps1' @{ SESSION = ''; AS = 'user'; ELEVATE = ''; ARGV = ''; CMDLINE = '"C:\Program Files\App\app.exe" --restored' })
 Section 'ui.ps1 system'         (Invoke-Payload 'ui.ps1' @{ SESSION = ''; AS = 'system'; ELEVATE = ''; ARGV = 'notepad.exe'; CMDLINE = '' })
+Section 'mount.sh'               (Invoke-Payload 'mount.sh'   @{ UNC = $mposix; USER = $muser; PASS = $mpass; MNT = $mmnt })
+Section 'unmount.sh'             (Invoke-Payload 'unmount.sh' @{ MNT = $mmnt })
+Section 'ui.sh argv'             (Invoke-Payload 'ui.sh' @{ SESSION = '2'; AS = 'user'; ARGV = (@('/opt/My App/app', "it's", '--flag') -join [char]0x1F); CMDLINE = '' })
+Section 'ui.sh cmdline'          (Invoke-Payload 'ui.sh' @{ SESSION = ''; AS = 'user'; ARGV = ''; CMDLINE = '"/opt/My App/app" --restored' })
+Section 'ui.sh system'           (Invoke-Payload 'ui.sh' @{ SESSION = ''; AS = 'system'; ARGV = 'gnome-text-editor'; CMDLINE = '' })

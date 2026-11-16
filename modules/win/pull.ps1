@@ -27,10 +27,11 @@ function Get-PullUsage {
         ''
         '  VM   domain to read from; it has to be running, since the copy is'
         '       driven from inside it'
-        "  SRC  guest path, relative to the guest's root -- C:\. Wildcards are"
-        '       allowed and match case-INsensitively, since the guest does the'
-        "       matching itself. Backslashes and a C:\ prefix are tolerated;"
-        "       '..' is refused."
+        "  SRC  guest path, relative to the guest's root -- C:\, or / in a"
+        '       Linux guest. Wildcards are allowed and the guest does the'
+        '       matching itself: case-INsensitively on Windows, as its own'
+        '       shell does on Linux. On Windows, backslashes and a C:\ prefix'
+        "       are tolerated; '..' is refused."
         '  DST  host directory to copy into (created if needed) -- or, when SRC'
         '       is one file with no wildcard and DST does not exist and has no'
         '       trailing \, the file to write: pull VM logs\run.json out\run.json'
@@ -38,7 +39,9 @@ function Get-PullUsage {
         '  -h, --help              this message'
         ''
         'A directory source is copied recursively. The guest copies it out'
-        'itself with robocopy and so moves only what changed.'
+        'itself -- robocopy on Windows, rsync on Linux -- and so moves only'
+        "what changed. The guest's OS is asked of its agent, not flagged. A"
+        'Linux guest mounts the share, so it needs cifs-utils beside rsync.'
         ''
         "On this host the share comes from the machine's own SMB server, so the"
         'transfer needs Administrator and mints a throwaway local account that'
@@ -80,10 +83,17 @@ function Pull-Main {
     if (-not $vm -or -not $src -or $seen -lt 3) { Usage (Get-PullUsage) 1 }
 
     Assert-XferReady $vm
+    $linux = ($script:XferGuestOs -eq 'linux')
 
-    $rel = ConvertTo-GuestWindowsPath $src 'source'
-    if (-not $rel) { Die 'source may not be the root of C:\' }
-    $guestSrc = 'C:\' + $rel.Replace('/', '\')
+    if ($linux) {
+        $rel = ConvertTo-GuestPosixPath $src 'source'
+        if (-not $rel) { Die 'source may not be /' }
+        $guestSrc = '/' + $rel
+    } else {
+        $rel = ConvertTo-GuestWindowsPath $src 'source'
+        if (-not $rel) { Die 'source may not be the root of C:\' }
+        $guestSrc = 'C:\' + $rel.Replace('/', '\')
+    }
 
     # Resolved to an absolute path before anything is staged: the staging seed
     # reads it and the copy back writes it, and a relative path would be
@@ -99,7 +109,7 @@ function Pull-Main {
     # which way to stage and Move-PullResult decides where it lands.
     $asFile = -not (Test-Path -LiteralPath $dstFull) -and
               -not ($dst.EndsWith('\') -or $dst.EndsWith('/')) -and
-              $guestSrc -notmatch '[*?]'
+              $guestSrc -notmatch $(if ($linux) { '[*?\[]' } else { '[*?]' })
     $dstDir = if ($asFile) { Split-Path -Parent $dstFull } else { $dstFull }
     if (-not (Test-Path -LiteralPath $dstDir)) {
         try { New-Item -ItemType Directory -Force -Path $dstDir | Out-Null }
@@ -116,8 +126,13 @@ function Pull-Main {
     $reported = Invoke-XferTransfer -Vm $vm @stageArgs -Write -Body {
         param($Session, $Stage)
 
-        $text = Invoke-Payload 'pull.ps1' @{ SRC = $guestSrc; DST = $Session.Unc }
-        $out = Invoke-GuestPsText $vm $text -Capture
+        if ($linux) {
+            $text = Invoke-Payload 'pull.sh' @{ SRC = $guestSrc; DST = "$($Session.Mount)/" }
+            $out = Invoke-GuestShText $vm $text -Capture
+        } else {
+            $text = Invoke-Payload 'pull.ps1' @{ SRC = $guestSrc; DST = $Session.Unc }
+            $out = Invoke-GuestPsText $vm $text -Capture
+        }
         $rc  = $script:VirutilExit
 
         # Out of the staging tree and into what the caller named, while the
@@ -128,9 +143,36 @@ function Pull-Main {
         # driver serves DST itself, so a copy that failed halfway leaves what it
         # managed in DST; staging would otherwise throw that away, and "anything
         # it did copy is left where it landed" is what pull says on both hosts.
+        # A Linux guest's symlinks, before anything is moved: see
+        # Remove-PullLinkStubs. On the failure path too, so a partial copy
+        # never leaves a stub in DST either.
+        $links = @()
+        if ($linux) { try { $links = @(Remove-PullLinkStubs $Stage) } catch { $links = @() } }
+
         if ($rc -ne 0) {
             try { Move-PullResult $Stage $dstFull $asFile 'partial copy' } catch { }
-            Pull-Die $rc $guestSrc
+            Pull-Die $rc $guestSrc -Linux:$linux
+        }
+        if ($links.Count -gt 0) {
+            # SRC itself was the link: the guest matched one file, and that file
+            # is the stub just removed. Whether DST was to be a file or is a
+            # directory that already holds other things, nothing came across,
+            # and "1 file pulled" with exit 0 would say otherwise.
+            $srcLeaf = ($guestSrc.TrimEnd('/') -split '/')[-1]
+            if ($links.Count -eq 1 -and $links[0].Name -eq $srcLeaf -and
+                (@($out) -join "`n") -match '(?m)^1 0 \d+\s*$') {
+                Die @(
+                    "$guestSrc is a symbolic link to $($links[0].Target), and the"
+                    'share a Windows host serves cannot hold a link. Nothing was'
+                    'copied: pull the file it points at.'
+                )
+            }
+            $shown = @($links | Select-Object -First 10 | ForEach-Object { "  $($_.Name) -> $($_.Target)" })
+            if ($links.Count -gt 10) { $shown += "  ... and $($links.Count - 10) more" }
+            Warn (@(
+                "$($links.Count) symbolic link(s) in the guest were left out: the share a"
+                'Windows host serves cannot hold a link. Pull what they point at:'
+            ) + $shown)
         }
         Move-PullResult $Stage $dstFull $asFile `
             "the guest copied the files out, but they could not be moved from the staging tree into $dstFull"
@@ -139,6 +181,39 @@ function Pull-Main {
     $clock.Stop()
 
     Write-PullReport $vm $reported $clock.ElapsedMilliseconds
+}
+
+# Remove-PullLinkStubs STAGE -- take a Linux guest's symlinks back out of what
+# it copied, and say what each pointed at.
+#
+# The guest's rsync copies a symlink as a symlink, and the share is NTFS behind
+# an SMB server that will not make one for it. mount.sh mounts with mfsymlinks
+# so that is not an error -- a tree with one link in it would otherwise come
+# back as "only part crossed", exit 23, every time. What mfsymlinks writes
+# instead is a stub: a file of exactly 1067 bytes reading "XSym", the target's
+# length, an md5 of it, and the target. Measured: `pull VM /etc/os-release
+# out.txt` wrote that stub as out.txt and reported one file pulled.
+#
+# So the stubs are removed here, before the copy back, and named to the caller
+# with their targets. A file is one only if it is that size *and* parses.
+function Remove-PullLinkStubs {
+    param([string]$Stage)
+    $found = @()
+    foreach ($f in Get-ChildItem -LiteralPath $Stage -Recurse -File -Force -ErrorAction SilentlyContinue) {
+        if ($f.Length -ne 1067) { continue }
+        $bytes = [IO.File]::ReadAllBytes($f.FullName)
+        $head  = [Text.Encoding]::ASCII.GetString($bytes, 0, 43)
+        $m = [regex]::Match($head, '\AXSym\n(\d{4})\n[0-9a-f]{32}\n')
+        if (-not $m.Success) { continue }
+        $len = [int]$m.Groups[1].Value
+        if ($len -lt 1 -or 43 + $len -gt $bytes.Length) { continue }
+        [IO.File]::Delete($f.FullName)
+        $found += [pscustomobject]@{
+            Name   = $f.FullName.Substring($Stage.Length).TrimStart('\').Replace('\', '/')
+            Target = [Text.Encoding]::UTF8.GetString($bytes, 43, $len)
+        }
+    }
+    return $found
 }
 
 # Move-PullResult STAGE DST ASFILE WHAT -- what the guest copied into STAGE, put
@@ -190,7 +265,18 @@ function Write-PullReport {
 # line above. The codes are section 5 of the contract and are the guest's, so
 # this is the same table the bash driver's pull_smb_die reads.
 function Pull-Die {
-    param([int]$Rc, [string]$GuestSrc)
+    param([int]$Rc, [string]$GuestSrc, [switch]$Linux)
+    if ($Linux) {
+        if ($Rc -eq 94) {
+            DieWith $Rc @(
+                "no match in the guest for $GuestSrc."
+                "The pattern is expanded by the guest's own shell, so it"
+                'matches case-sensitively -- unlike the Windows side, where'
+                'Windows does the matching.'
+            )
+        }
+        Stop-XferRsync $Rc 'the files being read out'
+    }
     switch ($Rc) {
         94 { DieWith $Rc "no match in the guest for $GuestSrc" }
         95 { DieWith $Rc @('robocopy could not complete the copy in the guest (its'

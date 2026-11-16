@@ -445,7 +445,7 @@ function Start-GuestPsDetached {
 # one is left a plain guest-exec, and the ledger reaps its record.
 function Invoke-GuestShText {
     param([Parameter(Mandatory)][string]$Vm, [Parameter(Mandatory)][string]$Script,
-          [switch]$Detach, [switch]$Emit, [string]$InputB64 = '')
+          [switch]$Detach, [switch]$Capture, [switch]$Emit, [string]$InputB64 = '')
 
     $nonce = ''
     $text = "set -e`n$Script"
@@ -463,7 +463,7 @@ function Invoke-GuestShText {
         )
     }
 
-    Invoke-GuestExec $Vm '/bin/sh' @('-c', $text) -Detach:$Detach -Emit:$Emit -InputB64 $InputB64 -Nonce $nonce
+    Invoke-GuestExec $Vm '/bin/sh' @('-c', $text) -Detach:$Detach -Capture:$Capture -Emit:$Emit -InputB64 $InputB64 -Nonce $nonce
 }
 
 # --- the command line -------------------------------------------------------

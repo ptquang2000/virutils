@@ -1,4 +1,4 @@
-# ui -- launch a process on a Windows guest's *interactive* desktop.
+# ui -- launch a process on a guest's *interactive* desktop.
 #
 #   virutil ui run VM [-i N] [-s] [--elevated] [--] APP...
 #
@@ -9,6 +9,11 @@
 # agent already gives it: the guest half is payloads/win/ui.ps1, shared byte for
 # byte with the bash driver, which says how; docs/ui-psexec.md says why that
 # recipe. Nothing is staged in the guest first.
+#
+# A Linux guest has the same wall in another place: qemu-ga is a root service
+# with no display. payloads/linux/ui.sh finds the graphical logind session and
+# has that user's own systemd start the process, which is where the session's
+# display and bus are known. Which guest it is, is asked (Get-GuestOs).
 
 Set-StrictMode -Version Latest
 
@@ -20,7 +25,8 @@ function Get-UiUsage {
         'usage: virutil ui run VM [-i N] [-s] [--elevated] [--] APP...'
         ''
         '  run VM APP...   start APP on a guest session''s interactive desktop'
-        '                  (winsta0\default) and return without waiting for it.'
+        '                  (winsta0\default; in a Linux guest the graphical'
+        '                  logind session) and return without waiting for it.'
         '                  APP is a program plus its arguments; a bare name is'
         '                  looked up on the guest''s PATH. Prints'
         '                  "started PID <pid> in session <n> as <user>".'
@@ -29,10 +35,13 @@ function Get-UiUsage {
         '                  environment and profile -- what double-clicking it'
         '                  there would give, UAC-filtered if they are an admin.'
         ''
-        '    -i, --session N  that session instead of the console one'
-        '    -s, --system     as SYSTEM on that session''s desktop'
+        '    -i, --session N  that session instead of the console one (a'
+        '                     Linux guest: a logind session id)'
+        '    -s, --system     as SYSTEM on that session''s desktop (root, in'
+        '                     a Linux guest)'
         '    --elevated       the user''s full admin token, when UAC split it'
-        '                     -- no prompt. No effect with -s.'
+        '                     -- no prompt. No effect with -s, and none in a'
+        '                     Linux guest, which has no split token: use -s.'
         '    --               end of options; everything after it is APP'
         ''
         '                  Options stop at the first word that is not one, so'
@@ -50,6 +59,21 @@ function Invoke-UiDispatch {
     param([string]$Vm, [hashtable]$Values)
     $v = @{ SESSION = ''; AS = 'user'; ELEVATE = ''; ARGV = ''; CMDLINE = '' }
     foreach ($k in $Values.Keys) { $v[$k] = $Values[$k] }
+    if ((Get-GuestOs $Vm) -eq 'linux') {
+        if ($v['ELEVATE']) {
+            Warn '--elevated has no effect in a Linux guest: there is no split token. -s runs as root.'
+        }
+        $v.Remove('ELEVATE')
+        Invoke-GuestShText $Vm (Invoke-Payload 'ui.sh' $v)
+        if ($script:VirutilExit -eq $script:UiRcNoUser) {
+            DieWith $script:UiRcNoUser @(
+                "$Vm`: nothing to launch into -- log a user on to the guest's desktop"
+                'first (a guest at its login screen has no graphical session;'
+                'automatic login fixes it for good).'
+            )
+        }
+        return
+    }
     Invoke-GuestPsText $Vm (Invoke-Payload 'ui.ps1' $v)
     if ($script:VirutilExit -eq $script:UiRcNoUser) {
         DieWith $script:UiRcNoUser @("$Vm`: nothing to launch into -- log a user on to the guest first,"

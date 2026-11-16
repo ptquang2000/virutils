@@ -23,15 +23,18 @@ $ErrorActionPreference = 'Stop'
 # `sync` is here now, and it did drop in beside them with nothing rearranged:
 # its whole guest half is that transport plus the payload both drivers already
 # shared. What it added to xfer is one way of filling a staging directory --
-# sync builds its delivery tree there rather than copying one in. It delivers to
-# a **Windows guest** only, and refuses `@guest=linux` by name, up front: the
-# limit push and pull already have here.
+# sync builds its delivery tree there rather than copying one in.
+#
+# All three reach a Linux guest as well: it mounts the same share (cifs) and
+# runs the payloads/linux copiers against the mount point, so `@guest=linux` is
+# no longer refused here.
 #
 # `ui` is here too, and was the last of the bash tree's modules this list was
-# waiting on that could port at all. It is Windows-*guest*-only but was always
-# host-portable: its guest half is one powershell script both drivers send, and
-# its delivery is push's. With it came sync's `>pre-ui` / `>post-ui` run rules,
-# which are `ui` and which sync used to refuse here for that reason alone.
+# waiting on that could port at all. Its Windows-guest half is one powershell
+# script both drivers send, and its delivery is exec's. With it came sync's
+# `>pre-ui` / `>post-ui` run rules, which are `ui` and which sync used to refuse
+# here for that reason alone. A Linux guest's half is payloads/linux/ui.sh,
+# which only this driver sends so far.
 #
 # `usb` is on both drivers, by two mechanisms: device_add over the QEMU monitor
 # here, a libvirt <hostdev> there. What is on neither is the WSL case, where
@@ -137,8 +140,8 @@ function Get-TopUsage {
         ''
         'guest'
         '  exec       run commands inside a guest via the QEMU guest agent'
-        '  ui         launch a process on a Windows guest''s interactive desktop,'
-        '             as the logged-on user or SYSTEM'
+        '  ui         launch a process on a guest''s interactive desktop, as the'
+        '             logged-on user or SYSTEM (root in a Linux guest)'
         '  shot       capture a guest''s screen to a PNG on this host'
         '  input      click, drag, scroll, press keys and type in a guest, from this host'
         ''
@@ -156,7 +159,8 @@ function Get-TopUsage {
         'so they need Administrator and mint a throwaway local account for the'
         "length of the transfer. After 'virutil xfer setup' (once, elevated) they"
         'get it from a scheduled task with no prompt; without it, each prompts'
-        'once. They deliver to a Windows guest only. See README.md.'
+        'once. A Linux guest mounts that share, so it needs cifs-utils beside'
+        'rsync. See README.md.'
         ''
         "Run 'virutil <module>' for a module's own usage."
     )

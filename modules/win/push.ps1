@@ -15,6 +15,11 @@
 # the scheduled task `virutil xfer setup` registers, or as one UAC prompt per
 # transfer where setup never ran. The guest side is byte-identical: the same payloads/push-*.ps1
 # both drivers send.
+#
+# A Linux guest is asked for, not flagged (Get-GuestOs). It mounts the same
+# share and runs the payloads/linux/push-*.sh the bash driver sends, handed the
+# mount point where that driver hands them an rsync daemon's URL. DST is then
+# spelled from / and a backslash in it is a character, not a separator.
 
 function Get-PushUsage {
     @(
@@ -23,15 +28,19 @@ function Get-PushUsage {
         '  VM   domain to copy into; it has to be running, since the copy is'
         '       delivered over its own network'
         '  SRC  host file or directory to copy'
-        "  DST  guest path, relative to the guest's root -- C:\. A trailing"
-        '       slash means a directory, exactly as with rsync. Backslashes'
-        "       and a C:\ prefix are tolerated; '..' is refused."
+        "  DST  guest path, relative to the guest's root -- C:\, or / in a"
+        '       Linux guest. A trailing slash means a directory, exactly as'
+        '       with rsync. On Windows, backslashes and a C:\ prefix are'
+        "       tolerated; '..' is refused."
         ''
         '  -h, --help              this message'
         ''
         'A directory source is copied recursively. The payload is served to the'
-        'running guest, which fetches it itself with robocopy and so moves only'
-        'what changed.'
+        'running guest, which fetches it itself -- robocopy on Windows, rsync'
+        "on Linux -- and so moves only what changed. The guest's OS is asked"
+        'of its agent, not flagged. A Linux guest mounts the share, so it'
+        'needs cifs-utils beside rsync, and every file arrives mode 0755:'
+        'NTFS carries no mode to preserve.'
         ''
         "On this host the share comes from the machine's own SMB server, so the"
         'transfer needs Administrator and mints a throwaway local account that'
@@ -88,12 +97,15 @@ function Push-Main {
     Test-PushReadable $src
 
     Assert-XferReady $vm
+    $linux = ($script:XferGuestOs -eq 'linux')
 
     # The trailing slash rule is rsync's, which is where push borrowed it: it
     # has to be read off the argument the caller wrote, before normalising
     # strips it. A directory source always lands *in* a directory either way.
-    $dstIsDir = $dst.EndsWith('/') -or $dst.EndsWith('\') -or $srcIsDir
-    $rel = ConvertTo-GuestWindowsPath $dst 'destination'
+    # In a Linux guest a trailing backslash is the last character of a name.
+    $dstIsDir = $dst.EndsWith('/') -or (-not $linux -and $dst.EndsWith('\')) -or $srcIsDir
+    $rel = if ($linux) { ConvertTo-GuestPosixPath $dst 'destination' }
+           else        { ConvertTo-GuestWindowsPath $dst 'destination' }
 
     $base = Split-Path -Leaf ($src.TrimEnd('\', '/'))
     if (-not $base) { Die "could not work out a name to give $src in the guest" }
@@ -103,11 +115,11 @@ function Push-Main {
     # a trailing slash puts its *contents* into DST, and a source named without
     # one puts the directory itself under DST.
     if ($srcIsDir) {
-        if ($src.EndsWith('/') -or $src.EndsWith('\')) { $guestDst = Join-GuestPath $rel '' }
-        else                                           { $guestDst = Join-GuestPath $rel $base }
+        if ($src.EndsWith('/') -or $src.EndsWith('\')) { $guestDst = Join-GuestPath $rel '' -Posix:$linux }
+        else                                           { $guestDst = Join-GuestPath $rel $base -Posix:$linux }
     } else {
-        if ($dstIsDir) { $guestDst = Join-GuestPath $rel $base }
-        else           { $guestDst = Join-GuestPath $rel '' }
+        if ($dstIsDir) { $guestDst = Join-GuestPath $rel $base -Posix:$linux }
+        else           { $guestDst = Join-GuestPath $rel '' -Posix:$linux }
     }
 
     [Console]::Out.WriteLine("push: $src -> $guestDst")
@@ -115,6 +127,19 @@ function Push-Main {
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $reported = Invoke-XferTransfer -Vm $vm -StageFrom $src -Body {
         param($Session, $Stage)
+        if ($linux) {
+            # The staged tree is the share's root either way, so a directory is
+            # its contents and a file is the one name in it.
+            if ($srcIsDir) {
+                $text = Invoke-Payload 'push-dir.sh' @{ SRC = "$($Session.Mount)/"; DST = $guestDst }
+            } else {
+                $text = Invoke-Payload 'push-file.sh' `
+                    @{ SRC = "$($Session.Mount)/$base"; DST = $guestDst }
+            }
+            $out = Invoke-GuestShText $vm $text -Capture
+            if ($script:VirutilExit -ne 0) { Push-Die $script:VirutilExit -Linux }
+            return $out
+        }
         if ($srcIsDir) {
             $text = Invoke-Payload 'push-dir.ps1' @{ SRC = $Session.Unc; DST = $guestDst }
         } else {
@@ -127,7 +152,7 @@ function Push-Main {
     }
     $clock.Stop()
 
-    Write-PushReport $vm $srcIsDir $reported $clock.ElapsedMilliseconds
+    Write-PushReport $vm $srcIsDir $reported $clock.ElapsedMilliseconds -Linux:$linux
 }
 
 # Join-GuestPath REL NAME -- an absolute guest path out of a normalised relative
@@ -135,7 +160,13 @@ function Push-Main {
 # the bash driver's push_show_dst, because on this side the same string is both
 # what is printed and what goes into the payload.
 function Join-GuestPath {
-    param([string]$Rel, [string]$Name)
+    param([string]$Rel, [string]$Name, [switch]$Posix)
+    if ($Posix) {
+        $parts = @()
+        if ($Rel)  { $parts += $Rel }
+        if ($Name) { $parts += $Name }
+        return '/' + ($parts -join '/')
+    }
     $parts = @()
     if ($Rel)  { $parts += $Rel.Replace('/', '\') }
     if ($Name) { $parts += $Name }
@@ -190,7 +221,21 @@ function Test-PushReadable {
 # it -- so a figure computed from it would describe the overhead rather than the
 # transfer.
 function Write-PushReport {
-    param([string]$Vm, [bool]$IsDir, [string]$Reported, [double]$Ms)
+    param([string]$Vm, [bool]$IsDir, [string]$Reported, [double]$Ms, [switch]$Linux)
+
+    # A Linux guest's file line is "copied bytes ms": rsync skips a file that is
+    # already current, which Copy-Item cannot, so there is a count to report.
+    if ($Linux -and -not $IsDir) {
+        $f = @((Assert-XferReported $Vm $Reported '^\d+ \d+ \d+$') -split '\s+')
+        $bytes = [double]($f[1])
+        $gms   = [double]($f[2])
+        $note  = if ([int]($f[0]) -gt 0) { '' } else { ' (already current)' }
+        $rate  = Format-Rate $bytes $gms
+        $line  = "$Vm`: done ($(Format-Bytes $bytes)$note) in $(Format-Duration $gms)"
+        if ($rate -and -not $note) { $line += " ($rate on the wire)" }
+        [Console]::Out.WriteLine($line)
+        return
+    }
 
     # A line that is missing or malformed is a stop, never "all up to date".
     $shape = if ($IsDir) { '^\d+ \d+ \d+$' } else { '^\d+ \d+$' }
@@ -201,8 +246,9 @@ function Write-PushReport {
         $gms    = [double]($f[2])
         $what = "$total file"
         if ($total -ne 1) { $what += 's' }
-        if ($copied) { $what += ' present (some copied)' }
-        else         { $what += ' present (all up to date)' }
+        if ($copied -and $Linux) { $what += " present ($copied copied)" }
+        elseif ($copied)         { $what += ' present (some copied)' }
+        else                     { $what += ' present (all up to date)' }
         [Console]::Out.WriteLine("$Vm`: $what in $(Format-Duration $gms)")
         return
     }
@@ -219,7 +265,14 @@ function Write-PushReport {
 # line above. The codes are section 5 of the contract and are the guest's, so
 # this is the same table the bash driver's push_smb_die reads.
 function Push-Die {
-    param([int]$Rc)
+    param([int]$Rc, [switch]$Linux)
+    if ($Linux) {
+        if ($Rc -eq 92) {
+            DieWith $Rc @('the guest could not create the destination directory;'
+                          'its own message is above.')
+        }
+        Stop-XferRsync $Rc 'the payload'
+    }
     switch ($Rc) {
         93 { DieWith $Rc @('robocopy could not complete the copy in the guest (its'
                            'exit code is above). Anything it did copy is left where'

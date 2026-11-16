@@ -30,6 +30,7 @@ PAYLOADS_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../payloa
 payload_raw_value() {
     case "$1" in
         RC_NO_RSYNC)     printf '%s' "$GUEST_RC_NO_RSYNC" ;;
+        RC_NO_CIFS)      printf '%s' "$GUEST_RC_NO_CIFS" ;;
         RC_PUSH_MKDIR)   printf '%s' "$PUSH_RC_MKDIR" ;;
         RC_PUSH_ROBO)    printf '%s' "$PUSH_RC_ROBO" ;;
         RC_PULL_NOMATCH) printf '%s' "$PULL_RC_NOMATCH" ;;

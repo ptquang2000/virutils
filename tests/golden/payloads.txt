@@ -528,3 +528,179 @@ catch {
   exit 1
 }
 exit 0
+
+===== mount.sh =====
+command -v mount.cifs >/dev/null 2>&1 || {
+  echo "cifs-utils is not installed in this guest (no mount.cifs)" >&2
+  exit 91
+}
+unc='//10.0.2.2/k7m3qp9wr2xz'
+mnt='/run/virutil/k7m3qp9wr2xz'
+for m in "$(dirname "$mnt")"/*; do
+  [ -d "$m" ] || continue
+  umount -l "$m" 2>/dev/null || true
+  rmdir "$m" 2>/dev/null || true
+done
+mkdir -p "$mnt"
+umask 077
+if [ -d /run ]; then cred=$(mktemp -p /run); else cred=$(mktemp); fi
+printf 'username=%s\npassword=%s\n' 'vxp-k7m3qp9wr2xz' 'Pa55w0rdPa55w0rdPa55w0rd' > "$cred"
+rc=0
+mount -t cifs "$unc" "$mnt" -o "credentials=$cred,uid=0,gid=0,file_mode=0755,dir_mode=0755,mfsymlinks,nobrl" || rc=$?
+rm -f "$cred"
+if [ "$rc" != 0 ]; then
+  rmdir "$mnt" 2>/dev/null || true
+  echo "mount -t cifs $unc failed with exit $rc" >&2
+  exit 1
+fi
+echo ok
+
+===== unmount.sh =====
+mnt='/run/virutil/k7m3qp9wr2xz'
+umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || true
+rmdir "$mnt" 2>/dev/null || true
+echo ok
+
+===== ui.sh argv =====
+want='2'
+as='user'
+argv='/opt/My App/appit'\''s--flag'
+cmdline=''
+sid= user=
+for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+  [ -z "$want" ] || [ "$want" = "$s" ] || continue
+  p=$(loginctl show-session "$s" -p Class -p Type -p State -p Name 2>/dev/null) || continue
+  case $p in *Class=user*) ;; *) continue ;; esac
+  case $p in *Type=wayland*|*Type=x11*) ;; *) continue ;; esac
+  [ -n "$want" ] || case $p in *State=active*) ;; *) continue ;; esac
+  sid=$s
+  user=$(printf '%s\n' "$p" | sed -n 's/^Name=//p')
+  break
+done
+if [ -z "$sid" ] || [ -z "$user" ]; then
+  if [ -n "$want" ]; then echo "session $want is not a user's graphical session" >&2
+  else echo "no user is logged on to a graphical session" >&2; fi
+  exit 96
+fi
+uid=$(id -u "$user")
+rt=/run/user/$uid
+asuser() { runuser -u "$user" -- env XDG_RUNTIME_DIR="$rt" DBUS_SESSION_BUS_ADDRESS="unix:path=$rt/bus" "$@"; }
+unit=virutil-ui-$(date +%s)-$$
+type=exec
+systemd-run --help 2>/dev/null | grep -q -- --collect || { echo "systemd-run here is too old to start a transient unit with" >&2; exit 1; }
+[ "$(systemctl --version | awk 'NR==1{print $2}')" -ge 240 ] 2>/dev/null || type=simple
+if [ -n "$cmdline" ]; then set -- /bin/sh -c "$cmdline"
+else oldifs=$IFS; IFS=$(printf '\037'); set -- $argv; IFS=$oldifs; fi
+if [ "$as" = system ]; then
+  set -- --collect --quiet --unit="$unit" -p Type=$type -- "$@"
+  for kv in $(asuser systemctl --user show-environment | grep -E '^(DISPLAY|WAYLAND_DISPLAY|XAUTHORITY)='); do
+    set -- -E "$kv" "$@"
+  done
+  systemd-run -E XDG_RUNTIME_DIR="$rt" "$@" || exit 1
+  pid=$(systemctl show -p MainPID --value "$unit")
+  who=root
+else
+  asuser systemd-run --user --collect --quiet --unit="$unit" -p Type=$type -- "$@" || exit 1
+  pid=$(asuser systemctl --user show -p MainPID --value "$unit")
+  who=$user
+fi
+case $pid in
+  ''|0) echo "started in session $sid as $who; it has already exited" ;;
+  *) echo "started PID $pid in session $sid as $who" ;;
+esac
+
+===== ui.sh cmdline =====
+want=''
+as='user'
+argv=''
+cmdline='"/opt/My App/app" --restored'
+sid= user=
+for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+  [ -z "$want" ] || [ "$want" = "$s" ] || continue
+  p=$(loginctl show-session "$s" -p Class -p Type -p State -p Name 2>/dev/null) || continue
+  case $p in *Class=user*) ;; *) continue ;; esac
+  case $p in *Type=wayland*|*Type=x11*) ;; *) continue ;; esac
+  [ -n "$want" ] || case $p in *State=active*) ;; *) continue ;; esac
+  sid=$s
+  user=$(printf '%s\n' "$p" | sed -n 's/^Name=//p')
+  break
+done
+if [ -z "$sid" ] || [ -z "$user" ]; then
+  if [ -n "$want" ]; then echo "session $want is not a user's graphical session" >&2
+  else echo "no user is logged on to a graphical session" >&2; fi
+  exit 96
+fi
+uid=$(id -u "$user")
+rt=/run/user/$uid
+asuser() { runuser -u "$user" -- env XDG_RUNTIME_DIR="$rt" DBUS_SESSION_BUS_ADDRESS="unix:path=$rt/bus" "$@"; }
+unit=virutil-ui-$(date +%s)-$$
+type=exec
+systemd-run --help 2>/dev/null | grep -q -- --collect || { echo "systemd-run here is too old to start a transient unit with" >&2; exit 1; }
+[ "$(systemctl --version | awk 'NR==1{print $2}')" -ge 240 ] 2>/dev/null || type=simple
+if [ -n "$cmdline" ]; then set -- /bin/sh -c "$cmdline"
+else oldifs=$IFS; IFS=$(printf '\037'); set -- $argv; IFS=$oldifs; fi
+if [ "$as" = system ]; then
+  set -- --collect --quiet --unit="$unit" -p Type=$type -- "$@"
+  for kv in $(asuser systemctl --user show-environment | grep -E '^(DISPLAY|WAYLAND_DISPLAY|XAUTHORITY)='); do
+    set -- -E "$kv" "$@"
+  done
+  systemd-run -E XDG_RUNTIME_DIR="$rt" "$@" || exit 1
+  pid=$(systemctl show -p MainPID --value "$unit")
+  who=root
+else
+  asuser systemd-run --user --collect --quiet --unit="$unit" -p Type=$type -- "$@" || exit 1
+  pid=$(asuser systemctl --user show -p MainPID --value "$unit")
+  who=$user
+fi
+case $pid in
+  ''|0) echo "started in session $sid as $who; it has already exited" ;;
+  *) echo "started PID $pid in session $sid as $who" ;;
+esac
+
+===== ui.sh system =====
+want=''
+as='system'
+argv='gnome-text-editor'
+cmdline=''
+sid= user=
+for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+  [ -z "$want" ] || [ "$want" = "$s" ] || continue
+  p=$(loginctl show-session "$s" -p Class -p Type -p State -p Name 2>/dev/null) || continue
+  case $p in *Class=user*) ;; *) continue ;; esac
+  case $p in *Type=wayland*|*Type=x11*) ;; *) continue ;; esac
+  [ -n "$want" ] || case $p in *State=active*) ;; *) continue ;; esac
+  sid=$s
+  user=$(printf '%s\n' "$p" | sed -n 's/^Name=//p')
+  break
+done
+if [ -z "$sid" ] || [ -z "$user" ]; then
+  if [ -n "$want" ]; then echo "session $want is not a user's graphical session" >&2
+  else echo "no user is logged on to a graphical session" >&2; fi
+  exit 96
+fi
+uid=$(id -u "$user")
+rt=/run/user/$uid
+asuser() { runuser -u "$user" -- env XDG_RUNTIME_DIR="$rt" DBUS_SESSION_BUS_ADDRESS="unix:path=$rt/bus" "$@"; }
+unit=virutil-ui-$(date +%s)-$$
+type=exec
+systemd-run --help 2>/dev/null | grep -q -- --collect || { echo "systemd-run here is too old to start a transient unit with" >&2; exit 1; }
+[ "$(systemctl --version | awk 'NR==1{print $2}')" -ge 240 ] 2>/dev/null || type=simple
+if [ -n "$cmdline" ]; then set -- /bin/sh -c "$cmdline"
+else oldifs=$IFS; IFS=$(printf '\037'); set -- $argv; IFS=$oldifs; fi
+if [ "$as" = system ]; then
+  set -- --collect --quiet --unit="$unit" -p Type=$type -- "$@"
+  for kv in $(asuser systemctl --user show-environment | grep -E '^(DISPLAY|WAYLAND_DISPLAY|XAUTHORITY)='); do
+    set -- -E "$kv" "$@"
+  done
+  systemd-run -E XDG_RUNTIME_DIR="$rt" "$@" || exit 1
+  pid=$(systemctl show -p MainPID --value "$unit")
+  who=root
+else
+  asuser systemd-run --user --collect --quiet --unit="$unit" -p Type=$type -- "$@" || exit 1
+  pid=$(asuser systemctl --user show -p MainPID --value "$unit")
+  who=$user
+fi
+case $pid in
+  ''|0) echo "started in session $sid as $who; it has already exited" ;;
+  *) echo "started PID $pid in session $sid as $who" ;;
+esac

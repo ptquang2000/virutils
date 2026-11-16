@@ -84,8 +84,12 @@ function Invoke-GuestAgent {
     switch ($Command) {
         'guest-exec' {
             $argv = @($Arguments['arg'])
-            $script:Sent += [Text.Encoding]::Unicode.GetString(
-                [Convert]::FromBase64String($argv[$argv.Count - 1]))
+            # powershell's script is base64 of UTF-16; /bin/sh's is the text.
+            if ($Arguments['path'] -eq '/bin/sh') { $script:Sent += $argv[$argv.Count - 1] }
+            else {
+                $script:Sent += [Text.Encoding]::Unicode.GetString(
+                    [Convert]::FromBase64String($argv[$argv.Count - 1]))
+            }
             return ([pscustomobject]@{ pid = 4242 })
         }
         'guest-exec-status' {
@@ -95,7 +99,7 @@ function Invoke-GuestAgent {
             # of them could never reach the delivery: the >pre rule would have
             # died first, and the test would have asserted the wrong refusal.
             $last  = $script:Sent[$script:Sent.Count - 1]
-            $isDelivery = $last -match '\$dst = "C:\\"'
+            $isDelivery = $last -match '\$dst = "C:\\"' -or $last -match 'rootmode=\$\(stat'
             # $UiRc is the same idea for a ui run rule's launch script, so the
             # no-user answer can be given to that script and no other.
             $isUi = $last -match 'WTSQueryUserToken'
@@ -123,6 +127,7 @@ function Publish-XferShare {
     return @{
         Token = $Token; Scratch = (Get-XferScratch $Token)
         Unc = "\\10.0.2.2\$Token"; User = "vxp-$Token"; Password = 'notarealpassword'
+        Posix = "//10.0.2.2/$Token"; Mount = "/run/virutil/$Token"
         HelperPid = 0
     }
 }
@@ -132,9 +137,12 @@ function Unpublish-XferShare { param($Session) $script:Unpublished++ }
 # Both are asserted for ordering rather than for content.
 $script:ReadyFails = $false
 $script:Running    = $true
+# What the guest says it is, which the real Assert-XferReady asks its agent.
+$script:GuestIs    = 'windows'
 function Assert-XferReady {
     param([string]$Vm)
     if ($script:ReadyFails) { Die "$Vm is not running" }
+    $script:XferGuestOs = $script:GuestIs
 }
 function Test-DomainRunning { param([string]$Vm) return $script:Running }
 
@@ -265,19 +273,53 @@ try {
     Check 'a backslash makes it a path' '.\x.conf'      (Resolve-SyncConfig '.\x.conf')
     Check 'a drive letter makes it a path' 'C:\x.conf'  (Resolve-SyncConfig 'C:\x.conf')
 
-    # --- refused before anything is fetched ---------------------------------
+    # --- a Linux guest ------------------------------------------------------
     #
-    # Ordering, not wording: both of these are properties of this *host*, so
-    # there is no reason to spend a fetch, an elevation prompt and a delivery
-    # before saying so. $Published staying 0 is the assertion that matters.
+    # Refused here once, by name and before the fetch, because this host could
+    # reach a Windows guest only. Now it is delivered, and what is asserted is
+    # what reaches the guest: the mount pair around the bash driver's own
+    # sync.sh, handed the mount point for its source, and /bin/sh throughout.
 
-    $linuxConf = WriteConf 'linux.conf' ($base + @('@guest=linux'))
-    $script:Published = 0
-    $why = Dies { Capture { Sync-Main @('win11', '-c', $linuxConf) } }
-    CheckTrue '@guest=linux is refused by name' ($why -match 'Windows guest')
-    CheckTrue '@guest=linux points at the bash driver' ($why -match 'section 7')
-    Check     '@guest=linux published no share' 0 $script:Published
-    CheckTrue '@guest=linux fetched nothing' (-not (Test-Path -LiteralPath $script:VirutilsStagingRoot))
+    $linuxConf = WriteConf 'linux.conf' @(
+        "@repo=$repo"
+        '@staging=projlin'
+        '@guest=linux'
+        '@dest=opt/example'
+        '!*.pdb'
+        '<bin/Release|.'
+        '*|'
+        '-var/log/example'
+        '>pre  systemctl stop example'
+        '>post systemctl start example'
+    )
+    $script:Published = 0; $script:Unpublished = 0; $script:GuestIs = 'linux'
+    $out = Capture { Sync-Main @('ubuntu', '-c', $linuxConf) }
+    Check     '@guest=linux: the share went up and came down' '1 1' "$($script:Published) $($script:Unpublished)"
+    CheckTrue '@guest=linux: the map destination is spelled from /' ($out -match [regex]::Escape('-> /opt/example'))
+    CheckTrue '@guest=linux: the delivery line names /' ($out -match 'deliver: .* -> ubuntu /')
+    $mount = @($script:Sent | Where-Object { $_ -match 'mount -t cifs' })
+    Check     '@guest=linux: the share is mounted once' 1 $mount.Count
+    CheckTrue '@guest=linux: by its posix name, at its own mount point' `
+        ($mount[0] -match "unc='//10\.0\.2\.2/[a-z0-9]+'" -and $mount[0] -match "mnt='/run/virutil/[a-z0-9]+'")
+    $deliver = @($script:Sent | Where-Object { $_ -match 'rootmode=\$\(stat' })
+    Check     '@guest=linux: one delivery' 1 $deliver.Count
+    CheckTrue '@guest=linux: rsync reads the mount point, with its slash' `
+        ($deliver[0] -match "src='/run/virutil/[a-z0-9]+/'")
+    CheckTrue '@guest=linux: the run rules are sh, not powershell' `
+        (@($script:Sent | Where-Object { $_ -match '(?m)^systemctl stop example$' }).Count -eq 1)
+    CheckTrue '@guest=linux: the cleanup rule is the sh one' `
+        (@($script:Sent | Where-Object { $_ -match "clean '/var/log/example'" }).Count -eq 1)
+    CheckTrue '@guest=linux: the share is unmounted' `
+        (@($script:Sent | Where-Object { $_ -match '(?m)^umount "\$mnt"' }).Count -eq 1)
+    CheckTrue '@guest=linux: the count is reported' ($out -match 'ubuntu: 2 files offered, 1 copied')
+    CheckTrue '@guest=linux: and the run completes' ($out -match 'copy complete -> ubuntu')
+
+    # @guest against what the guest says: a warning, and the config wins.
+    $script:GuestIs = 'windows'
+    $out = Capture { Sync-Main @('ubuntu', '-c', $linuxConf) }
+    CheckTrue 'a guest that is not what @guest says is warned about' ($out -match 'says @guest=linux, but ubuntu reports\s+windows')
+    CheckTrue 'and the config still decides the copier' `
+        (@($script:Sent | Where-Object { $_ -match 'rootmode=\$\(stat' }).Count -eq 1)
 
     # --- a ui run rule -------------------------------------------------------
     #

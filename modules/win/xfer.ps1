@@ -44,6 +44,20 @@ Set-StrictMode -Version Latest
 # creates, and a bridged domain is not supported here.
 $script:XferHostAddr = '10.0.2.2'
 
+# Which guest the transfer in hand is talking to, 'windows' or 'linux'. Set by
+# Assert-XferReady, which asks the guest, and overridden by sync, whose config
+# says. It picks the mount pair below and nothing else in this file: the share,
+# the account and the helper are the same for both.
+$script:XferGuestOs = 'windows'
+
+# Where a Linux guest mounts the share, one directory per transfer. /run is a
+# tmpfs on every systemd distribution, so a mount point left by a run that died
+# does not outlive the guest's next boot.
+$script:XferGuestMountRoot = '/run/virutil'
+
+# The guest's "no mount.cifs here", contract section 5. mount.sh raises it.
+$script:XferRcNoCifs = 91
+
 # What makes "mine to reap" decidable without a state file. A Windows local
 # account name is capped at 20 characters, so the prefix plus the token has to
 # fit inside that: 4 + 12 leaves room to spare and still leaves the token wide
@@ -984,6 +998,9 @@ function Publish-XferShare {
     return @{
         Token     = $Token
         Scratch   = $scratch
+        # The same share as a Linux guest spells it, and where it mounts it.
+        Posix     = "//$($script:XferHostAddr)/$Token"
+        Mount     = "$($script:XferGuestMountRoot)/$Token"
         Unc       = "\\$($script:XferHostAddr)\$Token"
         User      = $cred.User
         Password  = $cred.Password
@@ -1171,6 +1188,35 @@ function Unpublish-XferShare {
 function Mount-XferGuest {
     param([Parameter(Mandatory)][string]$Vm, [Parameter(Mandatory)]$Session)
 
+    # A Linux guest mounts the share and the copier payloads are handed the
+    # mount point where a Linux host hands them an rsync daemon's URL: see
+    # payloads/linux/mount.sh.
+    if ($script:XferGuestOs -eq 'linux') {
+        $text = Invoke-Payload 'mount.sh' @{
+            UNC = $Session.Posix; USER = $Session.User; PASS = $Session.Password
+            MNT = $Session.Mount
+        }
+        Invoke-GuestShText $Vm $text -Capture | Out-Null
+        if ($script:VirutilExit -eq $script:XferRcNoCifs) {
+            DieWith $script:XferRcNoCifs @(
+                "$Vm has no mount.cifs, and from a Windows host a Linux guest"
+                'reaches the payload by mounting an SMB share. Install it there'
+                "-- 'apt install cifs-utils' or 'dnf install cifs-utils' -- and"
+                'run this again.'
+            )
+        }
+        if ($script:VirutilExit -ne 0) {
+            Die @(
+                "$Vm could not mount $($Session.Posix); mount's own error is"
+                'above. The share is on this host and is published for one'
+                'throwaway account. "cifs filesystem not supported" is a kernel'
+                'without the cifs module (a cloud kernel keeps it in'
+                'linux-modules-extra); "Permission denied" is the SMB logon.'
+            )
+        }
+        return
+    }
+
     $text = Invoke-Payload 'mount.ps1' @{
         UNC = $Session.Unc; USER = $Session.User; PASS = $Session.Password
     }
@@ -1200,8 +1246,13 @@ function Dismount-XferGuest {
     param([Parameter(Mandatory)][string]$Vm, [Parameter(Mandatory)]$Session)
     $keep = $script:VirutilExit
     try {
-        $text = Invoke-Payload 'unmount.ps1' @{ UNC = $Session.Unc }
-        Invoke-GuestPsText $Vm $text -Capture | Out-Null
+        if ($script:XferGuestOs -eq 'linux') {
+            $text = Invoke-Payload 'unmount.sh' @{ MNT = $Session.Mount }
+            Invoke-GuestShText $Vm $text -Capture | Out-Null
+        } else {
+            $text = Invoke-Payload 'unmount.ps1' @{ UNC = $Session.Unc }
+            Invoke-GuestPsText $Vm $text -Capture | Out-Null
+        }
     } catch { } finally {
         $script:VirutilExit = $keep
     }
@@ -1227,21 +1278,59 @@ function Assert-XferReady {
             "$Vm's QEMU guest agent is not answering, and the agent is what"
             'drives the copy from inside the guest. Check that qemu-ga is'
             "running there -- on a Windows guest that is the 'QEMU Guest Agent'"
-            'service, installed by virtio-win-guest-tools.'
+            'service, installed by virtio-win-guest-tools; on a Linux one,'
+            "'systemctl enable --now qemu-guest-agent'."
         )
     }
 
     # Asked rather than flagged, exactly as the bash driver asks -- see
-    # Get-GuestOs in modules/win/guest.ps1.
-    $os = Get-GuestOs $Vm
-    if ($os -ne 'windows') {
-        Die @(
-            "$Vm reports a $os guest, and this host can only transfer to a"
-            'Windows guest so far. The Linux side is payload selection against'
-            'payloads that already exist plus one unmeasured fact, and it is a'
-            'later pass; the bash driver has it today. See docs/contract.md'
-            'section 7.'
-        )
+    # Get-GuestOs in modules/win/guest.ps1. Left in module scope rather than
+    # returned: every caller runs this as a statement, and a value returned
+    # from a statement is a line on the caller's output.
+    $script:XferGuestOs = Get-GuestOs $Vm
+}
+
+# Stop-XferRsync RC WHAT -- name what went wrong in a Linux guest's copy; the
+# guest has already printed rsync's own lines above. The bash driver's
+# guest_rsync_die, with the one difference this host makes: the guest's rsync
+# reads or writes a mounted share rather than talking to a daemon, so there is
+# no socket to fail and no protocol to disagree about.
+function Stop-XferRsync {
+    param([int]$Rc, [string]$What)
+    switch ($Rc) {
+        90 {
+            DieWith $Rc @(
+                "the guest has no rsync, and $What is the guest copying with"
+                "it. Install it there -- 'apt install rsync' or"
+                "'dnf install rsync' -- and run this again."
+            )
+        }
+        { $_ -in @(23, 24) } {
+            DieWith $Rc @(
+                "only part of $What crossed (rsync exit $Rc). What did move is"
+                "in place, and rsync's own lines above name the files that did"
+                'not, and which side refused: a path under'
+                "$($script:XferGuestMountRoot) is the share on this host, any"
+                'other is the guest. The share holds no device, no socket and'
+                'no owner, so a pull of one of those is what a line naming the'
+                'share most often means.'
+            )
+        }
+        { $_ -in @(10, 11, 12, 30, 35) } {
+            DieWith $Rc @(
+                "the guest lost the share while moving $What (rsync exit $Rc);"
+                'its own message is above. The share is this host''s own SMB'
+                'server, reached at 10.0.2.2: check the guest still has its'
+                'address, and that nothing here retired the share early.'
+            )
+        }
+        default {
+            DieWith $Rc @(
+                "the guest failed to move $What (rsync exit $Rc); its own"
+                'error is above. It had mounted the share, so a failure here is'
+                'the copy rather than the credential.'
+            )
+        }
     }
 }
 

@@ -39,6 +39,13 @@ XFER_MOUNT_UNC='\\10.0.2.2\k7m3qp9wr2xz'
 XFER_MOUNT_USER='vxp-k7m3qp9wr2xz'
 XFER_MOUNT_PASS='Pa55w0rdPa55w0rdPa55w0rd'
 
+# The same share as a Linux guest is given it. mount.sh and unmount.sh are the
+# mount pair's other half, and ui.sh is `ui` for a Linux guest: the Windows
+# driver sends all three and this one renders them, for the golden file.
+XFER_MOUNT_POSIX='//10.0.2.2/k7m3qp9wr2xz'
+XFER_MOUNT_MNT='/run/virutil/k7m3qp9wr2xz'
+US=$''
+
 # A real directory and a real file: push branches on which SRC is.
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
@@ -65,3 +72,8 @@ section 'unmount.ps1'           ; payload_render unmount.ps1 UNC="$XFER_MOUNT_UN
 section 'ui.ps1 argv'           ; ui_run win11 -i 2 --elevated 'C:\Program Files\App\app.exe' "it's" --flag
 section 'ui.ps1 cmdline'        ; ui_run_cmdline win11 '"C:\Program Files\App\app.exe" --restored'
 section 'ui.ps1 system'         ; ui_run win11 -s notepad.exe
+section 'mount.sh'               ; payload_render mount.sh UNC="$XFER_MOUNT_POSIX" USER="$XFER_MOUNT_USER" PASS="$XFER_MOUNT_PASS" MNT="$XFER_MOUNT_MNT"; echo
+section 'unmount.sh'             ; payload_render unmount.sh MNT="$XFER_MOUNT_MNT"; echo
+section 'ui.sh argv'             ; payload_render ui.sh SESSION=2 AS=user ARGV="/opt/My App/app${US}it's${US}--flag" CMDLINE=; echo
+section 'ui.sh cmdline'          ; payload_render ui.sh SESSION= AS=user ARGV= CMDLINE='"/opt/My App/app" --restored'; echo
+section 'ui.sh system'           ; payload_render ui.sh SESSION= AS=system ARGV=gnome-text-editor CMDLINE=; echo

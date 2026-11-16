@@ -191,6 +191,9 @@ guest_os() {
 # Distinct from every code rsync itself uses (its highest is in the thirties),
 # so "the guest has no rsync" can be told apart from "rsync failed".
 GUEST_RC_NO_RSYNC=90
+# No mount.cifs: a Linux guest of a Windows host mounts the share it copies from
+# (payloads/linux/mount.sh). This driver renders that payload and never sends it.
+GUEST_RC_NO_CIFS=91
 
 # The lines that refuse early and legibly when rsync is missing -- rather than
 # letting sh report "not found" with exit 127 and leaving the host to guess
