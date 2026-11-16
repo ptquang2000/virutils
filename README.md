@@ -3,7 +3,8 @@
 A small set of shell tools for driving Windows guests under libvirt/KVM from a
 Linux host, including a WSL host talking to the Windows machine it runs on —
 and, on a Mac, Windows 11 on Arm under raw QEMU and hvf (see
-[On a macOS host](#on-a-macos-host)). Everything hangs off a single driver,
+[On a macOS host](#on-a-macos-host)) and a macOS guest under tart (see
+[A macOS guest on a macOS host](#a-macos-guest-on-a-macos-host)). Everything hangs off a single driver,
 `virutil`, which dispatches to a set of sourced modules under `modules/` — each
 a small function library with no build step and no dependencies beyond the
 utilities it calls.
@@ -29,6 +30,7 @@ utilities it calls.
 - [Guest prerequisites](#guest-prerequisites)
    - [A Windows guest](#a-windows-guest)
    - [A Windows guest on a macOS host](#a-windows-guest-on-a-macos-host)
+   - [A macOS guest on a macOS host](#a-macos-guest-on-a-macos-host)
    - [A Linux guest](#a-linux-guest)
 - [virutil sync](#virutil-sync)
    - [Synopsis](#synopsis)
@@ -121,6 +123,20 @@ fix UTM's qemu carries (`patches/qemu/`) into `~/.virutils/cache/qemu` — a few
 minutes, 360 MB — and the driver uses that build in preference to Homebrew's,
 which stays installed for its libraries.
 
+A macOS guest needs none of that and three other things, all optional for a
+Mac that only runs Windows on Arm:
+
+```sh
+brew trust --formula openai/tools/tart openai/tools/softnet
+brew install tart rsync python
+```
+
+`tart` is in the tap `openai/tools`, which Homebrew refuses until it is
+trusted, and `softnet` is tart's own dependency in the same tap. `rsync`
+because macOS's own `/usr/bin/rsync` is openrsync, which cannot drive a guest's
+rsync the way `push`, `pull` and `sync` need. See
+[A macOS guest on a macOS host](#a-macos-guest-on-a-macos-host).
+
 On a Windows host, run this once per user, from any PowerShell (no elevation):
 
 ```powershell
@@ -210,7 +226,7 @@ host-side machinery in `modules/linux/xfer` and `modules/linux/guest`, which is
 | Module | Purpose | Usage |
 | --- | --- | --- |
 | `domain` | The domain lifecycle: create one from an install ISO with a KVM-tuned profile, delete one along with its disks, and the everyday operations in between. | `virutil domain {create\|delete\|list\|start\|shutdown\|addr\|port} [VM] [ISO] [OPTIONS]` |
-| `snapshot` | Snapshots, disk and memory for a running domain and disk-only for a shut-off one. **Linux and macOS hosts.** External overlays through libvirt on Linux; qcow2 internal snapshots on macOS, where hvf saves memory. The Windows driver had these four verbs as internal snapshots and they were removed: WHPX blocks saving a running guest's memory, so a snapshot there could only ever be a disk. `virutil snapshot` on a Windows host says so and exits 1. | `virutil snapshot {create\|list\|revert\|delete} VM [SNAP]` |
+| `snapshot` | Snapshots, disk and memory for a running domain and disk-only for a shut-off one. **Linux and macOS hosts.** External overlays through libvirt on Linux; qcow2 internal snapshots on macOS, where hvf saves memory; for a macOS guest there, a `tart clone` of the shut-off domain. The Windows driver had these four verbs as internal snapshots and they were removed: WHPX blocks saving a running guest's memory, so a snapshot there could only ever be a disk. `virutil snapshot` on a Windows host says so and exits 1. | `virutil snapshot {create\|list\|revert\|delete} VM [SNAP]` |
 
 ### transfer
 
@@ -221,6 +237,10 @@ host-side machinery in `modules/linux/xfer` and `modules/linux/guest`, which is
 | `push` | Copy a file or directory from the host into a guest's `C:` drive. | `virutil push VM SRC DST` |
 | `xfer` | **Windows host only.** Set up, once and elevated, the scheduled task that lets the three above elevate without a UAC prompt; see [On a Windows host](#on-a-windows-host). The bash driver refuses it by name. | `virutil xfer {setup\|remove\|status}` |
 
+On a macOS host the three reach a macOS guest (a tart domain) only, by the
+host's rsync run through the guest agent, and refuse a QEMU domain by name:
+see [A macOS guest on a macOS host](#a-macos-guest-on-a-macos-host).
+
 All three write the same C:-shaped tree — see
 [How files move](#how-files-move). `sync` and `push` deliver into a **running**
 guest over its own NIC, moving only what changed; `pull` reads back the same
@@ -230,7 +250,7 @@ way.
 
 | Module | Purpose | Usage |
 | --- | --- | --- |
-| `exec` | Run commands inside a guest through the QEMU guest agent, with no guest networking required. `cmd` and `ps` address a Windows guest, `sh` a Linux one. | `virutil exec {ping\|cmd\|ps\|sh} VM [FLAGS] [ARGS]` |
+| `exec` | Run commands inside a guest through the QEMU guest agent, with no guest networking required. `cmd` and `ps` address a Windows guest, `sh` a Linux one, and a macOS one through tart's own agent. | `virutil exec {ping\|cmd\|ps\|sh} VM [FLAGS] [ARGS]` |
 | `shot` | Capture a **running** guest's screen to a PNG on the host, from the hypervisor: nothing runs in the guest. Every host. See [virutil shot](#virutil-shot). | `virutil shot VM [-o FILE]` |
 | `input` | Click, drag, scroll, press keys and type in a **running** guest, at the pixel coordinates of a shot, through its emulated tablet and keyboard: nothing runs in the guest. Every host. See [virutil input](#virutil-input). | `virutil input {click\|move\|drag\|wheel\|key\|type} VM ...` |
 
@@ -746,6 +766,117 @@ virtio-win CD. Two consequences:
   driver) and `vioinput`; the domain uses ramfb and USB input today, so neither
   is needed.
 
+### A macOS guest on a macOS host
+
+A macOS guest is not a QEMU domain. macOS on Apple silicon boots only on
+Apple's own virtual hardware, which only Virtualization.framework provides, and
+[tart](https://github.com/openai/tart) is the command line around that
+framework. So the macOS driver runs a second kind of domain, a **tart domain**,
+and the same commands take it by name:
+
+```
+virutil domain create macos27 ghcr.io/cirruslabs/macos-golden-gate-base:latest
+virutil exec ping macos27
+virutil ui run macos27 open -a Safari https://example.com
+virutil shot macos27 -o screen.png
+```
+
+**tart keeps the domain, not virutil.** A tart domain is whatever
+`tart list --source local` names; its disk, nvram and config are in
+`~/.tart/vms/VM`. `virutil domain list` shows both kinds in one table, and a
+QEMU domain of the same name wins. What virutil writes, beside the QEMU
+domains' files in `~/.virutils/images`, is `VM-tart.log`, `VM.tart.pid` and
+`VM.tart.args`.
+
+**What `domain create` makes one from** is whatever stands in ISO's place:
+
+| SOURCE | result |
+| --- | --- |
+| an image in a registry, `host/name[:tag]` | pulled once (tens of GB), then cloned: 1.4 s |
+| a tart VM already on this host | cloned, its state included |
+| an `.ipsw` restore image: a file, a URL, or `latest` | a fresh install, which starts in Setup Assistant with no account and no guest agent |
+
+`-s`, `-m` and `-c` default to what the image says; `-p` is refused, because a
+tart domain sits on the host's shared NAT with an address the host reaches
+directly (`virutil domain addr VM`, 192.168.64.N), every port of it. `-o` and
+`-v` are accepted and ignored.
+
+**Which guests run.** Virtualization.framework guests on Apple silicon start at
+**macOS 12**; nothing older boots here, on any Mac with an M-series chip. And
+**two macOS guests run at once, not three**: the third `domain start` fails
+with tart's "The number of VMs exceeds the system limit (other running VMs:
+...)", which is Apple's limit and counts every macOS guest on the host,
+whoever started it. An
+image that is already set up saves the whole of Setup Assistant: the
+`ghcr.io/cirruslabs/macos-*-base` images log `admin` (password `admin`) in on
+the console at boot, let it `sudo` without a password, have System Integrity
+Protection and Gatekeeper's assessments disabled, and carry the tart guest
+agent. Everything below was measured against one, macOS 27.2, on an M5 Max
+running macOS 27.2.1 and tart 2.41.1.
+
+**The guest agent is tart's own**, and `exec`, `ui`, `sync`, `push` and `pull`
+all go through `tart exec`. It runs as the logged-in user, so `exec sh` goes
+through `sudo -n` to be root, as the contract says it is; a guest whose user
+cannot `sudo` without a password is refused with the sudoers line that fixes
+it. There is no lock and no polling: the agent serves any number of callers,
+and output arrives as the command writes it. A guest with no agent costs each
+of those commands tart's own 30 seconds before it says so.
+
+What each command does there, and how long it took:
+
+| command | on a tart domain |
+| --- | --- |
+| `domain start VM [-G]` | `tart run --vnc-experimental`, detached; returns in 6 to 9 s, and the agent answers about 2 s later. Without `-G` tart also opens the host's Screen Sharing on the console, and that window stays open after the domain stops |
+| `domain shutdown VM` | the agent's `shutdown -h now`: off in 3 to 8 s. With no agent, the power button: a macOS guest with a user logged in answers it with "Are you sure you want to shut down your computer now?" and waits; `virutil input key VM enter` answers, and it is off 7 s later |
+| `domain destroy VM` | `tart stop`: off in 3 s, without asking the guest |
+| `domain delete VM` | a shut-off domain only; its snapshots go with it |
+| `snapshot` | `tart clone` to `VM@SNAP`, of a **shut-off** domain only: tart keeps no memory image, so a running one is refused with the two commands that get there. `revert` powers a running domain off, replaces it with a clone of the snapshot, and starts it the way it was last started: 10 s, with the same address. Flat: no snapshot has a parent |
+| `exec ping`, `exec sh` | `sh` as root; the guest's exit code is virutil's. `cmd` and `ps` are refused by name |
+| `ui run VM APP...` | APP as the user logged in on the console, in that user's session: `started PID 706 in session console as admin`. `-s` is root in the same session; exit 96 when nobody is logged in. `-i` and `--elevated` are a Windows guest's and are refused |
+| `push`, `pull` | this host's rsync with the guest's as its far end, over `tart exec`: no server, no network. 19.1 MiB at 107 MiB/s; an unchanged tree moves nothing; a `pull` that matches nothing exits 94 |
+| `sync` | the same transport under the same config grammar, `@guest=macos`: one file delivered in 112 ms. Run rules go through `/bin/sh` as root, `>pre-ui` and `>post-ui` onto the desktop |
+| `shot` | the console's frame, 1024x768, with nothing in the guest: at the login window and in recovery too |
+| `input` | `click`, `move`, `drag`, `key` and `type` through the same console. `wheel` is refused |
+
+**Start a tart domain through virutil.** `shot` and `input` reach the VNC
+console that `tart run --vnc-experimental` serves, on a loopback port behind a
+password tart prints once; `virutil domain start` always asks for it and keeps
+the line in `VM-tart.log`. A domain started with `tart run` itself is still a
+domain here, and those two commands say so and name the restart.
+
+**`tart list` must not be polled while a domain starts.** Ten calls a second
+during a start made Virtualization.framework give the start up ("The virtual
+machine failed to start", "Internal Virtualization error"), every time; a
+single call 0.3, 1, 2 or 4 seconds in did not. `domain start` waits on its own log and pidfile for that
+reason. A script waiting for a guest should ask `virutil exec ping VM` every
+couple of seconds, not `tart list` in a tight loop.
+
+**What `input` cannot do there.** The console passes no wheel on to a macOS
+guest: RFB's wheel buttons arrive and scroll nothing, so `input wheel` is
+refused by name with what does scroll, which is the arrow keys (space, in a
+browser) and a drag of the scroll bar. `pgup`, `pgdn` and `end` did nothing in
+a Finder window either. `cmd` (and `win`) is the Command key and `alt` is
+Option. Typed text goes through the guest's autocorrect where the focused field
+has it: TextEdit turned "virutil" into "virtual".
+
+**What stops on a dialog.** `exec sh` is root and outside the user's login
+session, so it cannot open a window; anything with one goes through `ui run`.
+A command that needs an administrator's consent raises a dialog in the guest
+and does not return until it is answered: `systemextensionsctl developer on`
+asks for a password even as root, and `osascript` driving another application
+asks for Automation consent. `virutil shot` shows it, and `virutil input type`
+and `virutil input key VM enter` answer it.
+
+**Recovery and SIP.** The recovery environment, where `csrutil` changes System
+Integrity Protection, is a boot tart has a flag for and virutil does not, so it
+is passed for one start: `VIRUTILS_TART_ARGS=--recovery virutil domain start VM
+-G` lands on the startup options screen, where `shot` and `input` work and
+`exec` does not. The words are not remembered, so the next start, and a
+snapshot revert, are ordinary boots. The `cirruslabs` base images need none of
+this: SIP is disabled in them already, which is also what lets
+`systemextensionsctl developer on` take effect and an unnotarized system
+extension load.
+
 ### A Linux guest
 
 Two things, and both are usually a package away:
@@ -999,7 +1130,7 @@ and is rejected.
 | --- | --- | --- | --- |
 | `@repo` | yes | — | Root of the build tree on the host. Fetch sources are relative to it. A relative path is resolved against the directory the config file is in — never the current directory — so a config kept inside its project can say `@repo=..`. |
 | `@staging` | yes | — | Staging directory *name*. Always placed under `~/.virutils/staging/`, whatever is written here. |
-| `@guest` | no | `windows` | Which OS the guest runs: `windows` or `linux`. It selects the guest half of the delivery — SMB + `robocopy` + PowerShell, or an `rsync` daemon + `rsync` + `/bin/sh`. |
+| `@guest` | no | `windows` | Which OS the guest runs: `windows`, `linux` or `macos`. It selects the guest half of the delivery — SMB + `robocopy` + PowerShell, or an `rsync` daemon + `rsync` + `/bin/sh`. `macos` is a tart domain on a macOS host, where the host's `rsync` pushes through the guest agent and the run rules go through `/bin/sh`; it has to match what tart says the domain runs. |
 | `@dest` | no | *(empty)* | Install directory in the guest, relative to the guest's root — `C:\`, or `/` when `@guest=linux`. Every map destination hangs off it, so the install path is spelled once. Empty means that root itself. |
 
 #### Fetch rules
@@ -2025,6 +2156,11 @@ own firewall allows the port — no host-side plumbing works around either.
 virutil domain create win11arm ~/Downloads/Win11_25H2_English_Arm64.iso
 ```
 
+This section is the QEMU kind of domain. A macOS guest is the other kind, a
+tart domain, which `domain create` makes when what stands in ISO's place is an
+image tart reads: see
+[A macOS guest on a macOS host](#a-macos-guest-on-a-macos-host).
+
 On a Mac, `virutil` loads `modules/mac`: raw QEMU under hvf, no libvirt, and an
 **arm64** guest — hvf accelerates the host's own architecture only, so the
 install ISO has to be Windows 11 on Arm
@@ -2078,9 +2214,9 @@ What differs from the other hosts, and why:
    `VM.qcow2` and `VM_VARS.qcow2`, memory included when the domain runs. They
    cost space in the image directory and go with `domain delete`, and a disk
    that has any cannot be grown with `start -s` until they are deleted.
-- **`sync`, `push`, `pull`, `ui` and `usb` are not here yet**, and each says so
-   by name. Until they are, `exec` is the way into the guest, and RDP's drive
-   redirection is the way to move a file.
+- **`sync`, `push`, `pull` and `ui` are not here yet for a QEMU domain, nor
+   `usb` for any**, and each says so by name. Until they are, `exec` is the way
+   into the guest, and RDP's drive redirection is the way to move a file.
 
 See [A Windows guest on a macOS host](#a-windows-guest-on-a-macos-host) for
 what to do inside Setup.
@@ -2114,6 +2250,7 @@ its own way:
 | Linux | `virsh screenshot` | whatever libvirt returns; a PPM is converted to PNG with `python3` |
 | Windows | `screendump -f png` over the QEMU monitor | PNG from qemu; a qemu without libpng gets PPM, converted here |
 | macOS | QMP `screendump`, format `png` | PNG from qemu |
+| macOS, a tart domain | a full-frame update from the VNC console `tart run --vnc-experimental` serves | PNG written by `libexec/mac/vnc.py` |
 
 **This is the domain's console, not an RDP session.** `shot` captures the
 emulated display: what the domain's own window or virt-viewer shows. That is
@@ -2189,6 +2326,7 @@ How each host does it, and what it needs:
 | Linux | QMP `input-send-event`, `abs` axes, through `virsh qemu-monitor-command` | QMP `send-key`, the same way | `jq`, and a tablet: `virt-install` gives a domain with graphics a USB tablet. libvirt then logs the domain as tainted (`custom-monitor`); nothing else changes |
 | Windows | an `input-barrier` object hot-added over the QEMU monitor, which carries absolute positions to the tablet | `sendkey` on the monitor | the `usb-tablet` every `domain create` launcher has. No QMP socket, no launcher change, no restart |
 | macOS | QMP `input-send-event` on the domain's socket | QMP `send-key` | the `usb-tablet` every `domain create` launcher has |
+| macOS, a tart domain | RFB pointer events on the domain's VNC console | RFB key events, the modifier row translated for a Mac (`cmd` and `win` are Command, `alt` is Option) | `python3`, and a domain started by `virutil domain start`. **`wheel` is refused**: the console does not pass it on to a macOS guest |
 
 The Windows host takes the long way round because its only handle on a running
 domain is the human monitor, and that monitor's `mouse_move` sends *relative*
@@ -2551,6 +2689,15 @@ Host, on macOS (`modules/mac`) — none of the above, and instead:
 - a `VIRUTILS_IMAGE_DIR` short enough that `VM.tpm/swtpm.sock` inside it stays
    under 104 bytes, macOS's cap on a Unix socket path; `create` refuses a
    longer one by name
+
+Host, on macOS, for a macOS guest (a tart domain) — beside `bash` and `jq`
+above, and none of the qemu entries:
+
+- `tart` 2.41 or newer (`brew install tart`, after `brew trust --formula
+   openai/tools/tart openai/tools/softnet`)
+- `rsync` 3.2.4 or newer ahead of `/usr/bin/rsync` on PATH (`brew install
+   rsync`), for `sync`, `push` and `pull`
+- `python3`, for `shot` and `input`
 
 Guest — see [Guest prerequisites](#guest-prerequisites) for where each of
 these comes from and how to install it:

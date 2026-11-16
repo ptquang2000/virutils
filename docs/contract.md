@@ -4,7 +4,7 @@ virutil ships as two programs: `virutil`, a bash driver, and `virutil.ps1`, a
 PowerShell driver for a Windows host (raw QEMU under WHPX). The bash driver
 carries two module trees and loads the one `uname` names: `modules/linux` for a
 Linux host (libvirt/KVM) and `modules/mac` for a macOS host (raw QEMU under
-hvf). That is three host implementations, and they share no source. This file
+hvf, and tart for a macOS guest). That is three host implementations, and they share no source. This file
 is what they do share -- the observable surface a user and a script may rely
 on, identically, on any host.
 
@@ -47,6 +47,9 @@ virutil domain create   VM ISO [-s GiB] [-m MiB] [-c N] [-o ID] [-v ISO|none]
                                # ISO may be a qcow2 cloud image: Windows host, a Linux id
                                # -c N: Linux and macOS hosts; a Windows host creates
                                #       at 1 vcpu and refuses it (section 9)
+                               # macOS host: ISO may instead be a SOURCE tart reads
+                               #       (a registry image, a local tart VM, an .ipsw),
+                               #       which makes a tart domain (section 7)
 virutil domain delete   VM
 virutil domain list
 virutil domain start    VM [-s GiB] [-m MiB] [-c N] [-G]
@@ -94,8 +97,9 @@ virutil xfer {setup|remove|status}       # Windows host only
 than by a gap in a port. It registers, once and elevated, the scheduled task
 that lets `push`, `pull` and `sync` on a Windows host get Administrator without
 a UAC prompt per transfer (section 7). A Linux host's transport has its own
-`smbd` and nothing to elevate, and macOS has no transport yet, so the bash
-driver refuses `virutil xfer` by name on both, with that reason.
+`smbd` and nothing to elevate, and a macOS host's transport is the tart guest
+agent with nothing to elevate either, so the bash driver refuses `virutil xfer`
+by name on both, with that reason.
 
 `usb` is on both drivers and holds to one grammar over two mechanisms -- a
 libvirt `<hostdev>` on the bash side, `device_add` over the QEMU monitor on the
@@ -113,8 +117,9 @@ what a command line means should not have to find them somewhere else -- but a
 script using them is a script for one host. `snapshot` is marked the same way
 for the same reason, the other way round: it was on both drivers and was taken
 out of the Windows one (section 7). Everything else above is on the Linux and
-Windows drivers; the macOS driver carries `domain`, `snapshot`, `exec`, `shot` and `input` so far
-and refuses the rest by name (section 7). Section 9 says what each flag *does*
+Windows drivers; the macOS driver carries `domain`, `snapshot`, `exec`, `shot`
+and `input` for both of its kinds of domain, `sync`, `push`, `pull` and `ui`
+for a tart domain only, and refuses the rest by name (section 7). Section 9 says what each flag *does*
 where the drivers cannot agree.
 
 Invariants that are contract, not implementation:
@@ -146,9 +151,20 @@ Invariants that are contract, not implementation:
   on both hosts, with one exception: a `@guest=linux` config that carries a ui
   rule runs on the Windows driver and is refused by the bash one, whose `ui`
   reaches a Windows guest only (section 7).
-- **On a macOS host, `sync`, `push`, `pull`, `ui` and `usb` are not there yet**,
-  and each is refused by name with the reason rather than as an unknown module
-  (section 7).
+- **On a macOS host, `sync`, `push`, `pull` and `ui` reach a tart domain
+  only**, which is a macOS guest: a QEMU domain is refused by name with the
+  reason, and so is `usb` for either kind, never as an unknown module
+  (section 7). There the delivery goes over the guest agent rather than the
+  guest's network, and the rest of the first invariant holds: the domain
+  running, the disk image and the guest's uptime untouched. Guest paths are
+  relative to `/`, `pull` wildcards match case-sensitively, and `exec` runs as
+  root.
+- **A tart domain's `snapshot` is disk-only and of a shut-off domain**: tart
+  keeps no memory image, so `snapshot create` on a running one is refused with
+  the two commands that get there. `revert` still leaves the domain running at
+  the snapshot (section 7).
+- **`input wheel` is refused for a macOS guest in a tart domain**, by name and
+  before anything is sent: its console does not carry the wheel (section 7).
 - `domain delete` never prompts and removes disks, backing chain, snapshot
   overlays and memory files, mount points and port forwards; files another
   domain uses are kept.
@@ -181,7 +197,8 @@ Invariants that are contract, not implementation:
   a key name it does not know, a character the US layout cannot type, a
   position off the screen and a pointer verb on a domain with no absolute
   pointer.
-- The disk is always `<image dir>/VM.qcow2`.
+- The disk is always `<image dir>/VM.qcow2`. A tart domain is the exception:
+  its disk is tart's, in tart's own home (section 3).
 
 ## 3. State layout
 
@@ -207,6 +224,14 @@ while it runs a pidfile and two Unix sockets (`VM.qmp`, `VM.qga`), plus a
 `VM.tpm/` directory holding swtpm's state and the copies a disk-only snapshot
 keeps of it, and the guest agent lock `VM.agent.lock`. Nothing outside that
 list is ever written there, and `domain delete` removes all of it.
+
+A tart domain keeps nothing of itself under the root. Its disk, nvram and
+config are tart's, in `~/.tart/vms/VM` (`TART_HOME` moves it, and that is
+tart's variable, not virutil's), and a snapshot is another tart VM beside it,
+`VM@SNAP`. What a macOS host's `images` holds for one is what a run leaves:
+`VM-tart.log` (tart's output, which is where the console's address is),
+`VM.tart.pid` and `VM.tart.args` (how it was last started). `domain delete`
+removes those three, the snapshots and the VM.
 
 Root is `~/.virutils` on Linux and macOS and `%USERPROFILE%\.virutils` on
 Windows. The
@@ -296,6 +321,7 @@ this table means both drivers must *accept* it, not that both can act on it.
 | variable | meaning |
 |---|---|
 | `VIRUTILS_AGENT_WAIT` | seconds a guest agent call waits for another run's (default 120), Windows and macOS hosts |
+| `VIRUTILS_TART_ARGS` | words added to one `tart run`, split on spaces (`--recovery`, `--dir=NAME:PATH`); macOS host, a tart domain's `domain start`. Never remembered |
 
 **Several runs may use one guest's agent at once, and they take turns per
 command.** The agent channel serves one host client at a time and qemu-ga
@@ -549,6 +575,110 @@ two refusals a stock 24H2 client brings (insecure guest logons off, signing
 required). `ui` needs only `exec`, so it waits on nothing but being wired in. `usb` is
 unmeasured: whether qemu under hvf can claim a device from macOS's own USB stack
 at all is the first question, and it has not been asked.
+
+### The macOS host's second kind of domain: tart, for a macOS guest
+
+Everything above is about a QEMU domain, and a macOS guest cannot be one: macOS
+on Apple silicon boots only on Apple's own virtual hardware, which only
+Virtualization.framework provides. tart is the command line around that
+framework, so on this host a macOS guest is a **tart domain**, and
+`modules/mac/tart`, `tart-exec`, `tart-xfer` and `tart-screen` put the grammar
+of section 2 on one. Which kind a name is, is asked per command: a QEMU
+launcher of that name wins, then a tart VM. Nothing is flagged, and no module
+is told.
+
+**tart keeps the domain.** The disk, nvram and config are in tart's home and
+virutil writes nothing there (section 3). A VM made or started with tart itself
+is a domain here like any other; the two verbs that need the console say so
+when the domain was not started by virutil.
+
+What each module stands on, and what was measured on an M5 Max, macOS 27.2.1,
+tart 2.41.1, against a macOS 27.2 guest cloned from
+`ghcr.io/cirruslabs/macos-golden-gate-base`:
+
+| module | mechanism | measured |
+|---|---|---|
+| `domain create` | `tart clone` of a registry image or a local VM; `tart create --from-ipsw` for a fresh install | clone 1.4s once the image is pulled |
+| `domain start` | `tart run --vnc-experimental`, detached, `--no-graphics` with `-G` | returns in 6 to 9s; the agent answers about 2s after |
+| `domain shutdown` | the agent's `shutdown -h now`; with no agent, the power button (SIGUSR2 to tart, Virtualization's `requestStop`) | agent: off in 3 to 8s. Power button: the guest asks, and waited over two minutes; off 7s after Enter |
+| `domain destroy` | `tart stop` | off in 3s |
+| `domain addr` | `tart ip`, the agent's resolver second | 192.168.64.N, reachable from the host |
+| `snapshot` | `tart clone` to `VM@SNAP`; revert is delete, clone back, rename, restart | create 2s; revert of a running domain 10s, same address, a file written after the snapshot gone |
+| `exec` | `tart exec`, through `sudo -n` when the agent is not root | exit code 3 passed through; root; stdin and binary stdout clean |
+| `ui run` | `tart exec`, as the console's user in their own session | `started PID 706 in session console as admin`; an app's window appears |
+| `push`, `pull` | the host's rsync with the guest's as its far end, `tart exec -i` as the remote shell (`libexec/mac/tart-rsh`) | 19.1 MiB at 107 MiB/s; an unchanged tree moves nothing; no-match exits 94 |
+| `sync` | the same transport, under `modules/linux/sync`'s host half | one file in 112ms; unchanged, nothing; pre and post rules as uid 0; a ui rule on the desktop; `/` keeps mode 0755 |
+| `shot` | a full-frame update from Virtualization.framework's VNC server | 1024x768 in 60ms; at the desktop, at the shutdown dialog, in recovery |
+| `input` | RFB pointer and key events on the same server | click, drag, key and type land; the wheel does not |
+
+**`snapshot` is a clone, and disk-only.** tart has no snapshots; what it has is
+an APFS copy-on-write copy of the whole VM. A copy of a running VM's disk is a
+disk caught mid-write with nothing of its memory, which is a crash image, and
+tart's own way to keep memory (`tart suspend`) needs the VM started
+`--suspendable`, which takes its audio and entropy devices away. So `snapshot
+create` refuses a running tart domain and names the shutdown that makes it
+possible, where a QEMU domain on the same host snapshots memory. The rest of
+the contract holds: a revert leaves the domain running at the snapshot, started
+the way it was last started, and it keeps its MAC address across the swap and
+so its DHCP lease. Snapshots are flat, as qcow2-internal ones are.
+
+**The transfer layer is the guest agent, not the network.** Every other host
+serves and has the guest fetch over its NIC. `tart exec -i` carries a process's
+stdin and stdout, which is all rsync asks of a remote shell, so there is no
+server, no account, no share and nothing to tear down, and the copier is the
+host's rsync: its exit status is the result, and section 2's "guest copier sent
+no result" has nothing to check. The two ends are different rsyncs. The host's
+must be rsync 3.2.4 or newer (macOS's own openrsync has no `--old-args` and is
+refused by name); the guest's is whatever `/usr/bin/rsync` it has, openrsync on
+macOS 27, and both speak protocol 29. The options are `-rlt -O --old-args`: no
+`-p`, which would lay the source tree's root mode over the guest's `/` (it has
+chmod'ed a guest's `/` to 0700 before, `modules/linux/sync`), and `-O` because
+`/` on a Mac is a sealed volume whose mtime cannot be set.
+
+**`exec` is root by asking.** The agent runs as the user its launchd job names,
+the logged-in user in the images measured, so `exec sh` asks `id -u` once and
+goes through `sudo -n` when the answer is not 0. A guest where that needs a
+password is refused with the sudoers line. `ui run` is the same two cases the
+other way round: the console's user, in their session, or `-s` for root in it.
+There is no lock on this agent (section 4's is qemu-ga's): it serves any number
+of callers at once.
+
+**A guest with no agent costs 30 seconds per question**, which is how long
+`tart exec` waits on the control socket; tart has no flag for it. `domain
+shutdown` pays it once before it presses the power button.
+
+**tart is not asked while a domain starts.** `tart list` at ten a second during
+a start made Virtualization.framework give the start up, every time --
+`VZErrorDomain Code=1 "The virtual machine failed to start."`, `Internal
+Virtualization error` -- where a single call at 0.3s, 1s, 2s or 4s did not. So
+`domain start` waits on its own log and pidfile and asks tart once at the end.
+
+**The console is VNC, and it has a hole.** Virtualization.framework's server is
+RFB 3.8 with VNC authentication, on a loopback port and behind a password tart
+makes up and prints once; the line in `VM-tart.log` is the only place either is
+written. It reads a keysym as a *key*: `A` with no Shift held typed `a`. Its
+modifier row is Apple's: Alt is Command, Meta is Option, Super and Hyper are
+nothing, and `libexec/mac/vnc.py` translates so `cmd` and `win` are Command and
+`alt` is Option. And it drops the wheel: RFB buttons 4 and 5, and 6 and 7
+beside them, reached the server and scrolled nothing in a macOS 27 guest, with
+or without a wait between press and release. `input wheel` is therefore
+refused for a macOS guest, by name, with what does scroll -- the arrow keys,
+and a drag of the scroll bar -- rather than sent and reported as done. `pgup`,
+`pgdn` and `end` did nothing in a Finder window either, and are sent as asked.
+
+**What is refused, by name, and why.** `domain port` and `create -p`: the guest
+is on the host's shared NAT with its own address. `exec cmd` and `exec ps`, and
+`ui run -i` and `--elevated`: a Windows guest's. `usb`: tart offers no device
+passthrough. `sync`, `push`, `pull` and `ui` against a QEMU domain: section 7's
+open question above is still open for that kind.
+
+**Which guests there are.** Virtualization.framework guests on Apple silicon
+start at macOS 12, so a product whose minimum is older than that has no guest
+on this host. Two macOS guests run at once and the third start is refused,
+measured: "The number of VMs exceeds the system limit (other running VMs:
+macos27, t1)". That is Apple's limit, and `domain start` passes tart's line on. tart reads only `disk.v2` registry images: an older image
+(`macos-monterey-base:latest`) is refused with "disk chunks must start with a
+disk.v2 base".
 
 ### `sync`: ported, on the transport `push` and `pull` built
 
@@ -1135,6 +1265,7 @@ drivers:
 | `tests/win/domain.ps1` | the launcher round trip: monitor port, agent channel and port forwards written, read back, edited and read again. |
 | `tests/win/usb.ps1` | a passed-through device and an emulated stick of each kind written into a launcher, read back beside a hand-written one, and taken out leaving the file as it was; `ports` rewriting the controller; `image`'s FAT32 layout and bytes. Then a real paused qemu with the default 4 root ports, plugged into over its monitor: the third stick behind the hub and said so, `cycle` without a leaked drive, `unplug` freeing the backend, a refused plug leaving nothing behind. Skips that half with no qemu. |
 | `tests/mac/domain.sh` | the macOS driver against a real hvf domain with no OS: create's files, start, port forwards live and in the launcher, every snapshot verb with the domain running and shut off, the launcher edits, delete. Driven from the runner on a Mac; skips anywhere else. |
+| `tests/mac/tart.sh` | the macOS driver's tart half with tart (`tests/mac/fake-tart.sh`) and its VNC console (`tests/mac/fake-vnc.py`) substituted, and a directory standing for the guest's `/`: which kind a name is, create from each kind of source, every domain and snapshot verb and refusal, `exec` and `ui run` as root and as the console user, `push`, `pull` and `sync` through the real host rsync and `libexec/mac/tart-rsh`, a shot's PNG, the events each `input` verb sends and the wheel's refusal, and that a QEMU domain is refused by name by the four modules that are tart's alone. Skips anywhere but a Mac with jq, python3 and rsync 3.2.4. |
 | `tests/win/xfer.ps1` | `push` and `pull` on a Windows host with both seams substituted -- the guest agent and the share publisher -- so the guest path rules, credential generation, the free-space refusal, the sweep's liveness decision, the rendered payload and the teardown all run with no VM and no Administrator. Under the publisher, its own three seams (the task lookup, the task start, the UAC start) are substituted instead, so the choice between task and prompt, the request the helper is handed and the helper pid read back from the status file are asserted too; and the real helper is run unelevated against the requests it must refuse. Nothing registers a task or elevates. |
 | `tests/linux/exec.sh`, `tests/mac/exec.sh` | qemu-ga's exec records (docs/qga-exec-records.md) against each bash tree's `gexec`: a reused pid's leftover record never answers for the call, its nonce is checked and stripped, a silent process of the call's own is still its own, the ledger is reaped before every exec, `cmd -d` and `sh -d` are written down for the reaper, `exec ps -d` goes through the launcher and leaves no record, and refuses stdin. The cases are shared (`tests/linux/exec-records.sh`); the agent is `tests/mac/fake-qga.pl` started with `model`, reached through a stand-in `virsh` (libvirt tree) or the real agent socket (macOS tree). The Windows driver's cases are in `tests/win/exec.ps1`. |
 | `tests/linux/xfer.sh` | `sync`, `push` and `pull` on the libvirt driver with the transport substituted, the way `tests/linux/pull.sh` does it: a guest copier line that is missing or not the payload's numbers stops the command after its teardown, and never reports the guest as current; a good line reports as before. `tests/win/sync.ps1` and `tests/win/xfer.ps1` hold the Windows driver to the same. |
@@ -1157,6 +1288,11 @@ propagates the guest's exit code (`exit 7` is virutil's 7), the agent answers
 again after a guest reboot, `shutdown` through the agent powers the domain off
 in 4s, a cold `start` has the agent answering in 12s, and a memory snapshot
 round-trips (above).
+
+The tart half is the same split: `tests/mac/tart.sh` reaches no guest, and what
+a real one does was measured by hand against macOS 27 and is recorded in
+section 7 -- every verb in the table there, the power-button dialog, the
+recovery boot, the snapshot revert keeping the address.
 
 The PowerShell half skips itself, loudly, on a host with no `pwsh`.
 
@@ -1393,6 +1529,27 @@ same user-mode-NAT reasons, and in two of its own:
 - **`snapshot revert` to a disk-only snapshot of a running domain powers it off
   first**, with `quit` rather than asking the guest, as `virsh snapshot-revert`
   does: what the guest had not written is exactly what a revert discards.
+
+A tart domain on that host bends it further, because the hypervisor is not
+qemu and the guest is not Windows:
+
+- **`domain create` takes a SOURCE where the ISO goes**, and what it is decides
+  the kind of domain: a registry image, a local tart VM or an `.ipsw` is
+  tart's, an install ISO is QEMU's. `-o` and `-v` are accepted and ignored;
+  **`-p` and `domain port` are refused**, since the guest has an address the
+  host reaches directly and there is nothing to forward. `domain addr` prints
+  that address, as on Linux.
+- **`domain start` without `-G`** opens the console in the host's Screen
+  Sharing rather than in a window of the hypervisor's own, and with `-G` the
+  console is still served, for `shot` and `input`.
+- **`domain shutdown`'s power button is a question** to a macOS guest with a
+  user logged in, and it waits for the answer.
+- **`snapshot create` refuses a running domain**, and `snapshot list` shows
+  every snapshot as `shutoff`.
+- **`exec cmd` and `exec ps` are refused by name**; `ui run -i` and
+  `--elevated` likewise. `ui run` prints `in session console`, there being one.
+- **`input wheel` is refused**, and `input key`'s `cmd` and `win` are the
+  Command key, `alt` is Option.
 
 The same rule covers the environment. `VIRUTILS_OSINFO`, `VIRUTILS_NETWORK` and
 `VIRUTILS_FIRMWARE` are read by the Windows driver and acted on by none of it,
