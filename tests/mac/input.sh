@@ -36,6 +36,8 @@ STATUS=running RUNNING=1
 MICE='[{"name":"QEMU HID Tablet","index":3,"current":true,"absolute":true}]'
 domain_need()    { [[ "$1" != nosuch ]] || die "no such domain: $1 (see: virutil domain list)"; }
 domain_running() { (( RUNNING )); }
+# No domain here is tart's: this is the QEMU half. tests/mac/tart.sh has the other.
+tart_claims()    { return 1; }
 qmp_need()       { printf 'open\n' >> "$LOG"; }
 qmp() {
     case "$1" in

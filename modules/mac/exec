@@ -486,6 +486,12 @@ exec_main() {
     VM="${2:-}"
     [ -n "$VM" ] || exec_usage
     shift 2
+    # A tart domain is reached over tart's own agent (modules/mac/tart-exec).
+    if tart_claims "$VM"; then
+        case "$CMD" in ping|cmd|ps|sh) ;; *) exec_usage ;; esac
+        tart_exec "$CMD" "$VM" "$@"
+        return
+    fi
     domain_need "$VM" || exec_usage
 
     case "$CMD" in

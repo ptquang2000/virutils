@@ -1,0 +1,53 @@
+# push -- copy a file or directory from this host into a guest.
+#
+# On this host that is a tart domain only: the transfer layer is rsync run
+# through the tart guest agent (modules/mac/tart-xfer). A QEMU domain has no
+# transfer layer here yet and is refused by name, with the reason.
+
+push_usage() {
+    printf '%s\n' \
+        "usage: virutil push VM SRC DST" \
+        "" \
+        "  VM   tart domain to copy into; it has to be running, since the copy" \
+        "       is delivered through its guest agent" \
+        "  SRC  host file or directory to copy" \
+        "  DST  guest path, relative to the guest's root, /. A trailing slash" \
+        "       means a directory, exactly as with rsync; '..' is refused." \
+        "" \
+        "  -h, --help              this message" \
+        "" \
+        "A directory source is copied recursively. This host's rsync drives the" \
+        "guest's own through 'tart exec', and so moves only what changed. What" \
+        "lands is root's; a new file keeps its mode, and nothing already in the" \
+        "guest has its mode or its directory times changed." \
+        "" \
+        "A QEMU domain is refused on this host: it has no transfer layer yet." >&2
+    exit "${1:-1}"
+}
+
+push_main() {
+    local VM="" SRC="" DST=""
+    while (( $# )); do
+        case "$1" in
+            -h|--help) push_usage 0 ;;
+            -*)        warn "unrecognised argument: $1"; push_usage ;;
+            *)
+                if   [[ -z "$VM"  ]]; then VM="$1"
+                elif [[ -z "$SRC" ]]; then SRC="$1"
+                elif [[ -z "$DST" ]]; then DST="$1"
+                else warn "unexpected argument: $1"; push_usage
+                fi
+                shift ;;
+        esac
+    done
+    [[ -n "$VM" && -n "$SRC" && -n "$DST" ]] || push_usage
+
+    [[ -e "$SRC" ]] || die "source not found: $SRC"
+    [[ -r "$SRC" ]] || die "source not readable: $SRC"
+
+    domain_exists "$VM" && xfer_qemu_refuse push "$VM"
+    tart_claims "$VM" || die "no such domain: $VM (see: virutil domain list)"
+
+    xfer_check "$VM"
+    tart_push "$VM" "$SRC" "$DST"
+}

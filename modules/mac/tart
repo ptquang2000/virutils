@@ -1,0 +1,630 @@
+# tart -- the second kind of domain on a macOS host: a Virtualization.framework
+# VM kept and run by tart (https://github.com/openai/tart). Shared by every
+# module; this file says what a tart domain is, finds one, and carries the
+# `domain` and `snapshot` verbs for it.
+#
+# Why there are two kinds. modules/mac/qemu runs raw QEMU under hvf, which
+# accelerates an arm64 guest of any OS that boots on the `virt` board: Windows
+# on Arm, Linux. A macOS guest is not one of those. macOS on Apple silicon
+# boots only on Apple's own virtual hardware, which only Virtualization.
+# framework provides, and tart is the command line around that framework. So a
+# macOS guest is a tart VM, and the same verbs reach it through tart.
+#
+# **tart keeps the domain, not virutil.** A tart domain is whatever
+# `tart list --source local` names: its disk, nvram and config live in tart's
+# own home (~/.tart/vms/VM), and virutil writes nothing there. What virutil
+# keeps, in the image directory beside the QEMU domains' files, is only what a
+# run leaves: VM-tart.log (tart's output, which is where the console's VNC
+# address is), VM.tart.pid and VM.tart.args (how it was last started). A VM
+# made or started with tart itself is still a domain here; the verbs that need
+# the console say so when it was not started by virutil.
+#
+# Which kind a name is, is asked per command (tart_claims): a QEMU launcher of
+# that name wins, then a tart VM. Nothing is flagged and no module is told.
+#
+# What tart gives each verb, measured on an M5 Max, macOS 27.2, tart 2.41.1,
+# against a macOS 27 guest (docs/contract.md section 7 has the numbers):
+#
+#   start     `tart run --vnc-experimental`, detached. Always with the VNC
+#             console, because that is the only way in to the screen from the
+#             host with nothing in the guest: shot and input use it.
+#   shutdown  the guest agent's own `shutdown -h now`; without an agent, the
+#             power button (tart's SIGUSR2, Virtualization's requestStop).
+#   destroy   `tart stop`, which is the plug, not a request.
+#   addr      `tart ip`: the guest is on the host's shared NAT with an address
+#             the host reaches directly, so there is nothing to forward.
+#   exec      `tart exec`, over the tart guest agent (modules/mac/tart-exec).
+#   snapshot  `tart clone`, an APFS copy-on-write copy named VM@SNAP.
+
+TART=""
+
+# tart_have -- is tart installed? Quiet: a Mac with no tart has QEMU domains
+# only, and nothing about them should mention it.
+tart_have() {
+    [[ -n "$TART" ]] && return 0
+    TART="$(command -v tart 2>/dev/null || true)"
+    [[ -n "$TART" ]]
+}
+
+tart_tool() {
+    tart_have || die "tart not found. A macOS guest runs under tart:" \
+                     "  brew install tart" \
+                     "(the formula is in the tap openai/tools, which Homebrew asks" \
+                     "you to trust first: brew trust --formula openai/tools/tart" \
+                     "openai/tools/softnet)"
+    command -v jq >/dev/null || die "jq not found (brew install jq)"
+}
+
+# A snapshot is a tart VM named VM@SNAP. '@' is not a character a domain name
+# may hold (domain create refuses it), so the two never collide, and `domain
+# list` leaves every name with one out.
+TART_SNAP_SEP='@'
+
+# --- where a run's files live --------------------------------------------------
+
+tart_log()     { printf '%s/%s-tart.log'  "$VIRUTILS_IMAGE_DIR" "$1"; }
+tart_pidfile() { printf '%s/%s.tart.pid'  "$VIRUTILS_IMAGE_DIR" "$1"; }
+tart_argsfile(){ printf '%s/%s.tart.args' "$VIRUTILS_IMAGE_DIR" "$1"; }
+
+# tart's own home, for the one thing asked of it directly: when a clone was made.
+tart_home() { printf '%s' "${TART_HOME:-$HOME/.tart}"; }
+
+# --- which domains are tart's --------------------------------------------------
+
+# tart_rows -- "NAME<TAB>STATE" per local tart VM, snapshots included, tart's
+# own words for the state (running, stopped, suspended).
+tart_rows() {
+    tart_have || return 0
+    "$TART" list --source local --format json 2>/dev/null \
+        | jq -r '.[] | [.Name, .State] | @tsv' 2>/dev/null || true
+}
+
+# tart_names -- every tart domain, one per line, sorted. Snapshots are not
+# domains.
+tart_names() {
+    tart_rows | cut -f1 | grep -vF -- "$TART_SNAP_SEP" | sort || true
+}
+
+tart_exists() {
+    [[ -n "${1:-}" ]] || return 1
+    tart_rows | cut -f1 | grep -qxF -- "$1"
+}
+
+# tart_claims VM -- is VM a tart domain? A QEMU launcher of the same name wins:
+# it was there first, and every command already means it.
+tart_claims() {
+    [[ -n "${1:-}" && "$1" != -* && "$1" != *"$TART_SNAP_SEP"* ]] || return 1
+    domain_exists "$1" && return 1
+    tart_exists "$1"
+}
+
+# tart_state VM -- running, paused or shut off: virsh's words, as domain_state
+# gives them for a QEMU domain. tart's "suspended" is a saved, stopped machine
+# that resumes at its next start, which is what paused means to a caller.
+tart_state() {
+    local s
+    s="$(tart_rows | awk -F'\t' -v n="$1" '$1 == n { print $2 }')"
+    case "$s" in
+        running)   printf 'running' ;;
+        suspended) printf 'paused' ;;
+        *)         printf 'shut off' ;;
+    esac
+}
+
+tart_running() { [[ "$(tart_state "$1")" == running ]]; }
+
+# tart_info VM -- `tart get` as JSON: CPU, Memory (MiB), Disk (GB), OS, MACAddress.
+tart_info() { "$TART" get "$1" --format json; }
+
+# tart_guest_os VM -- macos or linux, from tart's own config: it is what tart
+# built the virtual hardware for, so it needs no agent to ask.
+tart_guest_os() {
+    case "$(tart_info "$1" 2>/dev/null | jq -r '.OS // empty')" in
+        linux) printf linux ;;
+        *)     printf macos ;;
+    esac
+}
+
+# tart_pid VM -- the pid of the `tart run` that is VM, or nothing (exit 1). The
+# pidfile first; a VM someone started with tart itself has none, so the process
+# list is asked second.
+tart_pid() {
+    local vm="$1" pid cmd
+    pid="$(tr -dc '0-9' < "$(tart_pidfile "$vm")" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+        if [[ "$cmd" == *tart*" run "*" $vm" ]]; then printf '%s' "$pid"; return 0; fi
+    fi
+    while read -r pid cmd; do
+        [[ "$cmd" == *tart*" run "*" $vm" || "$cmd" == *tart*" run $vm" ]] || continue
+        printf '%s' "$pid"
+        return 0
+    done < <(ps -axo pid=,command= 2>/dev/null | grep -F ' run ' || true)
+    return 1
+}
+
+# --- the console ---------------------------------------------------------------
+#
+# `tart run --vnc-experimental` serves the VM's display and input over
+# Virtualization.framework's own VNC server on a loopback port it picks, behind
+# a password it makes up, and prints both once:
+#
+#   VNC server is running at vnc://:word-word-word-word@127.0.0.1:58122
+#
+# (or "Opening vnc://..." when it also opens Screen Sharing on the host). That
+# line in VM-tart.log is the only place either is written, so the log of the
+# current run is where shot and input find the console.
+
+TART_VNC_HOST="" TART_VNC_PORT="" TART_VNC_PASSWORD=""
+
+# tart_vnc VM -- sets the three above, or 1 when this run has no console.
+tart_vnc() {
+    local url
+    url="$(grep -oE 'vnc://:[^@[:space:]]*@[0-9.]+:[0-9]+' "$(tart_log "$1")" 2>/dev/null | tail -n 1 || true)"
+    [[ "$url" =~ ^vnc://:([^@]*)@([0-9.]+):([0-9]+)$ ]] || return 1
+    TART_VNC_PASSWORD="${BASH_REMATCH[1]}"
+    TART_VNC_HOST="${BASH_REMATCH[2]}"
+    TART_VNC_PORT="${BASH_REMATCH[3]}"
+}
+
+# tart_vnc_need VM -- tart_vnc, or die saying why there is no console to reach.
+tart_vnc_need() {
+    tart_running "$1" || die "$1 is not running ($(tart_state "$1")): there is no display to reach"
+    tart_vnc "$1" && nc -z -G 2 "$TART_VNC_HOST" "$TART_VNC_PORT" >/dev/null 2>&1 && return 0
+    die "$1 is running, but not with the console virutil reaches: it was started" \
+        "by tart itself, or by a virutil whose log is gone, so there is no VNC" \
+        "address to find in $(tart_log "$1")." \
+        "Restart it through virutil and the console comes with it:" \
+        "  virutil domain shutdown $1   (then, once it is off)" \
+        "  virutil domain start $1 -G"
+}
+
+# --- starting one --------------------------------------------------------------
+
+# tart_launch VM [TART_RUN_ARGS...] -- `tart run` detached, and wait until tart
+# lists VM as running. Detached as domain_launch detaches qemu, for the same
+# three reasons: its own process group, nohup, and a subshell that exits.
+#
+# VIRUTILS_TART_ARGS adds words to this one `tart run`, split on spaces: the
+# way to a boot virutil has no flag for -- `--recovery`, for the recovery
+# environment where SIP is changed, or `--dir=NAME:PATH` for a shared folder.
+# They are for the one start and are not remembered, so a revert never
+# restarts a domain into recovery.
+tart_launch() {
+    local vm="$1"; shift
+    local log pidfile i tail
+    local -a once=()
+    log="$(tart_log "$vm")"
+    pidfile="$(tart_pidfile "$vm")"
+    mkdir -p -- "$VIRUTILS_IMAGE_DIR"
+    if (( $# )); then printf '%s\n' "$@" > "$(tart_argsfile "$vm")"
+    else : > "$(tart_argsfile "$vm")"; fi
+    virutils_env TART_ARGS ""
+    read -r -a once <<<"$VIRUTILS_ENV"
+    if (( ${#once[@]} )); then say "tart run, this once, with: ${once[*]}"; fi
+    : > "$log"
+    (
+        set -m
+        nohup "$TART" run --vnc-experimental "$@" ${once[@]+"${once[@]}"} "$vm" </dev/null >>"$log" 2>&1 &
+        printf '%s\n' "$!" > "$pidfile"
+    )
+    # Started means tart has printed the console's address and is still there
+    # a few seconds later. tart is **not asked** while it starts, and that is
+    # measured rather than cautious: `tart list` at ten a second during a start
+    # made Virtualization.framework give the start up, every time --
+    #
+    #   Error Domain=VZErrorDomain Code=1 "The virtual machine failed to start."
+    #   ... NSLocalizedFailure=Internal Virtualization error.
+    #
+    # -- where a single call at 0.3s, 1s, 2s or 4s did not. So the wait reads
+    # the log and the pid, which are this driver's own files, and asks tart
+    # once at the end: the address is printed 0.4s in, and tart is then given
+    # four seconds to still be there before the one question.
+    for (( i = 0; i < 300; i++ )); do
+        tart_vnc "$vm" && break
+        if (( i > 20 )) && ! tart_launch_alive "$vm"; then break; fi
+        sleep 0.1
+    done
+    if tart_vnc "$vm"; then
+        for (( i = 0; i < 40; i++ )); do
+            tart_launch_alive "$vm" || break
+            sleep 0.1
+        done
+        if tart_launch_alive "$vm" && tart_running "$vm"; then return 0; fi
+    fi
+    tail="$(tail -n 8 -- "$log" 2>/dev/null | grep -v '^$' || true)"
+    if tart_launch_alive "$vm"; then
+        die "$vm's tart is running, but it did not print its console's address" \
+            "within 30s, so shot and input cannot reach it. tart said:" "${tail:-nothing}" \
+            "(all of it in $log)"
+    fi
+    die "$vm did not start. tart said:" "${tail:-nothing}" "(all of it in $log)"
+}
+
+# tart_launch_alive VM -- is the tart this driver started for VM still there?
+# The pidfile and the process table only: see tart_launch for why tart itself
+# is not asked.
+tart_launch_alive() {
+    local pid
+    pid="$(tr -dc '0-9' < "$(tart_pidfile "$1")" 2>/dev/null || true)"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# tart_last_args VM -- the arguments VM was last started with, one per line.
+tart_last_args() { cat -- "$(tart_argsfile "$1")" 2>/dev/null || true; }
+
+# --- domain ---------------------------------------------------------------------
+
+# tart_source_kind SOURCE -- what `domain create VM SOURCE` is being asked to
+# make a tart domain from, or nothing when SOURCE is not tart's to read:
+#
+#   ipsw    an .ipsw restore image (a file, a URL) or the word `latest`: a
+#           fresh macOS install, which lands in Setup Assistant
+#   oci     an image in a registry, host/name[:tag]: pulled and cloned
+#   local   a tart VM already on this host: cloned
+#
+# An existing file that is not an .ipsw is an install ISO, and QEMU's.
+tart_source_kind() {
+    local s="$1"
+    if [[ "$s" == latest || "$s" =~ ^https?://.*\.ipsw$ ]]; then printf ipsw; return 0; fi
+    if [[ -f "$s" ]]; then
+        if [[ "$s" == *.ipsw ]]; then printf ipsw; fi
+        return 0
+    fi
+    if [[ "$s" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?/[^[:space:]]+$ && ( "${s%%/*}" == *.* || "${s%%/*}" == *:* || "${s%%/*}" == localhost ) ]]; then
+        printf oci; return 0
+    fi
+    if tart_have && tart_exists "$s"; then printf local; fi
+    return 0
+}
+
+# tart_create_source ARGS... -- `domain create`'s arguments, read only far
+# enough to find SOURCE (the second word that is not a flag or a flag's value)
+# and say what kind it is; nothing when it is not tart's.
+tart_create_source() {
+    local n=0
+    while (( $# )); do
+        case "$1" in
+            -s|--size|-m|--memory|-c|--vcpus|-o|--osinfo|-v|--virtio|-p|--port) shift ;;
+            -*) ;;
+            *)  n=$(( n + 1 ))
+                if (( n == 2 )); then tart_source_kind "$1"; return 0; fi ;;
+        esac
+        (( $# )) && shift
+    done
+    return 0
+}
+
+tart_domain_create() {
+    local VM="" SRC="" SIZE="" MEM="" VCPUS="" NOSTART=0 kind info
+    while (( $# )); do
+        case "$1" in
+            -s|--size)     SIZE="${2:?$1 needs a value}";  shift 2 ;;
+            -m|--memory)   MEM="${2:?$1 needs a value}";   shift 2 ;;
+            -c|--vcpus)    VCPUS="${2:?$1 needs a value}"; shift 2 ;;
+            -N|--no-start) NOSTART=1; shift ;;
+            -o|--osinfo|-v|--virtio)
+                : "${2:?$1 needs a value}"
+                warn "$1 is accepted and ignored for a tart domain: the image says" \
+                     "what OS it is, and its virtual hardware needs no driver disc."
+                shift 2 ;;
+            -p|--port)
+                die "a tart domain takes no port forward: it sits on the host's" \
+                    "shared NAT with an address this host reaches directly, every" \
+                    "port of it. Drop $1; 'virutil domain addr VM' prints the address." ;;
+            -h|--help)     domain_usage 0 ;;
+            -*)            die "virutil domain create: unknown option: $1" ;;
+            *)
+                if   [[ -z "$VM"  ]]; then VM="$1"
+                elif [[ -z "$SRC" ]]; then SRC="$1"
+                else die "virutil domain create: unexpected argument: $1"
+                fi
+                shift ;;
+        esac
+    done
+    [[ -n "$VM" && -n "$SRC" ]] || domain_usage
+    tart_tool
+
+    [[ "$VM" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+        || die "a domain name is letters, digits, '.', '_' and '-', got '$VM'"
+    [[ -z "$SIZE"  || "$SIZE"  =~ ^[0-9]+$ ]] || die "--size wants a whole number of GB, got '$SIZE'"
+    [[ -z "$MEM"   || "$MEM"   =~ ^[0-9]+$ ]] || die "--memory wants MiB, got '$MEM'"
+    [[ -z "$VCPUS" || "$VCPUS" =~ ^[0-9]+$ ]] || die "--vcpus wants a whole number, got '$VCPUS'"
+    domain_exists "$VM" && die "domain already exists: $VM (see: virutil domain list)"
+    tart_exists "$VM"   && die "domain already exists: $VM (see: virutil domain list)"
+
+    kind="$(tart_source_kind "$SRC")"
+    case "$kind" in
+        ipsw)
+            say "creating $VM from $SRC (a fresh macOS install; this downloads" \
+                "and restores, and takes a while)"
+            "$TART" create "$VM" --from-ipsw "$SRC" ${SIZE:+--disk-size "$SIZE"} \
+                || die "tart could not create $VM from $SRC"
+            SIZE="" ;;
+        oci|local)
+            say "cloning $SRC to $VM"
+            "$TART" clone "$SRC" "$VM" || die "tart could not clone $SRC to $VM" ;;
+        *)  die "virutil domain create: $SRC is not something tart can make a domain from" ;;
+    esac
+
+    tart_set "$VM" "$SIZE" "$MEM" "$VCPUS"
+
+    info="$(tart_info "$VM")"
+    say "domain:   $VM (tart, arm64, $(tart_guest_os "$VM"))" \
+        "source:   $SRC" \
+        "cpu:      $(jq -r '.CPU' <<<"$info") vcpus" \
+        "memory:   $(jq -r '.Memory' <<<"$info") MiB" \
+        "disk:     $(tart_home)/vms/$VM ($(jq -r '.Disk' <<<"$info") GB)"
+
+    if [[ "$kind" == ipsw ]]; then
+        say "" \
+            "A fresh install starts in Setup Assistant, with no account, no guest" \
+            "agent and nothing signed in. Walk it with 'virutil shot' and 'virutil" \
+            "input', or create from an image that is already set up. See README.md," \
+            "'A macOS guest on a macOS host'."
+    fi
+    (( NOSTART )) && return 0
+    tart_launch "$VM"
+    say "$VM started"
+}
+
+# tart_set VM SIZE MEM VCPUS -- write the ones that are not empty into tart's
+# config. tart refuses to shrink a disk, which is the check wanted.
+tart_set() {
+    local vm="$1" size="$2" mem="$3" vcpus="$4"
+    if [[ -n "$vcpus" ]]; then
+        "$TART" set "$vm" --cpu "$vcpus" || die "tart could not set $vm to $vcpus vcpus"
+        say "vcpus:  $vcpus"
+    fi
+    if [[ -n "$mem" ]]; then
+        "$TART" set "$vm" --memory "$mem" || die "tart could not set $vm to $mem MiB"
+        say "memory: $mem MiB"
+    fi
+    if [[ -n "$size" ]]; then
+        "$TART" set "$vm" --disk-size "$size" \
+            || die "tart could not resize $vm's disk to $size GB (it never shrinks one)"
+        say "disk:   $size GB" \
+            "        the guest still has to grow its volume into it"
+    fi
+}
+
+tart_domain_start() {
+    local VM="" SIZE="" MEM="" VCPUS="" GUI=1
+    while (( $# )); do
+        case "$1" in
+            -s|--size)   SIZE="${2:?$1 needs a value}";  shift 2 ;;
+            -m|--memory) MEM="${2:?$1 needs a value}";   shift 2 ;;
+            -c|--vcpus)  VCPUS="${2:?$1 needs a value}"; shift 2 ;;
+            -G|--no-gui) GUI=0; shift ;;
+            -h|--help)   domain_usage 0 ;;
+            -*)          die "virutil domain start: unknown option: $1" ;;
+            *)           [[ -z "$VM" ]] || die "unexpected argument: $1"
+                         VM="$1"; shift ;;
+        esac
+    done
+    tart_tool
+    [[ -z "$SIZE"  || "$SIZE"  =~ ^[0-9]+$ ]] || die "--size wants a whole number of GB, got '$SIZE'"
+    [[ -z "$MEM"   || "$MEM"   =~ ^[0-9]+$ ]] || die "--memory wants MiB, got '$MEM'"
+    [[ -z "$VCPUS" || "$VCPUS" =~ ^[0-9]+$ ]] || die "--vcpus wants a whole number, got '$VCPUS'"
+
+    if [[ -n "$SIZE$MEM$VCPUS" ]] && [[ "$(tart_state "$VM")" != 'shut off' ]]; then
+        die "$VM is $(tart_state "$VM"); -s/-m/-c rewrite its config and disk," \
+            "which only works with it shut off." \
+            "  virutil domain shutdown $VM"
+    fi
+    tart_set "$VM" "$SIZE" "$MEM" "$VCPUS"
+
+    if tart_running "$VM"; then
+        say "$VM is already running"
+        return 0
+    fi
+    local -a extra=()
+    # Without -G tart opens the console in the host's Screen Sharing. With it
+    # the console is still served, for shot and input, and nothing is opened.
+    (( GUI )) || extra=(--no-graphics)
+    tart_launch "$VM" ${extra[@]+"${extra[@]}"}
+    say "$VM started"
+}
+
+# The agent's own shutdown first, the power button second -- the same order as
+# a QEMU domain's. The agent's is `shutdown -h now` as root: macOS closes every
+# app without asking, and the domain is off 3 to 8 seconds later. The power
+# button is a request, and a macOS guest with a user logged in answers it with
+# the "Are you sure you want to shut down your computer now?" dialog. On macOS
+# 27 that dialog waits: it was still there two minutes on, and the guest went
+# off 7 seconds after Enter (Shut Down is its default button). So the power
+# button's line says how to answer it. Neither path waits for the guest.
+#
+# A guest whose agent is not answering costs `tart exec`'s own 30 seconds
+# before the power button is tried: that is how long tart waits on the
+# control socket, and it has no flag for it.
+tart_domain_shutdown() {
+    local VM="$1" pid
+    tart_tool
+    tart_running "$VM" || die "$VM is not running"
+    if tart_agent_up "$VM"; then
+        # Detached in the guest: the agent goes down with it, and a call still
+        # waiting on its reply would report the shutdown as a failure.
+        tart_agent_root "$VM" /bin/sh -c 'nohup /sbin/shutdown -h now >/dev/null 2>&1 &' \
+            >/dev/null 2>&1 </dev/null || true
+        say "$VM is being shut down (guest agent)"
+        return 0
+    fi
+    pid="$(tart_pid "$VM")" || die "$VM is running, but its tart process was not found;" \
+                                   "'virutil domain destroy $VM' powers it off"
+    kill -USR2 "$pid" 2>/dev/null || die "could not signal tart (pid $pid) for $VM"
+    say "$VM is being shut down (power button)" \
+        "A macOS guest with a user logged in asks first, and waits for the" \
+        "answer; Shut Down is the dialog's default button:" \
+        "  virutil input key $VM enter"
+}
+
+# Off now: `tart stop` ends the VM without asking the guest, and returns once
+# it is gone.
+tart_domain_destroy() {
+    local VM="$1" i
+    tart_tool
+    [[ "$(tart_state "$VM")" != 'shut off' ]] || die "$VM is not running"
+    "$TART" stop "$VM" --timeout 10 >/dev/null 2>&1 || true
+    for (( i = 0; i < 40; i++ )); do
+        tart_running "$VM" || { say "$VM is destroyed (tart stop)"; return 0; }
+        sleep 0.25
+    done
+    die "$VM did not stop: tart still lists it as running"
+}
+
+tart_domain_addr() {
+    local VM="$1" ip
+    tart_tool
+    tart_running "$VM" || die "$VM is not running, so it has no address"
+    # dhcp first: it needs nothing in the guest. The agent second, which is
+    # the one that still answers on a bridged network.
+    ip="$("$TART" ip "$VM" 2>/dev/null || true)"
+    [[ -n "$ip" ]] || ip="$("$TART" ip "$VM" --resolver agent 2>/dev/null || true)"
+    [[ -n "$ip" ]] || die "$VM has no address yet: it has not asked the host's DHCP" \
+                          "server for one. A guest still booting has none; try again."
+    printf '%s\n' "$ip"
+}
+
+tart_domain_port() {
+    die "$1 is a tart domain and takes no port forward: it sits on the host's" \
+        "shared NAT with an address this host reaches directly, every port of" \
+        "it. 'virutil domain addr $1' prints the address."
+}
+
+tart_domain_delete() {
+    local VM="$1" snap f
+    tart_tool
+    [[ "$(tart_state "$VM")" == 'shut off' ]] \
+        || die "$VM is $(tart_state "$VM"). Shut it down first -- 'virutil domain" \
+               "shutdown $VM' -- so the disk is closed before it is removed."
+    while read -r snap; do
+        [[ -n "$snap" ]] || continue
+        "$TART" delete "$VM$TART_SNAP_SEP$snap" && say "removed snapshot $snap"
+    done < <(tart_snapshot_names "$VM")
+    for f in "$(tart_log "$VM")" "$(tart_pidfile "$VM")" "$(tart_argsfile "$VM")"; do
+        [[ -e "$f" ]] || continue
+        rm -f -- "$f" && say "removed $f"
+    done
+    # The VM last, as the launcher is last for a QEMU domain: a delete that
+    # fails partway still lists, and can be run again.
+    "$TART" delete "$VM" || die "tart could not delete $VM"
+    say "removed $(tart_home)/vms/$VM"
+}
+
+# tart_domain CMD VM [ARGS...] -- the domain verbs for a tart domain.
+tart_domain() {
+    local cmd="$1" vm="$2"; shift 2
+    case "$cmd" in
+        start)    tart_domain_start    "$vm" "$@" ;;
+        shutdown) tart_domain_shutdown "$vm" ;;
+        destroy)  tart_domain_destroy  "$vm" ;;
+        addr)     tart_domain_addr     "$vm" ;;
+        port)     tart_domain_port     "$vm" ;;
+        delete)   tart_domain_delete   "$vm" ;;
+        *)        die "virutil domain: unknown command: $cmd (see: virutil domain -h)" ;;
+    esac
+}
+
+# --- snapshot ------------------------------------------------------------------
+#
+# tart has no snapshots. What it has is `tart clone`, which on APFS is a
+# copy-on-write copy of the whole VM -- disk, nvram, config -- made in well
+# under a second and costing only the blocks that later differ. So a snapshot
+# is a clone named VM@SNAP, a revert replaces VM with a clone of that clone,
+# and the four verbs print what they print for a QEMU domain.
+#
+# Disk only, and only of a domain that is shut off. A clone of a running VM's
+# disk is a disk caught mid-write with nothing of its memory, which is a crash
+# image and not a snapshot; tart's own way to keep memory (`tart suspend`)
+# needs the VM started with --suspendable, which takes its audio and entropy
+# devices away, and needs a macOS 14 guest, which rules out the oldest guest
+# this driver runs. So `snapshot create` on a running tart domain is refused,
+# with the two commands that get there.
+#
+# Flat, as qcow2-internal snapshots are: none has a parent, and deleting one
+# never touches another.
+
+# tart_snapshot_names VM -- VM's snapshot names, one per line.
+tart_snapshot_names() {
+    tart_rows | cut -f1 | awk -v p="$1$TART_SNAP_SEP" 'index($0, p) == 1 { print substr($0, length(p) + 1) }' \
+        | grep -vF -- "$TART_SNAP_SEP" || true
+}
+
+tart_snapshot_exists() { tart_snapshot_names "$1" | grep -qxF -- "$2"; }
+
+tart_snapshot() {
+    local CMD="$1" VM="$2" SNAP="${3:-}" clone name mac tmp
+    local -a args=()
+    tart_tool
+    case "$CMD" in
+    create)
+        SNAP="${SNAP:-snap-$(date +%Y%m%d-%H%M%S)}"
+        [[ "$SNAP" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+            || die "a snapshot name is letters, digits, '.', '_' and '-', got '$SNAP'"
+        ! tart_snapshot_exists "$VM" "$SNAP" \
+            || die "snapshot '$SNAP' already exists on $VM" \
+                   "Pick another name, or: virutil snapshot delete $VM $SNAP"
+        [[ "$(tart_state "$VM")" == 'shut off' ]] \
+            || die "$VM is $(tart_state "$VM"), and a tart snapshot is a copy of a disk" \
+                   "that is closed: tart keeps no memory image, so a copy taken now" \
+                   "would be a disk caught mid-write. Shut it down, then snapshot:" \
+                   "  virutil domain shutdown $VM" \
+                   "  virutil snapshot create $VM $SNAP"
+        say "shut off: disk-only snapshot (no memory image)"
+        "$TART" clone "$VM" "$VM$TART_SNAP_SEP$SNAP" \
+            || die "tart could not clone $VM to $VM$TART_SNAP_SEP$SNAP"
+        echo "created: $SNAP"
+        ;;
+    list)
+        printf ' %-30s %-27s %s\n' Name 'Creation Time' State
+        printf '%s\n' '----------------------------------------------------------------------'
+        while read -r name; do
+            [[ -n "$name" ]] || continue
+            clone="$(tart_home)/vms/$VM$TART_SNAP_SEP$name"
+            printf ' %-30s %-27s %s\n' "$name" \
+                "$(date -r "$(stat -f %B "$clone" 2>/dev/null || echo 0)" '+%Y-%m-%d %H:%M:%S %z')" shutoff
+        done < <(tart_snapshot_names "$VM")
+        ;;
+    revert)
+        [[ -n "$SNAP" ]] || die "usage: virutil snapshot revert VM SNAP"
+        tart_snapshot_exists "$VM" "$SNAP" || die "no such snapshot on $VM: $SNAP"
+        if [[ "$(tart_state "$VM")" != 'shut off' ]]; then
+            say "$SNAP is disk-only: powering $VM off to revert it"
+            "$TART" stop "$VM" --timeout 10 >/dev/null 2>&1 || true
+            [[ "$(tart_state "$VM")" == 'shut off' ]] \
+                || die "$VM did not stop; nothing has been reverted."
+        fi
+        # The copy is made before the domain is removed, so a clone that fails
+        # leaves the domain as it was. The domain keeps its MAC address across
+        # the swap, and so its DHCP lease and its address: a clone made beside
+        # the VM it came from is given a new one.
+        mac="$(tart_info "$VM" | jq -r '.MACAddress // empty')"
+        tmp="$VM${TART_SNAP_SEP}revert-$$"
+        "$TART" clone "$VM$TART_SNAP_SEP$SNAP" "$tmp" \
+            || die "tart could not clone snapshot $SNAP; $VM is unchanged."
+        if ! "$TART" delete "$VM"; then
+            "$TART" delete "$tmp" 2>/dev/null || true
+            die "tart could not remove $VM to replace it; $VM is unchanged."
+        fi
+        "$TART" rename "$tmp" "$VM" \
+            || die "$VM was removed and its replacement could not be renamed into" \
+                   "place. It is the tart VM '$tmp': tart rename '$tmp' $VM"
+        if [[ -n "$mac" ]]; then "$TART" set "$VM" --mac "$mac" 2>/dev/null || true; fi
+        # Running at the snapshot, as every revert leaves a domain: started the
+        # way it was last started, window or none.
+        mapfile -t args < <(tart_last_args "$VM")
+        tart_launch "$VM" ${args[@]+"${args[@]}"}
+        echo "reverted: $SNAP"
+        ;;
+    delete)
+        [[ -n "$SNAP" ]] || die "usage: virutil snapshot delete VM SNAP"
+        tart_snapshot_exists "$VM" "$SNAP" || die "no such snapshot on $VM: $SNAP"
+        "$TART" delete "$VM$TART_SNAP_SEP$SNAP" || die "tart could not delete snapshot $SNAP"
+        echo "deleted: $SNAP"
+        ;;
+    *)
+        snapshot_usage
+        ;;
+    esac
+}

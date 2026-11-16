@@ -277,6 +277,10 @@ input_main() {
         unset 'combos[-1]'
     fi
 
+    # A tart domain takes the same events over its VNC console
+    # (modules/mac/tart-screen), which reads this function's locals.
+    if tart_claims "$VM"; then tart_input; return; fi
+
     domain_need "$VM"
     domain_running "$VM" || die "$VM is not running (shut off): there is nothing to send input to"
     # One channel for the whole run; the EXIT trap modules/mac/qemu sets

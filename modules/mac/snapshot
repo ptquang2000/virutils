@@ -111,6 +111,12 @@ snapshot_main() {
     [ -n "$CMD" ] || snapshot_usage
     case "$CMD" in -h|--help) snapshot_usage 0 ;; esac
     VM="${2:-}"
+    # A tart domain's snapshots are clones (modules/mac/tart).
+    if tart_claims "$VM"; then
+        case "$CMD" in create|list|revert|delete) ;; *) snapshot_usage ;; esac
+        tart_snapshot "$CMD" "$VM" "${3:-}"
+        return
+    fi
     domain_need "$VM" || snapshot_usage
     qemu_tools
 

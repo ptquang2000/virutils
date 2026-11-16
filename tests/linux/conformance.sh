@@ -81,11 +81,13 @@ done
 exits 1 'virutil domain bogus'    bash "$ROOT/virutil" domain bogus
 exits 1 'virutil exec bogus VM'   bash "$ROOT/virutil" exec bogus VM
 
-# The macOS driver publishes the whole grammar and carries three modules of it.
-# The rest are refused by name with the reason, never as "unknown module" --
-# the same rule the Windows driver's snapshot refusal is tested for below.
+# The macOS driver publishes the whole grammar and carries all of it but usb,
+# which is refused by name with the reason, never as "unknown module" -- the
+# same rule the Windows driver's snapshot refusal is tested for below. sync,
+# push, pull and ui are modules there now and refuse a QEMU domain the same
+# way; tests/mac/tart.sh holds them to it.
 if [[ "$BASH_TREE" == mac ]]; then
-    for m in sync push pull ui usb; do
+    for m in usb; do
         if out="$(bash "$ROOT/virutil" "$m" 2>&1)"; then
             bad "virutil $m is refused on macOS" 'it exited 0'
         elif printf '%s' "$out" | grep -q 'is not on the macOS driver'; then
@@ -113,10 +115,12 @@ fi
 # sources the macOS module with qmp() substituted, so it runs here too, on any
 # host. exec.sh and tests/mac/exec.sh put each tree's gexec against a model of
 # qemu-ga's exec records (docs/qga-exec-records.md); xfer.sh checks that sync,
-# push and pull stop when the guest copier's line never came.
+# push and pull stop when the guest copier's line never came. tests/mac/tart.sh
+# drives the macOS driver's tart half with tart and its VNC console
+# substituted, and skips anywhere but a Mac.
 printf '\n-- bash unit tests --\n'
 for t in "$HERE/shot.sh" "$HERE/input.sh" "$HERE/pull.sh" "$HERE/exec.sh" "$HERE/xfer.sh" \
-         "$ROOT/tests/mac/input.sh" "$ROOT/tests/mac/exec.sh"; do
+         "$ROOT/tests/mac/input.sh" "$ROOT/tests/mac/exec.sh" "$ROOT/tests/mac/tart.sh"; do
     name="tests/${t#"$ROOT/tests/"}"
     if out="$(bash "$t" 2>&1)"; then
         printf '%s\n' "$out" | sed 's/^/  /'

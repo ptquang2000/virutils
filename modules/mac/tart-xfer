@@ -1,0 +1,373 @@
+# tart-xfer -- how files move between this host and a tart domain: the transfer
+# layer under modules/mac/push, pull and sync.
+#
+# Every other host's transfer has the host *serve* and the guest *fetch*, over
+# the guest's NIC: SMB and robocopy for a Windows guest, an rsync daemon and
+# rsync for a Linux one. A tart domain needs neither a server nor the network.
+# `tart exec -i` carries a process's stdin and stdout to and from the guest, and
+# that is all rsync asks of a remote shell, so the host's rsync runs the guest's
+# as its far end through libexec/mac/tart-rsh:
+#
+#   rsync -e tart-rsh SRC VM:/DST        rsync --server, in the guest, over the agent
+#
+# What that keeps of the contract: the guest keeps running, sees no new device,
+# and only what differs moves (rsync's size-and-mtime check), so a second push
+# of an unchanged tree moves nothing. What it changes: the copier is this
+# host's rsync, so its exit status is the result, and there is no "guest copier
+# sent no result" to check for -- a transfer that did not happen is an rsync
+# that did not exit 0.
+#
+# The two ends are different rsyncs, and the options are chosen for the older:
+#
+#   host    Homebrew's rsync 3.x. macOS's own /usr/bin/rsync is openrsync,
+#           which has no --old-args and no --mkpath, so it is refused by name.
+#   guest   whatever /usr/bin/rsync the guest has: rsync 2.6.9 up to macOS 14,
+#           openrsync from macOS 15. Both speak protocol 29, and the host's
+#           rsync talks down to it.
+#
+# So: -rlt and nothing newer than 2.6.9 knew. No -p, which would lay the
+# source's modes over directories the guest already has (rsync applies the
+# mode of a tree's root to the destination's, and one sync onto / has chmod'ed
+# a guest's / to 0700 that way, modules/linux/sync): a new file keeps its
+# source mode under the guest's umask, and anything already there keeps its
+# own. -O for the same reason about times: a sync delivers onto /, which on a
+# Mac is a sealed read-only volume, and setting its mtime fails the run.
+# --old-args because there is no shell on the far side: an argument arrives as
+# the one word it was sent as, and must not be escaped for a shell that is not
+# there. No -E: to the 2.6.9 Apple ships it means extended attributes.
+#
+# Everything lands as root's -- the agent is root, or reaches it through sudo
+# (modules/mac/tart-exec) -- which is what a package would leave behind.
+
+# --- numbers a person can read -------------------------------------------------
+#
+# modules/linux/guest's, byte for byte in what they print: the lines these
+# appear in are the same lines on every host.
+
+fmt_bytes() {
+    awk -v b="${1:-0}" 'BEGIN {
+        split("B KiB MiB GiB TiB", u, " ")
+        i = 1
+        while (b >= 1024 && i < 5) { b /= 1024; i++ }
+        printf (i == 1 ? "%d %s" : "%.1f %s"), b, u[i]
+    }'
+}
+
+fmt_duration() {
+    awk -v ms="${1:-0}" 'BEGIN {
+        if      (ms <  1000) printf "%dms", ms
+        else if (ms < 60000) printf "%.1fs", ms / 1000
+        else                 printf "%dm%02ds", int(ms / 60000), int(ms % 60000 / 1000)
+    }'
+}
+
+fmt_rate() {
+    local ms="${2:-0}"
+    (( ms > 0 )) || return 0
+    awk -v b="${1:-0}" -v ms="$ms" 'BEGIN {
+        r = b * 1000 / ms
+        split("B KiB MiB GiB", u, " ")
+        i = 1
+        while (r >= 1024 && i < 4) { r /= 1024; i++ }
+        printf "%.1f %s/s", r, u[i]
+    }'
+}
+
+# now_ms -- bash's own clock: BSD date has no %N.
+now_ms() { local t="${EPOCHREALTIME/./}"; printf '%s' "${t:0:${#t}-3}"; }
+
+# '.' spells "the root of this tree" and must not reach rsync as a path.
+root_rel() { local s="$1"; [[ "$s" == "." ]] && s=""; printf '%s' "$s"; }
+
+# guest_norm_posix PATH [WHAT] -- PATH relative to the guest's /: no leading
+# slash, no empty or '.' component, and '..' refused rather than resolved.
+guest_norm_posix() {
+    local s="$1" what="${2:-path}" out="" comp
+    while [[ -n "$s" ]]; do
+        while [[ "$s" == /* ]]; do s="${s#/}"; done
+        comp="${s%%/*}"
+        [[ -n "$comp" ]] || break
+        case "$comp" in
+            '.') ;;
+            '..') die "$what may not contain '..': $1" ;;
+            *)    out="${out:+$out/}$comp" ;;
+        esac
+        s="${s#"$comp"}"
+    done
+    printf '%s' "$out"
+}
+
+# tree_bytes DIR -- the apparent size of every file under DIR.
+tree_bytes() {
+    find "$1" -type f -exec stat -f %z {} + 2>/dev/null | awk '{ s += $1 } END { printf "%d", s }'
+}
+
+# xfer_room_for BYTES DIR -- refuse, before the spend, a copy DIR's filesystem
+# has no room for.
+xfer_room_for() {
+    local need="$1" dir="$2" free
+    free="$(df -k "$dir" 2>/dev/null | awk 'NR == 2 { printf "%d", $4 * 1024 }')" || return 0
+    [[ "$free" =~ ^[0-9]+$ ]] || return 0
+    (( free > need )) \
+        || die "packing this needs about $(fmt_bytes "$need") in $dir and" \
+               "there is $(fmt_bytes "$free") free. Point VIRUTILS_TMP_DIR at" \
+               "somewhere with room, or push fewer files."
+}
+
+# xfer_qemu_refuse WHAT VM -- push, pull and sync against a QEMU domain. The
+# reason is the one the parser gave for the whole module while no domain on
+# this host had a transfer layer.
+xfer_qemu_refuse() {
+    die "virutil $1 is not on the macOS driver for a QEMU domain, and $2 is one:" \
+        "it needs the transfer layer, which a QEMU domain does not have here yet." \
+        "See docs/contract.md section 7. A tart domain has one."
+}
+
+# --- the copier ----------------------------------------------------------------
+
+XFER_RSYNC=""        # the host's rsync
+XFER_STAGE=""        # scratch under VIRUTILS_TMP_DIR, removed however the run ends
+XFER_LOG=""          # rsync's itemised output for the transfer in hand
+XFER_COPIED=0        # how many files that transfer actually sent
+XFER_LAND=""         # pull's landing directory beside a file DST
+
+xfer_stop() {
+    [[ -n "$XFER_STAGE" && -d "$XFER_STAGE" ]] && rm -rf -- "$XFER_STAGE"
+    [[ -n "$XFER_LAND"  && -d "$XFER_LAND"  ]] && rm -rf -- "$XFER_LAND"
+    XFER_STAGE="" XFER_LAND=""
+    return 0
+}
+
+# xfer_stage -- make XFER_STAGE, and arm its removal.
+xfer_stage() {
+    [[ -n "$XFER_STAGE" ]] && return 0
+    mkdir -p "$VIRUTILS_TMP_DIR" || die "could not create $VIRUTILS_TMP_DIR"
+    XFER_STAGE="$(mktemp -d "$VIRUTILS_TMP_DIR/xfer.XXXXXX")" \
+        || die "could not create a scratch directory for the transfer"
+    # chan_close is modules/mac/qemu's EXIT trap, which this replaces.
+    trap 'xfer_stop; chan_close' EXIT
+}
+
+# xfer_check VM -- everything a transfer needs, checked before anything moves:
+# the host's rsync, the domain running, the agent answering as root, and an
+# rsync in the guest.
+GUEST_RC_NO_RSYNC=90
+xfer_check() {
+    local vm="$1"
+    tart_tool
+    XFER_RSYNC="$(command -v rsync || true)"
+    [[ -n "$XFER_RSYNC" ]] || die "rsync not found (brew install rsync)"
+    # Captured, then searched: grep -q in a pipe exits at the first match and
+    # pipefail reads rsync's SIGPIPE as a failure.
+    local help; help="$("$XFER_RSYNC" --help 2>&1 || true)"
+    grep -q -- '--old-args' <<<"$help" \
+        || die "$XFER_RSYNC is too old to drive a guest's rsync through tart: it" \
+               "has no --old-args. macOS's own /usr/bin/rsync is openrsync, which" \
+               "is one of those. Install rsync 3.2.4 or newer ahead of it on PATH:" \
+               "  brew install rsync"
+    [[ "$(tart_state "$vm")" == running ]] \
+        || die "$vm is $(tart_state "$vm"). The copy is delivered into the running" \
+               "guest over its agent, so start it first:" \
+               "  virutil domain start $vm"
+    tart_agent_sudo "$vm"
+    if ! "$TART" exec "$vm" /bin/sh -c 'command -v rsync >/dev/null 2>&1' </dev/null; then
+        warn "$vm has no rsync, and rsync is what copies in the guest. macOS ships" \
+             "one in /usr/bin; a Linux guest wants its distribution's rsync package."
+        exit "$GUEST_RC_NO_RSYNC"
+    fi
+}
+
+# xfer_rsync ARGS... -- one transfer through the guest agent. rsync's itemised
+# output goes to XFER_LOG and the number of files it sent to XFER_COPIED; its
+# own messages stay on stderr, and its exit status is returned.
+#
+# A `<` or `>` in the first column of an itemised line is a file whose contents
+# crossed, in whichever direction; a directory or an unchanged file has
+# neither. Counted rather than parsed from a summary: --out-format is not
+# localised.
+xfer_rsync() {
+    local rc=0
+    xfer_stage
+    XFER_LOG="$XFER_STAGE/rsync.log"
+    VIRUTIL_TART="$TART" VIRUTIL_TART_SUDO="${TART_SUDO[*]:-}" \
+        "$XFER_RSYNC" -rlt -O --old-args --out-format='%i %n' \
+        -e "$HERE/libexec/mac/tart-rsh" "$@" >"$XFER_LOG" || rc=$?
+    XFER_COPIED="$(grep -c '^[<>]f' "$XFER_LOG" || true)"
+    return "$rc"
+}
+
+# xfer_rsync_die RC WHAT -- an rsync that failed, said the way a person can act
+# on. rsync's own lines are already above.
+xfer_rsync_die() {
+    local rc="$1" what="$2"
+    case "$rc" in
+        23|24) die "rsync moved only part of $what (exit $rc); the files it names" \
+                   "above are the ones it could not. Anything it did copy is left" \
+                   "where it landed." ;;
+        12|255) die "rsync lost the guest while moving $what (exit $rc): the guest" \
+                    "agent dropped the stream, or the guest's rsync never started." \
+                    "Its own error is above." ;;
+        *)     die "rsync could not move $what (exit $rc); its own error is above." ;;
+    esac
+}
+
+# --- push ----------------------------------------------------------------------
+
+PUSH_RC_MKDIR=92
+
+# tart_push VM SRC DST -- DST is the caller's spelling; the rules for whether
+# it names a file or a directory are the contract's (section 2).
+tart_push() {
+    local VM="$1" SRC="$2" DST="$3"
+    local is_dir=0 dst base rc=0 t0 ms total bytes what note rate
+    DOMAIN="$VM"
+
+    [[ "$DST" == */ ]] && is_dir=1
+    DST="$(guest_norm_posix "$DST" destination)" || exit 1
+    [[ -d "$SRC" ]] && is_dir=1
+    base="$(basename -- "$SRC")"
+
+    if [[ -d "$SRC" ]]; then
+        # A trailing slash on SRC means its contents, as with rsync.
+        if [[ "$SRC" == */ ]]; then dst="/$DST"
+        else                        dst="/${DST:+$DST/}$base"
+        fi
+        tart_sh_text "$VM" "mkdir -p $(sh_quote "$dst")" || exit "$PUSH_RC_MKDIR"
+        echo "push: $SRC -> ${dst%/}/"
+        t0="$(now_ms)"
+        xfer_rsync "${SRC%/}/" "$VM:$dst/" || rc=$?
+        ms=$(( $(now_ms) - t0 ))
+        (( rc == 0 )) || xfer_rsync_die "$rc" "the payload"
+        total="$(tart_sh_text "$VM" "find $(sh_quote "$dst") -type f | wc -l" | tr -dc '0-9')"
+        [[ -n "$total" ]] || die "$DOMAIN: could not count what is in $dst after the copy"
+        what="$total file"; (( total == 1 )) || what+="s"
+        if (( XFER_COPIED > 0 )); then what+=" present, $XFER_COPIED copied"
+        else                           what+=" present (all up to date)"
+        fi
+        echo "$DOMAIN: $what in $(fmt_duration "$ms")"
+    else
+        if (( is_dir )); then
+            dst="/${DST:+$DST/}$base"
+            tart_sh_text "$VM" "mkdir -p $(sh_quote "/$DST")" || exit "$PUSH_RC_MKDIR"
+            echo "push: $SRC -> /${DST:+$DST/}"
+        else
+            dst="/$DST"
+            tart_sh_text "$VM" "mkdir -p $(sh_quote "$(dirname -- "$dst")")" || exit "$PUSH_RC_MKDIR"
+            echo "push: $SRC -> $dst"
+        fi
+        t0="$(now_ms)"
+        xfer_rsync "$SRC" "$VM:$dst" || rc=$?
+        ms=$(( $(now_ms) - t0 ))
+        (( rc == 0 )) || xfer_rsync_die "$rc" "the payload"
+        bytes="$(stat -f %z -- "$SRC")"
+        note=""; rate="$(fmt_rate "$bytes" "$ms")"
+        if (( XFER_COPIED == 0 )); then note=" (already current)"; rate=""; fi
+        echo "$DOMAIN: done ($(fmt_bytes "$bytes")$note) in" \
+             "$(fmt_duration "$ms")${rate:+ ($rate on the wire)}"
+    fi
+    xfer_stop
+}
+
+# --- pull ----------------------------------------------------------------------
+
+PULL_RC_NOMATCH=94
+
+# The guest half of a pull: expand the pattern with the guest's own shell and
+# name what it matched. The pattern travels as data -- $1, never source -- and
+# still globs: with IFS empty, `set -- $pat` splits into no fields and expands
+# each match to one (payloads/linux/pull.sh has the reasoning). A glob that
+# matched nothing is left as its own text, and is told apart by not existing.
+#
+# Prints "<files> <dirs>", then one match per line.
+TART_PULL_MATCH='pat=$1
+oldifs=$IFS; IFS=""; set -- $pat; IFS=$oldifs
+if [ $# -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; then
+  echo "no match for $pat" >&2
+  exit '"$PULL_RC_NOMATCH"'
+fi
+nf=0 nd=0
+for f do
+  if [ -d "$f" ] && [ ! -L "$f" ]; then nd=$((nd+1)); else nf=$((nf+1)); fi
+done
+echo "$nf $nd"
+for f do printf "%s\n" "$f"; done'
+
+# pull_place LAND DST -- move what landed in LAND onto DST: the one file as DST
+# itself, a directory as DST, nothing as nothing.
+pull_place() {
+    local land="$1" dst="$2"
+    local -a items=()
+    mapfile -t items < <(find "$land" -mindepth 1 -maxdepth 1)
+    if (( ${#items[@]} == 1 )) && [[ -f "${items[0]}" ]]; then
+        mv -f -- "${items[0]}" "$dst" && rmdir -- "$land"
+    elif (( ${#items[@]} > 0 )); then
+        mv -- "$land" "$dst" && chmod -- "$(umask -S)" "$dst"
+    else
+        rmdir -- "$land"
+    fi
+}
+
+# tart_pull VM SRC DST
+tart_pull() {
+    local VM="$1" SRC="$2" DST="$3"
+    local as_file=0 into out rc=0 counts files dirs t0 ms what m
+    local -a matches=() remote=()
+    DOMAIN="$VM"
+
+    SRC="$(guest_norm_posix "$SRC" source)" || exit 1
+    [[ -n "$SRC" ]] || die "source may not be the root of /"
+
+    out="$("$TART" exec "$VM" ${TART_SUDO[@]+"${TART_SUDO[@]}"} /bin/sh -c "$TART_PULL_MATCH" sh "/$SRC" </dev/null)" || rc=$?
+    if (( rc == PULL_RC_NOMATCH )); then
+        warn "no match in $DOMAIN for /$SRC." \
+             "The pattern is expanded by the guest's own shell, so it matches" \
+             "case-sensitively."
+        exit "$PULL_RC_NOMATCH"
+    fi
+    (( rc == 0 )) || die "$DOMAIN could not list /$SRC (exit $rc); its own error is above."
+    counts="$(head -n 1 <<<"$out")"
+    [[ "$counts" =~ ^[0-9]+\ [0-9]+$ ]] \
+        || die "$DOMAIN: the guest did not say what /$SRC matched (got [$counts])"
+    read -r files dirs <<<"$counts"
+    mapfile -t matches < <(tail -n +2 <<<"$out")
+    (( ${#matches[@]} == files + dirs )) \
+        || die "$DOMAIN: /$SRC matches a name with a newline in it, which cannot" \
+               "be listed across to this host. Pull its directory instead."
+
+    # The same rule as push, the other way round: one file, no wildcard, to a
+    # DST that does not exist and has no trailing slash, is that file.
+    if [[ ! -e "$DST" && "$DST" != */ && "$SRC" != *[\*\?\[]* ]]; then
+        as_file=1
+        mkdir -p -- "$(dirname -- "$DST")" || die "could not create destination: $(dirname -- "$DST")"
+        XFER_LAND="$(mktemp -d "$(dirname -- "$DST")/.virutil-pull-XXXXXX")" \
+            || die "could not make a directory beside $DST to copy into"
+        xfer_stage
+        into="$XFER_LAND"
+    else
+        mkdir -p -- "$DST" || die "could not create destination: $DST"
+        into="$DST"
+    fi
+    [[ -w "$into" ]] || die "$into is not writable by you"
+
+    echo "pull: /$SRC -> $DST"
+    for m in "${matches[@]}"; do remote+=("$VM:$m"); done
+    t0="$(now_ms)"
+    xfer_rsync "${remote[@]}" "${into%/}/" || rc=$?
+    ms=$(( $(now_ms) - t0 ))
+    if (( as_file )); then
+        pull_place "$XFER_LAND" "$DST" || true
+        XFER_LAND=""
+    fi
+    (( rc == 0 )) || xfer_rsync_die "$rc" "the files being read out"
+    xfer_stop
+
+    what=""
+    if (( files )) || (( ! dirs )); then
+        what="$files file"; (( files == 1 )) || what+="s"
+    fi
+    if (( dirs )); then
+        [[ -n "$what" ]] && what+=" and "
+        what+="$dirs director"; (( dirs == 1 )) && what+="y" || what+="ies"
+    fi
+    echo "$DOMAIN: $what pulled in $(fmt_duration "$ms")"
+}

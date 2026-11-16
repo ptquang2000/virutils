@@ -1,0 +1,17 @@
+#!/bin/sh
+# tart-rsh -- rsync's remote shell for a tart guest: modules/mac/tart-xfer hands
+# this to rsync as -e, so the far end of a push, pull or sync is reached over
+# the tart guest agent rather than over ssh. No address, no key, no sshd.
+#
+# rsync calls it as `tart-rsh VM rsync --server ...`. The words after VM are run
+# in the guest as an argv, exactly as given: there is no shell on the far side
+# to split or expand them, which is why the caller passes rsync --old-args.
+#
+#   VIRUTIL_TART       the tart binary
+#   VIRUTIL_TART_SUDO  non-empty when the agent is not root: go through sudo -n
+vm=$1
+shift
+if [ -n "${VIRUTIL_TART_SUDO:-}" ]; then
+    exec "${VIRUTIL_TART:-tart}" exec -i "$vm" /usr/bin/sudo -n "$@"
+fi
+exec "${VIRUTIL_TART:-tart}" exec -i "$vm" "$@"

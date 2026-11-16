@@ -1,0 +1,59 @@
+# ui -- start a process on a guest's interactive desktop.
+#
+#   virutil ui run VM [-s] [--] APP...
+#
+# On this host that is a tart domain running macOS: APP is started as the user
+# logged in on the console, inside that user's session, so it has a window, a
+# Dock and a keychain -- which a process `exec` starts, as root and outside the
+# session, does not. modules/mac/tart-exec has the guest half and the reasons.
+# A QEMU domain's `ui` is not wired in here yet and is refused by name.
+
+ui_usage() {
+    printf '%s\n' \
+        "usage: virutil ui run VM [-s] [--] APP..." \
+        "" \
+        "  run VM APP...   start APP on the desktop of the user logged in on" \
+        "                  VM's console, and return without waiting for it." \
+        "                  APP is a program plus its arguments; a bare name is" \
+        "                  looked up on the guest's PATH. Prints" \
+        "                  \"started PID <pid> in session console as <user>\"." \
+        "                  APP runs as that user, in their login session: what" \
+        "                  double-clicking it there would give. To open an app" \
+        "                  bundle or a document, APP is 'open':" \
+        "                    virutil ui run VM open -a 'Google Chrome' https://example.com" \
+        "" \
+        "    -s, --system  as root, in that same session" \
+        "    --            end of options; everything after it is APP" \
+        "" \
+        "                  Options stop at the first word that is not one, so" \
+        "                  APP's own flags stay APP's. Exits 96 when no user is" \
+        "                  logged in on the console." \
+        "" \
+        "  -h, --help     this message" \
+        "" \
+        "VM is a tart domain running macOS. -i and --elevated are a Windows" \
+        "guest's and are refused by name; so is a QEMU domain, whose ui is not" \
+        "wired into this driver yet." >&2
+    exit "${1:-1}"
+}
+
+ui_main() {
+    local CMD="${1:-}" VM
+    case "$CMD" in
+        "")        ui_usage 1 ;;
+        -h|--help) ui_usage 0 ;;
+        run)       ;;
+        *)         die "virutil ui: unknown command: $CMD (see: virutil ui -h)" ;;
+    esac
+    shift
+    case "${1:-}" in -h|--help) ui_usage 0 ;; esac
+    VM="${1:-}"
+    [[ -n "$VM" ]] || ui_usage 1
+    shift
+    domain_exists "$VM" \
+        && die "virutil ui is not on the macOS driver for a QEMU domain, and $VM is" \
+               "one: it is not wired into this driver yet. See docs/contract.md" \
+               "section 7. A tart domain has it."
+    tart_claims "$VM" || die "no such domain: $VM (see: virutil domain list)"
+    tart_ui "$VM" "$@"
+}

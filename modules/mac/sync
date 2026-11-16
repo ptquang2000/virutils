@@ -1,0 +1,425 @@
+# sync -- fetch a project's build output into a staging tree, then deliver it
+# into a running guest. Config format: see README.md.
+#
+# modules/linux/sync carried over to a macOS host, with the delivery swapped.
+# Everything host-side is the same code doing the same thing: the config
+# grammar, the fetch into a staging tree that outlives the run, the excludes,
+# and the map rules building a delivery tree laid out as the guest's root. What
+# differs is the last step. There the host serves the tree and the guest
+# fetches it; here this host's rsync pushes it through the tart guest agent
+# (modules/mac/tart-xfer), because a tart domain is the only kind this host can
+# transfer to, and that channel needs no server and no network.
+#
+# @guest says which OS the guest runs, and on this host it has to be what tart
+# says the domain is -- `macos`, or `linux` for a tart Linux VM. It is checked
+# rather than believed: tart knows what it built the virtual hardware for, and
+# a config's run rules are written for one shell.
+
+CONF_DIR="${VIRUTILS_CONF_DIR:-$HOME/.virutils/conf}"
+SYNC_LEGACY_CONF_DIR="$HOME/.config/virutils"
+SYNC_DEFAULT_CONF="sync.conf"
+
+# The fetch is host-to-host and wants what modules/linux/sync's wants of rsync:
+# --mkpath, so a fetch rule's destination need not exist yet.
+RSYNC=(rsync -rlt --mkpath --info=progress2 --no-perms --no-owner --no-group)
+
+sync_config_lookup() {
+    local name="$1"
+    [[ -f "$CONF_DIR/$name" ]] && { printf '%s' "$CONF_DIR/$name"; return 0; }
+    [[ -f "$SYNC_LEGACY_CONF_DIR/$name" ]] \
+        && { printf '%s' "$SYNC_LEGACY_CONF_DIR/$name"; return 0; }
+    printf '%s' "$CONF_DIR/$name"
+}
+
+SYNC_STAGING_ROOT="${VIRUTILS_STAGING_ROOT:-$VIRUTILS_ROOT/staging}"
+
+REPO=""; STAGING=""; DEST=""; DOMAIN=""
+FETCH=(); MAPPINGS=(); EXCLUDES=(); CLEANUP=(); RUN_PRE=(); RUN_POST=()
+
+# Which OS the guest runs, from @guest. windows when the config does not say,
+# because that is what every config written before @guest existed means.
+GUEST_OS="windows"
+
+sync_set_guest() {
+    case "$2" in
+        windows|linux|macos) GUEST_OS="$2" ;;
+        *) die "$1: unknown @guest value '$2'." \
+               "It wants 'windows', 'linux' or 'macos'." ;;
+    esac
+}
+
+sync_usage() {
+    printf '%s\n' \
+        "usage: virutil sync VM [-c NAME|PATH]" \
+        "" \
+        "  VM                      tart domain delivered into. It has to be" \
+        "                          running, since the delivery goes through" \
+        "                          its guest agent" \
+        "  -c, --config NAME|PATH  config to use. A value containing '/' is a" \
+        "                          path, taken as given; anything else names a" \
+        "                          config looked up in $CONF_DIR first, then" \
+        "                          $SYNC_LEGACY_CONF_DIR" \
+        "                          ('.conf' is appended when absent)." \
+        "                          default: $SYNC_DEFAULT_CONF" \
+        "  -h, --help              this message" \
+        "" \
+        "The config is the whole interface; see README.md for its format." \
+        "" \
+        "The delivery moves only what changed, so a re-run after a rebuild of" \
+        "one file moves one file." \
+        "" \
+        "@guest in the config has to name what the tart domain runs: 'macos'" \
+        "(or 'linux' for a tart Linux VM). The run rules go through /bin/sh as" \
+        "root; a >pre-ui or >post-ui rule is started on the desktop of the user" \
+        "logged in on a macOS guest's console." \
+        "" \
+        "A QEMU domain is refused on this host: it has no transfer layer yet." >&2
+    exit "${1:-1}"
+}
+
+# A map rule's destination is relative to @dest. Empty means @dest itself.
+guest_dir() { printf '%s' "${DEST:+$DEST${1:+/}}$1"; }
+
+sync_dst_rel() {
+    local s="$1"
+    [[ "/$s/" == */../* ]] && die "destination may not contain '..': $s"
+    root_rel "$s"
+}
+
+# sync_map_into ROOT -- run every map rule, delivering into ROOT/<dst>. ROOT
+# stands for the guest's /: the tree built here is the layout the guest wants.
+sync_map_into() {
+    local root="$1" rule globs rel dst_rel g m
+    local -a patterns files matches
+
+    shopt -s nullglob
+    for rule in "${MAPPINGS[@]}"; do
+        globs="${rule%%|*}"
+        rel="$(sync_dst_rel "${rule#*|}")" || exit 1
+        dst_rel="$(guest_dir "$rel")"
+
+        # read never does pathname expansion, unlike `for g in $globs`.
+        IFS=' ' read -r -a patterns <<< "$globs"
+
+        files=()
+        for g in "${patterns[@]}"; do
+            # A pattern with no wildcard expands to itself whether the file is
+            # there or not, so existence is checked rather than assumed.
+            matches=()
+            for m in "$STAGING/"$g; do [[ -e "$m" ]] && matches+=("$m"); done
+            (( ${#matches[@]} )) || { warn "warning: no match for '$g'"; continue; }
+            files+=("${matches[@]}")
+        done
+        (( ${#files[@]} )) || { warn "skipping '/$dst_rel': nothing matched"; continue; }
+
+        echo "-> /$dst_rel (${#files[@]} item(s))"
+        "${RSYNC[@]}" --whole-file ${EXCLUDES[@]+"${EXCLUDES[@]}"} "${files[@]}" "$root/$dst_rel/"
+    done
+    shopt -u nullglob
+}
+
+# sync_run WHEN ENTRY... -- the run rules, in config order. Fatal on the first
+# failure: a rule exists to make the copy land correctly, so carrying on past
+# one that did not happen would deliver a half-installed guest and call it done.
+sync_run() {
+    local when="$1"; shift
+    local entry mode cmd
+    if ! tart_running "$DOMAIN"; then
+        warn "   $when run rules skipped: $DOMAIN is $(tart_state "$DOMAIN")," \
+             "not running, so there is no agent to run them"
+        return 0
+    fi
+    for entry in "$@"; do
+        mode="${entry%%$'\t'*}"
+        cmd="${entry#*$'\t'}"
+        if [[ "$mode" == ui ]]; then
+            [[ "$GUEST_OS" == macos ]] \
+                || die "a >$when-ui run rule needs a desktop session to start in, and" \
+                       "on this host that is a macOS guest's; this one is $GUEST_OS: $cmd"
+            echo "run ($when/ui): $cmd"
+            tart_ui_start "$DOMAIN" 0 "$cmd" \
+                || die "$when-ui run rule failed in $DOMAIN: $cmd" \
+                       "Its output is above. Nothing after it was run."
+        else
+            echo "run ($when): $cmd"
+            tart_sh_text "$DOMAIN" "$cmd" \
+                || die "$when run rule failed in $DOMAIN: $cmd" \
+                       "Its output is above. Nothing after it was run."
+        fi
+    done
+}
+
+sync_main() {
+    local CONF_ARG="" CONF lineno line VM="" p
+
+    while (( $# )); do
+        case "$1" in
+            -c|--config) (( $# >= 2 )) || { warn "$1 needs a value"; sync_usage; }
+                         CONF_ARG="$2"; shift 2 ;;
+            -h|--help)   sync_usage 0 ;;
+            -*)          warn "unrecognised argument: $1"; sync_usage ;;
+            *)           [[ -z "$VM" ]] || { warn "unexpected argument: $1"; sync_usage; }
+                         VM="$1"; shift ;;
+        esac
+    done
+    [[ -n "$VM" ]] || { warn "VM is required"; sync_usage; }
+    DOMAIN="$VM"
+
+    # Decided on spelling alone, never on what exists: the same command must
+    # mean the same config from any directory.
+    if   [[ -z "$CONF_ARG"    ]]; then CONF="$(sync_config_lookup "$SYNC_DEFAULT_CONF")"
+    elif [[ "$CONF_ARG" == */* ]]; then CONF="$CONF_ARG"
+    else                               CONF="$(sync_config_lookup "${CONF_ARG%.conf}.conf")"
+    fi
+    [[ -f "$CONF" ]] || die "config not found: $CONF" \
+        "Create it, or point -c elsewhere. README.md documents the format."
+
+    # Parsed up front so a malformed config fails before anything is touched.
+    local key val GUEST_SET=0
+    REPO=""; STAGING=""; DEST=""; GUEST_OS="windows"
+    FETCH=(); MAPPINGS=(); EXCLUDES=(); CLEANUP=(); RUN_PRE=(); RUN_POST=()
+    lineno=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        (( ++lineno ))
+        line="${line%%#*}"                       # strip comments
+        line="${line#"${line%%[![:space:]]*}"}"  # trim leading space
+        line="${line%"${line##*[![:space:]]}"}"  # trim trailing space
+        [[ -z "$line" ]] && continue
+
+        case "$line" in
+            @*)  IFS='=' read -r key val <<< "${line#@}"
+                 case "$key" in
+                     repo)    REPO="$val" ;;
+                     staging) STAGING="$val" ;;
+                     dest)    DEST="$val" ;;
+                     guest)   sync_set_guest "$CONF:$lineno" "$val"; GUEST_SET=1 ;;
+                     domain)  die "$CONF:$lineno: @domain is no longer a setting" \
+                                  "-- pass the domain as an argument: virutil sync $val" ;;
+                     nbd|mnt|shutdown_timeout|transport)
+                              die "$CONF:$lineno: @$key is no longer a setting" \
+                                  "-- it configured the disk-image delivery, which has" \
+                                  "been removed. Drop the line; the delivery goes into" \
+                                  "the running guest." ;;
+                     *) die "$CONF:$lineno: unknown setting '$key'" ;;
+                 esac ;;
+            !*)  local -a pats
+                 read -r -a pats <<< "${line#!}"
+                 for p in "${pats[@]}"; do EXCLUDES+=(--exclude="$p"); done ;;
+            -*)  CLEANUP+=("${line#-}") ;;
+            \>*) local when cmd
+                 cmd="${line#>}"
+                 cmd="${cmd#"${cmd%%[![:space:]]*}"}"
+                 when="${cmd%%[[:space:]]*}"
+                 cmd="${cmd#"$when"}"
+                 cmd="${cmd#"${cmd%%[![:space:]]*}"}"
+                 [[ -n "$cmd" ]] \
+                     || die "$CONF:$lineno: run rule has no command: $line"
+                 case "$when" in
+                     pre)     RUN_PRE+=("sh"$'\t'"$cmd") ;;
+                     post)    RUN_POST+=("sh"$'\t'"$cmd") ;;
+                     pre-ui)  RUN_PRE+=("ui"$'\t'"$cmd") ;;
+                     post-ui) RUN_POST+=("ui"$'\t'"$cmd") ;;
+                     *) die "$CONF:$lineno: run rule needs 'pre', 'post', 'pre-ui' or 'post-ui': $line" \
+                            "  >pre  COMMAND      before the files reach the guest (guest shell, as root)" \
+                            "  >post COMMAND      after they have" \
+                            "  >pre-ui  COMMAND   same timing, started on the desktop of the user logged in" \
+                            "  >post-ui COMMAND   likewise -- e.g. relaunch a GUI app the sync replaced" ;;
+                 esac ;;
+            \<*) [[ "$line" == *"|"* ]] \
+                     || die "$CONF:$lineno: fetch rule needs '|': $line"
+                 FETCH+=("${line#<}") ;;
+            *)   # Map rules are the only unsigilled form.
+                 [[ "${line:0:1}" == [A-Za-z0-9_./*?] ]] \
+                     || die "$CONF:$lineno: unrecognised directive: $line"
+                 [[ "$line" == *"|"* ]] \
+                     || die "$CONF:$lineno: missing '|' separator: $line"
+                 MAPPINGS+=("$line") ;;
+        esac
+    done < "$CONF"
+
+    # A relative @repo is relative to the directory the config is in, never to
+    # wherever virutil was run from.
+    if [[ -n "$REPO" && "$REPO" != /* ]]; then
+        REPO="$(cd "$(dirname "$CONF")" && pwd)/$REPO"
+    fi
+
+    [[ -n "$STAGING" ]] || die "$CONF: @staging is required"
+    [[ "/$STAGING/" == */../* ]] \
+        && die "$CONF: @staging may not contain '..': $STAGING"
+    STAGING="$SYNC_STAGING_ROOT/${STAGING#/}"
+
+    echo "config: $CONF"
+    echo "  ${#FETCH[@]} fetch, ${#MAPPINGS[@]} map, ${#EXCLUDES[@]} exclude," \
+         "${#CLEANUP[@]} cleanup, $(( ${#RUN_PRE[@]} + ${#RUN_POST[@]} )) run"
+    echo "  staging: $STAGING"
+    echo "  domain: $DOMAIN ($GUEST_OS)"
+    echo "  delivery: rsync into the running guest, through its agent"
+
+    # Before the fetch: a guest in the wrong state, or a config written for
+    # another kind of guest, is worth saying before minutes are spent fetching.
+    domain_exists "$DOMAIN" && xfer_qemu_refuse sync "$DOMAIN"
+    tart_claims "$DOMAIN" || die "no such domain: $DOMAIN (see: virutil domain list)"
+
+    local actual; actual="$(tart_guest_os "$DOMAIN")"
+    if [[ "$GUEST_OS" != "$actual" ]]; then
+        die "$CONF says @guest=$GUEST_OS$( (( GUEST_SET )) || printf ', by not saying')," \
+            "and $DOMAIN is a tart domain running $actual. The run rules are" \
+            "written for one guest's shell, so this is refused rather than guessed" \
+            "at. For this domain the config wants:" \
+            "  @guest=$actual"
+    fi
+
+    xfer_check "$DOMAIN"
+
+    # --- fetch: build tree -> staging ---------------------------------------
+    (( ${#FETCH[@]} )) || die "no fetch rules in $CONF"
+    [[ -n "$REPO" ]] || die "$CONF: @repo is required"
+    [[ -d "$REPO" ]] || die "repo not found: $REPO"
+
+    echo "fetch: $REPO"
+    local rule rel sub
+    for rule in "${FETCH[@]}"; do
+        rel="${rule%%|*}"
+        sub="$(sync_dst_rel "${rule#*|}")" || exit 1
+        [[ -d "$REPO/$rel" ]] \
+            || { warn "   warning: no such source dir, skipped: $rel"; continue; }
+
+        echo "   $rel -> ${sub:-.}"
+        "${RSYNC[@]}" --whole-file --chmod=F755,D755 ${EXCLUDES[@]+"${EXCLUDES[@]}"} \
+              "$REPO/$rel/" "$STAGING${sub:+/$sub}/"
+    done
+
+    # --- deliver: staging -> guest ------------------------------------------
+    [[ -d "$STAGING" ]] || die "staging dir not found: $STAGING"
+    (( ${#MAPPINGS[@]} )) || die "no map rules in $CONF"
+
+    sync_deliver
+}
+
+# sync_deliver -- build the delivery tree and push it onto the guest's /.
+#
+# No --delete: the destination is the guest's root, and deletions are the
+# cleanup rules' job, which name the directories they are allowed to empty.
+sync_deliver() {
+    local deliver files bytes rc=0 t0 ms what
+
+    xfer_stage
+    deliver="$XFER_STAGE/root"
+    mkdir -p "$deliver" || die "could not create the delivery tree: $deliver"
+    # The tree's root stands for the guest's /, so its mode must be one that
+    # could be copied onto it. Nothing here copies it (no -p, tart-xfer), and
+    # it is still made sane rather than left at mktemp's 0700.
+    chmod 755 "$deliver"
+
+    # Priced before it is built: the whole staging tree, an upper bound.
+    xfer_room_for "$(tree_bytes "$STAGING")" "$deliver"
+
+    sync_map_into "$deliver"
+
+    files="$(find "$deliver" -type f | wc -l | tr -dc '0-9')"
+    (( files )) || die "no map rule matched anything in $STAGING, so there is" \
+                       "nothing to deliver. The warnings above say which."
+    bytes="$(tree_bytes "$deliver")"
+
+    printf 'deliver: %s file(s), %s -> %s /\n' "$files" "$(fmt_bytes "$bytes")" "$DOMAIN"
+
+    # Here, and no sooner: a rule that frees a locked file ("stop the service")
+    # is not holding the guest open across the fetch above.
+    if (( ${#RUN_PRE[@]} )); then sync_run pre "${RUN_PRE[@]}"; fi
+
+    t0="$(now_ms)"
+    xfer_rsync "$deliver/" "$DOMAIN:/" || rc=$?
+    ms=$(( $(now_ms) - t0 ))
+    (( rc == 0 )) || xfer_rsync_die "$rc" "the delivery"
+
+    what="$files file"; (( files == 1 )) || what+="s"
+    if (( XFER_COPIED > 0 )); then
+        what+=" offered, $XFER_COPIED copied"
+    else
+        what+=" offered, all already current in the guest"
+    fi
+    echo "$DOMAIN: $what in $(fmt_duration "$ms")"
+    xfer_stop
+
+    # After the delivery: a cleanup pattern that overlaps a map destination
+    # has always emptied it last.
+    if (( ${#CLEANUP[@]} )); then sync_cleanup; fi
+
+    # Last, so a rule that starts the service sees the delivered files and the
+    # emptied directories.
+    if (( ${#RUN_POST[@]} )); then sync_run post "${RUN_POST[@]}"; fi
+
+    echo "copy complete -> $DOMAIN"
+}
+
+# The guest-side sh for the cleanup rules: one function, called once per
+# pattern with the pattern as its argument. modules/linux/sync's, and its
+# reasoning: the pattern travels as data and still globs, because with IFS
+# empty `set -- $pat` splits into no fields and expands each match to one.
+sync_cleanup_fn() {
+    printf '%s\n' \
+        'clean() {' \
+        '  pat=$1 hit=0 oldifs=$IFS' \
+        '  IFS=""; set -- $pat; IFS=$oldifs' \
+        '  for f do' \
+        '    [ -e "$f" ] || [ -L "$f" ] || continue' \
+        '    hit=1' \
+        '    rel=${f#/}' \
+        '    case $rel in */*) ;; *) echo "unsafe $f"; continue ;; esac' \
+        '    if [ -d "$f" ] && [ ! -L "$f" ]; then' \
+        '      n=0' \
+        '      for k in "$f"/* "$f"/.[!.]* "$f"/..?*; do' \
+        '        [ -e "$k" ] || [ -L "$k" ] || continue' \
+        '        if rm -rf -- "$k" 2>/dev/null; then n=$((n+1))' \
+        '        else echo "locked $k"; fi' \
+        '      done' \
+        '      echo "emptied $n $f"' \
+        '    elif rm -f -- "$f" 2>/dev/null; then echo "deleted $f"' \
+        '    else echo "locked $f"' \
+        '    fi' \
+        '  done' \
+        '  [ "$hit" = 1 ] || echo "absent $pat"' \
+        '}'
+}
+
+# sync_cleanup -- the cleanup rules, run in the guest: each pattern is expanded
+# there, every directory it names has its contents removed but not itself, and
+# every file it names is deleted. The two-levels-down rule is enforced twice,
+# here on the pattern and in the guest on what it resolved to.
+sync_cleanup() {
+    local pat script out line kind rest n path
+    local -a pats=()
+
+    for pat in "${CLEANUP[@]}"; do
+        pat="$(guest_norm_posix "$pat" "cleanup path")" || exit 1
+        if [[ "$pat" != */* ]]; then
+            warn "refusing unsafe cleanup pattern: /$pat"
+            continue
+        fi
+        pats+=("/$pat")
+    done
+    (( ${#pats[@]} )) || return 0
+
+    script="$(sync_cleanup_fn)"
+    for pat in "${pats[@]}"; do
+        script+=$'\n'"clean $(sh_quote "$pat")"
+    done
+
+    out="$(tart_sh_text "$DOMAIN" "$script")" \
+        || die "the guest could not run the cleanup rules; its own error is" \
+               "above. What was delivered is already in place."
+
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        kind="${line%% *}"; rest="${line#* }"
+        case "$kind" in
+            absent)  echo "   not present, skipped: $rest" ;;
+            unsafe)  warn "refusing unsafe cleanup path: $rest" ;;
+            locked)  warn "   could not remove: $rest" ;;
+            deleted) echo "   deleted $rest" ;;
+            emptied) n="${rest%% *}"; path="${rest#* }"
+                     echo "   emptied $path ($n entries)" ;;
+            *)       echo "   $line" ;;
+        esac
+    done <<<"$out"
+}

@@ -1,0 +1,218 @@
+# tart-exec -- run commands inside a tart domain, and start one on its desktop:
+# `exec` and `ui` for the macOS host's second kind of domain (modules/mac/tart).
+#
+# The channel is tart's own: `tart exec VM CMD...`, which reaches the tart guest
+# agent in the guest over the VM's control socket. It carries an argv, the three
+# standard streams and the exit code, so there is no qemu-ga here and none of
+# what modules/mac/exec does around it: no base64, no polling, no exec records,
+# no nonce, and no lock -- the agent serves any number of callers at once.
+# Output arrives as the command writes it rather than when it ends.
+#
+# **Who a command runs as.** The contract says `exec` runs as root, and the
+# agent runs as whoever its launchd job says: the logged-in user, in the images
+# this was measured on. So `exec sh` asks first (`id -u`), and when the agent is
+# not root it goes through `sudo -n`, which those images allow without a
+# password. `ui run` wants the opposite -- the user on the console, in their
+# session -- and is the same two cases the other way round.
+#
+#   virutil exec ping VM              is the agent answering?
+#   virutil exec sh   VM [-d] SCRIPT  run SCRIPT via /bin/sh -c, as root
+#   virutil ui  run   VM [-s] APP...  start APP on the console user's desktop
+#
+# cmd and ps are a Windows guest's and are refused by name.
+
+# tart_agent_up VM -- does the agent answer? One round trip, nothing printed.
+tart_agent_up() {
+    "$TART" exec "$1" /usr/bin/true </dev/null >/dev/null 2>&1
+}
+
+tart_agent_dead() {
+    tart_running "$1" || die "$1 is not running"
+    die "$1's tart guest agent is not answering." \
+        "The agent is what runs anything inside the guest, so nothing can" \
+        "proceed without it. A guest still booting has not started it yet; a" \
+        "guest that never answers has none installed. See README.md, 'A macOS" \
+        "guest on a macOS host'."
+}
+
+# tart_agent_sudo VM -- sets TART_SUDO to the words that make a guest command
+# root: nothing when the agent is root already, `sudo -n` when it is not. Dies
+# when the agent does not answer, or cannot become root without a password.
+# Asked once per run and per VM.
+TART_SUDO=() TART_SUDO_VM=""
+tart_agent_sudo() {
+    local vm="$1" uid
+    [[ "$TART_SUDO_VM" == "$vm" ]] && return 0
+    uid="$("$TART" exec "$vm" /usr/bin/id -u </dev/null 2>/dev/null | tr -dc '0-9')" || true
+    [[ -n "$uid" ]] || tart_agent_dead "$vm"
+    if (( uid == 0 )); then
+        TART_SUDO=()
+    else
+        "$TART" exec "$vm" /usr/bin/sudo -n /usr/bin/true </dev/null >/dev/null 2>&1 \
+            || die "$vm's guest agent runs as uid $uid, and that user cannot sudo" \
+                   "without a password. virutil runs everything in a guest as root," \
+                   "so give the user a NOPASSWD sudoers entry in the guest:" \
+                   "  echo 'USER ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/USER-nopasswd"
+        TART_SUDO=(/usr/bin/sudo -n)
+    fi
+    TART_SUDO_VM="$vm"
+}
+
+# tart_agent_root VM CMD... -- CMD in the guest as root: its streams and exit
+# code are this call's.
+tart_agent_root() {
+    local vm="$1"; shift
+    tart_agent_sudo "$vm"
+    "$TART" exec "$vm" ${TART_SUDO[@]+"${TART_SUDO[@]}"} "$@"
+}
+
+# tart_sh_text VM SCRIPT -- SCRIPT in VM's /bin/sh as root; its exit code. What
+# exec_sh_text is to a QEMU domain, and what sync's run rules and the transfer
+# helpers call. set -e, for the reason exec_sh_text gives.
+#
+# With INPUT=1 the host's stdin is the guest process's stdin. Without it the
+# guest reads nothing, so a script that reads stdin by accident ends rather
+# than hangs.
+tart_sh_text() {
+    local vm="$1" script="set -e
+$2" input="${3:-0}"
+    tart_agent_sudo "$vm"
+    if (( input )); then
+        "$TART" exec -i "$vm" ${TART_SUDO[@]+"${TART_SUDO[@]}"} /bin/sh -c "$script"
+    else
+        "$TART" exec "$vm" ${TART_SUDO[@]+"${TART_SUDO[@]}"} /bin/sh -c "$script" </dev/null
+    fi
+}
+
+# tart_exec CMD VM [FLAGS] [ARGS] -- `virutil exec` for a tart domain. The
+# flags and the stdin rules are modules/mac/exec's own (parse_flags,
+# resolve_text), so a command line means the same against either kind.
+tart_exec() {
+    local CMD="$1" VM="$2" pid input=0
+    shift 2
+    tart_tool
+    case "$CMD" in
+    ping)
+        tart_running "$VM" || die "$VM is not running"
+        tart_agent_up "$VM" || tart_agent_dead "$VM"
+        echo "$VM: agent up"
+        ;;
+    sh)
+        parse_flags "$@"
+        set -- ${E_REST[@]+"${E_REST[@]}"}
+        resolve_text "$@" || { echo "usage: virutil exec sh VM [-d] SCRIPT..." >&2; exit 1; }
+        tart_running "$VM" || die "$VM is not running"
+        if [ "$DETACH" = 1 ]; then
+            # Started in the background of a shell that exits at once, with
+            # none of its streams the agent's: the agent would otherwise hold
+            # the call open until the script closed them.
+            pid="$(tart_sh_text "$VM" \
+                "nohup /bin/sh -c $(sh_quote "set -e
+$TEXT") >/dev/null 2>&1 </dev/null &
+echo \$!")" || exit 1
+            [[ "$pid" =~ ^[0-9]+$ ]] || die "$VM could not start the detached script; it printed: [$pid]"
+            echo "$pid"
+            return 0
+        fi
+        # resolve_text read the host's stdin into INPUT_B64 when there was any
+        # to pass on; here it goes back out as the guest's.
+        if [[ -n "$INPUT_B64" ]]; then
+            base64 -d <<<"$INPUT_B64" | tart_sh_text "$VM" "$TEXT" 1
+        else
+            tart_sh_text "$VM" "$TEXT"
+        fi
+        ;;
+    cmd|ps)
+        die "virutil exec $CMD is a Windows guest's shell, and $VM is a tart" \
+            "domain running $(tart_guest_os "$VM"). Use: virutil exec sh $VM ..."
+        ;;
+    *)
+        exec_usage
+        ;;
+    esac
+}
+
+# --- ui ------------------------------------------------------------------------
+#
+# `ui run` on a Windows guest crosses session 0 isolation. A macOS guest has
+# the same split under another name: a process started outside the user's
+# login session -- by a daemon, or by sudo -- is not in the Aqua session, so it
+# cannot open a window, and an app it launches has no Dock and no keychain. So
+# APP is started as the user who owns the console, inside that user's session
+# (`launchctl asuser`), with its streams detached so it outlives the call.
+#
+# The guest script answers one line, "PID USER", or exits UI_RC_NO_USER when
+# nobody is logged in: the console is then loginwindow's, and root owns it.
+
+UI_RC_NO_USER=96
+
+# tart_ui_script AS_ROOT QUOTED_COMMAND -- the guest half, /bin/sh.
+tart_ui_script() {
+    printf '%s\n' \
+        'user=$(/usr/bin/stat -f %Su /dev/console 2>/dev/null || true)' \
+        'case "$user" in ""|root|loginwindow|_*) echo "no user is logged in on the console" >&2; exit '"$UI_RC_NO_USER"' ;; esac' \
+        'uid=$(/usr/bin/id -u "$user")' \
+        'cd "$(/usr/bin/dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | /usr/bin/sed "s/^NFSHomeDirectory: //")" 2>/dev/null || cd /' \
+        "as_root=$1" \
+        'if [ "$as_root" = 1 ]; then' \
+        '  /bin/launchctl asuser "$uid" /bin/sh -c "$1" >/dev/null 2>&1 </dev/null &' \
+        '  user=root' \
+        'elif [ "$(/usr/bin/id -u)" = "$uid" ]; then' \
+        '  /bin/sh -c "$1" >/dev/null 2>&1 </dev/null &' \
+        'else' \
+        '  /bin/launchctl asuser "$uid" /usr/bin/sudo -n -u "$user" -H /bin/sh -c "$1" >/dev/null 2>&1 </dev/null &' \
+        'fi' \
+        'echo "$! $user"'
+}
+
+# tart_ui_start VM AS_ROOT CMDLINE -- start CMDLINE (one /bin/sh command line)
+# on VM's console desktop. Prints the contract's line; exits 96 with nobody
+# logged in.
+tart_ui_start() {
+    local vm="$1" as_root="$2" cmdline="$3" out rc=0 pid user
+    tart_running "$vm" || die "$vm is not running"
+    tart_agent_sudo "$vm"
+    out="$("$TART" exec "$vm" ${TART_SUDO[@]+"${TART_SUDO[@]}"} /bin/sh -c \
+        "$(tart_ui_script "$as_root")" sh "$cmdline" </dev/null)" || rc=$?
+    if (( rc == UI_RC_NO_USER )); then
+        warn "$vm: nothing to launch into -- log a user on to the guest first," \
+             "or pass -s to run as root in the console session."
+        exit "$UI_RC_NO_USER"
+    fi
+    (( rc == 0 )) || die "$vm could not start it (exit $rc)"
+    read -r pid user <<<"$out"
+    [[ "$pid" =~ ^[0-9]+$ ]] || die "$vm could not start it; the guest said: [$out]"
+    echo "started PID $pid in session console as $user"
+}
+
+# tart_ui VM [FLAGS] [--] APP... -- `virutil ui run` for a tart domain.
+tart_ui() {
+    local VM="$1" as_root=0 cmdline="" a
+    shift
+    tart_tool
+    while (( $# )); do
+        case "$1" in
+            -s|--system) as_root=1; shift ;;
+            -i|--session)
+                die "virutil ui run -i names a Windows session, and $VM is a tart" \
+                    "domain running $(tart_guest_os "$VM"): a Mac has one console" \
+                    "session, and that is where APP goes. Drop $1." ;;
+            --elevated)
+                die "virutil ui run --elevated lifts a UAC-split token, which a" \
+                    "Windows guest has and $VM does not. Use -s to run as root." ;;
+            -h|--help)   ui_usage 0 ;;
+            --)          shift; break ;;
+            -*)          die "virutil ui run: unknown flag: $1 (use -- before APP's own flags)" ;;
+            *)           break ;;
+        esac
+    done
+    (( $# )) || ui_usage 1
+    [[ "$(tart_guest_os "$VM")" == macos ]] \
+        || die "virutil ui run reaches a macOS guest's console session, and $VM" \
+               "is a tart domain running $(tart_guest_os "$VM")."
+    # APP and its arguments are an argv; the guest runs one command line, so
+    # each word is quoted for /bin/sh here and arrives as it was given.
+    for a in "$@"; do cmdline+="${cmdline:+ }$(sh_quote "$a")"; done
+    # `exec`, so the pid printed is APP's and not a shell's around it.
+    tart_ui_start "$VM" "$as_root" "exec $cmdline"
+}

@@ -1,0 +1,50 @@
+# pull -- copy a file or directory out of a guest onto this host.
+#
+# The other direction of modules/mac/push, on the same transfer layer
+# (modules/mac/tart-xfer), and for a tart domain only for the same reason.
+
+pull_usage() {
+    printf '%s\n' \
+        "usage: virutil pull VM SRC DST" \
+        "" \
+        "  VM   tart domain to read from; it has to be running, since the copy" \
+        "       comes through its guest agent" \
+        "  SRC  guest path, relative to the guest's root, /. Wildcards are" \
+        "       allowed and are expanded by the guest's own shell, so they" \
+        "       match case-sensitively; '..' is refused." \
+        "  DST  host directory to copy into (created if needed) -- or, when SRC" \
+        "       is one file with no wildcard and DST does not exist and has no" \
+        "       trailing /, the file to write: pull VM logs/run.json out/run.json" \
+        "" \
+        "  -h, --help              this message" \
+        "" \
+        "A directory source is copied recursively. This host's rsync drives the" \
+        "guest's own through 'tart exec', and so moves only what changed." \
+        "" \
+        "A QEMU domain is refused on this host: it has no transfer layer yet." >&2
+    exit "${1:-1}"
+}
+
+pull_main() {
+    local VM="" SRC="" DST=""
+    while (( $# )); do
+        case "$1" in
+            -h|--help) pull_usage 0 ;;
+            -*)        warn "unrecognised argument: $1"; pull_usage ;;
+            *)
+                if   [[ -z "$VM"  ]]; then VM="$1"
+                elif [[ -z "$SRC" ]]; then SRC="$1"
+                elif [[ -z "$DST" ]]; then DST="$1"
+                else warn "unexpected argument: $1"; pull_usage
+                fi
+                shift ;;
+        esac
+    done
+    [[ -n "$VM" && -n "$SRC" && -n "$DST" ]] || pull_usage
+
+    domain_exists "$VM" && xfer_qemu_refuse pull "$VM"
+    tart_claims "$VM" || die "no such domain: $VM (see: virutil domain list)"
+
+    xfer_check "$VM"
+    tart_pull "$VM" "$SRC" "$DST"
+}

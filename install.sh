@@ -78,7 +78,13 @@ if [[ "$(uname -s)" == Darwin ]]; then
         "domain snapshot |qemu-system-aarch64 qemu-img swtpm"
         "exec            |iconv"
     )
-    OPTIONAL=()
+    # A macOS guest is a tart domain (modules/mac/tart); a Mac that only runs
+    # QEMU domains needs none of these.
+    OPTIONAL=(
+        "tart domains: a macOS guest, every verb for it|tart"
+        "sync, push, pull into a tart domain (macOS's own rsync is too old: brew install rsync)|rsync"
+        "shot, input on a tart domain|python3"
+    )
 else
     REQUIRED=(
         "core            |virsh awk"

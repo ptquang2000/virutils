@@ -55,12 +55,19 @@ shot_main() {
         esac
         shift
     done
-    domain_need "$VM" || shot_usage 1
-    domain_running "$VM" || die "$VM is not running: there is no display to capture"
+    local tart=0
+    if tart_claims "$VM"; then tart=1
+    else
+        domain_need "$VM" || shot_usage 1
+        domain_running "$VM" || die "$VM is not running: there is no display to capture"
+    fi
 
     OUT="${OUT:-$VM-$(date +%Y%m%d-%H%M%S).png}"
     [[ "$OUT" == /* ]] || OUT="$PWD/$OUT"
     [[ -d "$(dirname -- "$OUT")" ]] || die "virutil shot: no such directory: $(dirname -- "$OUT")"
+
+    # A tart domain's frame comes from its VNC console (modules/mac/tart-screen).
+    if (( tart )); then tart_shot "$VM" "$OUT"; return; fi
 
     # Written under <root>/tmp and moved into place after, so a failed capture
     # never truncates a file -o already names. The trap keeps modules/mac/qemu's

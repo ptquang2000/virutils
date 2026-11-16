@@ -1,8 +1,13 @@
 # parser -- top-level dispatch plus the helpers every module shares. The macOS
 # host's counterpart of modules/linux/parser: same bash, same helpers, a
 # different module list.
+#
+# This host has two kinds of domain -- raw QEMU under hvf (modules/mac/qemu)
+# and tart, for a macOS guest (modules/mac/tart) -- and every module below
+# takes either: which kind a VM is, is asked per command. sync, push, pull and
+# ui are here for a tart domain and refuse a QEMU one by name, with the reason.
 
-MODULES=(domain snapshot exec shot input)
+MODULES=(domain snapshot exec shot input sync push pull ui)
 
 # The commands in docs/contract.md section 2 that this driver does not have yet,
 # each with the reason. They are refused by name rather than falling through to
@@ -10,11 +15,7 @@ MODULES=(domain snapshot exec shot input)
 # told it exists. The Windows driver keeps the same kind of list for the same
 # reason ($script:ELSEWHERE in modules/win/parser.ps1).
 declare -A ELSEWHERE=(
-    [sync]="needs the transfer layer, which this driver does not have yet"
-    [push]="needs the transfer layer, which this driver does not have yet"
-    [pull]="needs the transfer layer, which this driver does not have yet"
-    [ui]="is not wired into this driver yet"
-    [usb]="has no macOS mechanism yet: host USB passthrough under hvf is unmeasured"
+    [usb]="has no macOS mechanism yet: host USB passthrough is unmeasured under hvf, and tart offers none"
     [xfer]="is a Windows-host command: it sets up the scheduled task that lets a transfer there elevate without a UAC prompt"
 )
 
@@ -26,20 +27,29 @@ top_usage() {
     cat >&2 <<'EOF'
 usage: virutil MODULE [ARGS]
 
-This is the macOS driver: raw QEMU under hvf, one launcher script per domain.
+This is the macOS driver. It runs two kinds of domain, and every command
+takes either: a QEMU domain (raw QEMU under hvf, one launcher script per
+domain; Windows on Arm, Linux) and a tart domain (Virtualization.framework,
+kept by tart; a macOS guest).
 
 domains
   domain     the domain lifecycle: create, delete, list, start, shutdown, addr, port
-  snapshot   qcow2 snapshots: disk and memory for a running domain, disk-only
-             for a shut-off one
+  snapshot   QEMU: qcow2 snapshots, disk and memory for a running domain,
+             disk-only for a shut-off one. tart: a clone of a shut-off domain
+
+transfer (a tart domain only)
+  sync       fetch build output and deliver it into a running guest, per config
+  push       copy a file or directory from the host into a running guest
+  pull       copy a file or directory out of a running guest
 
 guest
-  exec       run commands inside a guest via the QEMU guest agent
+  exec       run commands inside a guest via its guest agent
+  ui         start an app on a macOS guest's desktop (a tart domain only)
   shot       capture a guest's screen to a PNG on this host
   input      click, drag, scroll, press keys and type in a guest, from this host
 
-Not on this host yet: sync, push, pull, ui, usb. Each is refused by name,
-with the reason; see docs/contract.md section 7.
+Not on this host yet: usb, and sync, push, pull and ui for a QEMU domain. Each
+is refused by name, with the reason; see docs/contract.md section 7.
 
 Run 'virutil <module>' for a module's own usage. Every module takes -h/--help,
 which exits 0; a usage error exits 1.

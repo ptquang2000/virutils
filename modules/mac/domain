@@ -69,6 +69,18 @@ domain_usage() {
         "ISO must be an arm64 install image: hvf runs guests of the host's own" \
         "architecture only." \
         "" \
+        "A macOS guest is a tart domain, and create makes one when what stands in" \
+        "ISO's place is tart's to read rather than an install ISO:" \
+        "  virutil domain create VM SOURCE [-s GB] [-m MiB] [-c N] [-N]" \
+        "    SOURCE  an image in a registry (ghcr.io/cirruslabs/macos-tahoe-base:latest)," \
+        "            a tart VM already on this host, which is cloned, or an .ipsw" \
+        "            restore image -- a file, a URL, or 'latest' -- for a fresh" \
+        "            install that starts in Setup Assistant" \
+        "  -s/-m/-c default to what the image says. -p is refused: a tart domain" \
+        "  is on the host's shared NAT and 'domain addr' prints its address." \
+        "Every other domain command takes a tart domain by name, as it takes a" \
+        "QEMU one; 'domain port' is refused for it, for the same reason as -p." \
+        "" \
         "The disk is always $VIRUTILS_IMAGE_DIR/VM.qcow2;" \
         "VIRUTILS_IMAGE_DIR moves it, and the launcher, nvram and sockets with it." \
         "" \
@@ -109,6 +121,17 @@ domain_main() {
         -h|--help) domain_usage 0 ;;
     esac
     shift
+
+    # A tart domain's verbs are tart's (modules/mac/tart). Which kind VM is, is
+    # asked here and nowhere else in this file: create by what it is being made
+    # from, every other verb by which kind already has that name.
+    case "$CMD" in
+        create)
+            if [[ -n "$(tart_create_source "$@")" ]]; then tart_domain_create "$@"; return; fi ;;
+        start|shutdown|destroy|addr|port|delete)
+            case "${1:-}" in -h|--help) domain_usage 0 ;; esac
+            if tart_claims "${1:-}"; then tart_domain "$CMD" "$@"; return; fi ;;
+    esac
 
     case "$CMD" in
         create)   domain_create   "$@" ;;
@@ -595,18 +618,28 @@ domain_destroy() {
 
 # --- list / addr --------------------------------------------------------------
 
+# Both kinds in one table, QEMU's first and each sorted: a caller reading
+# `domain list` is asking what there is to start, not how it is run.
 domain_list() {
     local vm
-    local -a rows=()
+    local -a rows=() tart=()
     while read -r vm; do
         [[ -n "$vm" ]] && rows+=("$vm")
     done < <(domain_names)
-    (( ${#rows[@]} )) || return 0
+    while read -r vm; do
+        # A tart VM named as a QEMU domain is shadowed by it everywhere else,
+        # so it is not listed twice here.
+        [[ -n "$vm" ]] && ! domain_exists "$vm" && tart+=("$vm")
+    done < <(tart_names)
+    (( ${#rows[@]} + ${#tart[@]} )) || return 0
     # virsh's own shape, so the drivers read alike.
     printf ' %-24s %s\n' Name State
     printf '%s\n' '----------------------------------------'
-    for vm in "${rows[@]}"; do
+    for vm in ${rows[@]+"${rows[@]}"}; do
         printf ' %-24s %s\n' "$vm" "$(domain_state "$vm")"
+    done
+    for vm in ${tart[@]+"${tart[@]}"}; do
+        printf ' %-24s %s\n' "$vm" "$(tart_state "$vm")"
     done
 }
 
