@@ -23,3 +23,6 @@ modules/mac/*    text eol=lf
 tests/linux/*.sh text eol=lf
 tests/mac/*.sh   text eol=lf
 tests/mac/*.pl   text eol=lf
+
+# The bench's shell scripts run in a WSL distro and in a Linux guest.
+bench/*.sh       text eol=lf
