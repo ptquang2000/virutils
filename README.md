@@ -64,6 +64,7 @@ utilities it calls.
 - [virutil input](#virutil-input)
 - [virutil usb](#virutil-usb)
    - [USB passthrough under WSL, with usbipd](#usb-passthrough-under-wsl-with-usbipd)
+- [WHPX or KVM in WSL2 on a Windows host](#whpx-or-kvm-in-wsl2-on-a-windows-host)
 - [Requirements](#requirements)
 - [See also](#see-also)
 
@@ -2658,6 +2659,77 @@ usbipd unbind -b 3-3          # Administrator; stops sharing altogether
   elevated `usbipd policy add --effect Allow --operation AutoBind
   --hardware-id VID:PID` lets `usbipd attach --wsl --hardware-id VID:PID` bind
   it on the fly, as a normal user.
+
+## WHPX or KVM in WSL2 on a Windows host
+
+A Windows host can run a guest two ways: QEMU on Windows under WHPX, which the
+Windows driver (`modules/win`) does, or QEMU/KVM inside a WSL2 distribution,
+which the Linux driver does when it runs in that distribution (libvirt and
+everything [Requirements](#requirements) lists, in the distro). Both run on the
+one Windows hypervisor, side by side.
+
+**Windows guests: WHPX.** **Linux guests: KVM in WSL2 is faster, at a memory
+cost.** Measured 2026-11-18 on a 22-thread Core Ultra 7 165H with 32 GB, Windows 11,
+WSL 2.7.11 (kernel 6.18), the same guest disk and QEMU machine on both sides (q35,
+Skylake-Client, 4 vCPU, 8 GiB, virtio-blk `cache=writeback`, virtio-net on
+user-mode networking), 3 runs each. KVM ÷ WHPX of the medians: above 1 is better
+for KVM, except in the time rows, where below 1 is:
+
+| | Linux guest (Ubuntu 26.04) | Windows 11 guest |
+|---|---|---|
+| boot to ssh, time | 0.34× (25 s vs 74 s) | 0.79× (50 s vs 63 s) |
+| CPU, 1 and 4 threads (7-Zip; Linux also sysbench) | 1.11–1.31× | 1.12–1.14× |
+| memory bandwidth, 1 / 4 threads | 1.56× / 1.21× | 1.15× / 0.53× |
+| 4k random read / write, QD32 | 1.15× / 0.54× | **0.14× / 0.38×** |
+| 1M sequential read / write | 18× ¹ / 3.0× | 1.10× / 0.82× |
+| network, host → guest / guest → host | 1.7× / 3.2× | 0.60× / **0.11×, stalls** |
+| cold `make -j4` of zstd, time | 1.10× | 0.90× |
+| host RAM free while the guest runs | 2.8–3.2 GB vs 10.9–12.8 GB | 3.3–3.8 GB vs 6.4–7.7 GB |
+
+¹ Mostly the WSL VM's page cache serving the image, not the disk.
+
+The host ran endpoint security throughout, and P, E and LP-E cores mixed, so with
+3 runs a ratio within about ±20% is not a difference. Turning on the Hyper-V
+enlightenments that libvirt gives a Windows guest (`hv-relaxed`, `hv-vapic`,
+`hv-time`, `hv-synic`, `hv-stimer` and the rest) made Windows on KVM worse: boot
+1.7× slower, single-thread memory bandwidth a quarter, and every forwarded
+connection stalled. The cause was not found. The scripts and how to run them
+again: [`bench/`](bench/README.md).
+
+What each side gives and costs:
+
+- **Snapshots.** WHPX has no live snapshot: `savevm` is refused ("missing dirty
+  memory tracking support"), which is why the Windows driver has no `snapshot`
+  module. A shut-off disk still takes an offline one, `qemu-img snapshot -c` /
+  `-a` (0.25 s / 0.18 s, disk only), or an overlay. Under KVM, live `savevm` /
+  `loadvm` work once the UEFI vars are a qcow2 file (a raw pflash refuses: "Device
+  'pflash1' is writable but does not support snapshots"); an idle Linux guest with
+  2.4 GiB of state saved in 9.2 s and loaded in 10.3 s. A `loadvm` that fails leaves
+  the guest paused.
+- **Turning KVM on.** No Windows feature, `.wslconfig` change or reboot:
+  WSL 2.7.11 nests virtualization by default and its kernel ships KVM as modules.
+  In the distro, `modprobe kvm_intel` (`kvm_amd`), and `/dev/kvm` appears; list it in
+  `/etc/modules-load.d/` to keep it.
+- **A guest's lifetime.** WSL stops a distribution, and every guest in it, about
+  40 s after the last `wsl.exe` attached to it ends, libvirtd and systemd
+  notwithstanding. Something has to hold a `wsl.exe -d DISTRO` open for as long as a
+  guest runs: a per-user scheduled task running `conhost.exe --headless wsl.exe -d
+  DISTRO -e sleep infinity` does, with no elevation. `wsl --shutdown`, run by
+  anyone, ends every guest in every distribution.
+- **Memory.** WSL's VM (`vmmemWSL`) holds the guest's RAM and the Linux page cache
+  behind its image, about 11 GB for an 8 GB guest, and keeps it after the guest
+  exits until `wsl --terminate DISTRO`. WSL caps itself at half the host's RAM by
+  default: one 8 GB guest fits on a 32 GB host, two need `memory=` in
+  `.wslconfig`.
+- **Disk.** Images in the distro live in its `ext4.vhdx`, which grows and never
+  shrinks; WSL refuses to make it sparse without `--allow-unsafe`. Copying 36 GB in
+  over `/mnt/c` took 13 min.
+- **Reaching the guest.** A port forward inside WSL reaches Windows through
+  WSL's localhost relay (`wslrelay`); see [port](#port). A Windows guest's
+  forwarded connections through it stalled; a Linux guest's did not.
+- **Display.** WHPX draws a GTK window on the Windows desktop. Under KVM there is
+  none by default (a GTK window through WSLg, VNC or SPICE are the options); the
+  monitor's `screendump` works.
 
 ## Requirements
 
